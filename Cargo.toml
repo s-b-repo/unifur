@@ -1,0 +1,41 @@
+[package]
+name = "diffusionblocks"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Block-wise neural network training via diffusion interpretation (DiffusionBlocks++ in Rust)"
+readme = "README.md"
+keywords = ["deep-learning", "diffusion", "burn", "block-wise-training", "transformers"]
+categories = ["science", "mathematics"]
+
+[lib]
+name = "diffusionblocks"
+path = "src/lib.rs"
+
+[[bin]]
+name = "dblocks"
+path = "src/main.rs"
+
+[dependencies]
+burn = { version = "0.21", default-features = false, features = ["ndarray", "std", "simd", "autodiff"] }
+# Feature unification: burn declares burn-ndarray with default-features = false,
+# so simd/multi-threads must be enabled here explicitly. multi-threads turns on
+# rayon for elementwise/reduction ops and threaded GEMM (matrixmultiply).
+burn-ndarray = { version = "0.21", features = ["multi-threads"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+rand = "0.9"
+sha2 = "0.10"
+
+[dev-dependencies]
+approx = "0.5"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+[profile.dev.package."*"]
+opt-level = 2
