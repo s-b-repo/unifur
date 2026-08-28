@@ -28,7 +28,7 @@ Two documents are authoritative about what is and is not implemented:
 
 ```bash
 cargo build --release
-./target/release/dblocks verify        # 73 certificates, non-zero exit on failure
+./target/release/dblocks verify        # 74 certificates, non-zero exit on failure
 ./target/release/dblocks train --steps 200
 ./target/release/dblocks sample --planned --plan-depth 2   # plan the trajectory
 ./target/release/dblocks lm generate --lookahead 2         # plan the tokens

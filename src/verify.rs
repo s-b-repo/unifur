@@ -675,8 +675,18 @@ fn solver_certificates() -> Vec<Certificate> {
 // -------------------------------------------------------------- precision --
 
 fn precision_certificates() -> Vec<Certificate> {
+    let device: <B as burn::tensor::backend::BackendTypes>::Device = Default::default();
     let mut bound_excess: f64 = 0.0;
     let mut idempotence_err: f64 = 0.0;
+    // Both of the above are satisfied trivially by a `round` that does nothing:
+    // an identity has zero relative error and is trivially idempotent. So the
+    // suite also has to show that rounding *happens* -- a mutant that made
+    // `round_scalar` the identity passed both of the original certificates.
+    let mut inertness: f64 = 0.0;
+    // ...and that the tensor path agrees with the scalar one, since sampling
+    // uses `Precision::round` while these bounds were only ever measured on
+    // `round_scalar`.
+    let mut path_disagreement: f64 = 0.0;
 
     for precision in [Precision::Bf16, Precision::F16] {
         let u = precision.unit_roundoff() as f64;
@@ -693,6 +703,36 @@ fn precision_certificates() -> Vec<Certificate> {
                 }
             }
         }
+
+        // A value needing more significand bits than the format has *must*
+        // move. `1 + 2^-20` is representable in f32 and in neither bf16 (8
+        // bits) nor f16 (11), so an unchanged output means no rounding
+        // happened at all.
+        for probe in [
+            1.0f32 + 2f32.powi(-20),
+            1.0f32 + 2f32.powi(-18),
+            -(1.0f32 + 2f32.powi(-20)),
+        ] {
+            if precision.round_scalar(probe) == probe {
+                inertness = 1.0;
+            }
+        }
+
+        // The scalar and tensor paths are two implementations of one claim;
+        // they must not drift.
+        let values: Vec<f32> = (0..64)
+            .map(|i| (1.0 + i as f32 / 64.0) * 2f32.powi((i % 9) - 4))
+            .collect();
+        let rounded = precision.round(
+            Tensor::<B, 1>::from_floats(values.as_slice(), &device).reshape([8, 8]),
+        );
+        let got: Vec<f32> = rounded.into_data().convert::<f32>().iter::<f32>().collect();
+        for (tensor_value, scalar_input) in got.iter().zip(&values) {
+            let want = precision.round_scalar(*scalar_input);
+            if tensor_value.to_bits() != want.to_bits() {
+                path_disagreement = f64::from((tensor_value - want).abs()).max(f64::MIN_POSITIVE);
+            }
+        }
     }
 
     vec![
@@ -702,6 +742,13 @@ fn precision_certificates() -> Vec<Certificate> {
             "Round-to-nearest at p significand bits has relative error at most 2^-p, for bf16 and f16.",
             bound_excess,
             1e-6,
+        ),
+        cert(
+            "precision",
+            "rounding_actually_rounds",
+            "A value needing more significand bits than the format holds is changed by rounding, and the tensor path agrees with the scalar one bit for bit -- neither an inert `round` nor a drifted second implementation can pass.",
+            inertness.max(path_disagreement),
+            0.0,
         ),
         cert(
             "precision",
@@ -906,13 +953,36 @@ fn moe_certificates() -> Vec<Certificate> {
         for v in p.iter_mut() {
             *v /= total;
         }
-        let loss = e as f64 * p.iter().map(|x| x * x).sum::<f64>();
+        // Measured through `weighted_switch_loss` itself, not recomputed here.
+        // The inline version of this check passed while a mutant that dropped
+        // the `* E` factor shipped -- a certificate that reimplements the
+        // formula proves the formula, which was never in doubt.
+        let probs = Tensor::<B, 1>::from_floats(
+            p.iter().map(|v| *v as f32).collect::<Vec<f32>>().as_slice(),
+            &device,
+        )
+        .reshape([1, e]);
+        // On the diagonal `f == p`, so the top-1 assignment must reproduce the
+        // same distribution: a one-hot row per expert, weighted by `p`.
+        let ids = Tensor::<B, 1, Int>::arange(0..e as i64, &device).reshape([e, 1]);
+        let dense = probs.clone().repeat_dim(0, e);
+        let weights = probs.clone().reshape([e, 1]);
+        let loss = f64::from(
+            crate::moe::weighted_switch_loss(&dense, &ids, &weights, e).into_scalar(),
+        );
         bound_violation = bound_violation
             .max((1.0 - loss).max(0.0))
             .max((loss - e as f64).max(0.0));
     }
-    let uniform_gap =
-        (e as f64 * vec![1.0 / e as f64; e].iter().map(|x| x * x).sum::<f64>() - 1.0).abs();
+    // Uniform routing attains the lower bound exactly -- again measured through
+    // the implementation.
+    let uniform = Tensor::<B, 2>::full([e, e], 1.0 / e as f32, &device);
+    let uniform_ids = Tensor::<B, 1, Int>::arange(0..e as i64, &device).reshape([e, 1]);
+    let uniform_weights = Tensor::<B, 2>::full([e, 1], 1.0 / e as f32, &device);
+    let uniform_gap = f64::from(
+        crate::moe::weighted_switch_loss(&uniform, &uniform_ids, &uniform_weights, e).into_scalar(),
+    ) - 1.0;
+    let uniform_gap = uniform_gap.abs();
 
     // ------------------------------------------------------------------
     // The z-loss penalizes the log-sum-exp rather than the logits themselves,
@@ -1743,6 +1813,11 @@ fn accuracy_certificates() -> Vec<Certificate> {
 fn optim_certificates() -> Vec<Certificate> {
     use crate::reweight::{SigmaImportanceSampler, UncertaintyWeighting};
     use crate::schedule::{GradientAccumulator, LrSchedule};
+    use crate::sigma::{P_MEAN, P_STD};
+    use crate::train::DefaultTrainBackend as A2;
+    use rand::{rngs::StdRng, SeedableRng};
+
+    let device: <B as burn::tensor::backend::BackendTypes>::Device = Default::default();
 
     // ------------------------------------------------------------------
     // Gradient accumulation over k micro-batches must equal one k-times-larger
@@ -1842,13 +1917,29 @@ fn optim_certificates() -> Vec<Certificate> {
     // rescaling of the weights), and the result never leaves the interval
     // spanned by its inputs (no extrapolation into a region neither model
     // occupies).
+    //
+    // The decay is read from `Ema::effective_decay` rather than recomputed
+    // here. Recomputing it is what let a mutant that dropped the bias
+    // correction entirely pass this certificate: the inline copy stayed
+    // correct while the implementation did not.
+    let ema_device: <A2 as burn::tensor::backend::BackendTypes>::Device = Default::default();
+    let probe: burn::nn::Linear<A2> =
+        burn::nn::LinearConfig::new(2, 2).with_bias(false).init(&ema_device);
+
     let mut convexity_err: f64 = 0.0;
     let mut interval_err: f64 = 0.0;
     for decay in [0.0f64, 0.5, 0.9, 0.999, 1.0] {
-        for updates in [0usize, 1, 5, 100, 10_000] {
-            // The bias correction the implementation applies.
+        let mut ema = crate::schedule::Ema::new(&probe, decay);
+        for updates in [0usize, 1, 5, 100] {
+            while ema.updates() < updates {
+                ema.update::<A2>(&probe);
+            }
+            let d = ema.effective_decay();
+
+            // Bias correction: early on the shadow is still mostly its
+            // initialization, so the nominal decay is ramped in.
             let warm = (1.0 + updates as f64) / (10.0 + updates as f64);
-            let d = decay.min(warm);
+            convexity_err = convexity_err.max((d - decay.min(warm)).abs());
             convexity_err = convexity_err.max((d + (1.0 - d) - 1.0).abs());
             if !(0.0..=1.0).contains(&d) {
                 convexity_err = 1.0;
@@ -1922,6 +2013,43 @@ fn optim_certificates() -> Vec<Certificate> {
             optimum_err.max((objective(l_star) - UncertaintyWeighting::value_at_optimum(raw)).abs());
     }
 
+    // ...and `apply` must implement that objective, not merely agree with the
+    // closed form derived from it. Checking `optimal_log_variance` against
+    // inline arithmetic proves algebra that was never in doubt: a mutant that
+    // dropped the `+ l` term from `apply` passed every certificate in this
+    // group, because no certificate called `apply`.
+    let mut apply_err: f64 = 0.0;
+    let losses = [0.05f32, 1.0, 13.4, 1909.8];
+    let logvars = [-2.0f32, -0.25, 0.0, 3.5];
+    let raw = Tensor::<B, 1>::from_floats(losses.as_slice(), &device);
+    let lv = Tensor::<B, 1>::from_floats(logvars.as_slice(), &device);
+
+    let full: Vec<f32> = UncertaintyWeighting::full()
+        .apply(raw.clone(), lv.clone())
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect();
+    for ((got, l), v) in full.iter().zip(&losses).zip(&logvars) {
+        let want = f64::from(*l) * (-f64::from(*v)).exp() + f64::from(*v);
+        apply_err = apply_err.max((f64::from(*got) - want).abs() / want.abs().max(1.0));
+    }
+
+    // Strength 0 is the exact identity, bitwise -- a blended `(1-t)L + tL` is
+    // not `L` in floating point, and an almost-identity default is a leak
+    // nobody would look for.
+    let off: Vec<f32> = UncertaintyWeighting::off()
+        .apply(raw.clone(), lv.clone())
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect();
+    for (got, want) in off.iter().zip(&losses) {
+        if got.to_bits() != want.to_bits() {
+            apply_err = f64::INFINITY;
+        }
+    }
+
     // The property that actually fixes the 140x block imbalance: at the
     // optimum the gradient scale is `exp(-l*) * L = 1` regardless of `L`, so
     // rescaling any noise level's loss by a constant leaves the gradient it
@@ -1972,6 +2100,42 @@ fn optim_certificates() -> Vec<Certificate> {
         }
     }
 
+    // The proposal maths above never draws a sample, and `sample` is where the
+    // weight is actually attached. A mutant that returned `q/p` instead of
+    // `p/q` -- inverting the correction so it *amplifies* the proposal's bias
+    // rather than removing it -- passed every certificate *and* every unit
+    // test. So the weights are checked where they are produced.
+    let mut drawn_err: f64 = 0.0;
+    let mut rng = StdRng::seed_from_u64(0xA5A5);
+    for bins in [1usize, 4, 16] {
+        let mut sampler = SigmaImportanceSampler::new(bins).with_smoothing(0.2);
+        for bin in 0..bins {
+            sampler.observe(bin, (bin as f64 + 1.0).powi(2));
+        }
+        let q = sampler.proposal();
+        let prior = sampler.prior();
+        let (cdf_lo, cdf_hi) = (0.05f64, 0.95);
+
+        let drawn = sampler.sample(&mut rng, cdf_lo, cdf_hi, P_MEAN, P_STD, 256);
+        for (sigma, weight) in &drawn {
+            // Every sigma must land inside the window it was drawn from...
+            let cdf = crate::stats::norm_cdf((sigma.ln() - P_MEAN) / P_STD);
+            drawn_err = drawn_err
+                .max((cdf_lo - cdf).max(0.0))
+                .max((cdf - cdf_hi).max(0.0));
+            // ...and carry exactly the `p/q` of the bin it landed in.
+            let bin = sampler.bin_of(*sigma, cdf_lo, cdf_hi, P_MEAN, P_STD);
+            let expected = prior / q[bin];
+            drawn_err = drawn_err.max((weight - expected).abs() / expected.max(1.0));
+        }
+        // No Monte-Carlo convergence check here on purpose. "The mean weight
+        // tends to 1" is a *statistical* claim needing a sampling-error
+        // tolerance, and folding it into a certificate whose other terms are
+        // exact would force that whole certificate down to a bound no exact
+        // statement needs. The per-draw equality above is exact and already
+        // catches an inverted weight, which is what this exists to catch.
+    }
+
     vec![
         cert(
             "optim",
@@ -2001,9 +2165,12 @@ fn optim_certificates() -> Vec<Certificate> {
         cert(
             "optim",
             "uncertainty_optimum_is_the_log_loss",
-            "The uncertainty objective exp(-l)L + l is stationary and minimal at l = ln(L), with value 1 + ln(L): the head cannot report a smaller loss by claiming more uncertainty.",
-            optimum_err,
-            1e-9,
+            "`UncertaintyWeighting::apply` computes exp(-l)L + l, is the bitwise identity at strength 0, and that objective is stationary and minimal at l = ln(L) with value 1 + ln(L): the head cannot report a smaller loss by claiming more uncertainty.",
+            optimum_err.max(apply_err),
+            // The closed-form half is f64 and lands near 1e-15; `apply` runs in
+            // f32, where an exp, a multiply and an add cost about 3 eps
+            // ~ 1.8e-7 relative. The tolerance is set by the f32 half.
+            1e-6,
         ),
         cert(
             "optim",
@@ -2015,8 +2182,8 @@ fn optim_certificates() -> Vec<Certificate> {
         cert(
             "optim",
             "importance_sampling_is_unbiased",
-            "The proposal is a distribution and E_q[p/q] = 1 exactly, so reweighted samples estimate the prior's mean rather than the proposal's.",
-            bias.max(simplex),
+            "The proposal is a distribution, E_q[p/q] = 1 exactly, and `sample` attaches that exact p/q to every draw it returns -- so reweighted samples estimate the prior's mean rather than the proposal's.",
+            bias.max(simplex).max(drawn_err),
             1e-12,
         ),
         cert(

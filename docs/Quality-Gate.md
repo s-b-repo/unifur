@@ -36,7 +36,7 @@ A claim that cannot be reduced to a residual is not listed.
 ### Running it
 
 ```bash
-dblocks verify                 # all 73 certificates; exits non-zero on failure
+dblocks verify                 # all 74 certificates; exits non-zero on failure
 dblocks verify --group solver  # one group
 ```
 
@@ -48,7 +48,7 @@ schedule       boundary_endpoints                       1.038e-11    1.000e-8   
                window_tiling                              0.000e0     0.000e0       -  ok
                block_routing_involution                   0.000e0     0.000e0       -  ok
 ...
-73 / 73 certificates passed
+74 / 74 certificates passed
 ```
 
 The **margin** column is residual ÷ tolerance. A certificate drifting toward
@@ -277,6 +277,34 @@ cargo clippy --all-targets
 dblocks verify                # the gate, standalone
 dblocks train --verify-every 100 --steps 2000
 ```
+
+### Mutation testing: does the gate actually catch anything?
+
+A certificate that recomputes a formula proves the formula, which was never in
+doubt. The `--accumulate` bug shipped past a unit test *and* a certificate for
+exactly that reason.
+
+So the suite was audited by breaking the implementation and checking whether the
+gate noticed. Nine small, plausible defects, each applied alone — **five
+survived**, and one of those survived all 310 unit tests as well (an importance
+weight inverted from `p/q` to `q/p`, which would have biased every reweighted
+run in the worst possible direction).
+
+Every survivor had the same shape: the certificate reimplemented the claim
+instead of calling the code. All nine are caught now. Two findings only a sweep
+would surface:
+
+- **The precision bound was one-sided.** "Relative error at most `2^-p`" is
+  satisfied perfectly by rounding that does nothing. There is now a certificate
+  that rounding actually changes a value the format cannot represent — and that
+  the tensor path used in sampling agrees bit for bit with the scalar path the
+  bound was measured on.
+- **Tolerances moved when the checks became real.** `accumulation` went from
+  `1e-12` to `1e-6`, the uncertainty objective from `1e-9` to `1e-6`, because
+  gradients and `apply` run in f32 while the formulas they replaced ran in f64.
+  **A tolerance far tighter than the arithmetic allows is evidence the
+  certificate is not touching the code.** That is now the first thing to check
+  when adding one.
 
 ### One thing a certificate cannot catch
 

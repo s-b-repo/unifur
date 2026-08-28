@@ -212,7 +212,7 @@ invariants, not assumptions.
 
 - [x] **14.1–14.5** Every load-bearing identity is stated as a theorem and
       checked as a residual against a tolerance in `verify.rs`
-- [x] **14.6** Numerical verification — 73 certificates across 15 groups, run by
+- [x] **14.6** Numerical verification — 74 certificates across 15 groups, run by
       `dblocks verify` (non-zero exit on failure) and by the test suite
 
 **Status**: See [Quality gate](#quality-gate) below.
@@ -600,6 +600,57 @@ omission and its cost is written down above.
 
 ---
 
+## Mutation testing the gate
+
+A certificate that recomputes a formula proves the formula, which was never in
+doubt. The `--accumulate` bug shipped past a unit test *and* a certificate for
+exactly that reason: the test asserted an optimizer-step count and the
+certificate validated the averaging identity in f64, neither touching the code
+that discarded `k-1` of every `k` gradients.
+
+So the suite was audited the only way that settles it — by breaking the
+implementation and checking whether the gate notices. Nine small, plausible
+defects, each applied alone:
+
+| Mutation | Before | After |
+|---|---|---|
+| DPM++2M ratio sign flipped | caught | caught |
+| Block routing returns a constant | caught | caught |
+| Switch loss drops its `* E` factor | **survived** | caught |
+| Importance weight inverted to `q/p` | **survived — and no test caught it either** | caught |
+| `UncertaintyWeighting::apply` drops `+ l` | **survived** | caught |
+| Guidance ignores its scale | caught | caught |
+| `round_scalar` becomes the identity | **survived** | caught |
+| z-loss penalizes logits instead of the log-sum-exp | caught | caught |
+| EMA drops its bias correction | **survived** | caught |
+
+Five of nine survived. The inverted importance weight survived **all 310 unit
+tests as well** — it would have biased every reweighted training run in the
+worst possible direction, amplifying the proposal's bias instead of removing it,
+with nothing in the repository able to tell.
+
+Every survivor had the same shape: the certificate reimplemented the claim
+instead of calling the code. The fixes were correspondingly mechanical —
+`balance_loss_bounds` now calls `weighted_switch_loss`, the uncertainty
+certificate calls `apply`, the importance certificate calls `sample` and checks
+the weight attached to each draw, and the EMA certificate reads
+`effective_decay` instead of recomputing the ramp.
+
+Two findings that only a mutation sweep would surface:
+
+- **The precision bound was one-sided.** "Relative error at most `2^-p`" is
+  satisfied perfectly by rounding that does nothing. There is now a certificate
+  that a value needing more significand bits than the format holds is actually
+  changed — and that the tensor path used in sampling agrees with the scalar
+  path the bound was measured on, bit for bit.
+- **Tolerances moved when the checks became real.** `accumulation` went from
+  `1e-12` to `1e-6` and the uncertainty objective from `1e-9` to `1e-6`, because
+  gradients and `apply` run in f32 while the formulas they replaced ran in f64.
+  A tolerance that tight was evidence the certificate was not touching the code.
+
+The sweep script lives outside the repository; re-running it is a matter of
+applying each mutation, running `cargo test && dblocks verify`, and restoring.
+
 ## Quality gate
 
 `dblocks verify` runs a suite of numerical certificates. Each one states a
@@ -714,7 +765,7 @@ See [`docs/Quality-Gate.md`](docs/Quality-Gate.md).
 ## Test inventory
 
 310 unit + 22 integration tests, all passing; `cargo clippy --all-targets`
-clean; `cargo doc` warning-free. 73 numerical certificates in 15 groups, plus
+clean; `cargo doc` warning-free. 74 numerical certificates in 15 groups, plus
 five-phase verification inside every training run.
 
 ## How to Contribute
