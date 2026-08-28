@@ -3,6 +3,35 @@
 Compress N DiffusionBlocks → fewer blocks for efficient inference using
 teacher-student knowledge distillation.
 
+> **In this repository.** `src/distill.rs`, via
+> `DblockClassifier::distill_step` and
+> `dblocks train --objective distill --teacher <ckpt>`.
+>
+> Three signals, all differentiable through the student only:
+>
+> - **Trajectory** — the teacher takes `teacher_substeps` solver steps across a
+>   window; the student must reach the same latent in one. This is progressive
+>   step distillation applied to block windows, and it is what actually buys
+>   inference speed.
+> - **Logits** — KL between the two class distributions at temperature `T`,
+>   scaled by `T^2`. That factor is not cosmetic: softening by `T` shrinks the
+>   soft-target gradients by `1/T^2`, so without it the term's influence would
+>   silently depend on the temperature.
+> - **Hard labels** — the ground truth, so the student is never worse-anchored
+>   than the teacher.
+>
+> Teacher outputs are `detach`ed, so no gradient reaches it even when teacher
+> and student share a backend — which is what lets a *quantized copy* of a
+> model act as its own student (see [QLoRA](QLoRA.md)) with no extra plumbing.
+>
+> Without `--teacher` the initial model is frozen as the teacher:
+> self-distillation, still meaningful because the student must cover several
+> substeps in one.
+>
+> A model is a perfect student of itself at one substep — asserted, so the two
+> code paths provably evaluate the same function.
+
+
 ## Overview
 
 After training a large DiffusionBlocks model with many blocks, you may want
@@ -99,3 +128,7 @@ uv run python -m diffusionblocks.main train cifar100 \
 - Distilling the Knowledge in a Neural Network (Hinton et al., 2015)
 - QLoRA (Dettmers et al., 2023)
 - Original DiffusionBlocks paper (Shing et al., 2026)
+
+---
+
+See also: [Quality Gate](Quality-Gate.md) · [Training Guide](Training-Guide.md) · [Inference Guide](Inference-Guide.md) · [Home](Home.md)

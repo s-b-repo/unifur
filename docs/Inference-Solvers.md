@@ -3,6 +3,35 @@
 High-order ODE solvers for accelerating DiffusionBlocks++ inference beyond
 basic Euler integration.
 
+> **In this repository.** `src/solver.rs`. Five solvers, selected with
+> `SolverKind::parse`: `euler`, `heun`, `ddim`, `dpmpp2m`, `dpmpp3m`.
+>
+> All five share one implementation of each update rule (`SolverState::step`),
+> which both the monolithic `integrate()` and the gated multi-block sampler
+> drive — so neither path re-derives the arithmetic.
+>
+> Substituting `lambda = -log sigma` turns the ODE into `dz/dlambda = -z + x0(lambda)`,
+> whose exact one-step solution is
+> `z(lambda + h) = e^-h z + int_0^h e^-(h-s) x0(lambda + s) ds`. The
+> DPM-Solver++ family replaces `x0` inside that integral with a polynomial
+> interpolant, so the stiff linear part is always handled exactly.
+>
+> Two deliberate details:
+>
+> - **`dpmpp2m` is the published algorithm**, weighting the slope by
+>   `(1 - e^-h)h/2` rather than the exact `h - 1 + e^-h`. The two differ at
+>   order `h^3`, which is why it is second- and not third-order. Kept faithful
+>   so published results reproduce, and pinned by a test.
+> - **`dpmpp3m` is the exact-kernel variant**: it integrates the quadratic
+>   interpolant against the true exponential kernel.
+>
+> Correctness is certified rather than assumed — closed-form exactness on a
+> constant oracle, kernel moments against Simpson quadrature, interpolation
+> nodes, ancestral variance preservation, and the **measured** order of
+> convergence (log-log slope of error against step count). See
+> [Quality Gate](Quality-Gate.md).
+
+
 ## Available Solvers
 
 ### Euler (1st Order)

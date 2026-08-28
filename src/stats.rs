@@ -15,11 +15,19 @@
 
 use std::f64::consts::{FRAC_1_SQRT_2, FRAC_2_SQRT_PI, PI};
 
-/// Error function `erf(x)` with ~1e-14 absolute accuracy.
+/// Boundary between the Maclaurin series and the continued fraction.
+///
+/// Both [`erf`] and [`erfc`] switch here, so exactly one of them is ever
+/// evaluated directly and the other is its complement -- which is what makes
+/// their sum exact to rounding.
+const SERIES_CROSSOVER: f64 = 2.0;
+
+/// Error function `erf(x)` with ~1e-15 relative accuracy.
 pub fn erf(x: f64) -> f64 {
     let ax = x.abs();
-    if ax >= 3.0 {
-        // erf is within 1e-4 of +/-1; defer to erfc for the interesting part.
+    if ax >= SERIES_CROSSOVER {
+        // Past the crossover the series would lose digits to cancellation;
+        // the continued fraction in `erfc` does not.
         return if x >= 0.0 { 1.0 - erfc(ax) } else { erfc(ax) - 1.0 };
     }
     // Maclaurin series: erf(x) = 2/sqrt(pi) * sum_{n>=0} (-1)^n x^(2n+1) / (n! (2n+1))
@@ -41,7 +49,7 @@ pub fn erf(x: f64) -> f64 {
 /// Complementary error function `erfc(x)` with ~1e-15 relative accuracy.
 pub fn erfc(x: f64) -> f64 {
     let ax = x.abs();
-    if ax < 2.0 {
+    if ax < SERIES_CROSSOVER {
         return 1.0 - erf(x);
     }
     if ax >= 27.3 {

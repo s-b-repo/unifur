@@ -59,7 +59,9 @@ impl<B: Backend> HaltingHead<B> {
         }
         match acc {
             Some(total) => total.mean(),
-            None => Tensor::zeros([1], &Default::default()),
+            // No blocks were supplied: the expected depth is zero, on the
+            // head's own device rather than the backend default.
+            None => Tensor::zeros([1], &self.linear.weight.device()),
         }
     }
 }

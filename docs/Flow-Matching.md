@@ -4,6 +4,20 @@ Alternative to EDM's score-matching objective based on rectified flow
 (straight paths from noise to data). Enables ODE-based inference without
 the complex noise schedule.
 
+> **In this repository.** `src/flow.rs`, via `flow::flow_matching_loss` and
+> `dblocks train --objective flow`.
+>
+> The label embedding is `x0`, Gaussian noise is `x1`, the conditional OT path
+> is the straight line `x_t = (1-t)x_0 + t x_1` with `t ~ U(0,1)`, and the
+> velocity target is `v* = x_1 - x_0`. `flow::flow_sample` integrates
+> `dz/dt = v(z, t)` backwards from `t = 1` with Euler steps.
+>
+> Classification is by **cosine similarity** against the label table, with both
+> sides L2-normalized. The raw dot product would rank labels partly by
+> embedding norm, and the table is not norm-uniform — a bug this repository
+> shipped and fixed.
+
+
 ## Overview
 
 EDM (Elucidating Diffusion Models) uses score matching: the model learns
@@ -131,3 +145,7 @@ This can be more stable in some cases.
 - Flow Matching for Generative Modeling (Lipman et al., 2022)
 - Rectified Flow: Straight-Line Probability Transport (Liu et al., 2022)
 - Original DiffusionBlocks paper (Shing et al., 2026)
+
+---
+
+See also: [Quality Gate](Quality-Gate.md) · [Training Guide](Training-Guide.md) · [Inference Guide](Inference-Guide.md) · [Home](Home.md)

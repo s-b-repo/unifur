@@ -1,18 +1,27 @@
-//! Consistency training objectives (roadmap Phase 3).
+//! Consistency training objectives (roadmap Phase 3, plus the cross-fork term
+//! of 2.7).
 //!
-//! Three complementary losses encourage adjacent blocks and repeated
-//! evaluations to agree, which stabilizes multi-block inference:
+//! Four complementary residuals encourage blocks and repeated evaluations to
+//! agree, which is what makes multi-block inference legitimate:
 //!
-//! - **Boundary consistency** (3.1): the denoised x0 estimate of block `b`
-//!   at its upper window edge must match that of block `b + 1` evaluated at
-//!   the same sigma — blocks must agree at their shared boundary.
+//! - **Boundary consistency** (3.1): blocks `b` and `b + 1` evaluated at their
+//!   shared boundary sigma must produce the same x0 estimate.
 //! - **Self-consistency** (3.2): the same block evaluated at two different
 //!   noise levels of the *same* clean state must predict the same x0.
-//! - **Trajectory consistency** (3.3): a cheap full-chain Euler rollout must
-//!   end where a single low-sigma block evaluation starts from the rolled
-//!   state.
+//! - **Trajectory consistency** (3.3): a full-chain Euler rollout from
+//!   `sigma_max` must land where a *direct* noising of the clean data at the
+//!   final sigma lands, as judged by the last block.
+//! - **Cross-fork consistency** (2.7): for a non-adjacent pair `(i, j)` with
+//!   `j >= i + 2`, the joint span `i..=j` executed in one shot must reproduce
+//!   the sequential composition of those blocks. This is exactly the property
+//!   `Strategy::Parallel` relies on, so it is trained rather than assumed.
 //!
-//! [`ConsistencySchedule`] implements the weight scheduling of item 3.5.
+//! All four are plain MSE residuals combined as
+//! `total = task_loss + sum_k w_k * lambda(step) * L_k`, where `lambda` comes
+//! from [`ConsistencySchedule`] (item 3.5). The multiplier deliberately does
+//! not depend on `L_k` itself: scaling a residual by its own value optimizes
+//! `L_k^2`, whose gradient vanishes precisely where the residual is already
+//! small.
 
 use crate::dblock::DblockClassifier;
 use burn::tensor::{Int, Tensor, backend::Backend};
@@ -51,21 +60,42 @@ impl ConsistencySchedule {
     }
 }
 
-/// Weights of the three consistency terms.
+/// Weights of the four consistency terms.
 #[derive(Debug, Clone, Copy)]
 pub struct ConsistencyWeights {
     pub boundary: f64,
     pub self_consistency: f64,
     pub trajectory: f64,
+    /// Fork-reconverge agreement between a joint span and the sequential
+    /// composition of the same blocks (roadmap 2.7).
+    pub cross_fork: f64,
 }
 
 impl Default for ConsistencyWeights {
     fn default() -> Self {
-        Self { boundary: 1.0, self_consistency: 0.5, trajectory: 0.25 }
+        Self {
+            boundary: 1.0,
+            self_consistency: 0.5,
+            trajectory: 0.25,
+            cross_fork: 0.25,
+        }
     }
 }
 
-/// Configuration for [`consistency_step`].
+impl ConsistencyWeights {
+    /// Only the boundary term (cheapest configuration).
+    pub fn boundary_only() -> Self {
+        Self { boundary: 1.0, self_consistency: 0.0, trajectory: 0.0, cross_fork: 0.0 }
+    }
+
+    /// Every term disabled: `consistency_step` reduces exactly to
+    /// [`crate::dblock::DblockClassifier::training_step`].
+    pub fn none() -> Self {
+        Self { boundary: 0.0, self_consistency: 0.0, trajectory: 0.0, cross_fork: 0.0 }
+    }
+}
+
+/// Configuration for [`DblockClassifier::consistency_step`].
 #[derive(Debug, Clone, Copy)]
 pub struct ConsistencyConfig {
     pub gamma: f64,
@@ -91,6 +121,9 @@ pub struct ConsistencyMetrics {
     pub boundary_loss: f32,
     pub self_loss: f32,
     pub trajectory_loss: f32,
+    /// Fork-reconverge residual; `0.0` when the term is disabled or the model
+    /// has too few blocks to form a non-adjacent pair.
+    pub cross_fork_loss: f32,
     pub weight: f64,
     pub block_idx: usize,
 }
@@ -137,23 +170,32 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         let mut loss = (nll * w).mean();
 
         // --- Consistency terms -------------------------------------------
+        //
+        // Every term below is a plain MSE residual scaled by
+        // `weight * lambda`. Scaling by the residual's own *value* would
+        // silently optimize `L^2` (gradient `2 w lambda L dL`), which
+        // vanishes exactly where the term is already small and explodes where
+        // it is large -- so the multiplier is kept independent of `l`.
         let bounds = self.sampler(config.gamma).block_sigmas;
         let lambda = config.schedule.weight_at(step);
+        let n_blocks = self.num_blocks();
         let mut m_boundary = 0.0f32;
         let mut m_self = 0.0f32;
         let mut m_traj = 0.0f32;
+        let mut m_fork = 0.0f32;
 
-        if config.weights.boundary > 0.0 && self.num_blocks() >= 2 {
+        if config.weights.boundary > 0.0 && n_blocks >= 2 {
             // Evaluate both neighbors exactly at their shared boundary sigma.
-            let lo_blk = block_idx.min(self.num_blocks() - 2);
-            let shared = bounds[lo_blk + 1];
+            let lo_blk = block_idx.min(n_blocks - 2);
+            let shared = crate::sigma::shared_boundary_sigma(&bounds, lo_blk);
             let eps_b = Tensor::<B, 2>::random(z.dims(), Distribution::Normal(0.0, 1.0), &device);
             let zt_b = z.clone() + eps_b * shared;
-            let lo = self.x0_estimate(pixel_values, &(zt_b.clone()), shared, Some(self.layer_range(lo_blk)));
-            let hi = self.x0_estimate(pixel_values, &(zt_b), shared, Some(self.layer_range(lo_blk + 1)));
+            let lo = self.x0_estimate(pixel_values, &zt_b, shared, Some(self.layer_range(lo_blk)));
+            let hi =
+                self.x0_estimate(pixel_values, &zt_b, shared, Some(self.layer_range(lo_blk + 1)));
             let l = mse(&lo, &hi);
             m_boundary = l.clone().into_scalar();
-            loss = loss + l.mul_scalar((config.weights.boundary * lambda * m_boundary as f64) as f32);
+            loss = loss + l.mul_scalar((config.weights.boundary * lambda) as f32);
         }
 
         if config.weights.self_consistency > 0.0 {
@@ -168,33 +210,72 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             let p_hi = self.x0_estimate(pixel_values, &z_hi, hi_s, Some(span));
             let l = mse(&p_lo, &p_hi);
             m_self = l.clone().into_scalar();
-            loss = loss + l.mul_scalar((config.weights.self_consistency * lambda * m_self as f64) as f32);
+            loss = loss + l.mul_scalar((config.weights.self_consistency * lambda) as f32);
         }
 
-        if config.weights.trajectory > 0.0 && self.num_blocks() >= 2 {
-            // Roll the chain with no_grad-style detached estimates (we detach
-            // by not backpropagating through the rollout: each rollout step's
-            // contribution is dropped because we only train the final block).
-            let start_sigma = bounds[bounds.len() - 1];
+        if config.weights.trajectory > 0.0 && n_blocks >= 2 {
+            // Roll the whole chain downwards through the block boundaries.
+            // `bounds` ascends and block 0 owns the noisiest window, so block
+            // `b` steps from bounds[n - b] down to bounds[n - b - 1].
+            let start_sigma = bounds[n_blocks];
             let mut z_roll = z.clone()
                 + Tensor::<B, 2>::random(z.dims(), Distribution::Normal(0.0, 1.0), &device)
                     * start_sigma;
-            let frac = (start_sigma / bounds[1]).powf(1.0 / self.num_blocks() as f64);
-            let mut sigma = start_sigma;
-            for blk in 0..self.num_blocks() - 1 {
-                let next = (sigma * frac).max(bounds[1]);
-                let x0r = self.x0_estimate(pixel_values, &z_roll, sigma, Some(self.layer_range(blk)));
+            for blk in 0..n_blocks - 1 {
+                let (next, sigma) = crate::sigma::block_window(&bounds, blk);
+                let x0r =
+                    self.x0_estimate(pixel_values, &z_roll, sigma, Some(self.layer_range(blk)));
                 z_roll = crate::multi_block::euler_step(sigma, next, &z_roll, &x0r);
-                sigma = next;
             }
-            // Target: final block at the chain's endpoint...
-            let target = self.x0_estimate(pixel_values, &z_roll, sigma, Some(self.layer_range(self.num_blocks() - 1)));
-            // ...vs the trained block evaluated directly at its own window.
-            let direct_sig = sigmas[sigmas.len().saturating_sub(1)];
-            let direct = self.x0_estimate(pixel_values, &zt, direct_sig, Some(self.layer_range(self.num_blocks() - 1)));
+            // The chain must land where a *direct* noising of the clean data
+            // at the same sigma would: same block, same noise level, one
+            // latent reached by integration and one by construction.
+            let end_sigma = bounds[1];
+            let last = self.layer_range(n_blocks - 1);
+            let target =
+                self.x0_estimate(pixel_values, &z_roll, end_sigma, Some(last.clone()));
+            let z_direct = z.clone()
+                + Tensor::<B, 2>::random(z.dims(), Distribution::Normal(0.0, 1.0), &device)
+                    * end_sigma;
+            let direct = self.x0_estimate(pixel_values, &z_direct, end_sigma, Some(last));
             let l = mse(&direct, &target);
             m_traj = l.clone().into_scalar();
-            loss = loss + l.mul_scalar((config.weights.trajectory * lambda * m_traj as f64) as f32);
+            loss = loss + l.mul_scalar((config.weights.trajectory * lambda) as f32);
+        }
+
+        // Cross-fork consistency (roadmap 2.7): a *non-adjacent* block pair
+        // (i, j) with j >= i + 2 is trained against itself by requiring the
+        // joint span i..=j -- what `Strategy::Parallel` actually executes --
+        // to reproduce the sequential composition of the same blocks. This is
+        // the property that makes forking legitimate, so it is trained
+        // directly rather than hoped for.
+        if config.weights.cross_fork > 0.0 && n_blocks >= 3 {
+            let i = rng.random_range(0..n_blocks - 2);
+            let j = rng.random_range(i + 2..n_blocks);
+
+            let (_, sigma_start) = crate::sigma::block_window(&bounds, i);
+            let (sigma_end, _) = crate::sigma::block_window(&bounds, j);
+            let z_fork = z.clone()
+                + Tensor::<B, 2>::random(z.dims(), Distribution::Normal(0.0, 1.0), &device)
+                    * sigma_start;
+
+            // Sequential path: one block per boundary interval.
+            let mut z_seq = z_fork.clone();
+            for blk in i..=j {
+                let (next, sigma) = crate::sigma::block_window(&bounds, blk);
+                let x0b =
+                    self.x0_estimate(pixel_values, &z_seq, sigma, Some(self.layer_range(blk)));
+                z_seq = crate::multi_block::euler_step(sigma, next, &z_seq, &x0b);
+            }
+
+            // Forked path: the whole span in one shot, one step to the end.
+            let span = self.layer_range(i).start..self.layer_range(j).end;
+            let x0_par = self.x0_estimate(pixel_values, &z_fork, sigma_start, Some(span));
+            let z_par = crate::multi_block::euler_step(sigma_start, sigma_end, &z_fork, &x0_par);
+
+            let l = mse(&z_seq, &z_par);
+            m_fork = l.clone().into_scalar();
+            loss = loss + l.mul_scalar((config.weights.cross_fork * lambda) as f32);
         }
 
         let metrics = ConsistencyMetrics {
@@ -203,6 +284,7 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             boundary_loss: m_boundary,
             self_loss: m_self,
             trajectory_loss: m_traj,
+            cross_fork_loss: m_fork,
             weight: lambda,
             block_idx,
         };

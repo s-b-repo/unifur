@@ -3,6 +3,41 @@
 Memory-efficient block training using 4-bit NormalFloat quantization with
 LoRA adapters.
 
+> **In this repository.** `src/quantize.rs`.
+>
+> | Piece | Type |
+> |---|---|
+> | Blockwise NF4 quantization | `Nf4Tensor`, `BLOCK_SIZE = 64` |
+> | Double quantization of the scales | `Nf4Tensor::with_double_quantization` |
+> | Low-rank adapters | `LoraAdapter`, `LoraConfig` |
+> | Quantized + adapted linear | `QLoraLinear` |
+> | Whole-model quantization | `quantize_module(model, dq, &["label_embeddings"])` |
+>
+> Each block of 64 values is divided by its absolute maximum, then mapped to
+> the nearest of 16 levels drawn from the **quantiles of a standard normal** —
+> information-theoretically matched to how weight blocks are distributed.
+> Double quantization compresses the per-block `f32` scales to 8 bits, taking
+> amortized overhead from 4.5 to ~4.13 bits per value.
+>
+> Certified properties:
+>
+> - Reconstruction error never exceeds **half the widest level gap** times the
+>   block absmax.
+> - **Zero is exactly representable** and survives a round trip — masks,
+>   padding and pruned weights depend on it.
+> - NF4 beats a uniform 16-level grid on normally distributed data, so the
+>   quantile construction earns its complexity.
+> - A freshly attached LoRA adapter is an **exact no-op** (`B = 0`), so
+>   wrapping a trained checkpoint cannot perturb it before a gradient step.
+>
+> This is *storage* quantization: values are dequantized to f32 before the
+> matmul, exactly as bitsandbytes does. The saving is resident weight memory
+> (`QLoraLinear::resident_bits` computes it), not arithmetic throughput.
+>
+> Quantizing the label-embedding table is normally wrong — it *is* the
+> diffusion process's data space — hence the skip list.
+
+
 ## Overview
 
 Training many blocks simultaneously can be memory-intensive. QLoRA reduces
@@ -130,3 +165,7 @@ uv run python -m diffusionblocks.main train cifar100 \
 - QLoRA (Dettmers et al., 2023)
 - LoRA (Hu et al., 2021)
 - bitsandbytes (Dettmers et al., 2022)
+
+---
+
+See also: [Quality Gate](Quality-Gate.md) · [Training Guide](Training-Guide.md) · [Inference Guide](Inference-Guide.md) · [Home](Home.md)

@@ -4,6 +4,26 @@ The core innovation of DiffusionBlocks++: training **multiple blocks simultaneou
 on overlapping noise windows, with a fork-reconverge protocol that enables
 inter-block cooperation while maintaining independent trainability.
 
+> **In this repository.** Span execution is
+> `DblockClassifier::denoise_span`; running only a span *is* gradient routing,
+> since gradients flow exclusively through executed layers. Fork-reconverge
+> happens through the shared latent between windows.
+>
+> Parallel sampling is only legitimate if a joint span reproduces the
+> sequential composition of the same blocks. That is **trained, not assumed**:
+> `ConsistencyWeights::cross_fork` samples a non-adjacent pair `(i, j)` with
+> `j >= i+2` and penalizes the difference between the forked and sequential
+> paths. See [Consistency Training](Consistency-Training.md).
+>
+> Overlapping windows come from `gamma` (`DblockSigmaSampler::extended_window`).
+>
+> **Block indexing:** boundaries ascend but block indices descend in noise
+> level — block 0 owns the noisiest window. The `block_routing_involution`
+> certificate asserts the training sampler and the inference router are mutual
+> inverses; getting this backwards trains every block on one noise range and
+> evaluates it on another, which is a bug this repository shipped and fixed.
+
+
 ## Motivation
 
 Original DiffusionBlocks trains **one block per step**. With B blocks, you need
@@ -213,3 +233,7 @@ for i, block in enumerate(blocks):
 - Universal Transformers (Dehghani et al., 2019)
 - Looped Transformers (Fan et al., 2025)
 - PonderNet (Banino et al., 2021)
+
+---
+
+See also: [Quality Gate](Quality-Gate.md) · [Training Guide](Training-Guide.md) · [Inference Guide](Inference-Guide.md) · [Home](Home.md)

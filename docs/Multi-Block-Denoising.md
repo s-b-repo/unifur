@@ -3,6 +3,32 @@
 Training and inference with multiple blocks simultaneously, including
 parallel trajectories, hybrid strategies, and adaptive depth control.
 
+> **In this repository.** Implemented in `src/multi_block.rs` as `Strategy`
+> (`Sequential` / `Parallel{k}` / `Hybrid{k, warmup_frac}` /
+> `Adaptive{k_max, conf_threshold}`) driven through the shared
+> `solver::SolverState`, so **any strategy composes with any solver** — the
+> integration test exercises the full 4x5 matrix. Alongside them,
+> `sample_planned` + `PlannedConfig` replace the fixed schedule with a search
+> (see [Planned Denoising](#planned-denoising)).
+>
+> `SamplingStats` reports `model_calls`, `layers_executed`, `mean_span_width`,
+> `spans`, `planning_calls`/`planning_layers` and a per-block gate ledger.
+> `layers_executed` is the honest cost measure: `parallel-2` makes the same
+> number of model calls as `sequential` but runs nearly twice the layers. It
+> also carries a solver's corrector evaluations and any planning work, which is
+> why `mean_span_width` averages the recorded `spans` instead — otherwise Heun's
+> spans would be reported at twice their real width.
+>
+> `Strategy::Adaptive` widens the span while confidence is below the threshold
+> **and narrows it again** once the estimate is confident, so the extra depth
+> is spent only where it is needed.
+>
+> CLI: `dblocks sample --strategy ... --k N`, `dblocks bench`.
+> Precision denoising is `MultiBlockConfig::precision` — see
+> [Precision & I/O](Precision-IO.md). Quality gating is
+> [Quality Gate](Quality-Gate.md).
+
+
 ## Overview
 
 Multi-block denoising encompasses several strategies for training and
@@ -116,6 +142,40 @@ if loss_plateau:
 elif loss_unstable:
     K = max(1, K - 1)      # Reduce to stabilize
 ```
+
+## Planned Denoising
+
+`Strategy::Adaptive` reacts: it widens the span after seeing an unconfident
+estimate and narrows it after a confident one, with no view of what comes next.
+Planned sampling replaces the reaction with a search.
+
+```bash
+dblocks sample --planned --plan-depth 2 --plan-beam 3 --plan-budget 32
+```
+
+```rust
+let (logits, stats, trace) = model.sample_planned(&pixels, &PlannedConfig {
+    budget: Budget { max_evaluations: 48, max_depth: 2, beam_width: 3 },
+    ..PlannedConfig::default()
+}, &mut rng);
+```
+
+Each step scores candidate `(sigma, span)` pairs and, when the depth allows,
+rolls the promising ones forward — then commits **only the winner's first
+step** and re-plans. Depth 0 is certified to be exactly the greedy policy, so
+this is a generalization of the adaptive strategy rather than a replacement for
+it.
+
+The sigma is chosen too, not just the span, which is the part `Adaptive` cannot
+do: the schedule is no longer fixed before the first model call. That needs a
+progress term in log-sigma to work at all — the most accurate single step is
+always the shortest one, so without a reward for descending the planner would
+never reach `sigma_min`.
+
+Planning is not free: `PlanTrace` reports the evaluations spent per committed
+step and `SamplingStats::planning_overhead` the fraction of executed layers that
+went to planning rather than sampling. Full detail:
+[Next-Step Planning](Next-Step-Planning.md).
 
 ## Quality-Gated Denoising
 

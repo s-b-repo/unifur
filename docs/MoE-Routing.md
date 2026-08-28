@@ -3,6 +3,42 @@
 Mixture-of-experts routing for DiffusionBlocks++. Each block can have
 multiple expert sub-networks that specialize in different noise regimes.
 
+> **In this repository.** `src/moe.rs` (`MoELayer`, `TopKRouter`, `MoEConfig`)
+> plus trunk integration through `ViTDiTConfig::moe` / `MoeTrunkConfig`.
+>
+> `MoeTrunkConfig::every_n_layers` replaces every *n*-th layer's dense MLP with
+> a mixture of experts — alternating dense and sparse layers is the standard
+> Switch/GLaM placement and keeps a dense path for the features every expert
+> needs.
+>
+> **Noise-aware routing (6.4)** falls out of the conditioning: the router sees
+> the adaLN vector, which is a pure function of sigma. With
+> `MoEConfig::route_on_tokens` it also sees the token's own features, so tokens
+> of the same example can diverge; without it every token in an example routes
+> identically.
+>
+> **Router z-loss** (`moe::router_z_loss`, `--z-level`) and **balance-weight
+> annealing** (`--balance-schedule anneal`) address the two routing pathologies
+> the literature is clearest about — see [Routing Quality](#routing-quality).
+>
+> The Switch load-balancing loss of the executed span is summed and added to
+> the objective automatically (`DblockConfig::moe_aux_weight`, default 0.01),
+> and logged as `balance_loss`.
+>
+> Two bounds are certified: gates form a probability distribution per token,
+> and on the diagonal `f == p` the balance loss lies in `[1, E]` by
+> Cauchy-Schwarz, attaining 1 exactly at uniform routing. (For *arbitrary*
+> `f` and `p` only `0 <= L <= E` holds — conflating the two is an easy mistake.)
+>
+> CLI: `--moe-every N --moe-experts E --moe-top-k K`.
+>
+> This layer is **flat**: one router over a homogeneous expert vector, with
+> experts addressed by integer index only. For named specialists grouped into
+> domains, with a manifest an inference engine can route from, see
+> [Mixture of Specialized Micro Experts](Mixture-of-Specialized-Micro-Experts.md)
+> — a single-box hierarchical layer reduces to this one bit-for-bit.
+
+
 ## Overview
 
 Standard DiffusionBlocks uses the same network for all noise levels. But
@@ -132,3 +168,124 @@ uv run python -m diffusionblocks.main train cifar100 \
 - Outrageously Large Neural Networks (Shazeer et al., 2017)
 - Mixtral of Experts (Jiang et al., 2024)
 - Switch Transformer (Fedus et al., 2021)
+- ST-MoE: Designing Stable and Transferable Sparse Expert Models (Zoph et al., 2022) — router z-loss
+- Demons in the Detail: On Implementing Load Balancing Loss for Training Specialized MoE Models (Zhu et al., 2025) — global-batch LBL
+- Auxiliary-Loss-Free Load Balancing for Mixture-of-Experts (Wang et al., 2024) — bias-based balancing
+
+---
+
+## Routing Quality
+
+Two failure modes dominate the MoE training literature, and they pull in
+opposite directions.
+
+### 1. Logit drift — and why the balance loss cannot see it
+
+The routing softmax exponentiates its logits, and **the softmax is invariant to
+a per-row constant shift**. So a router can drift arbitrarily large while every
+routing probability — and therefore the entire balance loss — stays exactly
+where it was. Once the logits are large, the exponentials amplify small
+numerical errors into round-off that destabilizes training, in f32 as well as in
+reduced precision.
+
+The router z-loss (Zoph et al., ST-MoE) is the term that *can* see it:
+
+```text
+L_z = mean_t ( logsumexp_e x_te )^2
+```
+
+```bash
+dblocks train --z-level 1e-3     # the ST-MoE default; 0.0 disables it exactly
+```
+
+Three implementation points that are easy to get wrong:
+
+- **It penalizes the log-sum-exp, not the logits.** That is what bounds the
+  largest one: `max_e x_e <= logsumexp <= max_e x_e + ln E`, so holding the
+  log-sum-exp near zero holds *every* logit within `ln E` of zero. Certificate
+  `moe/logsumexp_bounds_the_largest_logit`.
+- **Its optimum is not a logit of zero.** For a row of `E` equal logits it is
+  `-ln E`, and an offset `d` from there costs exactly `d²`. Certificate
+  `moe/z_loss_optimum_is_a_zero_logsumexp`.
+- **A width-1 router is charged nothing.** A softmax over one element is 1
+  whatever the logit is, so that logit steers nothing — charging it would put
+  gradient on a parameter with no alternatives, and it would break the
+  single-box reduction. This crate found that the second way.
+
+It is not free of routing pressure: the gradient is `2 z p`, proportional to the
+softmax, so it shrinks confident logits slightly harder than diffident ones.
+Keep the weight small.
+
+### 2. The balance loss fights specialization
+
+Zhu et al. (*Demons in the Detail*, 2025) show that computing the load-balancing
+loss over a **micro-batch** pushes the router to spread tokens evenly *within
+each batch*. Since a micro-batch holds few distinct inputs, that pressure lands
+on individual sequences and forces even clearly domain-specific inputs to route
+uniformly — it **actively inhibits the specialization the experts exist for**.
+
+Their fix computes the loss over the global batch. That needs the per-expert
+counts to escape the forward pass, which this crate cannot do yet (roadmap
+23.4).
+
+What ships is the tractable half of the same idea: anneal the *weight*.
+
+```bash
+dblocks train --balance-schedule anneal --balance-weight 0.01
+```
+
+Early in a run the balance loss is doing the job it is good at — preventing
+routing collapse, where one expert wins everything and the rest never receive
+gradient. Once every expert is alive, that pressure has nothing left to buy and
+starts costing specialization instead. So the schedule holds it high while
+collapse is the risk and decays it once it is not.
+
+The decay is **geometric**, because the useful range spans two decades (`1e-2`
+early, `1e-4` late) and a linear ramp would spend almost all of its steps near
+the top.
+
+### Measured: both terms were a null result here
+
+400 steps, 3 blocks, seed 42, MoSME with 2 boxes / 5 experts on every second
+trunk layer. Identical block visit counts across every run (138 / 145 / 117):
+
+| Configuration | mean loss | rejected | block 2 mean \|g\| | block 2 max \|g\| |
+|---|---|---|---|---|
+| MoSME baseline | 482.90 | 5 | 2.44e3 | 8.19e4 |
+| `--z-level 1e-3` | 483.28 | 5 | 2.43e3 | 8.19e4 |
+| `+ --balance-schedule anneal` | 483.26 | 5 | 2.40e3 | 8.19e4 |
+| `--uncertainty 1.0` | **136.76** | **0** | **1.76e2** | **8.68e3** |
+
+Three routing configurations within 0.1% of each other, with the same five
+gradient-gate rejections and the same peak gradient. So the instability in these
+runs is **not** a routing pathology — it is the EDM weight `w(sigma)` diverging
+in block 2, which is what [Loss Reduction](Loss-Reduction.md) addresses and what
+it does address.
+
+That does not make the routing terms wrong. Logit drift is a *slow* failure
+mode, and 400 CPU steps from random initialization is nowhere near enough for it
+to appear; the certificates confirm the terms behave exactly as specified. They
+are insurance, correctly priced at `1e-3`. What would be wrong is calling them
+an improvement on this evidence.
+
+**Practical recommendation for a MoSME run:** start with `--uncertainty 1.0`.
+Leave `--z-level` at its default and reach for `--balance-schedule anneal` only
+once a routing diagnostic exists to tell you whether it helped.
+
+### What is still missing
+
+The diagnostic. A balance loss tells you whether the *load* is even; it says
+nothing about whether routing is *confident*. Two normalized entropies would:
+
+| Load entropy | Per-token entropy | Reading |
+|---|---|---|
+| low | — | routing collapse: one expert wins everything |
+| high | high | **balanced but unspecialized** — the failure mode above |
+| high | low | balanced *and* specialized — what you want |
+
+The middle row is invisible in every number this crate currently reports, which
+is why roadmap 23.6 is the item to build before evaluating 23.4 or 23.5.
+
+---
+
+See also: [Mixture of Specialized Micro Experts](Mixture-of-Specialized-Micro-Experts.md) · [Loss Reduction](Loss-Reduction.md) · [Quality Gate](Quality-Gate.md) · [Training Guide](Training-Guide.md) · [Home](Home.md)

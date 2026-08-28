@@ -24,6 +24,116 @@ Original code: [SakanaAI/DiffusionBlocks](https://github.com/SakanaAI/DiffusionB
 
 ---
 
+## Implementation status — read this first
+
+**This repository is a Rust crate built on [Burn](https://burn.dev), not a
+Python package.** The Python snippets throughout this document are the original
+design specification, kept because they state the intent of each feature
+clearly; they do not describe files that exist here. The shipped code lives in
+`src/*.rs` and is driven by the `dblocks` binary.
+
+Everything implementable without a GPU, a cluster, or a new dependency is
+implemented. See [`TODO.md`](TODO.md) for per-item status, the list of bugs
+found and fixed along the way, and the exact blocker on each remaining item.
+[`docs/Quality-Gate.md`](docs/Quality-Gate.md) covers how correctness is
+verified at the implementation, run and step level, and
+[`docs/Home.md`](docs/Home.md) indexes the wiki — every page there now opens
+with an accurate "In this repository" block naming the module, types and flags
+that implement it.
+
+```bash
+# Build and run the quality gate: 40 numerical certificates, non-zero exit on
+# any failure.
+cargo build --release
+./target/release/dblocks verify
+
+# Train (synthetic data needs no download).
+./target/release/dblocks train --steps 200 --num-blocks 3
+
+# Train on CIFAR-100. Fetch the binary distribution first:
+#   wget https://www.cs.toronto.edu/~kriz/cifar-100-binary.tar.gz && tar xzf ...
+./target/release/dblocks train --dataset cifar100 --data-dir cifar-100 --steps 2000
+
+# Other objectives: consistency regularization, rectified flow, distillation.
+./target/release/dblocks train --objective consistency
+./target/release/dblocks train --objective flow
+./target/release/dblocks train --objective distill --teacher checkpoints/dblocks-<hash>.mpk
+
+# Mixture-of-experts in the trunk, resume from the newest checkpoint.
+./target/release/dblocks train --moe-every 2 --moe-experts 4 --moe-top-k 2 --resume
+
+# Training verifies quality at every phase by default (preflight certificates,
+# finite loss, gradient norm, finite parameters). Add periodic re-verification
+# of the live weights, or turn the checks off:
+./target/release/dblocks train --verify-every 100
+./target/release/dblocks train --no-checks
+
+# Boxes of specialized micro experts, with an index an engine can route from.
+./target/release/dblocks experts init --out boxes.json \
+    --box coding:rust,python,secure --box cyber:netsec,malware
+./target/release/dblocks train --mosme-spec boxes.json --mosme-every 2
+./target/release/dblocks experts list --index checkpoints/dblocks-<hash>.index.json
+
+# Sample with any solver x strategy x gate x precision combination.
+./target/release/dblocks sample --solver dpmpp3m --strategy adaptive --k 3 \
+    --gate tightening --precision bf16 --precision-switch 1.0
+
+# Sweep every solver against every strategy, reporting cost honestly.
+./target/release/dblocks bench --repeats 3
+
+# Batched inference with top-k output and per-batch profiling.
+./target/release/dblocks infer --top-k 3 --solver heun
+
+# Inspect the sigma schedule and block windows.
+./target/release/dblocks sigmas --num-blocks 3
+```
+
+Development loop:
+
+```bash
+cargo test --all && cargo clippy --all-targets && ./target/release/dblocks verify
+```
+
+### Where the Rust code lives
+
+| Concern | Module |
+|---|---|
+| ViT-DiT backbone, adaLN-zero, MoE placement | `vit.rs` |
+| Block-wise denoiser, EDM preconditioning | `dblock.rs`, `sigma.rs` |
+| ODE solvers (Euler / Heun / DDIM / DPM++ 2M & 3M) | `solver.rs` |
+| Sequential / parallel / hybrid / adaptive sampling | `multi_block.rs` |
+| Consistency and cross-fork objectives | `consistency.rs` |
+| Flow matching | `flow.rs` |
+| Flat mixture-of-experts | `moe.rs` |
+| Boxes of specialized micro experts | `mosme.rs`, `expert_index.rs` |
+| Block distillation | `distill.rs` |
+| NF4 quantization + LoRA (QLoRA) | `quantize.rs` |
+| Adaptive depth, loop graph | `adaptive.rs`, `loopgraph.rs` |
+| Quality gates: sampling *and* training phases | `quality.rs` |
+| Mixed-precision emulation and policy | `precision.rs` |
+| Datasets and streaming I/O | `data.rs`, `rawdata.rs`, `cifar.rs`, `tinyimagenet.rs` |
+| Training loop, checkpoints, logging | `train.rs`, `checkpoint.rs`, `logging.rs` |
+| Inference API, profiler | `infer.rs`, `profile.rs` |
+| **Numerical certificate suite** | `verify.rs` |
+
+### Deliberate omissions
+
+Three things the design document asks for are intentionally *not* implemented,
+each for a stated reason rather than for lack of time:
+
+- **Hosted W&B and HTTP serving** would pull in a network dependency tree. The
+  JSONL metrics schema is W&B-compatible and `infer::InferenceEngine` exposes
+  everything a server would call.
+- **Native `io_uring`** would require an external crate. The measurable goal --
+  fewer syscalls per batch -- is delivered by positional reads and run
+  coalescing in `rawdata.rs`, with the syscall count exposed for measurement.
+- **Native bf16 arithmetic** needs backend support the `ndarray` backend does
+  not have. `precision.rs` emulates the format exactly (round-to-nearest-even,
+  subnormals, overflow) so the *accuracy* question can be studied today; it is
+  not a speedup, and says so.
+
+---
+
 ## Table of Contents
 
 1. [Project Overview](#project-overview)

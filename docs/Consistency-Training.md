@@ -4,6 +4,33 @@ Self-consistency losses for DiffusionBlocks++ that encourage adjacent blocks
 to produce consistent predictions at their boundaries, enabling faster
 convergence and fewer inference steps.
 
+> **In this repository.** `src/consistency.rs`, via
+> `DblockClassifier::consistency_step` and `dblocks train --objective consistency`.
+>
+> Four residuals, weighted by `ConsistencyWeights` and ramped by
+> `ConsistencySchedule` (constant / linear / cosine):
+>
+> | Term | Statement |
+> |---|---|
+> | `boundary` | Blocks `b` and `b+1` agree at their shared sigma |
+> | `self_consistency` | One block, two noise levels of the same clean state |
+> | `trajectory` | A full chain rollout lands where direct noising lands |
+> | `cross_fork` | A joint span `i..=j` reproduces the sequential composition |
+>
+> Each is a plain MSE scaled by `weight x lambda(step)`. The multiplier
+> deliberately does **not** depend on the residual's own value: scaling a
+> residual by itself optimizes `L^2`, whose gradient vanishes precisely where
+> the residual is already small. (This repository shipped that bug; it is now
+> called out in the module docs.)
+>
+> With every weight zero the step reduces **exactly** to the plain training
+> loss — asserted by
+> `integration_disabling_every_consistency_term_reduces_to_the_plain_loss`, so
+> this is a strict superset rather than a parallel implementation.
+>
+> Cost: roughly 12 forward passes per step instead of one.
+
+
 ## Overview
 
 In standard DiffusionBlocks, each block is trained independently. This means
@@ -146,3 +173,7 @@ Recommended ablation experiments:
 
 - Consistency Models (Song et al., 2023)
 - Original DiffusionBlocks paper (Shing et al., 2026)
+
+---
+
+See also: [Quality Gate](Quality-Gate.md) · [Training Guide](Training-Guide.md) · [Inference Guide](Inference-Guide.md) · [Home](Home.md)

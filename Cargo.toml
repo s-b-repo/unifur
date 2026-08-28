@@ -25,6 +25,10 @@ burn = { version = "0.21", default-features = false, features = ["ndarray", "std
 burn-ndarray = { version = "0.21", features = ["multi-threads"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+# Already present transitively via burn; promoting it to a direct dependency
+# costs no new crate. The expert index must be *parsed*, not just emitted, and
+# a hand-rolled reader for a nested tagged document is pure liability.
+serde_json = "1"
 anyhow = "1"
 rand = "0.9"
 sha2 = "0.10"

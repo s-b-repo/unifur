@@ -3,6 +3,31 @@
 Learned halting probabilities so the model can dynamically skip blocks
 when confident enough, enabling dynamic compute per sample at inference.
 
+> **In this repository.** `src/adaptive.rs` (`HaltingHead`, `expected_depth`,
+> `early_exit_step`) and `src/loopgraph.rs` for the dynamic-graph version.
+>
+> Two mechanisms:
+>
+> - **`Strategy::Adaptive`** in `multi_block.rs` widens the executed span while
+>   the batch-mean class confidence is below the threshold and narrows it again
+>   once confident.
+> - **`LoopGraph`** turns halting probabilities into an ACT mixture with the
+>   remainder rule, so the weights sum to exactly 1 — see
+>   [Hybrid Loop Graph](Hybrid-Loop-Graph.md).
+>
+> Both decide one step at a time from what they can see now. `planner.rs`
+> generalizes that: it scores candidate steps and short rollouts of what follows
+> them, and is certified to reduce **exactly** to the one-step policy at depth 0
+> — see [Next-Step Planning](Next-Step-Planning.md).
+>
+> `HaltingHead::expected_depth` is the ponder cost: the mean over samples of
+> summed halting probabilities. Minimizing it encourages early exits; combine
+> with the task loss weighted by `HaltingConfig::ponder_weight`.
+>
+> Block usage is recorded rather than inferred: `ExecutionTrace::usage_histogram`
+> and `SamplingStats::spans` report exactly what ran.
+
+
 ## Overview
 
 In standard DiffusionBlocks, all B blocks are evaluated for every sample.
@@ -123,3 +148,7 @@ uv run python -m diffusionblocks.main test cifar100 \
 - PonderNet (Banino et al., 2021)
 - Looped Transformers (Fan et al., 2025)
 - Universal Transformers (Dehghani et al., 2019)
+
+---
+
+See also: [Next-Step Planning](Next-Step-Planning.md) · [Quality Gate](Quality-Gate.md) · [Training Guide](Training-Guide.md) · [Inference Guide](Inference-Guide.md) · [Home](Home.md)

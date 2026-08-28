@@ -11,7 +11,7 @@
 //!   lognormal-CDF space, descending order), matching `get_discrete_sigmas(dblock=True)`.
 //! - [`discrete_sigmas_edm`]: the classic EDM polynomial schedule with
 //!   exponent `rho=7`.
-//! - [`DblockSampler`]: per-sample truncated lognormal sigma sampling inside
+//! - [`DblockSigmaSampler`]: per-sample truncated lognormal sigma sampling inside
 //!   a block window extended by `gamma`, matching `get_sigmas`.
 
 use crate::stats::{norm_cdf, norm_ppf};
@@ -28,17 +28,48 @@ pub const P_STD: f64 = 1.2;
 /// Rho exponent of the EDM polynomial schedule.
 pub const RHO: f64 = 7.0;
 
-/// Block boundaries: ascending sigmas `[sigma_1 < ... < sigma_{B+1}]`
-/// equally spaced in lognormal-CDF space between `sigma_min` and `sigma_max`
-/// (`get_block_sigmas(num_layers=num_blocks)`).
+/// Block boundaries: ascending sigmas `[sigma_0 < ... < sigma_B]` equally
+/// spaced in lognormal-CDF space between `sigma_min` and `sigma_max`
+/// (`get_block_sigmas(num_layers=num_blocks)`). Length is `num_blocks + 1`.
 ///
-/// Block `i` (0-based) covers the descending window
-/// `(block_sigmas[i + 1], block_sigmas[i]]`... in reference terms:
-/// `sigma_min_block = block_sigmas[block_idx]`,
-/// `sigma_max_block = block_sigmas[block_idx + 1]`, where higher blocks see
-/// noisier inputs. The returned vec has length `num_blocks + 1`.
+/// # Block indexing
+///
+/// The returned vector ascends, but *block* indices descend in noise level:
+/// the composition `y = H_{B-1} o ... o H_0(x)` integrates the reverse ODE, so
+/// block 0 runs first and therefore owns the **noisiest** window. Concretely,
+/// block `b` covers
+///
+/// ```text
+/// (block_sigmas[B - b - 1], block_sigmas[B - b]]
+/// ```
+///
+/// so block `0` covers `(.., sigma_max]` and block `B - 1` covers
+/// `(sigma_min, ..]`. [`block_window`] does that arithmetic,
+/// [`estimate_target_layer`] is its inverse, and
+/// [`DblockSigmaSampler::extended_window`] applies the `gamma` extension on
+/// top. Everything downstream -- training-sigma sampling, boundary
+/// consistency, multi-block span selection -- must agree on this convention,
+/// which `test_block_index_roundtrip` pins.
 pub fn block_sigmas(num_blocks: usize) -> Vec<f64> {
     block_sigmas_with(num_blocks, SIGMA_MIN, SIGMA_MAX, P_MEAN, P_STD)
+}
+
+/// Half-open sigma window `(lo, hi]` owned by block `b` under the
+/// block-0-is-noisiest convention documented on [`block_sigmas`].
+///
+/// `bounds` must be the ascending boundary vector of length `num_blocks + 1`.
+pub fn block_window(bounds: &[f64], block_idx: usize) -> (f64, f64) {
+    let n = bounds.len() - 1;
+    assert!(n >= 1, "bounds must contain num_blocks + 1 entries");
+    assert!(block_idx < n, "block_idx {block_idx} out of range ({n} blocks)");
+    (bounds[n - block_idx - 1], bounds[n - block_idx])
+}
+
+/// Sigma shared by blocks `b` and `b + 1` (their common window edge).
+pub fn shared_boundary_sigma(bounds: &[f64], block_idx: usize) -> f64 {
+    let n = bounds.len() - 1;
+    assert!(block_idx + 1 < n, "blocks {block_idx} and {} do not both exist", block_idx + 1);
+    bounds[n - block_idx - 1]
 }
 
 /// [`block_sigmas`] with explicit schedule hyperparameters.
@@ -125,12 +156,15 @@ impl DblockSigmaSampler {
         }
     }
 
-    /// Extend one window by `gamma` in log space and clamp to global bounds.
+    /// Extend block `block_idx`'s window by `gamma` in log space and clamp to
+    /// the global bounds.
+    ///
+    /// Uses the block-0-is-noisiest convention of [`block_sigmas`], so this is
+    /// the exact window the block is *trained* on and the inverse of
+    /// [`estimate_target_layer`] up to the `gamma` extension.
     pub fn extended_window(&self, block_idx: usize) -> (f64, f64) {
         let n = self.block_sigmas.len() - 1;
-        assert!(block_idx < n, "block_idx {block_idx} out of range ({n} blocks)");
-        let mut lo = self.block_sigmas[block_idx];
-        let mut hi = self.block_sigmas[block_idx + 1];
+        let (mut lo, mut hi) = block_window(&self.block_sigmas, block_idx);
         if self.gamma > 0.0 {
             let log_range = hi.ln() - lo.ln();
             lo = (lo.ln() - self.gamma * log_range).exp();
@@ -272,11 +306,61 @@ mod tests {
     #[test]
     fn test_sampler_window_extension() {
         let sampler = DblockSigmaSampler::new(3, 0.05);
-        let (lo, hi) = sampler.extended_window(0);
-        assert!(lo <= sampler.block_sigmas[0]); // clamped to global min
-        assert!(hi >= sampler.block_sigmas[1]);
-        let (_, hi_last) = sampler.extended_window(2);
-        assert_relative_eq!(hi_last, SIGMA_MAX, max_relative = 1e-9); // clamped to global max
+        let bounds = &sampler.block_sigmas;
+
+        // Block 0 is the noisiest: its window tops out at the global max and
+        // stays clamped there after the gamma extension.
+        let (lo0, hi0) = sampler.extended_window(0);
+        assert_relative_eq!(hi0, SIGMA_MAX, max_relative = 1e-9);
+        assert!(lo0 < bounds[2], "gamma must widen downwards: {lo0} vs {}", bounds[2]);
+
+        // The last block is the cleanest and clamps at the global min.
+        let (lo_last, hi_last) = sampler.extended_window(2);
+        assert_relative_eq!(lo_last, SIGMA_MIN, max_relative = 1e-9);
+        assert!(hi_last > bounds[1]);
+
+        // gamma = 0 reproduces the bare windows exactly.
+        let bare = DblockSigmaSampler::new(3, 0.0);
+        for b in 0..3 {
+            assert_eq!(bare.extended_window(b), block_window(&bare.block_sigmas, b));
+        }
+    }
+
+    #[test]
+    fn test_block_index_roundtrip() {
+        // The certificate that closes the train/inference loop: a sigma drawn
+        // from block `b`'s *training* window must be routed back to block `b`
+        // at inference. If `extended_window` and `estimate_target_layer` ever
+        // disagree on the index convention, a block is trained on one noise
+        // range and evaluated on another.
+        for num_blocks in [1usize, 2, 3, 4, 6, 12] {
+            let sampler = DblockSigmaSampler::new(num_blocks, 0.0);
+            let bounds = &sampler.block_sigmas;
+            let mut rng = rand::rng();
+            for b in 0..num_blocks {
+                let sigmas = sampler.sample(&mut rng, b, 64);
+                for s in &sigmas {
+                    assert_eq!(
+                        estimate_target_layer(bounds, &[*s]),
+                        b,
+                        "sigma {s} trained on block {b} routes elsewhere ({num_blocks} blocks)"
+                    );
+                }
+                // ...and the windows tile the range without gaps or overlap.
+                let (lo, hi) = block_window(bounds, b);
+                assert!(lo < hi);
+                if b + 1 < num_blocks {
+                    assert_eq!(lo, block_window(bounds, b + 1).1);
+                    assert_eq!(lo, shared_boundary_sigma(bounds, b));
+                }
+            }
+            assert_relative_eq!(block_window(bounds, 0).1, SIGMA_MAX, max_relative = 1e-6);
+            assert_relative_eq!(
+                block_window(bounds, num_blocks - 1).0,
+                SIGMA_MIN,
+                max_relative = 1e-9
+            );
+        }
     }
 
     #[test]
@@ -317,7 +401,7 @@ mod tests {
 
     #[test]
     fn test_estimate_target_layer_mapping() {
-        let bounds = block_sigmas(3); // ~[0.002, 0.0578, 1.673, 80]
+        let bounds = block_sigmas(3); // ~[0.002, 0.180, 0.505, 80]
         // Highest-noise sigma -> block 0.
         assert_eq!(estimate_target_layer(&bounds, &[70.0]), 0);
         // Lowest-noise sigma -> last block.

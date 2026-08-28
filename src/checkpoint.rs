@@ -31,6 +31,9 @@ const HASH_LEN: usize = 16;
 
 type MpkRecorder = NamedMpkFileRecorder<FullPrecisionSettings>;
 
+/// Disambiguates concurrent temp files within one process.
+static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Serialize `module` into `dir` under a content-hashed filename.
 ///
 /// Returns the final path. If a checkpoint with identical parameters already
@@ -47,12 +50,16 @@ pub fn save_content_addressed<B: Backend, M: Module<B>>(
     let final_path = dir.join(format!("{stem}-{}.{}", &hash[..HASH_LEN], ext));
 
     if !final_path.exists() {
-        // save_file appends the recorder extension via set_extension, which
-        // *replaces* any existing suffix, so resolve the actual written path.
-        let tmp = dir.join(format!(".{stem}.tmp"));
+        // The temp name is unique per process *and* per call: two concurrent
+        // saves (an async save racing a synchronous one, say) must not write
+        // the same path and rename each other's half-written file into place.
+        let unique = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(".{stem}.{}.{unique}.tmp", std::process::id()));
         module
             .save_file(&tmp, &MpkRecorder::new())
             .map_err(|err| anyhow::anyhow!("serialize checkpoint: {err}"))?;
+        // save_file appends the recorder extension via set_extension, which
+        // *replaces* any existing suffix, so resolve the actual written path.
         let tmp = tmp.with_extension(ext);
         fs::rename(&tmp, &final_path)
             .with_context(|| format!("move {} to {}", tmp.display(), final_path.display()))?;
@@ -78,8 +85,55 @@ where
     std::thread::spawn(move || save_content_addressed(module, &dir, stem))
 }
 
-/// sha256 over the module's parameters, hex-encoded.
-fn canonical_hash_hex<B: Backend, M: Module<B>>(module: &M) -> String {
+/// Load a checkpoint into `module`.
+pub fn load<B, M>(module: M, path: &Path, device: &B::Device) -> anyhow::Result<M>
+where
+    B: Backend,
+    M: Module<B>,
+{
+    module
+        .load_file(path, &MpkRecorder::new(), device)
+        .map_err(|err| anyhow::anyhow!("load {}: {err}", path.display()))
+}
+
+/// Most recently modified checkpoint in `dir` whose name starts with `stem`.
+///
+/// Content-addressed names carry no ordering of their own -- that is the point
+/// of them -- so "latest" has to come from the filesystem's mtime.
+pub fn latest_in_dir(dir: &Path, stem: &str) -> anyhow::Result<Option<PathBuf>> {
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let ext = <MpkRecorder as FileRecorder<B32>>::file_extension();
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in fs::read_dir(dir).with_context(|| format!("read dir {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let matches_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with(stem) && n.ends_with(&format!(".{ext}")));
+        if !matches_name {
+            continue;
+        }
+        let modified = entry.metadata()?.modified()?;
+        if best.as_ref().is_none_or(|(t, _)| modified > *t) {
+            best = Some((modified, path));
+        }
+    }
+    Ok(best.map(|(_, p)| p))
+}
+
+/// The recorder's file extension does not depend on the backend, but the
+/// trait method does; this alias pins one so callers need not.
+type B32 = burn::backend::NdArray<f32>;
+
+/// sha256 over a module's parameters, hex-encoded.
+///
+/// Public because the expert index records a per-expert hash so an inference
+/// engine can tell whether the weights it holds are the ones the manifest
+/// describes.
+pub fn canonical_hash_hex<B: Backend, M: Module<B>>(module: &M) -> String {
     let mut hasher = ContentHasher::default();
     module.visit(&mut hasher);
     let digest = hasher.sha.finalize();
@@ -144,22 +198,7 @@ mod tests {
     type Device = <B as BackendTypes>::Device;
 
     fn tiny_vit_config() -> ViTDiTConfig {
-        ViTDiTConfig {
-            image_size: 32,
-            patch_size: 16,
-            in_channels: 3,
-            hidden_size: 32,
-            intermediate_size: 64,
-            num_hidden_layers: 4,
-            num_attention_heads: 4,
-            layer_norm_eps: 1e-12,
-            hidden_dropout_prob: 0.0,
-            attention_probs_dropout_prob: 0.0,
-            initializer_range: 0.02,
-            num_labels: 10,
-            cond_hidden_size: 8,
-            frequency_embedding_size: 16,
-        }
+        ViTDiTConfig::tiny(10)
     }
 
     fn tiny_model(device: &Device) -> DblockClassifier<B> {
@@ -231,6 +270,47 @@ mod tests {
         let pa = save_content_addressed(a, &dir, "dblocks").unwrap();
         let pb = save_content_addressed(b, &dir, "dblocks").unwrap();
         assert_ne!(pa, pb, "different content must map to different files");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_latest_in_dir_picks_the_newest_matching_file() {
+        let dir = scratch_dir("latest");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(latest_in_dir(&dir, "dblocks").unwrap().is_none(), "empty dir");
+
+        std::fs::write(dir.join("dblocks-aaaa.mpk"), b"a").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(dir.join("dblocks-bbbb.mpk"), b"b").unwrap();
+        // Decoys: wrong stem, wrong extension.
+        std::fs::write(dir.join("other-cccc.mpk"), b"c").unwrap();
+        std::fs::write(dir.join("dblocks-dddd.txt"), b"d").unwrap();
+
+        let latest = latest_in_dir(&dir, "dblocks").unwrap().unwrap();
+        assert_eq!(latest.file_name().unwrap(), "dblocks-bbbb.mpk");
+
+        // A directory that does not exist is "no checkpoint", not an error:
+        // a first run has nothing to resume from.
+        assert!(latest_in_dir(&dir.join("missing"), "dblocks").unwrap().is_none());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_load_restores_a_saved_model() {
+        let device = Default::default();
+        let dir = scratch_dir("load");
+        let model = tiny_model(&device);
+        let before = probe_logits(&model, &device);
+        let path = save_content_addressed(model, &dir, "dblocks").unwrap();
+
+        let restored = load::<B, _>(tiny_model(&device), &path, &device).unwrap();
+        let after = probe_logits(&restored, &device);
+        assert_eq!((before - after).abs().max().into_scalar(), 0.0);
+
+        // A missing file is a reported error, not a panic.
+        assert!(load::<B, _>(tiny_model(&device), &dir.join("nope.mpk"), &device).is_err());
 
         fs::remove_dir_all(&dir).unwrap();
     }

@@ -1,7 +1,44 @@
-# Hybrid Loop Graph & Quality Gate
+# Hybrid Loop Graph
 
-Advanced features for dynamic computation and quality control in
-DiffusionBlocks++.
+Dynamic computation graphs for DiffusionBlocks++: skipping blocks, looping
+back to refine, and bounding compute per sample.
+
+The quality-gate material that used to share this page now lives in
+[Quality Gate](Quality-Gate.md), which also covers training-time verification.
+
+> **In this repository.** `src/loopgraph.rs`.
+>
+> The decision logic lives in `LoopPlanner`, a host-side state machine with no
+> tensors in it. Dynamic control flow is easy to get subtly wrong — loops that
+> do not terminate, budgets that are exceeded, mixture weights that do not sum
+> to one — so it is separated out and its invariants are asserted directly:
+>
+> 1. it never authorizes more than `budget` block executions,
+> 2. it always terminates within `max_iterations`,
+> 3. the ACT mixture weights sum to **exactly 1**.
+>
+> Invariant 3 is the remainder rule of Graves (2016): the final step is charged
+> whatever probability mass is left rather than its own halting probability.
+> That is what makes the output a genuine convex combination of block outputs
+> rather than an arbitrarily scaled vector. Invariants 1 and 2 are tested
+> adversarially — confidence pinned so the planner always wants to loop back,
+> halting probability pinned at zero so ACT never terminates the run.
+>
+> Skip connections are **zero-initialized**, so a fresh loop graph computes the
+> pure ACT mixture and any skip pathway is one training deliberately opened —
+> the same identity-at-init discipline as the adaLN-zero trunk.
+>
+> `snr_confidence` is scale-invariant: doubling both the signal and sigma
+> leaves it unchanged, so one threshold means the same thing at every point of
+> the trajectory.
+>
+> `LoopGraph::x0_estimate` has the same signature as the fixed-depth predictor,
+> so it plugs straight into `solver::integrate`.
+>
+> The quality-gate half of this page has moved to
+> [Quality Gate](Quality-Gate.md), which now also covers training-time
+> verification.
+
 
 ## Hybrid Loop Graph Dynamic Transformers
 

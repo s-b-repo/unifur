@@ -54,3 +54,11 @@ Thumbs.db
 *.ckpt
 *.pth
 *.pt
+
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Burn checkpoints (also covered by checkpoints/ above)
+*.mpk

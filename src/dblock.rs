@@ -32,6 +32,9 @@ pub struct DblockConfig {
     pub sigma_data: f64,
     /// Number of Euler steps at inference (defaults to `num_blocks`).
     pub num_inference_steps: Option<usize>,
+    /// Weight of the MoE load-balancing auxiliary loss, when the trunk has
+    /// sparse layers. Ignored by a fully dense trunk.
+    pub moe_aux_weight: f64,
 }
 
 impl Default for DblockConfig {
@@ -41,6 +44,10 @@ impl Default for DblockConfig {
             gamma: 0.05,
             sigma_data: 0.5,
             num_inference_steps: None,
+            // Switch Transformer's default auxiliary weight: large enough to
+            // prevent router collapse, small enough not to distort the task
+            // loss.
+            moe_aux_weight: 0.01,
         }
     }
 }
@@ -51,6 +58,30 @@ pub struct StepMetrics {
     pub loss: f32,
     pub ce_loss: f32,
     pub block_idx: usize,
+    /// MoE load-balancing auxiliary loss of the executed span; `0.0` for a
+    /// dense trunk.
+    pub balance_loss: f32,
+}
+
+/// The pieces of one training step, kept separate so a caller can reweight
+/// them independently.
+///
+/// [`Self::loss`] already has the balance term folded in — that is the number a
+/// plain run backpropagates. [`Self::balance`] is handed back *as well* because
+/// a caller that reweights [`Self::per_sample`] must re-add it afterwards
+/// rather than reweight it: the balance term is a router regularizer, not a
+/// per-noise-level quantity, and scaling it by a sigma-indexed weight would tie
+/// load balancing to whichever noise levels a batch happened to draw.
+#[derive(Debug)]
+pub struct StepParts<B: Backend> {
+    /// Scalar loss, balance term included.
+    pub loss: Tensor<B, 1>,
+    /// Per-sample weighted losses `[b]`, before the mean and before the
+    /// balance term.
+    pub per_sample: Tensor<B, 1>,
+    /// The executed span's load-balancing loss; `None` for a dense trunk.
+    pub balance: Option<Tensor<B, 1>>,
+    pub metrics: StepMetrics,
 }
 
 /// DiffusionBlocks classifier.
@@ -59,6 +90,7 @@ pub struct DblockClassifier<B: Backend> {
     model: ViTDiTForImageClassification<B>,
     num_blocks: usize,
     sigma_data: f64,
+    moe_aux_weight: f64,
     layer_split: usize,
     inference_sigmas: Vec<f64>,
 }
@@ -94,6 +126,7 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             model,
             num_blocks: dblock_config.num_blocks,
             sigma_data: dblock_config.sigma_data,
+            moe_aux_weight: dblock_config.moe_aux_weight,
             layer_split: vit_config.num_hidden_layers / dblock_config.num_blocks,
             inference_sigmas,
         }
@@ -120,6 +153,11 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         self.sigma_data
     }
 
+    /// Weight applied to the MoE load-balancing auxiliary loss.
+    pub fn moe_aux_weight(&self) -> f64 {
+        self.moe_aux_weight
+    }
+
     /// Discrete (descending) inference schedule.
     pub fn inference_sigmas(&self) -> &[f64] {
         &self.inference_sigmas
@@ -142,7 +180,7 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         self.denoise_span(pixel_values, zt, sigmas, self.layer_range(block_idx))
     }
 
-    /// [`Denoiser::denoise`] over an arbitrary contiguous transformer-layer
+    /// [`Self::denoise`] over an arbitrary contiguous transformer-layer
     /// window (`start..end`). This is the primitive behind parallel /
     /// multi-block inference strategies; running only the span also acts as
     /// gradient routing during training, since gradients flow exclusively
@@ -154,6 +192,21 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         sigmas: &[f64],
         span: std::ops::Range<usize>,
     ) -> Tensor<B, 2> {
+        self.denoise_span_with_aux(pixel_values, zt, sigmas, span).0
+    }
+
+    /// [`Self::denoise_span`] that also returns the MoE load-balancing loss of
+    /// the executed span (`None` for a dense trunk).
+    ///
+    /// Inference paths discard it; training paths must add it, or a sparse
+    /// router is free to collapse onto a single expert.
+    pub fn denoise_span_with_aux(
+        &self,
+        pixel_values: Tensor<B, 4>,
+        zt: Tensor<B, 2>,
+        sigmas: &[f64],
+        span: std::ops::Range<usize>,
+    ) -> (Tensor<B, 2>, Option<Tensor<B, 1>>) {
         let device = zt.device();
         let b = zt.dims()[0];
         assert_eq!(sigmas.len(), b, "one sigma per sample required");
@@ -181,7 +234,10 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         let pooled = out.last_hidden_state.narrow(1, 0, 1); // [b, 1, h]
         let model_out = pooled * c_out.unsqueeze_dim::<3>(1) + zt.unsqueeze_dim::<3>(1) * c_skip.unsqueeze_dim::<3>(1);
 
-        self.model.forward_output_embeddings(model_out, out.conditioning)
+        (
+            self.model.forward_output_embeddings(model_out, out.conditioning),
+            out.balance_loss,
+        )
     }
 
     /// Denoised "clean" embedding estimate at scalar `sigma`: class
@@ -220,6 +276,25 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         let probs = softmax(logits, 1);
         let probs_out = if with_probs { Some(probs.clone()) } else { None };
         (probs.matmul(self.model.label_embedding_weight()), probs_out)
+    }
+
+    /// x0 estimate with the image conditioning removed.
+    ///
+    /// The unconditional half of a guided pair (roadmap 22.5). "Unconditional"
+    /// here means a zero image rather than a learned null embedding: this model
+    /// has no null token to fall back on, and zeros are the input the patch
+    /// embedding maps to its own bias — the closest thing to "no evidence" that
+    /// exists without retraining. A learned null embedding would be stronger
+    /// and is the natural upgrade if guidance proves worth training for.
+    pub fn x0_estimate_unconditional(
+        &self,
+        pixel_values: &Tensor<B, 4>,
+        z: &Tensor<B, 2>,
+        sigma: f64,
+        span: Option<std::ops::Range<usize>>,
+    ) -> Tensor<B, 2> {
+        let null = Tensor::<B, 4>::zeros(pixel_values.dims(), &pixel_values.device());
+        self.x0_estimate(&null, z, sigma, span)
     }
 
     /// Solve the full probability-flow ODE from pure noise down to
@@ -274,15 +349,39 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         gamma: f64,
         rng: &mut R,
     ) -> (Tensor<B, 1>, StepMetrics) {
+        let b = pixel_values.dims()[0];
+        let block_idx = rng.random_range(0..self.num_blocks);
+        let sigmas = self.sampler(gamma).sample(rng, block_idx, b);
+        let parts = self.training_step_on(pixel_values, labels, &sigmas, block_idx, None);
+        (parts.loss, parts.metrics)
+    }
+
+    /// [`Self::training_step`] with the block and noise levels chosen by the
+    /// caller, and optional per-sample importance weights (roadmap 20.6).
+    ///
+    /// Splitting this out is what lets [`crate::reweight::SigmaImportanceSampler`]
+    /// choose the sigmas without the sampler having to know anything about the
+    /// model, and what lets a caller reuse one set of noise levels across
+    /// objectives.
+    ///
+    /// Returns the loss, the metrics, the **per-sample** weighted losses `[b]`
+    /// and the balance term separately — see [`StepParts`], and the note there
+    /// on why the balance loss is handed back rather than only folded in.
+    pub fn training_step_on(
+        &self,
+        pixel_values: Tensor<B, 4>,
+        labels: Tensor<B, 1, Int>,
+        sigmas: &[f64],
+        block_idx: usize,
+        importance: Option<&[f64]>,
+    ) -> StepParts<B> {
         let device = pixel_values.device();
         let b = pixel_values.dims()[0];
+        assert_eq!(sigmas.len(), b, "one sigma per sample required");
+        assert!(block_idx < self.num_blocks, "block {block_idx} out of range");
 
         // Clean "data": normalized label embeddings.
         let z = self.model.normalized_label_embeds(labels.clone());
-
-        // Random block + per-sample sigmas within its window.
-        let block_idx = rng.random_range(0..self.num_blocks);
-        let sigmas = self.sampler(gamma).sample(rng, block_idx, b);
 
         // zt = z + sigma * eps
         let eps = Tensor::<B, 2>::random(z.dims(), Distribution::Normal(0.0, 1.0), &device);
@@ -292,7 +391,8 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         );
         let zt = z + eps * s.unsqueeze_dim::<2>(1);
 
-        let logits = self.denoise(pixel_values, zt, &sigmas, Some(block_idx));
+        let (logits, balance) =
+            self.denoise_span_with_aux(pixel_values, zt, sigmas, self.layer_range(block_idx));
 
         // Per-sample cross entropy.
         let log_probs = log_softmax(logits, 1);
@@ -308,14 +408,36 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             .map(|&sg| edm_loss_weight(sg, self.sigma_data) as f32)
             .collect();
         let w = Tensor::<B, 1>::from_floats(weights.as_slice(), &device);
-        let loss = (nll * w).mean();
+        let mut per_sample = nll * w;
+
+        // Importance weights, when the noise levels were not drawn from the
+        // prior. `p/q` is what keeps the estimator unbiased -- without it a
+        // proposal that favours the high-loss region would report a
+        // systematically larger loss and the optimizer would chase it.
+        if let Some(importance) = importance {
+            assert_eq!(importance.len(), b, "one importance weight per sample required");
+            let iw = Tensor::<B, 1>::from_floats(
+                importance.iter().map(|&v| v as f32).collect::<Vec<_>>().as_slice(),
+                &device,
+            );
+            per_sample = per_sample * iw;
+        }
+
+        let mut loss = per_sample.clone().mean();
+
+        let mut m_balance = 0.0f32;
+        if let Some(aux) = balance.clone() {
+            m_balance = aux.clone().into_scalar();
+            loss = loss + aux.mul_scalar(self.moe_aux_weight as f32);
+        }
 
         let metrics = StepMetrics {
             loss: loss.clone().into_scalar(),
             ce_loss: ce_loss.into_scalar(),
             block_idx,
+            balance_loss: m_balance,
         };
-        (loss, metrics)
+        StepParts { loss, metrics, per_sample, balance }
     }
 
     /// Euler-integrated classification (`diffusion_step`): integrate the

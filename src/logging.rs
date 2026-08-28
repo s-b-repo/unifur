@@ -6,7 +6,7 @@
 //! out on purpose to keep this crate network-free.
 
 use std::{
-    fs::File,
+    fs::{File, OpenOptions},
     io::{BufWriter, Write},
     path::Path,
 };
@@ -17,11 +17,28 @@ pub struct MetricsLogger {
 }
 
 impl MetricsLogger {
+    /// Open `path` for appending, creating it (and any parent directories) if
+    /// needed. Appending rather than truncating is what makes a resumed run
+    /// extend its own metrics file instead of erasing the history it is
+    /// resuming from.
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        Self::open_with(path, true)
+    }
+
+    /// Open `path`, truncating it first when `append` is false.
+    pub fn open_with(path: &Path, append: bool) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
         }
-        Ok(Self { writer: BufWriter::new(File::create(path)?) })
+        let file: File = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(append)
+            .truncate(!append)
+            .open(path)?;
+        Ok(Self { writer: BufWriter::new(file) })
     }
 
     /// Write one flat key/value record with a `step` field.
@@ -58,8 +75,12 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("metrics.jsonl");
 
-        let mut logger = MetricsLogger::open(&path).unwrap();
+        let mut logger = MetricsLogger::open_with(&path, false).unwrap();
         logger.log(0, &[("loss", jnum(1.5)), ("block", "0".to_string())]).unwrap();
+        drop(logger);
+
+        // Re-opening must append, not truncate: a resumed run keeps history.
+        let mut logger = MetricsLogger::open(&path).unwrap();
         logger.log(1, &[("loss", jnum(f32::NAN)), ("note", "\"nan-case\"".to_string())]).unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();

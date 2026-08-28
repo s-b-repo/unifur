@@ -2,6 +2,45 @@
 
 Advanced performance features for DiffusionBlocks++.
 
+> **In this repository.** Two independent modules.
+>
+> **Precision** — `src/precision.rs`. The `ndarray` backend computes in f32
+> only, so `Precision::{Bf16, F16}` **emulate** the formats: values are rounded
+> onto the target grid with correct round-to-nearest-even, subnormals and
+> overflow, while arithmetic stays in f32.
+>
+> This models representation error exactly but not a real low-precision
+> kernel's accumulation order, and it is **slower**, not faster. It is a
+> numerical-analysis tool — it answers "how much accuracy would bf16 cost
+> here?" — and `Precision::round_scalar` is the single place a native cast
+> swaps in once a backend offers one.
+>
+> `PrecisionPolicy::mixed(Bf16, switch_sigma)` runs high-sigma windows coarse
+> and low-sigma windows in f32: at high sigma the latent is dominated by noise
+> of magnitude sigma, so a relative error of `2^-8` sits far below the noise
+> floor. Certified: relative error `<= 2^-p`, and rounding is idempotent, so
+> the output really lies on the target grid. Verified against an independent
+> bit-level bf16 implementation.
+>
+> CLI: `--precision bf16 --precision-switch 1.0`.
+>
+> **I/O** — `src/rawdata.rs`. `StreamingSplit` uses positional reads (`pread`,
+> one syscall instead of `seek` + `read`), sorts sampled indices and
+> **coalesces contiguous runs into a single read**, and lands bytes in reusable
+> buffers so steady-state batching allocates nothing. `reads_issued()` exposes
+> the syscall count, and the label scan walks the file in 4 MiB chunks rather
+> than one header read per record.
+>
+> Native `io_uring` submission would need an external crate and is deliberately
+> not vendored: the measurable win it targets is what run coalescing already
+> delivers.
+>
+> **Profiling** — `src/profile.rs`. Named scopes with exact (not estimated)
+> percentiles, ranked by total time. Percentiles rather than means alone,
+> because a step that is usually fast but occasionally stalls has a healthy
+> mean and a terrible p95.
+
+
 ## Precision Denoising
 
 ### Overview
@@ -249,3 +288,7 @@ profiling:
 - io_uring (Axboe, 2019)
 - PyTorch AMP (Automatic Mixed Precision)
 - Original DiffusionBlocks paper (Shing et al., 2026)
+
+---
+
+See also: [Quality Gate](Quality-Gate.md) · [Training Guide](Training-Guide.md) · [Inference Guide](Inference-Guide.md) · [Home](Home.md)

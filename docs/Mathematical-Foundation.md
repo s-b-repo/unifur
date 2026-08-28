@@ -4,6 +4,45 @@ Rigorous mathematical treatment of DiffusionBlocks++ denoising theory,
 including multi-micro-block decomposition, lossless denoising conditions,
 and convergence proofs.
 
+> **In this repository.** The theory below is checked, not just stated.
+> `src/verify.rs` turns each load-bearing identity into a **residual** compared
+> against a tolerance derived from the arithmetic, run by `dblocks verify` and
+> by `cargo test`.
+>
+> | Claim here | Certificate |
+> |---|---|
+> | Block windows partition `[sigma_min, sigma_max]` | `schedule::window_tiling` |
+> | Boundaries are uniform in lognormal-CDF space | `schedule::cdf_uniform_spacing` |
+> | Training and inference agree on which block owns a sigma | `schedule::block_routing_involution` |
+> | EDM preconditioning reconstructs `x` exactly | `preconditioning::edm_denoiser_identity` |
+> | `c_in` normalizes the input to unit variance | `preconditioning::c_in_unit_variance` |
+> | The loss weight cancels the output scaling | `preconditioning::loss_weight_normalizes_c_out` |
+> | Solvers achieve their classical order | `solver::empirical_order_of_convergence` |
+> | The exponential-kernel moments are correct | `solver::kernel_moments` |
+> | DDIM redistributes variance rather than adding it | `solver::ancestral_variance_preserved` |
+> | `x0` stays in the convex hull of the label embeddings | `model::x0_in_convex_hull` |
+> | The ACT mixture is a partition of unity | `loopgraph::act_partition_of_unity` |
+> | Causal attention leaks nothing from the future | `lm::attention_cannot_see_the_future` |
+> | A KV cache is exact, not an approximation | `lm::kv_cache_matches_full_recompute` |
+> | Beam search at depth 0 *is* the greedy policy | `planner::depth_zero_is_greedy` |
+> | Guidance is affine in its two estimates | `accuracy::guidance_is_affine_in_the_estimates` |
+> | Uncertainty weighting is minimized at `l = ln L` | `optim::uncertainty_optimum_is_the_log_loss` |
+> | Its gradient is invariant to per-sigma rescaling | `optim::uncertainty_gradient_is_scale_free` |
+> | `E_q[p/q] = 1` for the importance estimator | `optim::importance_sampling_is_unbiased` |
+> | Accumulating `k` micro-batches equals one `k`x batch | `optim::accumulation_equals_one_large_batch` |
+> | Logit normalization is a monotone per-row map | `accuracy::logit_normalization_preserves_argmax` |
+> | Autodiff matches finite differences | `autodiff::distillation_gradcheck` |
+>
+> **These are numerical checks to a stated tolerance, not machine-checked
+> proofs.** Rust is not a proof assistant, and a floating-point implementation
+> of a real-valued identity can at best be correct to a tolerance. What the
+> suite buys is that a regression in any identity the code rests on surfaces as
+> a *named* failure rather than as quietly worse results — which is how the
+> `erf`/`erfc` crossover bug in this repository was found.
+>
+> See [Quality Gate](Quality-Gate.md).
+
+
 ## Table of Contents
 
 1. [Notation and Definitions](#notation-and-definitions)

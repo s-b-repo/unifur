@@ -2,6 +2,12 @@
 
 Frequently asked questions about DiffusionBlocks++.
 
+> **In this repository.** Answers below that reference Python APIs describe
+> the original design spec. The implementation is a Rust crate — see
+> [Home](Home.md) for the module map and [`TODO.md`](../TODO.md) for what is
+> and is not implemented.
+
+
 ## General
 
 ### What is DiffusionBlocks++?
@@ -26,9 +32,13 @@ The original DiffusionBlocks trains one block per step. DiffusionBlocks++ adds:
 
 ### What tasks does it support?
 
-- Image classification (ViT)
+- Image classification (ViT) — implemented
+- **Causal language modeling** — implemented (`lm.rs`), over the same trunk:
+  byte tokenizer, tied head, KV cache, streamed corpora. See
+  [Language Modeling](Language-Modeling.md). Loading pretrained Llama- or
+  Mistral-class weights is out of scope; the trunk trains from scratch
 - Image generation (DiT) — planned
-- Text generation (Masked Diffusion, AR Transformer) — planned
+- Masked-diffusion text generation — planned
 - Multi-task learning — planned
 
 ## Training
@@ -81,14 +91,35 @@ class CustomDataModule(ImageDataModule):
 
 ### What is classifier-free guidance?
 
-Classifier-free guidance (CFG) improves quality by mixing conditional and
-unconditional predictions:
+Guidance improves quality by extrapolating away from the unconditional
+prediction:
 
 ```
-logits = logits_uncond + scale * (logits_cond - logits_uncond)
+x0 = x0_uncond + scale * (x0_cond - x0_uncond)
 ```
 
-Higher scale → better quality but less diversity. Recommended: `scale=3.0`.
+Higher scale → sharper conditioning, less diversity, and past some point worse
+fidelity. `dblocks sample --guidance 3.0` is a reasonable starting point;
+`--guidance-rescale 0.7` contains the norm inflation a strong scale causes.
+
+Two things worth knowing here. "Unconditional" means a **zero image**, not a
+learned null embedding — this model has no null token, and a learned one is the
+natural upgrade if guidance proves worth training for. And `--guidance 1.0`
+returns the conditional estimate *bitwise*, not via `u + 1*(c - u)`, which is
+equal only in exact arithmetic. Details:
+[Accuracy Improvements](Accuracy-Improvements.md).
+
+### Can it plan ahead instead of taking the greedy step?
+
+Yes, on both paths. `dblocks sample --planned` scores candidate
+`(sigma, span)` pairs and short rollouts of what follows them;
+`dblocks lm generate --lookahead N` scores candidate token *continuations* and
+commits only the first token.
+
+Both are certified to reduce **exactly** to the greedy policy at depth 0, and
+both enforce a hard evaluation budget — the allowance is handed to the scoring
+function before it does the work, not applied afterwards. See
+[Next-Step Planning](Next-Step-Planning.md).
 
 ### How does adaptive depth work?
 
@@ -106,6 +137,28 @@ Solutions:
 2. Enable gradient checkpointing: `--gradient_checkpointing`
 3. Use QLoRA: `--use_qlora`
 4. Reduce parallel blocks: `--parallel_blocks 1`
+
+### Why is one block's loss two orders of magnitude larger than another's?
+
+Because the EDM weight `w(sigma) = (sigma^2 + sigma_d^2)/(sigma*sigma_d)^2`
+diverges as sigma goes to zero, and the block owning the low-noise end inherits
+that. This repository measured 13.4 for block 0 against 1909.8 for block 2 — a
+~140x spread — and it is expected from the objective, not a bug.
+
+It still matters: a shared trunk trained on a sum of terms that differ by two
+orders of magnitude is, in effect, trained almost entirely on the largest one.
+Three flags address it:
+
+```bash
+dblocks train --normalize-block-loss     # equalize on the geometric mean
+dblocks train --uncertainty 1.0          # learn the per-sigma scale and divide it out
+dblocks train --importance-bins 16       # spend samples where the loss varies
+```
+
+`--uncertainty` is the principled one: at its optimum the gradient becomes that
+of *log* loss, which is invariant to any per-sigma rescaling — so no weighting
+convention can reintroduce the imbalance. See
+[Loss Reduction](Loss-Reduction.md).
 
 ### Poor convergence
 

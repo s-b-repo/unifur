@@ -160,15 +160,13 @@ pub fn flow_sample<B: Backend<FloatElem = f32>, R: Rng>(
     pixel_values: &Tensor<B, 4>,
     num_steps: usize,
     rng: &mut R,
-) -> Tensor<B, 1, burn::tensor::Int>
-where
-    DblockClassifier<B>: Sized,
-{
+) -> Tensor<B, 1, burn::tensor::Int> {
+    assert!(num_steps >= 1, "flow sampling needs at least one step");
     let device = pixel_values.device();
     let b = pixel_values.dims()[0];
     let h_dim = model.model().label_embedding_weight().dims()[1];
 
-    let mut z = Tensor::<B, 2>::random([b, h_dim], Distribution::Normal(0.0, 1.0), &device);
+    let mut z = crate::solver::randn_like(&Tensor::<B, 2>::zeros([b, h_dim], &device), rng);
     let dt = 1.0f32 / num_steps as f32;
 
     for i in 0..num_steps {
@@ -181,12 +179,10 @@ where
         z = z - v.mul_scalar(dt); // descend from t=1 to t=0
     }
 
-    // Nearest-label classification via cosine similarity against the table.
-    let w = model
-        .model()
-        .label_embedding_weight()
-        .transpose();
-    let _ = rng; // reserved for optional stochastic samplers
-    let sims = z.matmul(w);
+    // Nearest-label classification by cosine similarity. Both sides must be
+    // L2-normalized: the raw dot product would rank labels by embedding norm
+    // as much as by direction, and the label table is not norm-uniform.
+    let table = crate::tensor_ext::l2_normalize_rows(model.model().label_embedding_weight());
+    let sims = crate::tensor_ext::l2_normalize_rows(z).matmul(table.transpose());
     sims.argmax(1).squeeze_dim::<1>(1)
 }
