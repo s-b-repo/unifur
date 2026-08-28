@@ -1747,45 +1747,83 @@ fn optim_certificates() -> Vec<Certificate> {
     // ------------------------------------------------------------------
     // Gradient accumulation over k micro-batches must equal one k-times-larger
     // batch. The accumulator *averages* rather than sums precisely so this
-    // holds — if it summed, the effective learning rate would scale with the
+    // holds -- if it summed, the effective learning rate would scale with the
     // accumulation count and every hyperparameter would silently change with it.
     //
-    // For equal micro-batches the statement is the algebraic identity
-    // `mean_i(mean(g_i)) == mean(concat(g_i))`, checked here against
-    // independently computed sums.
-    let mut state = 0x8E3B_9A1C_77D2_45F1u64;
-    let mut next = move || {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        (state >> 11) as f64 / (1u64 << 53) as f64 * 20.0 - 10.0
-    };
+    // This is checked against **real gradients through a real module**, not
+    // against the algebraic identity `mean_i(mean(g_i)) == mean(concat(g_i))`.
+    // The earlier version of this certificate checked the identity on plain
+    // f64 numbers and passed while the implementation threw k-1 of every k
+    // gradients away -- a formula is not an implementation, and a certificate
+    // that never touches the code path cannot tell the difference.
+    use burn::nn::{Linear, LinearConfig};
+    use burn::tensor::backend::AutodiffBackend;
+    use burn::optim::GradientsParams;
+    use crate::train::DefaultTrainBackend as A;
+
+    let ad_device = Default::default();
+    <A as burn::tensor::backend::Backend>::seed(&ad_device, 4242);
+    let layer: Linear<A> = LinearConfig::new(6, 4).with_bias(true).init(&ad_device);
+
+    // A fixed dataset, split k ways. Micro-batches are equal-sized, which is
+    // the condition under which the identity holds at all.
+    let micro = 3usize;
     let mut accumulation_err: f64 = 0.0;
-    for k in [1usize, 2, 3, 8] {
-        let micro = 5usize;
-        let batches: Vec<Vec<f64>> = (0..k).map(|_| (0..micro).map(|_| next()).collect()).collect();
+    for k in [1usize, 2, 4] {
+        let rows = k * micro;
+        let inputs = Tensor::<A, 2>::random(
+            [rows, 6],
+            Distribution::Uniform(-1.0, 1.0),
+            &ad_device,
+        );
 
-        let accumulator = GradientAccumulator::new(k);
-        let scale = accumulator.loss_scale();
-        let accumulated: f64 = batches
-            .iter()
-            .map(|b| scale * b.iter().sum::<f64>() / micro as f64)
-            .sum();
+        // One k-times-larger batch: the reference.
+        let single = layer.forward(inputs.clone()).powf_scalar(2.0).mean();
+        let reference = GradientsParams::from_grads(single.backward(), &layer);
 
-        let flat: Vec<f64> = batches.iter().flatten().copied().collect();
-        let single = flat.iter().sum::<f64>() / flat.len() as f64;
+        // The same data as k micro-batches, each scaled by `loss_scale` and
+        // folded in. The result must be the same gradient.
+        let mut accumulator = GradientAccumulator::new(k);
+        let scale = accumulator.loss_scale() as f32;
+        let mut summed = None;
+        for i in 0..k {
+            let chunk = inputs.clone().narrow(0, i * micro, micro);
+            let loss = layer.forward(chunk).powf_scalar(2.0).mean().mul_scalar(scale);
+            let grads = GradientsParams::from_grads(loss.backward(), &layer);
+            summed = accumulator.fold(grads, &layer).into_gradients();
+        }
+        let Some(summed) = summed else {
+            accumulation_err = f64::INFINITY;
+            continue;
+        };
 
-        accumulation_err = accumulation_err.max((accumulated - single).abs() / single.abs().max(1.0));
+        // Compare parameter by parameter.
+        let weight_id = layer.weight.id;
+        for (a, b) in [
+            (
+                summed.get::<<A as AutodiffBackend>::InnerBackend, 2>(weight_id),
+                reference.get::<<A as AutodiffBackend>::InnerBackend, 2>(weight_id),
+            ),
+        ] {
+            match (a, b) {
+                (Some(a), Some(b)) => {
+                    let diff: f32 = (a - b).abs().max().into_scalar();
+                    accumulation_err = accumulation_err.max(f64::from(diff));
+                }
+                _ => accumulation_err = f64::INFINITY,
+            }
+        }
     }
 
-    // A cycle must also fire exactly every k micro-batches -- an accumulator
-    // that drifts would change the effective batch size mid-run.
+    // A cycle must fire exactly every k micro-batches, whether the batches were
+    // folded in or skipped by a quality gate -- an accumulator that drifts
+    // would change the effective batch size mid-run.
     let mut cadence_err: f64 = 0.0;
     for k in [1usize, 2, 3, 8] {
         let mut accumulator = GradientAccumulator::new(k);
         let mut fired = 0usize;
         for i in 1..=(k * 7) {
-            if accumulator.accumulate() {
+            if accumulator.skip().is_ready() {
                 fired += 1;
                 if i % k != 0 {
                     cadence_err = 1.0;
@@ -1938,9 +1976,13 @@ fn optim_certificates() -> Vec<Certificate> {
         cert(
             "optim",
             "accumulation_equals_one_large_batch",
-            "Averaging k micro-batches reproduces a single k-times-larger batch exactly, so the learning rate does not silently scale with the accumulation count.",
+            "Folding k micro-batches through the real accumulator reproduces the gradient of one k-times-larger batch, and the cycle fires on exactly that cadence whether batches were folded or skipped.",
             accumulation_err.max(cadence_err),
-            1e-12,
+            // Gradients are f32 and the two paths sum in different orders.
+            // eps = 5.96e-8 over at most 12 rows bounds the difference at
+            // roughly 1e-6; the previous 1e-12 was only ever reachable because
+            // the check ran in f64 against a formula instead of the code.
+            1e-6,
         ),
         cert(
             "optim",

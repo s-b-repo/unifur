@@ -612,24 +612,52 @@ enum FeedForward<B: Backend> {
     Hierarchical(crate::mosme::MosmeFeedForward<B>),
 }
 
+/// The auxiliary losses a sparse layer produces.
+///
+/// The two are carried **separately** all the way to the training loop because
+/// they are weighted differently and must be: the balance term is a routing
+/// regularizer that a schedule may legitimately decay once every expert is
+/// alive, while the z-loss is a numerical *stabilizer* that must not decay —
+/// it matters most late, when the logits have had time to drift.
+///
+/// Folding them into one scalar also multiplied the z-loss by
+/// `moe_aux_weight`, so a configured `z_level` of `1e-3` was reaching the
+/// objective at `1e-5`. Keeping them apart is what makes `z_level` mean what
+/// ST-MoE means by it: a coefficient on the total loss.
+#[derive(Debug, Clone)]
+pub struct RouterAux<B: Backend> {
+    /// Load-balancing loss, unweighted.
+    pub balance: Tensor<B, 1>,
+    /// Router z-loss, already multiplied by its configured `z_level`.
+    pub z: Tensor<B, 1>,
+}
+
+impl<B: Backend> RouterAux<B> {
+    /// Sum two layers' contributions.
+    pub fn combine(self, other: Self) -> Self {
+        Self { balance: self.balance + other.balance, z: self.z + other.z }
+    }
+}
+
 impl<B: Backend> FeedForward<B> {
-    /// Returns the transformed states and, for sparse layers, the
-    /// load-balancing auxiliary loss that must be added to the training
-    /// objective.
+    /// Returns the transformed states and, for sparse layers, the auxiliary
+    /// losses that must be added to the training objective.
     fn forward(
         &self,
         x: Tensor<B, 3>,
         conditioning: &Tensor<B, 2>,
-    ) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
+    ) -> (Tensor<B, 3>, Option<RouterAux<B>>) {
         match self {
             Self::Dense(mlp) => (mlp.forward(x), None),
             Self::Sparse(moe) => {
                 let out = moe.forward(x, conditioning.clone());
-                (out.output, Some(out.balance_loss))
+                let z = out.z_loss.mul_scalar(moe.z_level() as f32);
+                (out.output, Some(RouterAux { balance: out.balance, z }))
             }
             Self::Hierarchical(mosme) => {
                 let out = mosme.forward(x, conditioning.clone());
-                (out.output, Some(out.balance.total))
+                let z = out.balance.z_loss.clone().mul_scalar(mosme.z_level() as f32);
+                (out.output, Some(RouterAux { balance: out.balance.total.clone(), z }))
             }
         }
     }
@@ -709,7 +737,7 @@ impl<B: Backend> DbLayer<B> {
         &self,
         hidden_states: Tensor<B, 3>,
         conditioning: &Tensor<B, 2>,
-    ) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
+    ) -> (Tensor<B, 3>, Option<RouterAux<B>>) {
         let causal = self.causal;
         self.forward_with(hidden_states, conditioning, |attn, normed| {
             attn.forward(normed, causal)
@@ -734,7 +762,7 @@ impl<B: Backend> DbLayer<B> {
         hidden_states: Tensor<B, 3>,
         conditioning: &Tensor<B, 2>,
         cache: &mut LayerKvCache<B>,
-    ) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
+    ) -> (Tensor<B, 3>, Option<RouterAux<B>>) {
         assert!(
             self.causal,
             "a KV cache is only sound for causal attention: with bidirectional \
@@ -750,7 +778,7 @@ impl<B: Backend> DbLayer<B> {
         hidden_states: Tensor<B, 3>,
         conditioning: &Tensor<B, 2>,
         attend: F,
-    ) -> (Tensor<B, 3>, Option<Tensor<B, 1>>)
+    ) -> (Tensor<B, 3>, Option<RouterAux<B>>)
     where
         F: FnOnce(&Attention<B>, Tensor<B, 3>) -> Tensor<B, 3>,
     {
@@ -805,7 +833,9 @@ pub struct BlockOutput<B: Backend> {
     /// Summed load-balancing loss of any MoE layers in the executed span;
     /// `None` for a fully dense span. Add it to the training objective --
     /// without it the router is free to collapse onto one expert.
-    pub balance_loss: Option<Tensor<B, 1>>,
+    /// Auxiliary routing losses of the executed span; `None` for a dense
+    /// trunk. See [`RouterAux`] for why balance and z-loss stay apart.
+    pub balance_loss: Option<RouterAux<B>>,
 }
 
 /// The ViT-DiT trunk (`ViTDiTModel`).
@@ -860,19 +890,19 @@ impl<B: Backend> ViTDiTModel<B> {
         range: std::ops::Range<usize>,
         mut hidden_states: Tensor<B, 3>,
         conditioning: &Tensor<B, 2>,
-    ) -> (Tensor<B, 3>, Option<Tensor<B, 1>>) {
-        let mut balance: Option<Tensor<B, 1>> = None;
+    ) -> (Tensor<B, 3>, Option<RouterAux<B>>) {
+        let mut aux_total: Option<RouterAux<B>> = None;
         for i in range.start..range.end.min(self.layers.len()) {
             let (states, aux) = self.layers[i].forward(hidden_states, conditioning);
             hidden_states = states;
             if let Some(aux) = aux {
-                balance = Some(match balance {
+                aux_total = Some(match aux_total {
                     None => aux,
-                    Some(acc) => acc + aux,
+                    Some(acc) => acc.combine(aux),
                 });
             }
         }
-        (self.final_layernorm.forward(hidden_states), balance)
+        (self.final_layernorm.forward(hidden_states), aux_total)
     }
 
     /// Block-wise forward (`forward_block`): embed inputs, run only the
@@ -1160,6 +1190,7 @@ mod tests {
         let sparse_span = model.vit().forward_block(0..4, pixels.clone(), zt.clone(), t.clone());
         let aux: f32 = sparse_span
             .balance_loss
+            .map(|a| a.balance)
             .expect("layers 1 and 3 are sparse")
             .into_scalar();
         assert!(aux.is_finite() && aux > 0.0, "balance loss must be positive: {aux}");
@@ -1221,7 +1252,7 @@ mod tests {
         // hierarchical layer contributes a box term and an expert term, both
         // at least 1 on the diagonal, so two layers give at least 4.
         let sparse = model.vit().forward_block(0..4, pixels.clone(), zt.clone(), t.clone());
-        let aux: f32 = sparse.balance_loss.expect("layers 1 and 3 are hierarchical").into_scalar();
+        let aux: f32 = sparse.balance_loss.expect("layers 1 and 3 are hierarchical").balance.into_scalar();
         assert!(aux.is_finite() && aux > 0.0, "balance loss must be positive: {aux}");
         assert!(aux >= 2.0, "two hierarchical layers must each contribute: {aux}");
 
@@ -1248,7 +1279,7 @@ mod tests {
             Tensor::<B, 2>::ones([1, 32], &device),
             Tensor::<B, 1>::zeros([1], &device),
         );
-        let aux: f32 = out.balance_loss.expect("layer 0 is hierarchical").into_scalar();
+        let aux: f32 = out.balance_loss.expect("layer 0 is hierarchical").balance.into_scalar();
         assert!(aux >= 1.0, "hierarchical path should be active, got {aux}");
     }
 

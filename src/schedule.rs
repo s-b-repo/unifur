@@ -129,15 +129,25 @@ fn warmup_factor(step: usize, warmup_steps: usize) -> f64 {
 /// Averaging rather than summing keeps the gradient magnitude independent of
 /// the accumulation count, so the learning rate does not need retuning when it
 /// changes.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct GradientAccumulator {
     every: usize,
     pending: usize,
+    /// Running sum of the micro-batch gradients folded in so far.
+    ///
+    /// This is the whole point of the type, and its absence was a real bug:
+    /// counting micro-batches and stepping on every k-th one *discards* the
+    /// other k-1 gradients. That is not accumulation, it is a k-fold reduction
+    /// in the data each step sees.
+    buffer: Option<GradientsParams>,
+    /// Micro-batches actually folded into `buffer`. Differs from `pending`
+    /// when a step is rejected mid-cycle.
+    folded: usize,
 }
 
 impl GradientAccumulator {
     pub fn new(every: usize) -> Self {
-        Self { every: every.max(1), pending: 0 }
+        Self { every: every.max(1), pending: 0, buffer: None, folded: 0 }
     }
 
     pub fn every(&self) -> usize {
@@ -148,15 +158,55 @@ impl GradientAccumulator {
         self.pending
     }
 
-    /// Record one micro-batch; returns whether the optimizer should step now.
-    pub fn accumulate(&mut self) -> bool {
+    /// Micro-batches folded into the current cycle.
+    pub fn folded(&self) -> usize {
+        self.folded
+    }
+
+    /// Fold one micro-batch's gradients in and advance the cycle.
+    ///
+    /// The caller should have scaled the loss by [`Self::loss_scale`] before
+    /// the backward pass, so the sum returned when the cycle completes is the
+    /// gradient of the mean over all `k * batch_size` samples — exactly what
+    /// one `k`-times-larger batch would produce.
+    pub fn fold<B, M>(&mut self, grads: GradientsParams, module: &M) -> Cycle
+    where
+        B: AutodiffBackend<FloatElem = f32>,
+        M: AutodiffModule<B>,
+    {
+        self.buffer = Some(match self.buffer.take() {
+            None => grads,
+            Some(mut acc) => {
+                let mut visitor = SumVisitor::<B> {
+                    into: &mut acc,
+                    from: grads,
+                    _backend: std::marker::PhantomData,
+                };
+                module.visit(&mut visitor);
+                acc
+            }
+        });
+        self.folded += 1;
+        self.advance()
+    }
+
+    /// Advance the cycle *without* folding anything in.
+    ///
+    /// Used when a micro-batch is rejected by a quality gate: its gradients are
+    /// not trustworthy, but the cycle should still complete rather than stall
+    /// forever waiting for a batch that may never come.
+    pub fn skip(&mut self) -> Cycle {
+        self.advance()
+    }
+
+    fn advance(&mut self) -> Cycle {
         self.pending += 1;
-        if self.pending >= self.every {
-            self.pending = 0;
-            true
-        } else {
-            false
+        if self.pending < self.every {
+            return Cycle::Filling;
         }
+        self.pending = 0;
+        self.folded = 0;
+        Cycle::Ready(self.buffer.take())
     }
 
     /// Scale a micro-batch's loss so the accumulated total is the mean.
@@ -167,6 +217,65 @@ impl GradientAccumulator {
     /// Whether anything is buffered (a run ending mid-cycle discards it).
     pub fn has_pending(&self) -> bool {
         self.pending > 0
+    }
+}
+
+/// What one micro-batch did to the accumulation cycle.
+///
+/// The two states are kept distinct because "the cycle completed" and "there
+/// are gradients to step with" are different facts: a cycle in which every
+/// micro-batch was rejected by a quality gate completes with nothing to apply.
+/// Collapsing them into a single `Option` made the cadence unobservable, which
+/// is how the first version of the accumulation certificate ended up unable to
+/// see whether the cycle fired at all.
+#[derive(Debug)]
+pub enum Cycle {
+    /// Still filling; nothing to do.
+    Filling,
+    /// The cycle completed. `Some` carries the summed gradients; `None` means
+    /// every micro-batch in it was rejected.
+    Ready(Option<GradientsParams>),
+}
+
+impl Cycle {
+    /// Whether the cycle completed, regardless of whether anything survived.
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    /// The summed gradients, if the cycle completed with any.
+    pub fn into_gradients(self) -> Option<GradientsParams> {
+        match self {
+            Self::Filling => None,
+            Self::Ready(grads) => grads,
+        }
+    }
+}
+
+/// Adds one `GradientsParams` into another, parameter by parameter.
+///
+/// A visitor rather than a loop over ids because the rank `D` differs per
+/// parameter and only the module traversal knows it — the same reason
+/// `ClipVisitor` and `GradNormVisitor` are written this way.
+struct SumVisitor<'a, B: AutodiffBackend> {
+    into: &'a mut GradientsParams,
+    from: GradientsParams,
+    _backend: std::marker::PhantomData<B>,
+}
+
+impl<B: AutodiffBackend<FloatElem = f32>> burn::module::ModuleVisitor<B> for SumVisitor<'_, B> {
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+        let Some(addend) = self.from.remove::<B::InnerBackend, D>(param.id) else {
+            return;
+        };
+        // A parameter absent from the accumulator has no gradient yet -- that
+        // happens legitimately, since block-wise training only touches the
+        // executed span -- so the addend becomes its first contribution.
+        let total = match self.into.remove::<B::InnerBackend, D>(param.id) {
+            Some(existing) => existing + addend,
+            None => addend,
+        };
+        self.into.register::<B::InnerBackend, D>(param.id, total);
     }
 }
 
@@ -625,9 +734,9 @@ mod tests {
     #[test]
     fn test_accumulator_fires_every_n_steps() {
         let mut acc = GradientAccumulator::new(3);
-        assert!(!acc.accumulate());
-        assert!(!acc.accumulate());
-        assert!(acc.accumulate(), "third micro-batch must trigger a step");
+        assert!(!acc.skip().is_ready());
+        assert!(!acc.skip().is_ready());
+        assert!(acc.skip().is_ready(), "third micro-batch must trigger a step");
         assert!(!acc.has_pending(), "the cycle resets");
         assert!((acc.loss_scale() - 1.0 / 3.0).abs() < 1e-12);
 
@@ -635,7 +744,71 @@ mod tests {
         // time rather than never.
         let mut every = GradientAccumulator::new(0);
         assert_eq!(every.every(), 1);
-        assert!(every.accumulate());
+        assert!(every.skip().is_ready());
+    }
+
+    #[test]
+    fn test_a_completed_cycle_with_nothing_folded_yields_no_gradients() {
+        // "The cycle completed" and "there are gradients to apply" are
+        // different facts. A cycle in which every micro-batch was rejected by a
+        // quality gate must still complete -- otherwise one persistently bad
+        // block stalls the run forever -- but it has nothing to step with.
+        let mut acc = GradientAccumulator::new(2);
+        assert!(!acc.skip().is_ready());
+        let cycle = acc.skip();
+        assert!(cycle.is_ready(), "the cycle must complete even with nothing folded");
+        assert!(cycle.into_gradients().is_none(), "but there is nothing to apply");
+    }
+
+    #[test]
+    fn test_folding_actually_sums_the_gradients() {
+        // The bug this type was written to have and did not: counting
+        // micro-batches and stepping on every k-th one silently discards the
+        // other k-1 gradients. Folding two identical gradients must give twice
+        // one of them, not one of them.
+        use burn::backend::{Autodiff, NdArray};
+        use burn::nn::LinearConfig;
+        use burn::tensor::Distribution;
+
+        type A = Autodiff<NdArray<f32>>;
+        let device = Default::default();
+        let layer = LinearConfig::new(4, 3).with_bias(false).init::<A>(&device);
+        let x = Tensor::<A, 2>::random([5, 4], Distribution::Uniform(-1.0, 1.0), &device);
+
+        let grads_of = || {
+            let loss = layer.forward(x.clone()).powf_scalar(2.0).mean();
+            GradientsParams::from_grads(loss.backward(), &layer)
+        };
+
+        let one: Vec<f32> = grads_of()
+            .get::<NdArray<f32>, 2>(layer.weight.id)
+            .expect("weight gradient")
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
+
+        let mut acc = GradientAccumulator::new(2);
+        assert!(!acc.fold(grads_of(), &layer).is_ready());
+        let summed = acc
+            .fold(grads_of(), &layer)
+            .into_gradients()
+            .expect("a completed cycle with two folds has gradients");
+        let two: Vec<f32> = summed
+            .get::<NdArray<f32>, 2>(layer.weight.id)
+            .expect("weight gradient")
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
+
+        for (a, b) in two.iter().zip(&one) {
+            assert!(
+                (a - 2.0 * b).abs() < 1e-6,
+                "folding two copies must double the gradient: {a} vs {}",
+                2.0 * b
+            );
+        }
     }
 
     #[test]

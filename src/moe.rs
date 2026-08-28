@@ -379,6 +379,11 @@ impl<B: Backend> MoELayer<B> {
         self.top_k
     }
 
+    /// Configured router z-loss weight.
+    pub fn z_level(&self) -> f64 {
+        self.z_level
+    }
+
     /// Assemble from already-built parts. Used by [`crate::mosme`] to produce
     /// the flat layer a single-box hierarchical layer must reduce to.
     /// `z_level` is a parameter rather than a default because the reduction

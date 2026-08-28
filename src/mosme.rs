@@ -213,9 +213,13 @@ impl<B: Backend> HierarchicalGates<B> {
             z_loss = z_loss + crate::moe::router_z_loss(&self.expert_logits[i]) * share;
         }
 
+        // `total` is the *balance* loss only. The z-loss is reported alongside
+        // and weighted by the caller: it is a numerical stabilizer, not a
+        // routing regularizer, and multiplying it by the balance weight (and
+        // decaying it with a balance schedule) is exactly the mistake this
+        // separation exists to prevent.
         let total = box_loss.clone().mul_scalar(weights.box_level as f32)
-            + expert_loss.clone().mul_scalar(weights.expert_level as f32)
-            + z_loss.clone().mul_scalar(weights.z_level as f32);
+            + expert_loss.clone().mul_scalar(weights.expert_level as f32);
         BalanceBreakdown { box_loss, expert_loss, per_box, z_loss, total }
     }
 }
@@ -226,8 +230,11 @@ pub struct BalanceBreakdown<B: Backend> {
     pub box_loss: Tensor<B, 1>,
     pub expert_loss: Tensor<B, 1>,
     pub per_box: Vec<Tensor<B, 1>>,
-    /// Router z-loss, summed over both routing levels.
+    /// Router z-loss, summed over both routing levels. **Unweighted** — see
+    /// [`crate::vit::RouterAux`] for why it is not folded into `total`.
     pub z_loss: Tensor<B, 1>,
+    /// The weighted balance loss: `w_box * box_loss + w_expert * expert_loss`.
+    /// Does **not** include the z-loss.
     pub total: Tensor<B, 1>,
 }
 
@@ -538,6 +545,11 @@ impl<B: Backend> MosmeFeedForward<B> {
 
     pub fn router(&self) -> &HierarchicalRouter<B> {
         &self.router
+    }
+
+    /// Configured router z-loss weight.
+    pub fn z_level(&self) -> f64 {
+        self.balance.z_level
     }
 
     pub fn router_mut(&mut self) -> &mut HierarchicalRouter<B> {

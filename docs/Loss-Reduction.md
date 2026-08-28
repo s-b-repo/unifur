@@ -153,7 +153,7 @@ before it has learned anything.
 | Flag | What it does | Certified |
 |---|---|---|
 | `--lr-schedule warmup-cosine` | Warmup then cosine decay | Never exceeds its peak; ramp non-decreasing, decay non-increasing |
-| `--accumulate k` | `k` micro-batches per optimizer step, **averaged** not summed | Equals one `k`× batch exactly, and fires on exactly that cadence |
+| `--accumulate k` | `k` micro-batches per optimizer step, **averaged** not summed | Real gradients folded through the accumulator reproduce one `k`× batch, and the cycle fires on that cadence whether batches were folded or skipped |
 | `--clip-norm` | Rescales a merely-large step | — (complements the gradient *gate*, which discards a pathological one) |
 | `--ema-decay` | Bias-corrected weight averaging | Coefficients sum to 1; the blend never leaves the interval its inputs span |
 | `--normalize-block-loss` | Equalizes blocks on the **geometric** mean | — (geometric because the imbalance spans orders of magnitude and an arithmetic mean would be pinned to the largest block) |
@@ -161,6 +161,25 @@ before it has learned anything.
 Averaging rather than summing in the accumulator is what keeps the learning rate
 meaningful: if it summed, the effective step size would scale with the
 accumulation count and every hyperparameter would silently change with it.
+
+Two details worth knowing, both learned the hard way:
+
+- **Clipping applies to the accumulated gradient**, not to each micro-batch.
+  Bounding `k` small vectors separately says nothing about the norm of their
+  sum, which is the step actually taken.
+- **A rejected micro-batch is skipped, not fatal to the cycle.** Its gradients
+  are untrustworthy, but discarding the whole cycle would let one persistently
+  bad block stall a run indefinitely. The cycle completes with whatever
+  survived — and `Cycle::Ready(None)` is a distinct state from "still filling",
+  because "the cycle completed" and "there is something to apply" are different
+  facts.
+
+The certificate behind this row folds **real gradients through a real module**
+and compares them against one `k`×-batch backward pass. An earlier version
+checked the averaging *formula* in f64 and passed for weeks while the
+implementation discarded `k-1` of every `k` gradients — a formula is not an
+implementation, and a certificate that never touches the code path cannot tell
+the difference.
 
 ---
 

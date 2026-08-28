@@ -143,6 +143,11 @@ impl SolverKind {
 /// thin loop over it, and [`crate::multi_block`] drives it step by step so it
 /// can vary the executed layer span per window and apply quality gates
 /// between steps -- without either path re-deriving the arithmetic.
+///
+/// `Clone` is what lets a planner explore a hypothetical continuation without
+/// disturbing the trajectory it is actually on: a multistep method carries
+/// history, so a rollout that shared the live state would corrupt it.
+#[derive(Clone)]
 pub struct SolverState<B: Backend> {
     kind: SolverKind,
     /// `(lambda, x0)` of the most recent steps, newest first, capped at two

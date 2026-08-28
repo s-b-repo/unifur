@@ -32,7 +32,7 @@ use crate::{
     solver::{SolverKind, SolverState},
 };
 use burn::tensor::{backend::Backend, Tensor};
-use rand::Rng;
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::collections::HashMap;
 
 /// How many transformer layers each window executes.
@@ -539,8 +539,20 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             // Rolled-forward latents, addressed by the path that produced them.
             // Cleared each committed step: once a step is taken the hypotheses
             // that assumed otherwise are worthless.
-            let mut states: HashMap<PathKey, Tensor<B, 2>> = HashMap::new();
-            states.insert(Vec::new(), z.clone());
+            //
+            // Each entry carries a **clone of the solver state**, not just the
+            // latent. A multistep method (DPM++ 2M/3M) integrates from its
+            // history of past x0 predictions, so a rollout that advanced with
+            // plain Euler would score candidates under dynamics the sampler is
+            // not going to follow -- and one that shared the live solver would
+            // corrupt the trajectory actually being taken.
+            let mut states: HashMap<PathKey, (Tensor<B, 2>, SolverState<B>)> = HashMap::new();
+            states.insert(Vec::new(), (z.clone(), solver.clone()));
+
+            // Rollouts draw their own noise. Using the caller's stream would
+            // make the committed trajectory depend on how much *speculation*
+            // happened, so the same seed would stop reproducing the same run.
+            let mut plan_rng = StdRng::seed_from_u64(0x5EED ^ trace.steps.len() as u64);
             // x0 estimates and their confidences, one per (node, span width).
             // Every sigma candidate departing from the same node with the same
             // width shares them, so the sigma choice costs no extra model call.
@@ -553,7 +565,7 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
                 sigma_floor,
                 |path, next_sigma, width, remaining| {
                     let key = path_key(path);
-                    let z_here = states.get(&key)?.clone();
+                    let (z_here, solver_here) = states.get(&key)?.clone();
                     let here = path.steps.last().map_or(sigma, |s| s.sigma);
 
                     let (x0, score) = match evaluated.get(&(key.clone(), width)) {
@@ -584,11 +596,30 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
                         }
                     };
 
-                    // Roll the hypothesis forward so a deeper level can be
-                    // scored from where this step actually lands.
+                    // Roll the hypothesis forward with the *real* solver so a
+                    // deeper level is scored from where this step actually
+                    // lands. Heun's corrector is a genuine extra model call and
+                    // is charged as one.
+                    let mut child_solver = solver_here;
+                    let base = crate::sigma::estimate_target_layer(&bounds, &[here]);
+                    let span = self.select_span(&Strategy::Parallel { k: width }, base, 1, here);
+                    let mut predictor = |sig: f64, zz: &Tensor<B, 2>| {
+                        calls += 1;
+                        layers += span.len();
+                        self.x0_estimate(pixel_values, zz, sig, Some(span.clone()))
+                    };
+                    let z_child = child_solver.step(
+                        here,
+                        next_sigma,
+                        z_here,
+                        &x0,
+                        &mut predictor,
+                        &mut plan_rng,
+                    );
+
                     let mut child = key;
                     child.push((next_sigma.to_bits(), width));
-                    states.insert(child, euler_step(here, next_sigma, &z_here, &x0));
+                    states.insert(child, (z_child, child_solver));
 
                     let progress = config.progress_weight * (here.ln() - next_sigma.ln());
                     Some(score + progress)

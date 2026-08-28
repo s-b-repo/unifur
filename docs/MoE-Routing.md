@@ -216,6 +216,14 @@ It is not free of routing pressure: the gradient is `2 z p`, proportional to the
 softmax, so it shrinks confident logits slightly harder than diffident ones.
 Keep the weight small.
 
+**`z_level` is a coefficient on the total loss**, matching ST-MoE's convention.
+That took a fix: the z-loss was originally summed into the balance term, which
+is itself scaled by `moe_aux_weight` (0.01), so a configured `1e-3` reached the
+objective at `1e-5`. Worse, `--balance-schedule anneal` decayed it — attenuating
+a numerical *stabilizer* exactly as a run gets long enough for logit drift to
+matter. The two are now carried separately end to end (`vit::RouterAux`): the
+balance term is scaled and may be annealed, the z-loss is not.
+
 ### 2. The balance loss fights specialization
 
 Zhu et al. (*Demons in the Detail*, 2025) show that computing the load-balancing
@@ -244,33 +252,31 @@ The decay is **geometric**, because the useful range spans two decades (`1e-2`
 early, `1e-4` late) and a linear ramp would spend almost all of its steps near
 the top.
 
-### Measured: both terms were a null result here
+### Measured on MoSME
 
 400 steps, 3 blocks, seed 42, MoSME with 2 boxes / 5 experts on every second
 trunk layer. Identical block visit counts across every run (138 / 145 / 117):
 
-| Configuration | mean loss | rejected | block 2 mean \|g\| | block 2 max \|g\| |
+| Configuration | mean loss | rejected | block 2 mean \|g\| | block 2 peak \|g\| |
 |---|---|---|---|---|
-| MoSME baseline | 482.90 | 5 | 2.44e3 | 8.19e4 |
-| `--z-level 1e-3` | 483.28 | 5 | 2.43e3 | 8.19e4 |
-| `+ --balance-schedule anneal` | 483.26 | 5 | 2.40e3 | 8.19e4 |
-| `--uncertainty 1.0` | **136.76** | **0** | **1.76e2** | **8.68e3** |
+| MoSME baseline (`--z-level 0`) | 482.90 | 5 | 2.44e3 | 8.19e4 |
+| `--z-level 1e-3` | 494.76 | 5 | 2.36e3 | **7.03e4** |
+| `--z-level 1e-3 --uncertainty 1.0` | **136.34** | **0** | **1.90e2** | **9.53e3** |
 
-Three routing configurations within 0.1% of each other, with the same five
-gradient-gate rejections and the same peak gradient. So the instability in these
-runs is **not** a routing pathology — it is the EDM weight `w(sigma)` diverging
-in block 2, which is what [Loss Reduction](Loss-Reduction.md) addresses and what
-it does address.
+The z-loss does what it is for: block 2's **peak** gradient falls 14%. It is
+just not the binding constraint here — the five gate rejections survive it,
+because the gate is firing on the EDM weight `w(sigma)` diverging in block 2,
+not on router logit drift. [Loss Reduction](Loss-Reduction.md)'s uncertainty
+weighting is what addresses that, and does.
 
-That does not make the routing terms wrong. Logit drift is a *slow* failure
-mode, and 400 CPU steps from random initialization is nowhere near enough for it
-to appear; the certificates confirm the terms behave exactly as specified. They
-are insurance, correctly priced at `1e-3`. What would be wrong is calling them
-an improvement on this evidence.
+Read the mean-loss column carefully: with `z_level > 0` the z term is part of
+the reported loss, so some of the 482.90 → 494.76 rise is the term being counted
+rather than the model being worse. The gradient columns are the fair comparison.
 
 **Practical recommendation for a MoSME run:** start with `--uncertainty 1.0`.
-Leave `--z-level` at its default and reach for `--balance-schedule anneal` only
-once a routing diagnostic exists to tell you whether it helped.
+Leave `--z-level` at its default — it is cheap insurance against a slow failure
+mode that 400 CPU steps cannot produce — and reach for `--balance-schedule
+anneal` only once a routing diagnostic exists to tell you whether it helped.
 
 ### What is still missing
 

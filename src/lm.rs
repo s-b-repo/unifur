@@ -145,7 +145,10 @@ pub struct LmOutput<B: Backend> {
     /// `[b, n, vocab]`.
     pub logits: Tensor<B, 3>,
     /// Summed MoE / MoSME balance loss over the executed span, if any.
-    pub balance_loss: Option<Tensor<B, 1>>,
+    /// Auxiliary routing losses of the executed span; `None` for a dense
+    /// trunk. Balance and z-loss are kept apart — see
+    /// [`crate::vit::RouterAux`].
+    pub balance_loss: Option<crate::vit::RouterAux<B>>,
 }
 
 /// A causal language model over the shared trunk.
@@ -271,14 +274,14 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         );
 
         let mut hidden = self.embed(tokens);
-        let mut balance: Option<Tensor<B, 1>> = None;
+        let mut balance: Option<crate::vit::RouterAux<B>> = None;
         for i in span.start..span.end.min(self.layers.len()) {
             let (states, aux) = self.layers[i].forward(hidden, &cond);
             hidden = states;
             if let Some(aux) = aux {
                 balance = Some(match balance {
                     None => aux,
-                    Some(acc) => acc + aux,
+                    Some(acc) => acc.combine(aux),
                 });
             }
         }
@@ -344,14 +347,14 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         let embedded = self.token_embedding.forward(tokens);
         let mut hidden = embedded + self.position_embedding.val().narrow(1, offset, m);
 
-        let mut balance: Option<Tensor<B, 1>> = None;
+        let mut balance: Option<crate::vit::RouterAux<B>> = None;
         for (layer, layer_cache) in self.layers.iter().zip(cache.layers.iter_mut()) {
             let (states, aux) = layer.forward_cached(hidden, &cond, layer_cache);
             hidden = states;
             if let Some(aux) = aux {
                 balance = Some(match balance {
                     None => aux,
-                    Some(acc) => acc + aux,
+                    Some(acc) => acc.combine(aux),
                 });
             }
         }
@@ -417,11 +420,14 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             balance_loss: out
                 .balance_loss
                 .as_ref()
-                .map_or(0.0, |t| t.clone().into_scalar()),
+                .map_or(0.0, |aux| aux.balance.clone().into_scalar()),
         };
 
+        // The balance term is scaled; the z-loss already carries its own
+        // `z_level` and is added at weight 1, so a stabilizer is not silently
+        // attenuated by a routing regularizer's coefficient.
         let loss = match out.balance_loss {
-            Some(aux) => loss + aux.mul_scalar(0.01),
+            Some(aux) => loss + aux.balance.mul_scalar(0.01) + aux.z,
             None => loss,
         };
         (loss, metrics)

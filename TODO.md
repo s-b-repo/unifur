@@ -480,26 +480,33 @@ helped**, which is worth recording as plainly as a success.
 400 steps, 3 blocks, seed 42, MoSME with 2 boxes / 5 experts on every second
 trunk layer. All runs visited the blocks identically (138 / 145 / 117):
 
-| Configuration | mean loss | rejected | block 2 mean \|g\| | block 2 max \|g\| |
+| Configuration | mean loss | rejected | block 2 mean \\|g\\| | block 2 peak \\|g\\| |
 |---|---|---|---|---|
-| MoSME baseline | 482.90 | 5 | 2.44e3 | 8.19e4 |
-| `--z-level 1e-3` | 483.28 | 5 | 2.43e3 | 8.19e4 |
-| `+ --balance-schedule anneal` | 483.26 | 5 | 2.40e3 | 8.19e4 |
-| `--uncertainty 1.0` | **136.76** | **0** | **1.76e2** | **8.68e3** |
-| all three | 136.73 | 0 | 1.76e2 | 8.68e3 |
+| MoSME baseline (`--z-level 0`) | 482.90 | 5 | 2.44e3 | 8.19e4 |
+| `--z-level 1e-3` | 494.76 | 5 | 2.36e3 | **7.03e4** |
+| `--z-level 1e-3 --uncertainty 1.0` | **136.34** | **0** | **1.90e2** | **9.53e3** |
 
-The routing terms move nothing: three configurations within 0.1% of each other,
-with the same five gradient-gate rejections and the same peak gradient. The
-diagnosis follows directly — **the instability in these runs is not a routing
-pathology at all.** It is the EDM weight `w(sigma)` diverging in block 2, which
-is what Phase 20's uncertainty weighting addresses and what it does address:
-3.5x lower mean loss, 14x smaller gradients, and every step accepted.
+**This table replaces an earlier one that was measured with the z-loss reaching
+the objective at 1% of its setting** (see the `mosme.rs`/`vit.rs` row in the bug
+table). At full strength the conclusion is narrower than "moves nothing":
 
-That does not make 23.1 and 23.2 wrong. Router logit drift is a slow failure
-mode; 400 CPU steps from random initialization is nowhere near enough for it to
-appear, and the certificates show the terms behave as specified. They are
-insurance, correctly priced at `1e-3`, against something that has not happened
-yet. What would be wrong is reporting them as an improvement on this evidence.
+The z-loss **does** do its job: block 2's peak gradient falls 14% (8.19e4 to
+7.03e4), which is precisely what a stabilizer is for. It is simply not the
+binding constraint here — the five gate rejections survive it, because the gate
+is firing on the EDM weight `w(sigma)` diverging in block 2, not on router logit
+drift. Phase 20's uncertainty weighting is what addresses that, and does:
+3.5x lower loss, 13x smaller gradients, every step accepted.
+
+The mean-loss column is not a clean comparison across the first two rows: with
+`z_level > 0` the z term is itself part of the reported loss, so some of the
+482.90 -> 494.76 rise is the term being counted rather than the model being
+worse. The gradient columns are the fair comparison.
+
+So: a real but small effect on the thing it targets, and no effect on the thing
+that was actually failing. Router logit drift is a slow failure mode, and 400
+CPU steps from random initialization is nowhere near enough for it to bite; the
+certificates show the term behaves as specified. It is insurance, correctly
+priced at `1e-3`, against something that has not happened yet.
 
 The remaining three items are designed and their specific blockers named; 23.6
 is the one to build first, because it is what would let 23.4 and 23.5 be
@@ -679,6 +686,12 @@ See [`docs/Quality-Gate.md`](docs/Quality-Gate.md).
 | `multi_block.rs` | Planned sampling could stop above `sigma_min` when `max_steps` bound first, and then denoise the latent at `sigma_min` anyway — an estimate conditioned on a noise level the latent did not have. The remaining distance is now closed explicitly and `PlanTrace::forced_final_step` records that it happened. |
 | `planner.rs` | The first beam search compared paths of *different* depths on raw accumulated score. Because deltas accumulate, a shorter path always wins under log-probabilities and always loses under costs — so lookahead could never beat greedy. Only fully expanded levels are compared now, and `test_lookahead_can_beat_greedy` is the regression. |
 | `planner.rs` | The budget was charged *after* `expand` returned, so a scoring function that calls a model had already spent the compute by the time it was truncated. The allowance is now passed into `expand`, with truncation kept only as a backstop. |
+| `schedule.rs`, `train.rs` | **`--accumulate` did not accumulate.** `GradientAccumulator` held only a counter: the loop scaled each micro-batch loss by `1/k`, backpropagated, and then stepped with *only the k-th* micro-batch's gradients — the other `k-1` were computed and dropped. `--accumulate 4` meant "run 4 passes, discard 3, take a quarter-sized step". Both existing checks passed anyway: the unit test asserted only the optimizer-step *count*, and the certificate validated the averaging *formula* in f64 without ever touching the code path. Now the accumulator sums real gradients through a `ModuleVisitor`, clipping applies to the accumulated step, and the certificate folds real gradients through a real module and compares against one `k`x batch. |
+| `dblock.rs`, `train.rs` | The importance sampler was estimating its proposal from **its own reweighted output**: `per_sample` already carried the `p/q` factor, so a favoured bin reported a smaller loss, which lowered its own `q`, which raised `w` again. It oscillated instead of converging on the loss profile. |
+| `dblock.rs`, `train.rs` | Importance and uncertainty weighting composed wrongly: `exp(-l)(wL) + l` instead of `w(exp(-l)L + l)`. The `+ l` term went unweighted, moving the head's optimum from `ln L` to `ln(wL)` — it would have learned to absorb the *proposal* rather than the loss scale, silently violating a certified property in the one configuration where both features are on. Weights are now carried out of `StepParts` and applied at aggregation, after any transform. |
+| `mosme.rs`, `vit.rs`, `dblock.rs` | **The router z-loss reached the objective at 1% of its setting.** It was summed into the balance term, which is then scaled by `moe_aux_weight` (0.01), so `z_level = 1e-3` arrived as `1e-5` — and `--balance-schedule anneal` decayed the *stabilizer* along with the regularizer, weakening it exactly as a run gets long enough for logit drift to matter. Balance and z-loss are now carried separately end to end (`vit::RouterAux`), and `z_level` means what ST-MoE means by it. This invalidated a null result already reported and required re-measuring. |
+| `train.rs` | `logvar_head.take()` sat inside a tuple pattern, so a failed match on any *later* element would move the head out and drop it — silently disabling uncertainty weighting for the rest of the run while the startup banner still announced it. Latent rather than live, but one refactor away from firing. |
+| `multi_block.rs` | The trajectory planner rolled candidates forward with plain `euler_step` while the committed step used `SolverState`. For DPM++ 2M/3M — which integrate from a history of past x0 predictions — the planner was scoring candidates under dynamics the sampler would not follow. Rollouts now clone the real solver state per path, and draw noise from their own seeded RNG so speculation cannot perturb the committed trajectory's reproducibility. |
 | `tests/integration.rs` | `integration_mosme_trunk_trains_end_to_end` asserted `balance_loss >= 2.0`, treating the Switch bound `L >= 1` as unconditional. It holds only on the diagonal `f == p`, which hard top-k routing does not give — so the test was really pinning one draw from a *global* backend RNG, and adding any concurrent test that builds a model broke it. It now asserts the structural upper bound, which is a theorem. |
 
 ## Remaining (requires external resources)
@@ -700,7 +713,7 @@ See [`docs/Quality-Gate.md`](docs/Quality-Gate.md).
 
 ## Test inventory
 
-306 unit + 22 integration tests, all passing; `cargo clippy --all-targets`
+310 unit + 22 integration tests, all passing; `cargo clippy --all-targets`
 clean; `cargo doc` warning-free. 73 numerical certificates in 15 groups, plus
 five-phase verification inside every training run.
 

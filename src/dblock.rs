@@ -81,6 +81,20 @@ pub struct StepParts<B: Backend> {
     pub per_sample: Tensor<B, 1>,
     /// The executed span's load-balancing loss; `None` for a dense trunk.
     pub balance: Option<Tensor<B, 1>>,
+    /// The executed span's router z-loss, already carrying its `z_level`.
+    ///
+    /// Separate from `balance` because it must **not** be scaled by the
+    /// balance weight or decayed by a balance schedule: it is a numerical
+    /// stabilizer, and it matters most late in a run.
+    pub z: Option<Tensor<B, 1>>,
+    /// Per-sample importance weights `p/q`, when the noise levels were drawn
+    /// from a proposal rather than the prior.
+    ///
+    /// **Not** applied to [`Self::per_sample`]. A caller that reweights the
+    /// per-sample losses must apply these afterwards, to the *transformed*
+    /// values — see the note in `training_step_on` for why that ordering is
+    /// the one that keeps both the estimator and the uncertainty head honest.
+    pub importance: Option<Tensor<B, 1>>,
     pub metrics: StepMetrics,
 }
 
@@ -195,7 +209,7 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         self.denoise_span_with_aux(pixel_values, zt, sigmas, span).0
     }
 
-    /// [`Self::denoise_span`] that also returns the MoE load-balancing loss of
+    /// [`Self::denoise_span`] that also returns the routing auxiliary losses of
     /// the executed span (`None` for a dense trunk).
     ///
     /// Inference paths discard it; training paths must add it, or a sparse
@@ -206,7 +220,7 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         zt: Tensor<B, 2>,
         sigmas: &[f64],
         span: std::ops::Range<usize>,
-    ) -> (Tensor<B, 2>, Option<Tensor<B, 1>>) {
+    ) -> (Tensor<B, 2>, Option<crate::vit::RouterAux<B>>) {
         let device = zt.device();
         let b = zt.dims()[0];
         assert_eq!(sigmas.len(), b, "one sigma per sample required");
@@ -391,8 +405,10 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         );
         let zt = z + eps * s.unsqueeze_dim::<2>(1);
 
-        let (logits, balance) =
+        let (logits, aux) =
             self.denoise_span_with_aux(pixel_values, zt, sigmas, self.layer_range(block_idx));
+        let balance = aux.as_ref().map(|a| a.balance.clone());
+        let z = aux.map(|a| a.z);
 
         // Per-sample cross entropy.
         let log_probs = log_softmax(logits, 1);
@@ -408,27 +424,50 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             .map(|&sg| edm_loss_weight(sg, self.sigma_data) as f32)
             .collect();
         let w = Tensor::<B, 1>::from_floats(weights.as_slice(), &device);
-        let mut per_sample = nll * w;
+        let per_sample = nll * w;
 
         // Importance weights, when the noise levels were not drawn from the
         // prior. `p/q` is what keeps the estimator unbiased -- without it a
         // proposal that favours the high-loss region would report a
         // systematically larger loss and the optimizer would chase it.
-        if let Some(importance) = importance {
-            assert_eq!(importance.len(), b, "one importance weight per sample required");
-            let iw = Tensor::<B, 1>::from_floats(
-                importance.iter().map(|&v| v as f32).collect::<Vec<_>>().as_slice(),
+        //
+        // They are applied at *aggregation* and carried out separately rather
+        // than folded into `per_sample`. Two things depend on that:
+        //
+        //  - the importance sampler estimates its proposal from the observed
+        //    loss, and feeding it `w * L` instead of `L` makes it learn from
+        //    its own output: a favoured bin reports a smaller loss, which
+        //    lowers its own `q`, which raises `w` again. It oscillates instead
+        //    of converging on the loss profile.
+        //  - uncertainty weighting transforms `L` into `exp(-l) L + l`, and the
+        //    unbiased estimator of *that* is `w (exp(-l) L + l)`, not
+        //    `exp(-l) (w L) + l`. Folding the weight in early leaves the `+ l`
+        //    term unweighted and moves the head's optimum from `ln L` to
+        //    `ln(w L)` -- it would learn to absorb the proposal rather than the
+        //    loss scale.
+        let importance = importance.map(|weights| {
+            assert_eq!(weights.len(), b, "one importance weight per sample required");
+            Tensor::<B, 1>::from_floats(
+                weights.iter().map(|&v| v as f32).collect::<Vec<_>>().as_slice(),
                 &device,
-            );
-            per_sample = per_sample * iw;
-        }
+            )
+        });
 
-        let mut loss = per_sample.clone().mean();
+        let mut loss = match &importance {
+            Some(iw) => (per_sample.clone() * iw.clone()).mean(),
+            None => per_sample.clone().mean(),
+        };
 
         let mut m_balance = 0.0f32;
         if let Some(aux) = balance.clone() {
             m_balance = aux.clone().into_scalar();
             loss = loss + aux.mul_scalar(self.moe_aux_weight as f32);
+        }
+        // The z-loss already carries its own `z_level`, so it is added at
+        // weight 1 rather than being multiplied by `moe_aux_weight` as well --
+        // that double scaling made a configured 1e-3 arrive as 1e-5.
+        if let Some(z) = z.clone() {
+            loss = loss + z;
         }
 
         let metrics = StepMetrics {
@@ -437,7 +476,7 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             block_idx,
             balance_loss: m_balance,
         };
-        StepParts { loss, metrics, per_sample, balance }
+        StepParts { loss, metrics, per_sample, balance, z, importance }
     }
 
     /// Euler-integrated classification (`diffusion_step`): integrate the
@@ -490,4 +529,88 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
 /// Convenience: build preconditioning for a scalar sigma (host side).
 pub fn precondition(sigma: f64, sigma_data: f64) -> EdmPreconditioning {
     EdmPreconditioning::new(sigma, sigma_data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vit::ViTDiTConfig;
+    use burn::backend::NdArray;
+    use burn::tensor::Distribution;
+
+    type B = NdArray<f32>;
+
+    fn fixture() -> (DblockClassifier<B>, Tensor<B, 4>, Tensor<B, 1, Int>) {
+        let device = Default::default();
+        <B as Backend>::seed(&device, 5);
+        let model = DblockClassifier::<B>::new(
+            &ViTDiTConfig::tiny(10),
+            &DblockConfig { num_blocks: 2, ..DblockConfig::default() },
+            &device,
+        );
+        let pixels =
+            Tensor::<B, 4>::random([3, 3, 32, 32], Distribution::Uniform(-0.5, 0.5), &device);
+        let labels = Tensor::<B, 1, Int>::from_ints([1i64, 4, 7].as_slice(), &device);
+        (model, pixels, labels)
+    }
+
+    fn values(t: Tensor<B, 1>) -> Vec<f32> {
+        t.into_data().convert::<f32>().iter::<f32>().collect()
+    }
+
+    #[test]
+    fn test_importance_weights_stay_out_of_the_per_sample_losses() {
+        // Two things read `per_sample`, and both break if the importance
+        // weight is folded into it:
+        //
+        //  - the importance sampler estimates its proposal from the observed
+        //    loss, so feeding it `w * L` makes it learn from its own output;
+        //  - uncertainty weighting transforms `L`, and the unbiased estimator
+        //    of the transformed objective is `w * f(L)`, not `f(w * L)`.
+        //
+        // So the weights are carried out separately and applied at aggregation.
+        let (model, pixels, labels) = fixture();
+        let sigmas = vec![0.5, 1.5, 4.0];
+        let weights = vec![2.0, 0.25, 1.0];
+
+        let plain = model.training_step_on(pixels.clone(), labels.clone(), &sigmas, 0, None);
+        let weighted =
+            model.training_step_on(pixels, labels, &sigmas, 0, Some(&weights));
+
+        // The per-sample losses are identical: the weights did not touch them.
+        let a = values(plain.per_sample.clone());
+        let b = values(weighted.per_sample.clone());
+        for (x, y) in a.iter().zip(&b) {
+            assert!((x - y).abs() < 1e-5, "per_sample was reweighted: {x} vs {y}");
+        }
+
+        // ...and they are handed back for the caller to apply.
+        let carried = values(weighted.importance.clone().expect("weights are carried out"));
+        for (got, want) in carried.iter().zip(&weights) {
+            assert!((f64::from(*got) - want).abs() < 1e-6);
+        }
+        assert!(plain.importance.is_none(), "no weights means nothing to carry");
+
+        // The aggregated loss *is* weighted, and equals the weighted mean.
+        let expected: f32 = a
+            .iter()
+            .zip(&weights)
+            .map(|(l, w)| l * *w as f32)
+            .sum::<f32>()
+            / a.len() as f32;
+        let got: f32 = weighted.loss.into_scalar();
+        assert!(
+            (got - expected).abs() < 1e-4,
+            "aggregated loss {got} != weighted mean {expected}"
+        );
+    }
+
+    #[test]
+    fn test_a_dense_trunk_reports_no_routing_auxiliaries() {
+        let (model, pixels, labels) = fixture();
+        let parts = model.training_step_on(pixels, labels, &[1.0, 1.0, 1.0], 0, None);
+        assert!(parts.balance.is_none(), "a dense trunk has no balance loss");
+        assert!(parts.z.is_none(), "and no router z-loss");
+        assert_eq!(parts.metrics.balance_loss, 0.0);
+    }
 }

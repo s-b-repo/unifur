@@ -505,19 +505,9 @@ where
         let head_grads = logvar_head
             .as_ref()
             .map(|head| GradientsParams::from_module(&mut all_grads, head));
-        let mut grads = GradientsParams::from_grads(all_grads, &model);
+        let grads = GradientsParams::from_grads(all_grads, &model);
         verdict.grad_norm = global_grad_norm(&model, &grads);
 
-        // Clipping rescales a merely-large step; the gate below discards a
-        // pathological one. They answer different questions, so both apply.
-        if let Some(max_norm) = config.clip_norm {
-            let scale =
-                crate::schedule::clip_gradients(&mut grads, &model, verdict.grad_norm, max_norm);
-            if scale < 1.0 {
-                summary.steps_clipped += 1;
-                verdict.grad_norm *= scale;
-            }
-        }
         if let Some(gate) = config.checks.grad_gate {
             if !grad_norm_ok(verdict.grad_norm, gate.min_norm, gate.max_norm) {
                 verdict.reject(
@@ -530,15 +520,41 @@ where
             }
         }
 
-        let ready = accumulator.accumulate();
-        if verdict.accepted && ready {
+        // Fold this micro-batch into the accumulation buffer, or skip it if a
+        // gate rejected it. A rejected micro-batch still advances the cycle:
+        // dropping the whole cycle instead would let one persistently bad block
+        // stall the run indefinitely.
+        let cycle = if verdict.accepted {
+            accumulator.fold(grads, &model)
+        } else {
+            accumulator.skip()
+        };
+
+        if let Some(mut summed) = cycle.into_gradients() {
+            // Clipping applies to the *accumulated* gradient, because that is
+            // the step being taken -- clipping each micro-batch separately
+            // would bound k small vectors whose sum can still be large.
+            let total_norm = global_grad_norm(&model, &summed);
+            if let Some(max_norm) = config.clip_norm {
+                let scale =
+                    crate::schedule::clip_gradients(&mut summed, &model, total_norm, max_norm);
+                if scale < 1.0 {
+                    summary.steps_clipped += 1;
+                }
+            }
+
             let lr = config.lr_schedule.at(step);
             summary.final_lr = lr;
-            model = optim.step(lr, model, grads);
-            if let (Some(head), Some(head_optim), Some(head_grads)) =
-                (logvar_head.take(), logvar_optim.as_mut(), head_grads)
-            {
-                logvar_head = Some(head_optim.step(lr, head, head_grads));
+            model = optim.step(lr, model, summed);
+
+            // `take()` only after every part is known present: evaluating it
+            // inside the tuple pattern would move the head out even when the
+            // match fails, silently disabling the feature for the rest of the
+            // run while the startup banner still claimed it was on.
+            if let (Some(head_optim), Some(head_grads)) = (logvar_optim.as_mut(), head_grads) {
+                if let Some(head) = logvar_head.take() {
+                    logvar_head = Some(head_optim.step(lr, head, head_grads));
+                }
             }
             if let Some(ema) = ema.as_mut() {
                 ema.update::<Autodiff<NdArray<f32>, C>>(&model);
@@ -804,12 +820,28 @@ impl<B: AutodiffBackend<FloatElem = f32>> Reweighting<'_, B> {
             w
         });
 
-        let rebalance = |per_sample: Tensor<B, 1>,
+        // Importance weights multiply the *final* per-sample values, after any
+        // uncertainty transform, so the estimator stays unbiased for whatever
+        // objective is actually being optimized.
+        let aggregate = |per_sample: Tensor<B, 1>,
+                         importance: Option<Tensor<B, 1>>,
                          balance: Option<Tensor<B, 1>>,
+                         z: Option<Tensor<B, 1>>,
                          weight: f64| -> Tensor<B, 1> {
-            let mut total = per_sample.mean();
+            let weighted = match importance {
+                Some(iw) => per_sample * iw,
+                None => per_sample,
+            };
+            let mut total = weighted.mean();
             if let Some(aux) = balance {
                 total = total + aux.mul_scalar(weight as f32);
+            }
+            // Outside the schedule on purpose: annealing the balance weight is
+            // meant to stop a routing regularizer fighting specialization, not
+            // to switch off a numerical stabilizer just as the run gets long
+            // enough for logit drift to matter.
+            if let Some(z) = z {
+                total = total + z;
             }
             total
         };
@@ -819,7 +851,8 @@ impl<B: AutodiffBackend<FloatElem = f32>> Reweighting<'_, B> {
             return match scheduled_balance {
                 None => (parts.loss, parts.metrics, extra),
                 Some(w) => {
-                    let loss = rebalance(parts.per_sample, parts.balance, w);
+                    let loss =
+                        aggregate(parts.per_sample, parts.importance, parts.balance, parts.z, w);
                     let value: f32 = loss.clone().into_scalar();
                     let metrics = crate::dblock::StepMetrics { loss: value, ..parts.metrics };
                     (loss, metrics, extra)
@@ -843,9 +876,11 @@ impl<B: AutodiffBackend<FloatElem = f32>> Reweighting<'_, B> {
         // dividing it by a noise-level uncertainty would tie load balancing to
         // whichever sigmas this batch happened to draw.
         let weight = scheduled_balance.unwrap_or_else(|| model.moe_aux_weight());
-        let balanced = rebalance(
+        let balanced = aggregate(
             self.weighting.apply(parts.per_sample, log_variance),
+            parts.importance,
             parts.balance,
+            parts.z,
             weight,
         );
 
