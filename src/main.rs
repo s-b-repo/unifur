@@ -6,9 +6,10 @@ use std::path::{Path, PathBuf};
 
 use diffusionblocks::{
     accuracy::{Ensemble, Guidance, LogitNorm, ScalingCurve, ScalingPoint},
+    antipattern::{Labeler, RuleSet},
     checkpoint,
-    corpus::TokenCorpus,
-    lm::{LanguageModel, LmConfig, Sampling},
+    corpus::{self, TokenCorpus},
+    lm::{LanguageModel, LmConfig, Sampling, Unlikelihood},
     tokenizer::ByteTokenizer,
     data::{SyntheticDataset, TrainDataset},
     dblock::{DblockClassifier, DblockConfig},
@@ -95,6 +96,13 @@ enum LmAction {
         /// Output corpus file (little-endian u16 tokens).
         #[arg(long)]
         out: PathBuf,
+        /// Also label anti-patterns (roadmap Phase 24), writing `<out>.labels`
+        /// and `<out>.labels.json` next to the corpus.
+        #[arg(long, default_value_t = false)]
+        label: bool,
+        /// Rule set JSON for `--label`; the built-in rules when omitted.
+        #[arg(long)]
+        rules: Option<PathBuf>,
     },
     /// Report what a corpus contains, without loading it into memory.
     Corpus {
@@ -103,6 +111,88 @@ enum LmAction {
         /// Context length used to count training windows.
         #[arg(long, default_value_t = 256)]
         context: usize,
+    },
+    /// Label an existing corpus with anti-pattern categories (roadmap Phase
+    /// 24). Writes `<corpus>.labels` and `<corpus>.labels.json`.
+    Label {
+        #[arg(long)]
+        corpus: PathBuf,
+        /// Rule set JSON; the built-in rules when omitted.
+        #[arg(long)]
+        rules: Option<PathBuf>,
+    },
+    /// List the anti-pattern findings in a source file, with line numbers.
+    Scan {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        rules: Option<PathBuf>,
+    },
+    /// Score the code quality of a source file: per-dimension breakdown and
+    /// the geometric mean that the filter and regularizer would read. Writes
+    /// a JSON report when `--out` is given; otherwise prints to stdout.
+    Score {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long, default_value = "rust")]
+        language: String,
+        /// Include the lexical (anti-pattern) dimension.
+        #[arg(long, default_value_t = true)]
+        lexical: bool,
+        /// Include the structural heuristics dimension.
+        #[arg(long, default_value_t = true)]
+        structural: bool,
+        /// Include the external-analyzer dimension. Requires the
+        /// `codequality-external` Cargo feature at build time and the named
+        /// tool on `PATH` at run time; otherwise the dimension is silently
+        /// skipped.
+        #[arg(long)]
+        external: Option<String>,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Write the built-in rule set as JSON to extend it, or validate a rule
+    /// file -- every rule must match its examples and none of its
+    /// counterexamples.
+    Rules {
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        check: Option<PathBuf>,
+    },
+    /// Train a causal language model on a corpus. With a `.labels` sidecar
+    /// present the run reports the probability it assigns to flagged tokens,
+    /// and `--penalty` charges for them instead of rewarding them.
+    Train {
+        #[arg(long)]
+        corpus: PathBuf,
+        #[arg(long, default_value_t = 200)]
+        steps: usize,
+        #[arg(long, default_value_t = 8)]
+        batch_size: usize,
+        #[arg(long, default_value_t = 3e-4)]
+        lr: f64,
+        #[arg(long, default_value_t = 0.01)]
+        weight_decay: f64,
+        /// Unlikelihood coefficient on labeled targets (roadmap Phase 24).
+        /// 0 trains plainly; requires labels when positive.
+        #[arg(long, default_value_t = 0.0)]
+        penalty: f32,
+        /// Stream windows from disk instead of loading the corpus.
+        #[arg(long, default_value_t = false)]
+        streaming: bool,
+        /// The small configuration, for CPU smoke runs.
+        #[arg(long, default_value_t = false)]
+        tiny: bool,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        #[arg(long, default_value_t = 10)]
+        log_every: usize,
+        /// Append-mode JSONL metrics.
+        #[arg(long)]
+        log: Option<PathBuf>,
+        #[arg(long, default_value = "checkpoints")]
+        out_dir: PathBuf,
     },
     /// Generate a continuation from an untrained model.
     ///
@@ -136,6 +226,12 @@ enum LmAction {
         cached: bool,
         #[arg(long, default_value_t = 1337)]
         seed: u64,
+        /// Weights from `dblocks lm train`; random when omitted.
+        #[arg(long)]
+        checkpoint: Option<PathBuf>,
+        /// The small configuration -- must match the checkpoint's.
+        #[arg(long, default_value_t = false)]
+        tiny: bool,
     },
 }
 
@@ -418,16 +514,28 @@ fn main() -> Result<()> {
     }
 }
 
+/// The rule set a `--rules` flag names, or the built-in one.
+fn load_labeler(rules: Option<&Path>) -> Result<Labeler> {
+    match rules {
+        Some(path) => Labeler::new(RuleSet::read(path)?),
+        None => Ok(Labeler::builtin()),
+    }
+}
+
 fn cmd_lm(action: LmAction) -> Result<()> {
     match action {
-        LmAction::Tokenize { input, out } => {
+        LmAction::Tokenize { input, out, label, rules } => {
             let count = TokenCorpus::tokenize_file(&input, &out)?;
             println!(
                 "{} -> {} | {count} tokens ({} bytes, u16 little-endian)",
                 input.display(),
                 out.display(),
-                count * diffusionblocks::corpus::TOKEN_BYTES
+                count * corpus::TOKEN_BYTES
             );
+            if label {
+                let manifest = TokenCorpus::label_file(&out, &load_labeler(rules.as_deref())?)?;
+                println!("labels -> {}\n{}", corpus::labels_path(&out).display(), manifest.render());
+            }
             Ok(())
         }
         LmAction::Corpus { path, context } => {
@@ -440,6 +548,204 @@ fn cmd_lm(action: LmAction) -> Result<()> {
                 corpus.len(),
                 corpus.windows(context)
             );
+            if corpus::manifest_path(&path).exists() {
+                print!("labels: {}", corpus.manifest()?.render());
+            } else {
+                println!("labels: none (`dblocks lm label --corpus {}` to add them)", path.display());
+            }
+            Ok(())
+        }
+        LmAction::Label { corpus: path, rules } => {
+            let manifest = TokenCorpus::label_file(&path, &load_labeler(rules.as_deref())?)?;
+            println!(
+                "{} -> {} + {}\n{}",
+                path.display(),
+                corpus::labels_path(&path).display(),
+                corpus::manifest_path(&path).display(),
+                manifest.render()
+            );
+            Ok(())
+        }
+        LmAction::Scan { input, rules } => {
+            let text = std::fs::read_to_string(&input)
+                .map_err(|err| anyhow::anyhow!("read {}: {err}", input.display()))?;
+            let labeler = load_labeler(rules.as_deref())?;
+            let report = labeler.report(&text);
+            if report.is_empty() {
+                println!("{}: no findings", input.display());
+            } else {
+                print!("{report}");
+                println!("{} finding(s) in {}", report.lines().count(), input.display());
+            }
+            Ok(())
+        }
+        LmAction::Score { input, language, lexical, structural, external, out } => {
+            use diffusionblocks::codequality::{
+                CodeAnalyzer, CompositeAnalyzer, ExternalAnalyzer as ExtTool,
+                Language as Lang, QualityScore, StructuralAnalyzer,
+            };
+            let text = std::fs::read_to_string(&input)
+                .map_err(|err| anyhow::anyhow!("read {}: {err}", input.display()))?;
+            let lang = Lang::parse(&language);
+            let lexical_labeler = if lexical { Some(load_labeler(None)?) } else { None };
+            let structural_analyzer = if structural { Some(StructuralAnalyzer::default()) } else { None };
+            let external_analyzer = external.as_ref().map(|tool| {
+                // The default invocation is a placeholder: users who care
+                // about this dimension configure their own command via the
+                // analyzer API. The CLI exists so the dimension is reachable
+                // without writing Rust code.
+                let args = match tool.as_str() {
+                    "clippy" => vec!["clippy".into(), "--message-format=json".into()],
+                    "ruff" => vec!["ruff".into(), "check".into(), "--output-format=json".into()],
+                    "eslint" => vec!["eslint".into(), "--format=json".into()],
+                    other => vec![other.into()],
+                };
+                ExtTool::new(tool.clone(), args)
+            });
+
+            struct Identity(Lang);
+            impl diffusionblocks::codequality::CodeAnalyzer for Identity {
+                fn language(&self) -> Lang {
+                    self.0
+                }
+                fn analyze(&self, _: &str) -> QualityScore {
+                    QualityScore::identity(self.0)
+                }
+            }
+            let composite = CompositeAnalyzer::<Identity>::new(
+                lang,
+                lexical_labeler,
+                structural_analyzer,
+                external_analyzer,
+            );
+            let score = composite.analyze(&text);
+
+            let rendered = format!(
+                "{}: language={} overall={:.4} lines={}\n",
+                input.display(),
+                lang.name(),
+                score.overall,
+                score.lines,
+            );
+            let dims = score
+                .dimensions
+                .iter()
+                .map(|d| format!("  {:<11} {:.4}\n", d.name, d.score))
+                .collect::<String>();
+            let report_text = format!("{rendered}{dims}");
+            match out {
+                Some(path) => {
+                    let json = serde_json::to_string_pretty(&score)
+                        .map_err(|err| anyhow::anyhow!("serialize: {err}"))?;
+                    std::fs::write(&path, format!("{json}\n"))
+                        .map_err(|err| anyhow::anyhow!("write {}: {err}", path.display()))?;
+                    println!("{report_text}wrote {}", path.display());
+                }
+                None => print!("{report_text}"),
+            }
+            Ok(())
+        }
+        LmAction::Rules { out, check } => {
+            if let Some(path) = &check {
+                let set = RuleSet::read(path)?;
+                println!(
+                    "{}: {} categories, {} rules, every example and counterexample holds",
+                    path.display(),
+                    set.categories.len(),
+                    set.rules.len()
+                );
+            }
+            match out {
+                Some(path) => {
+                    RuleSet::builtin().write(&path)?;
+                    println!("built-in rule set written to {}", path.display());
+                }
+                None if check.is_none() => print!("{}", RuleSet::builtin().to_json()?),
+                None => {}
+            }
+            Ok(())
+        }
+        LmAction::Train {
+            corpus: corpus_path,
+            steps,
+            batch_size,
+            lr,
+            weight_decay,
+            penalty,
+            streaming,
+            tiny,
+            seed,
+            log_every,
+            log,
+            out_dir,
+        } => {
+            type Train = train::DefaultTrainBackend;
+            let device: <Train as burn::tensor::backend::BackendTypes>::Device = Default::default();
+            <Train as burn::tensor::backend::Backend>::seed(&device, seed);
+
+            let mut corpus = if streaming {
+                TokenCorpus::streaming(&corpus_path)?
+            } else {
+                TokenCorpus::in_memory(&corpus_path)?
+            };
+            if corpus::labels_path(&corpus_path).exists() {
+                corpus.open_labels()?;
+                let manifest = corpus.manifest()?;
+                println!(
+                    "labels: {} of {} tokens flagged ({:.3}%) across {} categories | penalty {}",
+                    manifest.labeled_tokens,
+                    manifest.tokens,
+                    100.0 * manifest.labeled_fraction(),
+                    manifest.categories.iter().filter(|c| c.tokens > 0).count(),
+                    if penalty > 0.0 { format!("alpha={penalty}") } else { "off (measuring only)".into() }
+                );
+            } else if penalty > 0.0 {
+                anyhow::bail!(
+                    "--penalty {penalty} needs labels; run `dblocks lm label --corpus {}` first",
+                    corpus_path.display()
+                );
+            } else {
+                println!("labels: none");
+            }
+
+            let model_config = if tiny { LmConfig::tiny() } else { LmConfig::default() };
+            let model = LanguageModel::<Train>::new(&model_config, &device);
+            println!(
+                "training: {} tokens | context={} layers={} hidden={} | steps={steps} batch={batch_size} lr={lr}",
+                corpus.len(),
+                model_config.context,
+                model_config.num_layers,
+                model_config.hidden_size
+            );
+
+            let config = train::LmTrainConfig {
+                steps,
+                batch_size,
+                lr,
+                weight_decay,
+                seed,
+                penalty: Unlikelihood::new(penalty),
+                log_every,
+                log_path: log,
+            };
+            let (model, report) = train::train_lm(model, &mut corpus, &config, &device)?;
+            println!(
+                "done: {} steps in {:.1}s | loss {:.4} -> {:.4} (mean {:.4}) | {} skipped",
+                report.steps_taken,
+                report.elapsed_secs,
+                report.first_loss,
+                report.last_loss,
+                report.mean_loss,
+                report.steps_skipped
+            );
+            if report.penalized_tokens > 0 {
+                println!(
+                    "flagged targets: {} seen | p(bad) {:.4} -> {:.4}",
+                    report.penalized_tokens, report.first_penalized_prob, report.last_penalized_prob
+                );
+            }
+            let path = checkpoint::save_content_addressed(model, &out_dir, "lm")?;
+            println!("checkpoint saved: {}", path.display());
             Ok(())
         }
         LmAction::Generate {
@@ -453,12 +759,18 @@ fn cmd_lm(action: LmAction) -> Result<()> {
             budget,
             cached,
             seed,
+            checkpoint: weights,
+            tiny,
         } => {
             let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
             <Eval as burn::tensor::backend::Backend>::seed(&device, seed);
 
-            let config = LmConfig::default();
-            let model = LanguageModel::<Eval>::new(&config, &device);
+            let config = if tiny { LmConfig::tiny() } else { LmConfig::default() };
+            let mut model = LanguageModel::<Eval>::new(&config, &device);
+            if let Some(path) = &weights {
+                model = checkpoint::load::<Eval, _>(model, path, &device)?;
+                println!("loaded {}", path.display());
+            }
             let tokenizer = ByteTokenizer::new();
             let ids = tokenizer.encode(&prompt);
 
@@ -512,10 +824,12 @@ fn cmd_lm(action: LmAction) -> Result<()> {
                 format_duration(elapsed)
             );
             println!("---\n{}\n---", tokenizer.decode_lossy(&out));
-            println!(
-                "Weights are random, so the text is noise. What this run shows is\n\
-                 that the decoding paths agree and what each one costs."
-            );
+            if weights.is_none() {
+                println!(
+                    "Weights are random, so the text is noise. What this run shows is\n\
+                     that the decoding paths agree and what each one costs."
+                );
+            }
             Ok(())
         }
     }

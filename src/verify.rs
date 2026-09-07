@@ -37,6 +37,7 @@
 //! | `moe` | Gates are a probability distribution; the balance loss stays in `[1, E]` on the diagonal |
 //! | `mosme` | Composed two-level gates form a distribution; one box reduces exactly to flat MoE; adding a disabled expert is a bit-exact identity |
 //! | `lm` | Tokenization is lossless; causal attention leaks nothing backwards; an untrained tied head starts at `ln(vocab)` |
+//! | `antipattern` | Every shipped rule matches its examples and none of its counterexamples; labels follow tokens through both corpus readers; zero weights reproduce the plain loss bitwise; the unlikelihood term is 0 for an impossible token and finite for a certain one; a penalized target leaves the likelihood; one penalized step lowers p(bad) where one plain step raises it |
 //! | `model` | Softmax partition, unit-norm label embeddings, DiT zero-init, and that every `x0` estimate lies in the convex hull of the label table |
 //! | `autodiff` | Finite-difference gradient check on the distillation objective |
 
@@ -186,7 +187,7 @@ impl Report {
 }
 
 /// Names of every certificate group, in the order [`run_all`] emits them.
-pub const GROUPS: [&str; 15] = [
+pub const GROUPS: [&str; 17] = [
     "schedule",
     "preconditioning",
     "stats",
@@ -197,6 +198,8 @@ pub const GROUPS: [&str; 15] = [
     "moe",
     "mosme",
     "lm",
+    "antipattern",
+    "codequality",
     "planner",
     "accuracy",
     "optim",
@@ -241,6 +244,8 @@ pub fn run_all() -> Report {
     certificates.extend(moe_certificates());
     certificates.extend(mosme_certificates());
     certificates.extend(lm_certificates());
+    certificates.extend(antipattern_certificates());
+    certificates.extend(codequality_certificates());
     certificates.extend(planner_certificates());
     certificates.extend(accuracy_certificates());
     certificates.extend(optim_certificates());
@@ -1547,6 +1552,433 @@ fn lm_certificates() -> Vec<Certificate> {
     ]
 }
 
+// ------------------------------------------------------------ antipattern --
+
+fn antipattern_certificates() -> Vec<Certificate> {
+    use crate::antipattern::{text_tokens, Labeler, RuleSet, CLEAN};
+    use crate::corpus::TokenCorpus;
+    use crate::lm::{label_weights, unlikelihood, LanguageModel, LmConfig, Unlikelihood};
+    use crate::train::DefaultTrainBackend as A;
+    use burn::optim::{GradientsParams, Optimizer, SgdConfig};
+    use burn::tensor::activation::log_softmax;
+
+    let device = Default::default();
+    let labeler = Labeler::builtin();
+
+    // ------------------------------------------------------------------
+    // The rules are the specification of what "bad code" means here, and
+    // each carries the texts it must and must not match. If the matcher
+    // regresses, or a rule is edited into matching nothing, this is where it
+    // shows -- not as a training run whose penalty is quietly zero.
+    let rules_err = f64::from(u8::from(RuleSet::builtin().validate().is_err()));
+
+    // ------------------------------------------------------------------
+    // Labels are computed once over the whole corpus and read back through
+    // the same fixed-stride window as the tokens. Both readers must return
+    // the labels the labeler produced, on the tokens it produced them for,
+    // and every labeled token must decode to a rule body: here the ":" of a
+    // bare except, "pass" under it, and the "}" of an empty catch.
+    let text = "try:\n    f()\nexcept:\n    pass\ncatch (e) {}\n";
+    let dir = std::env::temp_dir().join("dblocks-verify-antipattern");
+    let corpus_err = (|| -> anyhow::Result<f64> {
+        std::fs::create_dir_all(&dir)?;
+        let source = dir.join("source.txt");
+        std::fs::write(&source, text)?;
+        let path = dir.join("corpus.bin");
+        TokenCorpus::tokenize_file(&source, &path)?;
+        TokenCorpus::label_file(&path, &labeler)?;
+
+        let mut memory = TokenCorpus::in_memory(&path)?;
+        memory.open_labels()?;
+        let mut streamed = TokenCorpus::streaming(&path)?;
+        streamed.open_labels()?;
+
+        let len = memory.len();
+        let tokens = memory.window(0, len)?;
+        let expected = labeler.label(&tokens);
+        let from_memory = memory.window_labels(0, len)?;
+        let mut from_stream = Vec::new();
+        for start in (0..len).step_by(5) {
+            from_stream.extend(streamed.window_labels(start, 5.min(len - start))?);
+        }
+        let mismatches = from_memory.iter().zip(&expected).filter(|(a, b)| a != b).count()
+            + from_stream.iter().zip(&expected).filter(|(a, b)| a != b).count()
+            + usize::from(from_stream.len() != expected.len());
+        let flagged: String = tokens
+            .iter()
+            .zip(&expected)
+            .filter(|(_, l)| **l != CLEAN)
+            .map(|(t, _)| char::from(*t as u8))
+            .collect();
+        Ok(mismatches as f64 + f64::from(u8::from(flagged != ":pass}")))
+    })()
+    .unwrap_or(f64::INFINITY);
+
+    // ------------------------------------------------------------------
+    // With nothing flagged, the penalized objective must be the plain one to
+    // the bit. Every labeled run takes this path on a clean batch.
+    let model = LanguageModel::<B>::new(&LmConfig { context: 32, ..LmConfig::tiny() }, &device);
+    let ids: Vec<i64> = text_tokens("except:\n    pass\n").iter().map(|t| i64::from(*t)).collect();
+    let n = ids.len();
+    let as_tensor = |v: &[i64]| Tensor::<B, 1, Int>::from_ints(v, &device).reshape([1, v.len()]);
+    let (plain, _) = model.next_token_loss(as_tensor(&ids), 0..model.num_layers());
+    let (penalized, _) = model.next_token_loss_penalized(
+        as_tensor(&ids),
+        Tensor::<B, 2>::zeros([1, n], &device),
+        Unlikelihood::default(),
+        0..model.num_layers(),
+    );
+    let plain_bits = plain.into_scalar().to_bits();
+    let mut identity_err = f64::from(u8::from(plain_bits != penalized.into_scalar().to_bits()));
+    // ...and with real weights but the charge off: measuring must not
+    // change what is trained on.
+    let flagged_labels = labeler.label(&text_tokens("except:\n    pass\n"));
+    let (measured, measured_metrics) = model.next_token_loss_penalized(
+        as_tensor(&ids),
+        label_weights::<B>(&[flagged_labels], &labeler.weight_table(), &device),
+        Unlikelihood::off(),
+        0..model.num_layers(),
+    );
+    if plain_bits != measured.into_scalar().to_bits() || measured_metrics.penalized_tokens == 0 {
+        identity_err = 1.0;
+    }
+
+    // ------------------------------------------------------------------
+    // -log(1 - p): zero when the bad token is impossible, ln 2 at a coin
+    // flip, and floored at -ln(eps) when the model is certain. A negative
+    // weight on cross-entropy would be -inf at the first and +inf at the
+    // last; this term has nothing to gain below zero and nowhere to diverge.
+    let eps = 1e-6f32;
+    let term: Vec<f32> = unlikelihood(
+        Tensor::<B, 1>::from_floats([-40.0f32, 0.5f32.ln(), 0.0], &device),
+        eps,
+    )
+    .into_data()
+    .convert::<f32>()
+    .iter::<f32>()
+    .collect();
+    let ceiling = Unlikelihood { alpha: 1.0, epsilon: eps }.ceiling();
+    let mut endpoint_err = f64::from(term[0].abs())
+        .max(f64::from((term[1] - 2f32.ln()).abs() / 2f32.ln()))
+        .max(f64::from((term[2] - ceiling).abs() / ceiling));
+    if !(term[0] < term[1] && term[1] < term[2]) {
+        endpoint_err = 1.0;
+    }
+
+    // ------------------------------------------------------------------
+    // A labeled target is charged and *only* charged: recomputing the
+    // objective from the raw logits with each target in exactly one sum
+    // must give the same number. This is the certificate that would catch a
+    // target being rewarded and penalized at once.
+    let sample = "except:\n    pass\n";
+    let sample_ids: Vec<u16> = text_tokens(sample);
+    let labels = labeler.label(&sample_ids);
+    let table = labeler.weight_table();
+    let weights = label_weights::<B>(&[labels.clone()], &table, &device);
+    let penalty = Unlikelihood { alpha: 1.5, epsilon: eps };
+    let sample_i64: Vec<i64> = sample_ids.iter().map(|t| i64::from(*t)).collect();
+    let (loss, metrics) = model.next_token_loss_penalized(
+        as_tensor(&sample_i64),
+        weights,
+        penalty,
+        0..model.num_layers(),
+    );
+    let m = sample_ids.len();
+    let logits = model
+        .forward(as_tensor(&sample_i64))
+        .logits
+        .narrow(1, 0, m - 1)
+        .reshape([m - 1, model.vocab_size()]);
+    let lp: Vec<f32> = log_softmax(logits, 1).into_data().convert::<f32>().iter::<f32>().collect();
+    let vocab = model.vocab_size();
+    let (mut likelihood, mut charge, mut negatives) = (0.0f64, 0.0f64, 0usize);
+    for j in 0..m - 1 {
+        let logp = f64::from(lp[j * vocab + sample_ids[j + 1] as usize]);
+        let w = f64::from(table[usize::from(labels[j + 1])]);
+        if w > 0.0 {
+            negatives += 1;
+            charge += w * -((1.0 - logp.exp()).max(f64::from(eps))).ln();
+        } else {
+            likelihood += -logp;
+        }
+    }
+    let expected = (likelihood + f64::from(penalty.alpha) * charge) / (m - 1) as f64;
+    let mut split_err = (f64::from(loss.into_scalar()) - expected).abs() / expected.abs().max(1.0);
+    if metrics.penalized_tokens != negatives || negatives != "pass".len() + ":".len() {
+        split_err = 1.0;
+    }
+
+    // ------------------------------------------------------------------
+    // The claim the whole phase rests on, checked on the real code path with
+    // a real optimizer step: one step of the penalized objective lowers the
+    // probability the model assigns to the flagged tokens, and one step of
+    // the plain objective on the same batch *raises* it. The second half is
+    // the motivation -- a corpus full of `except: pass` is a lesson in
+    // writing `except: pass` -- stated as a measurement rather than a belief.
+    let ad_device = Default::default();
+    <A as burn::tensor::backend::Backend>::seed(&ad_device, 24);
+    let context = 2 * sample.len();
+    let ad_model = LanguageModel::<A>::new(&LmConfig { context, ..LmConfig::tiny() }, &ad_device);
+    let batch_text = sample.repeat(2);
+    let batch_ids = text_tokens(&batch_text);
+    let batch_labels = labeler.label(&batch_ids);
+    let batch_i64: Vec<i64> = batch_ids.iter().map(|t| i64::from(*t)).collect();
+    let ad_tokens = || Tensor::<A, 1, Int>::from_ints(batch_i64.as_slice(), &ad_device).reshape([1, context]);
+    let ad_weights = || label_weights::<A>(&[batch_labels.clone()], &table, &ad_device);
+    let span = 0..ad_model.num_layers();
+    let bad_prob = |m: &LanguageModel<A>| {
+        m.next_token_loss_penalized(ad_tokens(), ad_weights(), Unlikelihood::off(), span.clone())
+            .1
+            .penalized_prob
+    };
+    let before = bad_prob(&ad_model);
+
+    let lr = 0.5;
+    let (loss, _) =
+        ad_model.next_token_loss_penalized(ad_tokens(), ad_weights(), Unlikelihood::new(1.0), span.clone());
+    let grads = GradientsParams::from_grads(loss.backward(), &ad_model);
+    let charged = SgdConfig::new().init().step(lr, ad_model.clone(), grads);
+    let after_charged = bad_prob(&charged);
+
+    let (loss, _) = ad_model.next_token_loss(ad_tokens(), span.clone());
+    let grads = GradientsParams::from_grads(loss.backward(), &ad_model);
+    let rewarded = SgdConfig::new().init().step(lr, ad_model, grads);
+    let after_rewarded = bad_prob(&rewarded);
+
+    let lowers_err = f64::from((after_charged - before).max(0.0));
+    let raises_err = f64::from((before - after_rewarded).max(0.0));
+
+    vec![
+        cert(
+            "antipattern",
+            "rules_match_their_examples_and_not_their_counterexamples",
+            "Every shipped rule matches each of its examples with a non-empty body and matches none of its counterexamples.",
+            rules_err,
+            0.0,
+        ),
+        cert(
+            "antipattern",
+            "labels_follow_tokens_through_both_readers",
+            "Labels written next to a corpus come back on the same tokens from the in-memory and the streaming reader, and every labeled token is a rule body.",
+            corpus_err,
+            0.0,
+        ),
+        cert(
+            "antipattern",
+            "zero_weights_or_zero_alpha_reproduce_the_plain_loss",
+            "With no target flagged, or with the charge off, the penalized objective equals the plain next-token loss bit for bit while the flagged targets are still counted.",
+            identity_err,
+            0.0,
+        ),
+        cert(
+            "antipattern",
+            "unlikelihood_is_zero_when_impossible_and_finite_when_certain",
+            "-log(1 - p) is 0 at p = 0, ln 2 at p = 1/2, -ln(eps) at p = 1, and increasing in between.",
+            endpoint_err,
+            1e-4,
+        ),
+        cert(
+            "antipattern",
+            "a_flagged_target_is_charged_and_leaves_the_likelihood",
+            "The objective equals (sum of -log p over clean targets + alpha * sum of w * -log(1 - p) over flagged targets) / counted, recomputed from the logits.",
+            split_err,
+            1e-5,
+        ),
+        cert(
+            "antipattern",
+            "one_penalized_step_lowers_the_flagged_probability",
+            "After one SGD step on the penalized objective, the mean probability of the flagged tokens is lower than before it.",
+            lowers_err,
+            0.0,
+        ),
+        cert(
+            "antipattern",
+            "one_plain_step_raises_the_flagged_probability",
+            "After one SGD step on the plain objective over the same batch, the mean probability of the flagged tokens is higher -- the plain loss learns the anti-pattern.",
+            raises_err,
+            0.0,
+        ),
+    ]
+}
+
+// ------------------------------------------------------------- codequality --
+
+fn codequality_certificates() -> Vec<Certificate> {
+    use crate::codequality::{
+        filter::WindowFilter, CodeAnalyzer, CompositeAnalyzer, Dimension, ExternalAnalyzer,
+        Language, QualityRegularizer, QualityScore, StructuralAnalyzer,
+    };
+    use burn::tensor::Tensor;
+
+    // ------------------------------------------------------------------
+    // The containment every "off by default" feature must satisfy: a
+    // regularizer with weight zero contributes nothing to the loss and
+    // produces an exact zero tensor. The bitwise comparison is what makes
+    // this strong: an almost-zero is enough to perturb every gradient in
+    // a run, and the certificate is what catches that.
+    let device = Default::default();
+    let scores = vec![
+        QualityScore::from_dimensions(
+            Language::Rust,
+            vec![Dimension::new("synthetic", 0.7)],
+            10,
+        ),
+        QualityScore::from_dimensions(
+            Language::Rust,
+            vec![Dimension::new("synthetic", 0.3)],
+            10,
+        ),
+    ];
+    let (loss_off, scalar_off) =
+        QualityRegularizer::off().loss::<burn::backend::NdArray<f32>>(&scores, &device);
+    let bits: u32 = loss_off.into_scalar().to_bits();
+    let identity_err = f64::from(u8::from(bits != 0.0_f32.to_bits())) + (scalar_off.abs() as f64);
+
+    // ------------------------------------------------------------------
+    // A filter at floor=ceiling=1.0 keeps every window at weight 1.0; a
+    // Drop policy at threshold 0.0 keeps every window. Both are the
+    // exact identity on a batch of arbitrary scores.
+    let (kept, ws) = WindowFilter::downweight(1.0, 1.0).decide(&scores);
+    let downweight_identity_err = f64::from(u8::from(kept.len() != scores.len() || ws.iter().any(|&w| w != 1.0)));
+    let (kept2, ws2) = WindowFilter::drop_below(0.0).decide(&scores);
+    let drop_zero_err = f64::from(u8::from(kept2.len() != scores.len() || ws2.iter().any(|&w| w != 1.0)));
+
+    // ------------------------------------------------------------------
+    // Pure function of the source. A regression that introduces hidden
+    // state (timestamps, randomness, accumulator drift) would silently
+    // invalidate every sidecar and every cached score; the certificate
+    // is the only thing that catches it deterministically.
+    struct Identity(Language);
+    impl CodeAnalyzer for Identity {
+        fn language(&self) -> Language {
+            self.0
+        }
+        fn analyze(&self, _: &str) -> QualityScore {
+            QualityScore::identity(self.0)
+        }
+    }
+    let composite = CompositeAnalyzer::<Identity>::new(
+        Language::Python,
+        None,
+        Some(StructuralAnalyzer::default()),
+        None,
+    );
+    let text = "def f(x):\n    return x + 1\n";
+    let a = composite.analyze(text);
+    let b = composite.analyze(text);
+    let c = composite.analyze(text);
+    let purity_err = f64::from(u8::from(!(a == b && b == c)));
+
+    // ------------------------------------------------------------------
+    // The geometric-mean contract: any single dimension at exactly 0
+    // makes `overall` exactly 0, which is the only signal `is_zero` and
+    // the Drop policy read. Without this, a sparse flagged window would
+    // look like a merely-bad one.
+    let dim_zero = QualityScore::from_dimensions(
+        Language::Rust,
+        vec![
+            Dimension::new("a", 1.0),
+            Dimension::new("b", 0.0),
+            Dimension::new("c", 1.0),
+        ],
+        10,
+    );
+    let geometric_err = f64::from(u8::from(dim_zero.overall != 0.0 || !dim_zero.is_zero()));
+
+    // ------------------------------------------------------------------
+    // External analyzer without the feature flag is a no-op, and the
+    // composite analyzer treats it that way: same source, same score.
+    let ext_no_feature = ExternalAnalyzer::new("clippy", vec!["clippy".into()]);
+    let composite_with_ext = CompositeAnalyzer::<Identity>::new(
+        Language::Rust,
+        None,
+        None,
+        Some(ext_no_feature),
+    );
+    let composite_without_ext = CompositeAnalyzer::<Identity>::new(Language::Rust, None, None, None);
+    let ext_no_op_err = f64::from(u8::from(
+        composite_with_ext.analyze("fn main() {}") != composite_without_ext.analyze("fn main() {}"),
+    ));
+
+    // ------------------------------------------------------------------
+    // Down-weighting preserves total weight within the closed interval
+    // [floor * batch, ceiling * batch], so a filter that promised
+    // "weighted" actually delivered weights in that range -- a
+    // regression that swapped floor and ceiling would still be a valid
+    // function of the score but would invert the user's intent.
+    let varied: Vec<QualityScore> = (0..16)
+        .map(|i| {
+            let overall = i as f32 / 15.0;
+            let mut s = QualityScore::from_dimensions(
+                Language::Rust,
+                vec![Dimension::new("synthetic", overall)],
+                1,
+            );
+            s.overall = overall;
+            s
+        })
+        .collect();
+    let (_, ws) = WindowFilter::downweight(0.2, 0.8).decide(&varied);
+    let min_w = ws.iter().cloned().fold(f32::INFINITY, f32::min);
+    let max_w = ws.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let bounds_err = f64::from(u8::from(min_w < 0.2 - 1e-6 || max_w > 0.8 + 1e-6))
+        + f64::from(u8::from(ws.len() != varied.len()));
+
+    let _ = Tensor::<B, 1>::zeros([1], &device);
+
+    vec![
+        cert(
+            "codequality",
+            "identity_at_strength_zero",
+            "QualityRegularizer with weight 0 produces an exact-zero tensor on every input.",
+            identity_err,
+            0.0,
+        ),
+        cert(
+            "codequality",
+            "downweight_at_one_one_is_exactly_keep",
+            "WindowFilter::downweight(1, 1) keeps every window at weight 1.0.",
+            downweight_identity_err,
+            0.0,
+        ),
+        cert(
+            "codequality",
+            "drop_below_zero_drops_nothing",
+            "WindowFilter::drop_below(0) keeps every window at weight 1.0.",
+            drop_zero_err,
+            0.0,
+        ),
+        cert(
+            "codequality",
+            "per_language_analyzers_are_pure",
+            "A composite analyzer applied to the same source three times yields identical scores.",
+            purity_err,
+            0.0,
+        ),
+        cert(
+            "codequality",
+            "geometric_mean_collapses_on_zero_dimension",
+            "Any single dimension at 0 makes `overall` exactly 0, which is the signal Drop reads.",
+            geometric_err,
+            0.0,
+        ),
+        cert(
+            "codequality",
+            "external_analyzer_without_feature_is_a_no_op",
+            "An ExternalAnalyzer produces a no-op composite score when the Cargo feature is off.",
+            ext_no_op_err,
+            0.0,
+        ),
+        cert(
+            "codequality",
+            "downweight_weights_lie_in_the_closed_interval",
+            "WindowFilter::downweight(floor, ceiling) assigns weights in [floor, ceiling].",
+            bounds_err,
+            0.0,
+        ),
+    ]
+}
+
 // --------------------------------------------------------------- accuracy --
 
 fn accuracy_certificates() -> Vec<Certificate> {
@@ -2641,7 +3073,9 @@ mod tests {
             groups,
             vec![
                 "accuracy",
+                "antipattern",
                 "autodiff",
+                "codequality",
                 "lm",
                 "loopgraph",
                 "model",

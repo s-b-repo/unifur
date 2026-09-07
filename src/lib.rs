@@ -24,6 +24,7 @@
 //! - [`cifar`]: CIFAR-100 binary-format dataset
 //! - [`tinyimagenet`]: Tiny ImageNet raw-format dataset
 //! - [`tokenizer`]: dependency-free byte-level tokenizer
+//! - [`antipattern`]: anti-pattern rules and per-token labels for negative supervision
 //! - [`corpus`]: pre-tokenized text corpora, in memory or streamed
 //! - [`lm`]: causal language model over the shared trunk
 //! - [`schedule`]: LR schedules, EMA, gradient accumulation and clipping
@@ -34,8 +35,13 @@
 //! - [`multi_block`]: sequential / parallel / hybrid / adaptive strategies
 //! - [`precision`]: reduced-precision emulation + mixed-precision policy
 //! - [`quality`]: quality gates for sampling and batch filtering
+//! - [`codequality`]: per-language code-quality signals, pre-training window
+//!   filter, and a regularizer that pulls the loss toward a target score
 //! - [`accuracy`]: guidance, logit normalization, ensembling, compute scaling
 //! - [`quantize`]: NF4 blockwise quantization + LoRA adapters (QLoRA)
+//! - [`quality_coder`]: scaffolding for the agentic code refiner
+//!   described in `docs/Quality-Coder.md`. Data adapters + eval harness
+//!   only; no model is loaded or trained yet.
 //! - [`consistency`]: boundary / self / trajectory consistency losses
 //! - [`distill`]: teacher/student block distillation (KL + trajectory)
 //! - [`flow`]: rectified-flow objective and sampler
@@ -52,8 +58,10 @@
 
 pub mod accuracy;
 pub mod adaptive;
+pub mod antipattern;
 pub mod checkpoint;
 pub mod cifar;
+pub mod codequality;
 pub mod consistency;
 pub mod corpus;
 pub mod data;
@@ -72,6 +80,7 @@ pub mod planner;
 pub mod precision;
 pub mod profile;
 pub mod quality;
+pub mod quality_coder;
 pub mod quantize;
 pub mod rawdata;
 pub mod reweight;

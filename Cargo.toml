@@ -36,6 +36,12 @@ sha2 = "0.10"
 [dev-dependencies]
 approx = "0.5"
 
+[features]
+# Enables shelling out to clippy/ruff/eslint from the code-quality module.
+# Disabled by default: the rest of the pipeline works identically with or
+# without it, so users without those tools installed pay no cost.
+codequality-external = []
+
 [profile.release]
 opt-level = 3
 lto = "thin"
