@@ -560,10 +560,10 @@ mod tests {
             target: Patch { diff: good_patch.into(), refusal_reason: None },
         };
         let harness = EvalHarness::new();
-        let (report, rows) = harness.score(Source::SweBench, &[example.clone()], &[Patch { diff: good_patch.into(), refusal_reason: None }]);
+        let (report, rows) = harness.score(Source::SweBench, std::slice::from_ref(&example), &[Patch { diff: good_patch.into(), refusal_reason: None }]);
         assert_eq!(report.evaluated, 1);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].applied, true);
+        assert!(rows[0].applied);
         // We don't assert on lint/test here because the small test
         // corpus and the harness's coarse structural proxy don't
         // always agree with a perfect patch; the metric contract is

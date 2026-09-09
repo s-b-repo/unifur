@@ -25,6 +25,10 @@ use crate::{
     schedule::{Ema, GradientAccumulator, LossScales, LrSchedule},
     vit::ViTDiTConfig,
 };
+use crate::{
+    corpus::TokenCorpus,
+    lm::{label_weights, LanguageModel, Unlikelihood},
+};
 use burn::{
     backend::{
         autodiff::checkpoint::strategy::{BalancedCheckpointing, CheckpointStrategy, NoCheckpointing},
@@ -1008,6 +1012,188 @@ impl RunningAvg {
     }
 }
 
+// -------------------------------------------------------- language model --
+
+/// Configuration for [`train_lm`] (roadmap Phase 24).
+#[derive(Debug, Clone)]
+pub struct LmTrainConfig {
+    pub steps: usize,
+    pub batch_size: usize,
+    pub lr: f64,
+    pub weight_decay: f64,
+    pub seed: u64,
+    /// The charge on labeled targets. Anything but [`Unlikelihood::off`]
+    /// needs the corpus to have its labels open.
+    pub penalty: Unlikelihood,
+    /// Print (and log, if `log_path` is set) every this many steps.
+    pub log_every: usize,
+    pub log_path: Option<PathBuf>,
+}
+
+impl Default for LmTrainConfig {
+    fn default() -> Self {
+        Self {
+            steps: 100,
+            batch_size: 8,
+            lr: 3e-4,
+            weight_decay: 0.01,
+            seed: 42,
+            penalty: Unlikelihood::off(),
+            log_every: 10,
+            log_path: None,
+        }
+    }
+}
+
+/// What a language-model run did.
+#[derive(Debug, Clone)]
+pub struct LmTrainReport {
+    pub steps_taken: usize,
+    /// Steps discarded for a non-finite loss.
+    pub steps_skipped: usize,
+    pub first_loss: f32,
+    pub last_loss: f32,
+    pub mean_loss: f32,
+    /// Mean probability the model gave the labeled targets, at the first and
+    /// the last step. Without labels both are 0.
+    pub first_penalized_prob: f32,
+    pub last_penalized_prob: f32,
+    /// Labeled targets seen over the whole run.
+    pub penalized_tokens: usize,
+    pub tokens_seen: usize,
+    pub elapsed_secs: f64,
+}
+
+/// Train a causal language model on `corpus`, charging labeled anti-patterns
+/// when the corpus has labels open (roadmap Phase 24).
+///
+/// With labels open and `config.penalty` off, the run trains plainly but still
+/// reports what probability it assigns to the labeled targets — which is how
+/// the plain objective is shown to *learn* the anti-patterns rather than merely
+/// tolerate them. With the penalty on, those targets are charged for instead.
+pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
+    mut model: LanguageModel<B>,
+    corpus: &mut TokenCorpus,
+    config: &LmTrainConfig,
+    device: &B::Device,
+) -> anyhow::Result<(LanguageModel<B>, LmTrainReport)> {
+    anyhow::ensure!(config.steps > 0, "steps must be positive");
+    anyhow::ensure!(config.batch_size > 0, "batch_size must be positive");
+    let context = model.context();
+    anyhow::ensure!(context >= 2, "a context of {context} has no target position");
+
+    let labeled = corpus.has_labels();
+    anyhow::ensure!(
+        labeled || config.penalty.is_off(),
+        "a penalty of {} needs labels: label the corpus and open them first",
+        config.penalty.alpha
+    );
+    let table = if labeled { Some(corpus.manifest()?.weight_table()) } else { None };
+
+    let mut optim = AdamWConfig::new()
+        .with_weight_decay(config.weight_decay as f32)
+        .init();
+    let mut rng = StdRng::seed_from_u64(config.seed);
+    let mut logger = config
+        .log_path
+        .as_ref()
+        .map(|path| crate::logging::MetricsLogger::open(path))
+        .transpose()?;
+    let span = 0..model.num_layers();
+
+    let started = std::time::Instant::now();
+    let mut report = LmTrainReport {
+        steps_taken: 0,
+        steps_skipped: 0,
+        first_loss: f32::NAN,
+        last_loss: f32::NAN,
+        mean_loss: 0.0,
+        first_penalized_prob: 0.0,
+        last_penalized_prob: 0.0,
+        penalized_tokens: 0,
+        tokens_seen: 0,
+        elapsed_secs: 0.0,
+    };
+    let mut loss_sum = 0.0f64;
+
+    for step in 0..config.steps {
+        let (windows, labels) = if labeled {
+            corpus.sample_batch_labeled(config.batch_size, context - 1, &mut rng)?
+        } else {
+            (corpus.sample_batch(config.batch_size, context - 1, &mut rng)?, Vec::new())
+        };
+        let flat: Vec<i64> = windows
+            .iter()
+            .flat_map(|w| w.iter().map(|t| i64::from(*t)))
+            .collect();
+        let tokens = Tensor::<B, 1, burn::tensor::Int>::from_ints(flat.as_slice(), device)
+            .reshape([config.batch_size, context]);
+
+        let (loss, metrics) = match &table {
+            Some(table) => model.next_token_loss_penalized(
+                tokens,
+                label_weights::<B>(&labels, table, device),
+                config.penalty,
+                span.clone(),
+            ),
+            None => model.next_token_loss(tokens, span.clone()),
+        };
+
+        if !metrics.loss.is_finite() {
+            // The same policy as the image loop: a pathological step is
+            // discarded, not clipped into something that looks fine.
+            report.steps_skipped += 1;
+            println!("step {step}: non-finite loss {}, step discarded", metrics.loss);
+            continue;
+        }
+
+        let grads = GradientsParams::from_grads(loss.backward(), &model);
+        model = optim.step(config.lr, model, grads);
+
+        if report.steps_taken == 0 {
+            report.first_loss = metrics.loss;
+            report.first_penalized_prob = metrics.penalized_prob;
+        }
+        report.last_loss = metrics.loss;
+        report.last_penalized_prob = metrics.penalized_prob;
+        report.steps_taken += 1;
+        report.penalized_tokens += metrics.penalized_tokens;
+        report.tokens_seen += metrics.tokens_counted;
+        loss_sum += f64::from(metrics.loss);
+
+        if config.log_every > 0 && (step % config.log_every == 0 || step + 1 == config.steps) {
+            let mut line = format!(
+                "step {step}: loss {:.4} ppl {:.2}",
+                metrics.loss, metrics.perplexity
+            );
+            if labeled {
+                line.push_str(&format!(
+                    " | {} labeled targets, p(bad) {:.4}, charge {:.4}",
+                    metrics.penalized_tokens, metrics.penalized_prob, metrics.penalty
+                ));
+            }
+            println!("{line}");
+            if let Some(logger) = logger.as_mut() {
+                logger.log(
+                    step,
+                    &[
+                        ("loss", crate::logging::jnum(metrics.loss)),
+                        ("perplexity", crate::logging::jnum(metrics.perplexity)),
+                        ("penalized_tokens", metrics.penalized_tokens.to_string()),
+                        ("penalized_prob", crate::logging::jnum(metrics.penalized_prob)),
+                        ("penalty", crate::logging::jnum(metrics.penalty)),
+                    ],
+                )?;
+            }
+        }
+    }
+
+    anyhow::ensure!(report.steps_taken > 0, "every step produced a non-finite loss");
+    report.mean_loss = (loss_sum / report.steps_taken as f64) as f32;
+    report.elapsed_secs = started.elapsed().as_secs_f64();
+    Ok((model, report))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1336,5 +1522,31 @@ mod tests {
             );
             assert!(summary.aborted.is_none(), "aborted: {:?}", summary.aborted);
         }
+    }
+
+    #[test]
+    fn test_train_lm_refuses_a_penalty_without_labels_and_runs_plainly_with_none() {
+        use crate::lm::LmConfig;
+        let dir = std::env::temp_dir().join("dblocks-train-lm-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("plain.txt");
+        std::fs::write(&source, "abcabcabcabcabcabcabcabcabcabcabc".repeat(4)).unwrap();
+        let path = dir.join("plain.bin");
+        TokenCorpus::tokenize_file(&source, &path).unwrap();
+        let mut corpus = TokenCorpus::in_memory(&path).unwrap();
+
+        let device = Default::default();
+        let model = LanguageModel::<DefaultTrainBackend>::new(&LmConfig::tiny(), &device);
+
+        let charged = LmTrainConfig { steps: 2, batch_size: 2, penalty: Unlikelihood::new(1.0), ..Default::default() };
+        let err = train_lm(model.clone(), &mut corpus, &charged, &device).unwrap_err().to_string();
+        assert!(err.contains("needs labels"), "unhelpful error: {err}");
+
+        let plain = LmTrainConfig { steps: 3, batch_size: 2, log_every: 0, ..Default::default() };
+        let (_, report) = train_lm(model, &mut corpus, &plain, &device).unwrap();
+        assert_eq!(report.steps_taken, 3);
+        assert_eq!(report.penalized_tokens, 0);
+        assert!(report.first_loss.is_finite() && report.last_loss.is_finite());
+        assert_eq!(report.tokens_seen, 3 * 2 * (LmConfig::tiny().context - 1));
     }
 }

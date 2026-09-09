@@ -212,7 +212,7 @@ invariants, not assumptions.
 
 - [x] **14.1–14.5** Every load-bearing identity is stated as a theorem and
       checked as a residual against a tolerance in `verify.rs`
-- [x] **14.6** Numerical verification — 74 certificates across 15 groups, run by
+- [x] **14.6** Numerical verification — 88 certificates across 17 groups, run by
       `dblocks verify` (non-zero exit on failure) and by the test suite
 
 **Status**: See [Quality gate](#quality-gate) below.
@@ -600,6 +600,91 @@ omission and its cost is written down above.
 
 ---
 
+## Phase 24: Negative Supervision for Code
+
+Ordinary next-token training has one signal: *make the corpus more likely*.
+Every `except: pass` in the training data is therefore a lesson in writing
+`except: pass`. This phase adds the other half of the signal: a rule set names
+the idioms that should **not** be learned, every token that belongs to one is
+labeled, and the loss charges the model for the probability it assigns to those
+tokens instead of rewarding it.
+
+- [x] **24.1** Rule language and built-in rules (`antipattern.rs`): a rule is a
+      *context* pattern that is matched but never penalized and a *body* pattern
+      that is matched **and** penalized -- for `except:\n    pass` nothing is
+      wrong with `except:`, the failure is choosing `pass` after it. Patterns are
+      matched by a small backtracking engine (literals, classes, `\s \w \d`, word
+      boundaries, greedy quantifiers; no groups or alternation -- an unescaped
+      `(` is a parse error, not a silent literal), over **token ids**, so a
+      special token ends every match and no rule can span two documents.
+      24 built-in rules across 4 categories (`error-swallowing`, `broad-catch`,
+      `suppressed-diagnostics`, `hardcoded-secret`) for Python, Rust, Go, Java,
+      JS/TS, C-family and language-agnostic secrets; every rule carries the
+      examples and counterexamples it is certified against, and `RuleSet` is
+      plain `serde` JSON with **no Burn dependency**
+- [x] **24.2** Labels on disk (`corpus.rs`): a `book.labels` sidecar holding one
+      `u8` per token in the same index space as `book.bin`, read with the same
+      one-seek window, plus `book.labels.json` naming the categories and their
+      penalty weights so a corpus can be trained on without the rule set that
+      produced it. Labels are computed over the whole corpus *before* windows
+      are cut, so a match straddling a window boundary is still found. A sidecar
+      of the wrong length is refused: it was made from a different corpus, and
+      every label after the first divergence would land on the wrong token
+- [x] **24.3** The objective (`lm.rs`): Welleck et al.'s unlikelihood
+      `-log(1 - p)` on labeled targets, **not** a negative weight on the
+      cross-entropy -- `w * log p` is unbounded below and one impossible bad
+      token would dominate the batch; `-log(1 - p)` is 0 when the pattern is
+      gone and floored at `-ln(eps)`. A charged target is *removed* from the
+      likelihood term (charging and rewarding one token is a tug of war, not a
+      signal); with `alpha = 0` nothing is removed and the objective is the plain
+      loss bit for bit while `p(bad)` is still measured
+- [x] **24.4** `train::train_lm` / `LmTrainConfig` / `LmTrainReport`: the LM
+      training loop, reporting `p(bad)` at the first and last step whether or
+      not it is charged -- which is how a plain run is shown to *learn* the
+      anti-patterns rather than merely tolerate them
+- [x] **24.5** CLI: `dblocks lm tokenize --label`, `lm label`, `lm scan`
+      (findings with line numbers), `lm rules` (export or `--check` a rule
+      file), `lm train --penalty`
+- [x] **24.6** Certificates (`antipattern` group, 7): every rule matches its
+      examples and none of its counterexamples; labels come back on the same
+      tokens through both readers; zero weights or zero alpha reproduce the
+      plain loss bit for bit; the unlikelihood term is 0 at `p = 0`, `ln 2` at
+      `p = 1/2` and `-ln(eps)` at `p = 1`; the objective recomputed from the raw
+      logits with each target in exactly one sum; and, on the real optimizer, a
+      penalized step ends with the flagged tokens **strictly less probable** than
+      the plain step from the same weights, while the plain step raises them
+- [#] **24.7** Code-quality signals (`codequality/`): per-language lexical and
+      structural scores, a `WindowFilter` (keep / down-weight / drop) and a
+      `QualityRegularizer` that pulls the loss toward a target score, with 7
+      certificates. Composes with 24.3 as three independent knobs. *Partial*:
+      the external-analyzer dimension shells out to `clippy`/`ruff`/`eslint`
+      behind the `codequality-external` feature and is unmeasured
+- [#] **24.8** Quality coder (`quality_coder/`, `docs/Quality-Coder.md`):
+      Task/Prompt/Patch contract, JSONL adapters for CodeReviewer, SWE-bench and
+      Code-Feedback, and an eval harness. *Design and scaffolding only*: it
+      targets a pretrained base model this crate cannot load
+
+**Status**: Done. Measured end to end by
+`integration_negative_supervision_unlearns_error_swallowing`: a corpus in which
+every handler swallows its error is trained on twice from one initialization and
+one window sequence. The plain run **learns** the anti-pattern -- `p(pass | except:)`
+rises above 0.25 -- and the charged run drives it more than 20x lower while its
+loss on the clean tokens still falls, and its greedy continuation after `except:`
+is no longer `pass`.
+
+One thing the measurement corrected: the unlikelihood gradient scales with `p`,
+so for the first few dozen steps generalization from `try:` raises `p(bad)`
+faster than the charge lowers it (0.004 -> 0.018 at step 30) before the charge
+takes over. "One penalized step lowers `p(bad)`" was therefore a certificate
+that failed at residuals near 1e-3 depending on the initialization; the
+comparative claim that *is* true to first order for any initialization --
+the penalized step ends below the plain step -- replaced it.
+
+What is *not* claimed: that lexical rules find every instance of an idiom, or
+that unlearning 24 idioms makes a model write good code. The rules are a
+reviewable, extensible floor; a learned detector would be the next step and
+needs labeled data this repository does not have.
+
 ## Mutation testing the gate
 
 A certificate that recomputes a formula proves the formula, which was never in
@@ -671,6 +756,8 @@ from current behaviour. The command exits non-zero on any failure, and
 | `moe` | Gates are a distribution; the balance loss lies in `[1, E]` on the diagonal; `max_e x_e <= logsumexp <= max_e x_e + ln E`; the z-loss is the squared distance of the log-sum-exp from zero; a per-row shift moves the z-loss but no routing probability |
 | `mosme` | Two-level gates compose into a distribution; one box reduces *exactly* to flat MoE; adding a disabled expert is bit-identical; a `-inf` mask gives an exactly zero gate |
 | `lm` | Tokenization is lossless; causal attention leaks *exactly* nothing backwards; an untrained tied head starts at `ln(vocab)`; top-1 sampling is greedy decoding; the KV cache matches full recompute under every chunking, and cached decoding emits identical tokens |
+| `antipattern` | Every rule matches its examples and none of its counterexamples; labels follow tokens through both readers; zero weights or zero alpha reproduce the plain loss bit for bit; the unlikelihood term is 0 at `p = 0` and bounded at `p = 1`; the objective recomputed from the logits with each target in exactly one sum; a penalized optimizer step ends strictly below the plain step, which raises `p(bad)` |
+| `codequality` | A regularizer at strength 0 is an exact zero; the identity filter policies keep every window at weight 1; analyzers are pure functions of the source; the geometric mean collapses on a zero dimension; the external analyzer without its feature is a no-op; down-weights lie in the closed interval |
 | `planner` | The budget is never exceeded, even against an `expand` that ignores its allowance; depth 0 *is* the greedy policy; `beam(1)` reproduces greedy exactly; only a plan's first step is committed; planned sigmas fall monotonically without undershooting; lookahead defeats a myopic trap |
 | `optim` | Accumulation over `k` steps equals one `k`x batch and fires on that cadence; the EMA is a convex combination that never extrapolates; the LR schedule is bounded, its ramp monotone; the uncertainty optimum is `ln L` and its gradient scale is 1 for every loss magnitude; importance sampling is unbiased with weights bounded by the smoothing floor |
 | `accuracy` | Guidance at scale 1 is bitwise identity and affine in the estimates elsewhere; every logit normalization preserves the arg-max; ensembles emit distributions and N copies of one member are that member; the scaling frontier is exactly the undominated set |
@@ -744,6 +831,7 @@ See [`docs/Quality-Gate.md`](docs/Quality-Gate.md).
 | `train.rs` | `logvar_head.take()` sat inside a tuple pattern, so a failed match on any *later* element would move the head out and drop it — silently disabling uncertainty weighting for the rest of the run while the startup banner still announced it. Latent rather than live, but one refactor away from firing. |
 | `multi_block.rs` | The trajectory planner rolled candidates forward with plain `euler_step` while the committed step used `SolverState`. For DPM++ 2M/3M — which integrate from a history of past x0 predictions — the planner was scoring candidates under dynamics the sampler would not follow. Rollouts now clone the real solver state per path, and draw noise from their own seeded RNG so speculation cannot perturb the committed trajectory's reproducibility. |
 | `tests/integration.rs` | `integration_mosme_trunk_trains_end_to_end` asserted `balance_loss >= 2.0`, treating the Switch bound `L >= 1` as unconditional. It holds only on the diagonal `f == p`, which hard top-k routing does not give — so the test was really pinning one draw from a *global* backend RNG, and adding any concurrent test that builds a model broke it. It now asserts the structural upper bound, which is a theorem. |
+| `verify.rs` | The certificate "one penalized step lowers `p(bad)`" asserted something that is not a theorem: the clean targets' likelihood gradient can raise `p(bad)` faster than the charge lowers it in one step, so it failed at residuals near 1e-3 that moved with the global backend RNG. Replaced by the comparative claim that holds to first order for any initialization: the penalized step ends strictly below the plain step from the same weights. |
 
 ## Remaining (requires external resources)
 
@@ -764,8 +852,8 @@ See [`docs/Quality-Gate.md`](docs/Quality-Gate.md).
 
 ## Test inventory
 
-310 unit + 22 integration tests, all passing; `cargo clippy --all-targets`
-clean; `cargo doc` warning-free. 74 numerical certificates in 15 groups, plus
+397 unit + 23 integration tests, all passing; `cargo clippy --all-targets`
+clean; `cargo doc` warning-free. 88 numerical certificates in 17 groups, plus
 five-phase verification inside every training run.
 
 ## How to Contribute

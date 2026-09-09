@@ -724,6 +724,87 @@ fn integration_lookahead_costs_more_than_greedy_planning() {
 }
 
 #[test]
+fn integration_negative_supervision_unlearns_error_swallowing() {
+    // The Phase 24 claim end to end. A corpus in which every handler swallows
+    // its error is tokenized, labeled and trained on twice from the same
+    // initialization and the same window sequence: once plainly, once with
+    // the flagged tokens charged. The plain run must *learn* `pass` after
+    // `except:`; the penalized run must drive it down -- and still fit the
+    // clean tokens, or the penalty would merely be breaking the model.
+    use diffusionblocks::antipattern::Labeler;
+    use diffusionblocks::corpus::TokenCorpus;
+    use diffusionblocks::lm::{LanguageModel, LmConfig, Sampling, Unlikelihood};
+    use diffusionblocks::tokenizer::ByteTokenizer;
+    use diffusionblocks::train::{train_lm, LmTrainConfig};
+
+    let device: Device = Default::default();
+    let dir = std::env::temp_dir().join("dblocks-lm-negative-integration");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("swallow.py");
+    let corpus_path = dir.join("swallow.bin");
+
+    let unit = "try:\n    f()\nexcept:\n    pass\n";
+    std::fs::write(&source, unit.repeat(40)).unwrap();
+    TokenCorpus::tokenize_file(&source, &corpus_path).unwrap();
+    let manifest = TokenCorpus::label_file(&corpus_path, &Labeler::builtin()).unwrap();
+    assert_eq!(manifest.labeled_tokens, 40 * ":pass".len(), "{}", manifest.render());
+
+    let mut corpus = TokenCorpus::streaming(&corpus_path).unwrap();
+    corpus.open_labels().unwrap();
+
+    let config = LmConfig { context: 32, ..LmConfig::tiny() };
+    <B as burn::tensor::backend::Backend>::seed(&device, 7);
+    let init = LanguageModel::<B>::new(&config, &device);
+
+    // 100 steps rather than 30: the unlikelihood gradient scales with p, so
+    // for the first few dozen steps generalization from `try:` raises p(bad)
+    // faster than the charge lowers it (0.004 -> 0.018 at step 30 in the
+    // Phase 24 measurement) before the charge takes over.
+    let base = LmTrainConfig { steps: 100, batch_size: 8, lr: 3e-3, log_every: 0, ..Default::default() };
+    let plain_cfg = LmTrainConfig { penalty: Unlikelihood::off(), ..base.clone() };
+    let charged_cfg = LmTrainConfig { penalty: Unlikelihood::new(1.0), ..base };
+
+    let (_, plain) = train_lm(init.clone(), &mut corpus, &plain_cfg, &device).unwrap();
+    let (charged_model, charged) = train_lm(init, &mut corpus, &charged_cfg, &device).unwrap();
+
+    assert_eq!(plain.steps_taken, 100);
+    assert!(plain.penalized_tokens > 0, "the labeled corpus must surface labeled targets");
+    assert!(
+        plain.last_penalized_prob > plain.first_penalized_prob && plain.last_penalized_prob > 0.25,
+        "plain training should learn the anti-pattern: p(bad) {} -> {}",
+        plain.first_penalized_prob,
+        plain.last_penalized_prob
+    );
+    assert!(
+        charged.last_penalized_prob < charged.first_penalized_prob,
+        "penalized training should unlearn it: p(bad) {} -> {}",
+        charged.first_penalized_prob,
+        charged.last_penalized_prob
+    );
+    assert!(
+        charged.last_penalized_prob < plain.last_penalized_prob / 20.0,
+        "the two runs should end far apart: charged {} vs plain {}",
+        charged.last_penalized_prob,
+        plain.last_penalized_prob
+    );
+    assert!(
+        charged.last_loss < charged.first_loss,
+        "the clean tokens must still be learned: {} -> {}",
+        charged.first_loss,
+        charged.last_loss
+    );
+
+    // ...and the trained model's own choice after `except:` is no longer `pass`.
+    let prompt = ByteTokenizer::new().encode("except:\n    ");
+    let out = charged_model.generate(&prompt, 4, &Sampling::Greedy, &mut StdRng::seed_from_u64(1), &device);
+    let continuation = ByteTokenizer::new().decode_lossy(&out[prompt.len()..]);
+    assert!(
+        !continuation.starts_with("pass"),
+        "after negative supervision the greedy continuation is still {continuation:?}"
+    );
+}
+
+#[test]
 fn integration_a_language_model_trains_on_a_corpus() {
     // The whole language path end to end: tokenize text, stream windows out of
     // a corpus file, take real optimizer steps, and check the loss actually

@@ -160,7 +160,7 @@ the Pareto frontier marked and the marginal accuracy per extra layer — see
 
 ## `dblocks lm`
 
-Language-model paths (Phases 19 and 21b).
+Language-model paths (Phases 19, 21b and 24).
 
 ### `dblocks lm tokenize`
 
@@ -168,13 +168,64 @@ Language-model paths (Phases 19 and 21b).
 |---|---|---|
 | `--input` | — | UTF-8 text file |
 | `--out` | — | Corpus file: little-endian `u16` tokens, no header |
+| `--label` | `false` | Also label anti-patterns, writing `<out>.labels` and `<out>.labels.json` (Phase 24) |
+| `--rules` | built-in | Rule set JSON for `--label` |
 
 ### `dblocks lm corpus`
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--path` | — | Corpus to describe. Opened streaming, so reporting never needs to hold it in memory |
+| `--path` | — | Corpus to describe. Opened streaming, so reporting never needs to hold it in memory. Reports the label manifest when one exists |
 | `--context` | `256` | Context length used to count training windows |
+
+### `dblocks lm label` (Phase 24)
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--corpus` | — | Existing corpus; writes `<corpus>.labels` and `<corpus>.labels.json` next to it |
+| `--rules` | built-in | Rule set JSON |
+
+### `dblocks lm scan` (Phase 24)
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--input` | — | Source file; findings are printed with line numbers and categories |
+| `--rules` | built-in | Rule set JSON |
+
+### `dblocks lm rules` (Phase 24)
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--out` | stdout | Write the built-in rule set as JSON, to extend it |
+| `--check` | — | Validate a rule file: every rule must match its examples and none of its counterexamples |
+
+### `dblocks lm score`
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--input` | — | Source file to score |
+| `--language` | `rust` | Analyzer language |
+| `--lexical` | `true` | Include the anti-pattern dimension |
+| `--structural` | `true` | Include the structural heuristics dimension |
+| `--external` | — | `clippy` \| `ruff` \| `eslint` \| a command; needs the `codequality-external` Cargo feature, else silently skipped |
+| `--out` | stdout | Write the JSON report here |
+
+### `dblocks lm train` (Phase 24)
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--corpus` | — | Corpus from `lm tokenize`; a `.labels` sidecar next to it is opened automatically |
+| `--steps` | `200` | |
+| `--batch-size` | `8` | |
+| `--lr` | `3e-4` | AdamW |
+| `--weight-decay` | `0.01` | |
+| `--penalty` | `0` | Unlikelihood coefficient on labeled targets. `0` trains plainly and only *measures* `p(bad)`; a positive value charges for them and requires labels |
+| `--streaming` | `false` | Sample windows from disk instead of loading the corpus |
+| `--tiny` | `false` | The small configuration, for CPU smoke runs |
+| `--seed` | `42` | |
+| `--log-every` | `10` | |
+| `--log` | — | Append-mode JSONL metrics (`loss`, `perplexity`, `penalized_tokens`, `penalized_prob`, `penalty`) |
+| `--out-dir` | `checkpoints` | Content-addressed checkpoint, stem `lm` |
 
 ### `dblocks lm generate`
 
@@ -190,6 +241,8 @@ Language-model paths (Phases 19 and 21b).
 | `--beam` | `3` | Beam width for `--lookahead` |
 | `--budget` | `32` | Candidate evaluations per committed token |
 | `--seed` | `1337` | |
+| `--checkpoint` | — | Weights from `dblocks lm train`; random when omitted |
+| `--tiny` | `false` | Must match the checkpoint's configuration |
 
 Weights are random unless a checkpoint is loaded, so the text is noise. What the
 command demonstrates is that the decoding paths agree and what each one costs.

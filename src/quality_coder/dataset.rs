@@ -481,7 +481,7 @@ mod tests {
         ]);
         let (examples, report) = load_swe_bench(&path).unwrap();
         assert_eq!(report.loaded, 1);
-        assert_eq!(examples[0].prompt.text.contains("Tests must pass"), true);
+        assert!(examples[0].prompt.text.contains("Tests must pass"));
         assert_eq!(examples[0].source, Source::SweBench);
     }
 

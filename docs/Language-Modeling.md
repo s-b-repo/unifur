@@ -5,10 +5,13 @@ tokenization, a structurally tied head, block-wise spans, MoSME routing, a
 key/value cache, and pre-tokenized corpora that stream from disk.
 
 > **In this repository.** `tokenizer.rs` (`ByteTokenizer`, `Special`,
-> `VOCAB_SIZE`), `corpus.rs` (`TokenCorpus`), `lm.rs` (`LmConfig`,
-> `LanguageModel`, `KvCache`, `Sampling`, `LookaheadStats`). The causal mask
+> `VOCAB_SIZE`), `corpus.rs` (`TokenCorpus`, label sidecars), `lm.rs`
+> (`LmConfig`, `LanguageModel`, `KvCache`, `Sampling`, `LookaheadStats`,
+> `Unlikelihood`), `train.rs` (`train_lm`, `LmTrainConfig`, `LmTrainReport`),
+> `antipattern.rs` (rules and labels for negative supervision). The causal mask
 > lives in `vit.rs` (`causal_mask`, `causal_mask_offset`, `ViTDiTConfig::causal`).
-> CLI: `dblocks lm tokenize | corpus | generate`. Certificates: the `lm` group.
+> CLI: `dblocks lm tokenize | corpus | label | scan | rules | train | generate`.
+> Certificates: the `lm` and `antipattern` groups.
 
 ---
 
@@ -186,6 +189,23 @@ Lookahead decoding is on its own page: [Next-Step Planning](Next-Step-Planning.m
 
 ---
 
+## Training, and what the corpus should not teach
+
+```bash
+dblocks lm train --corpus book.bin --steps 2000 --log run.jsonl
+dblocks lm train --corpus repo.bin --penalty 1.0      # charge labeled anti-patterns
+```
+
+`train_lm` is the LM training loop: AdamW over windows sampled from the corpus,
+a non-finite loss discarded rather than clipped, JSONL metrics, and a
+content-addressed checkpoint at the end. When the corpus carries a `.labels`
+sidecar the loss can **charge** the model for labeled tokens instead of
+rewarding it — a corpus full of `except: pass` is otherwise a lesson in writing
+`except: pass`. The rules, the label format and the unlikelihood objective are
+on their own page: [Negative Supervision](Negative-Supervision.md).
+
+---
+
 ## What is out of scope
 
 Loading pretrained Llama- or Mistral-class weights. It needs safetensors or GGUF
@@ -195,6 +215,7 @@ scratch.
 
 ---
 
-See also: [Architecture](Architecture.md) · [Next-Step Planning](Next-Step-Planning.md) ·
+See also: [Architecture](Architecture.md) · [Negative Supervision](Negative-Supervision.md) ·
+[Next-Step Planning](Next-Step-Planning.md) ·
 [Mixture of Specialized Micro Experts](Mixture-of-Specialized-Micro-Experts.md) ·
 [Quality Gate](Quality-Gate.md) · [Training Guide](Training-Guide.md)

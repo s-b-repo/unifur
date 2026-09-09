@@ -130,12 +130,12 @@ work on large-model questions, the practical options are:
    not a generator, that fits the codebase's design and gets the
    job done in 700 lines.
 
-4. **Use a hosted 700B model via API.** Don't train; just *use* a
+3. **Use a hosted 700B model via API.** Don't train; just *use* a
    700B model. Anthropic, OpenAI, Together, and others expose
    large models at API-call cost. Useful for evaluation, less
    useful for producing a deployable artifact.
 
-5. **Borrow a 700B model and fine-tune via LoRA on a single large
+4. **Borrow a 700B model and fine-tune via LoRA on a single large
    GPU.** With QLoRA, a 70B model fits in 24GB for inference and
    fine-tuning. A 700B model needs ~1.5TB of GPU RAM at full
    precision; ~150GB at 4-bit; still out of reach for most

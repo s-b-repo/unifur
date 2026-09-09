@@ -44,6 +44,92 @@ use crate::{
     vit::{DbLayer, LayerKvCache, TimestepEmbedder, ViTDiTConfig},
 };
 
+/// Unlikelihood penalty on labeled targets (roadmap Phase 24).
+///
+/// A target token carrying a label is a **negative** example: the model is
+/// charged for the probability it assigns to it rather than rewarded. The term
+/// is Welleck et al.'s unlikelihood, `-log(1 - p)`, not a negative weight on
+/// the cross-entropy. The distinction is the whole design:
+///
+/// - `-w * (-log p) = w * log p` is **unbounded below**. The model can drive
+///   the loss to `-inf` by making one bad token impossible, and that one term
+///   then dominates every real target in the batch.
+/// - `-log(1 - p)` is `0` when the bad token is impossible and grows without
+///   bound only as `p -> 1`. It rewards nothing; it stops charging once the
+///   pattern is gone.
+///
+/// `epsilon` floors `1 - p` so the term is finite even for a target the model
+/// is certain of: the largest single charge is `-ln(epsilon)`.
+///
+/// A penalized target is also **removed from the likelihood term**. Charging
+/// and rewarding the same token would leave the gradient at whichever term is
+/// currently larger, which is a tug of war rather than a signal. With
+/// `alpha = 0` nothing is removed either: the objective is then exactly the
+/// plain loss, and the flagged targets are only measured.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Unlikelihood {
+    /// Coefficient on the penalty. `0` disables the charge while the metrics
+    /// are still reported, which is how a plain run measures what it is
+    /// learning.
+    pub alpha: f32,
+    /// Floor on `1 - p` inside the logarithm.
+    pub epsilon: f32,
+}
+
+impl Default for Unlikelihood {
+    fn default() -> Self {
+        Self { alpha: 1.0, epsilon: 1e-6 }
+    }
+}
+
+impl Unlikelihood {
+    pub fn new(alpha: f32) -> Self {
+        Self { alpha, ..Self::default() }
+    }
+
+    /// Metrics only, no charge.
+    pub fn off() -> Self {
+        Self::new(0.0)
+    }
+
+    pub fn is_off(&self) -> bool {
+        self.alpha == 0.0
+    }
+
+    /// The most one token can contribute: `-ln(epsilon)`.
+    pub fn ceiling(&self) -> f32 {
+        -self.epsilon.ln()
+    }
+}
+
+/// The per-token unlikelihood term `-log(1 - p)` from log-probabilities,
+/// floored at `-log(epsilon)`.
+pub fn unlikelihood<B: Backend>(log_probs: Tensor<B, 1>, epsilon: f32) -> Tensor<B, 1> {
+    let p = log_probs.exp();
+    p.neg().add_scalar(1.0).clamp_min(epsilon).log().neg()
+}
+
+/// Per-token penalty weights from label bytes, via a label -> weight table
+/// such as [`crate::antipattern::LabelManifest::weight_table`].
+///
+/// Returns `[batch, n]` aligned with the tokens; a clean token weighs `0`.
+pub fn label_weights<B: Backend>(
+    labels: &[Vec<u8>],
+    table: &[f32; 256],
+    device: &B::Device,
+) -> Tensor<B, 2> {
+    let batch = labels.len();
+    let n = labels.first().map_or(0, Vec::len);
+    let flat: Vec<f32> = labels
+        .iter()
+        .flat_map(|row| {
+            assert_eq!(row.len(), n, "every label row must be the window length");
+            row.iter().map(|l| table[usize::from(*l)])
+        })
+        .collect();
+    Tensor::<B, 1>::from_floats(flat.as_slice(), device).reshape([batch, n])
+}
+
 /// Shape of a causal language model.
 #[derive(Debug, Clone)]
 pub struct LmConfig {
@@ -386,6 +472,33 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         tokens: Tensor<B, 2, Int>,
         span: std::ops::Range<usize>,
     ) -> (Tensor<B, 1>, LmMetrics) {
+        self.objective(tokens, span, None)
+    }
+
+    /// Next-token loss with labeled targets **charged** rather than rewarded
+    /// (roadmap Phase 24).
+    ///
+    /// `weights` is `[batch, n]`, aligned with `tokens`: a positive entry at
+    /// `[b, i]` makes token `i` a negative target with that weight on its
+    /// unlikelihood term, and removes it from the likelihood term. Build it
+    /// with [`label_weights`]. With every weight zero this is exactly
+    /// [`Self::next_token_loss`], bit for bit.
+    pub fn next_token_loss_penalized(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        weights: Tensor<B, 2>,
+        penalty: Unlikelihood,
+        span: std::ops::Range<usize>,
+    ) -> (Tensor<B, 1>, LmMetrics) {
+        self.objective(tokens, span, Some((weights, penalty)))
+    }
+
+    fn objective(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        span: std::ops::Range<usize>,
+        negatives: Option<(Tensor<B, 2>, Unlikelihood)>,
+    ) -> (Tensor<B, 1>, LmMetrics) {
         let device = tokens.device();
         let [b, n] = tokens.dims();
         assert!(n >= 2, "next-token loss needs at least two positions");
@@ -400,7 +513,8 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         let flat_targets = targets.clone().reshape([b * (n - 1), 1]);
 
         let log_probs = log_softmax(flat_logits, 1);
-        let nll = -log_probs.gather(1, flat_targets).squeeze_dim::<1>(1); // [b*(n-1)]
+        let target_log_prob = log_probs.gather(1, flat_targets).squeeze_dim::<1>(1); // [b*(n-1)]
+        let nll = -target_log_prob.clone();
 
         // Mask padding out of both the numerator and the denominator.
         let pad = Tensor::<B, 1, Int>::full([b * (n - 1)], Special::Pad.id() as i64, &device);
@@ -410,7 +524,49 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             .bool_not()
             .float();
         let counted = keep.clone().sum().clamp_min(1.0);
-        let loss = (nll * keep).sum() / counted.clone();
+
+        let (loss, penalized_tokens, penalty, penalized_prob) = match negatives {
+            None => ((nll * keep).sum() / counted.clone(), 0, 0.0, 0.0),
+            Some((weights, unlikelihood_term)) => {
+                assert_eq!(weights.dims(), [b, n], "weights must be shaped like the tokens");
+                let w = weights.narrow(1, 1, n - 1).reshape([b * (n - 1)]);
+                // A flagged target is measured whether or not it is charged;
+                // a padded position is neither.
+                let flagged = w.clone().greater_elem(0.0).float() * keep.clone();
+                let count = flagged.clone().sum();
+                let per_flagged = count.clone().clamp_min(1.0);
+                let prob = (target_log_prob.clone().exp() * flagged.clone()).sum() / per_flagged.clone();
+                let charge = unlikelihood(target_log_prob, unlikelihood_term.epsilon) * w * flagged.clone();
+                let charge_sum = charge.sum();
+
+                // With the penalty off, the objective *is* the plain one: the
+                // flagged targets stay in the likelihood and are merely
+                // reported on. Removing them while charging nothing would be
+                // a third objective -- "never learn these, never unlearn
+                // them" -- and it was, briefly: a run with `alpha = 0` showed
+                // p(bad) falling to 0.001 while its loss fell to 0.17, which
+                // is impossible for a model being trained on those tokens.
+                let negative = if unlikelihood_term.is_off() {
+                    flagged.zeros_like()
+                } else {
+                    flagged
+                };
+                let positive = keep - negative;
+                let likelihood = (nll * positive).sum();
+
+                // Both terms share the denominator, so a batch with few
+                // negatives is not dominated by them and a batch with none
+                // reduces to the plain loss exactly.
+                let loss = (likelihood + charge_sum.clone().mul_scalar(unlikelihood_term.alpha))
+                    / counted.clone();
+                (
+                    loss,
+                    count.into_scalar() as usize,
+                    (charge_sum / per_flagged).into_scalar(),
+                    prob.into_scalar(),
+                )
+            }
+        };
 
         let value: f32 = loss.clone().into_scalar();
         let metrics = LmMetrics {
@@ -421,6 +577,9 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
                 .balance_loss
                 .as_ref()
                 .map_or(0.0, |aux| aux.balance.clone().into_scalar()),
+            penalized_tokens,
+            penalty,
+            penalized_prob,
         };
 
         // The balance term is scaled; the z-loss already carries its own
@@ -717,6 +876,14 @@ pub struct LmMetrics {
     /// Non-padding targets the loss was averaged over.
     pub tokens_counted: usize,
     pub balance_loss: f32,
+    /// Targets carrying a penalty weight (roadmap Phase 24); 0 without labels.
+    pub penalized_tokens: usize,
+    /// Mean weighted unlikelihood charge over the penalized targets.
+    pub penalty: f32,
+    /// Mean probability the model assigned to the penalized targets — the
+    /// number negative supervision exists to drive down, reported whether or
+    /// not it is being charged for.
+    pub penalized_prob: f32,
 }
 
 /// How the next token is chosen.
@@ -801,6 +968,136 @@ mod tests {
     fn tokens(device: &<B as burn::tensor::backend::BackendTypes>::Device, ids: &[u16]) -> Tensor<B, 2, Int> {
         let v: Vec<i64> = ids.iter().map(|t| *t as i64).collect();
         Tensor::<B, 1, Int>::from_ints(v.as_slice(), device).reshape([1, v.len()])
+    }
+
+    fn logp_of_targets(m: &LanguageModel<B>, ids: &[u16], device: &<B as burn::tensor::backend::BackendTypes>::Device) -> Vec<f32> {
+        // log p(target_j | prefix) for j = 0..n-1, straight from the logits.
+        let n = ids.len();
+        let logits = m.forward(tokens(device, ids)).logits.narrow(1, 0, n - 1).reshape([n - 1, VOCAB_SIZE]);
+        let lp: Vec<f32> = log_softmax(logits, 1).into_data().convert::<f32>().iter::<f32>().collect();
+        (0..n - 1).map(|j| lp[j * VOCAB_SIZE + ids[j + 1] as usize]).collect()
+    }
+
+    #[test]
+    fn test_penalized_loss_with_no_labels_is_the_plain_loss_bitwise() {
+        // Every run with labels open but nothing flagged in the batch goes
+        // through the penalized path; it must cost exactly nothing.
+        let (m, device) = model();
+        let ids = [65u16, 66, 67, 68, 69, 70];
+        let (plain, pm) = m.next_token_loss(tokens(&device, &ids), 0..m.num_layers());
+        let zeros = Tensor::<B, 2>::zeros([1, ids.len()], &device);
+        let (penalized, qm) =
+            m.next_token_loss_penalized(tokens(&device, &ids), zeros, Unlikelihood::default(), 0..m.num_layers());
+        assert_eq!(plain.into_scalar().to_bits(), penalized.into_scalar().to_bits());
+        assert_eq!(qm.tokens_counted, pm.tokens_counted);
+        assert_eq!((qm.penalized_tokens, qm.penalty, qm.penalized_prob), (0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn test_a_penalized_target_is_charged_and_leaves_the_likelihood() {
+        // Recomputed by hand from the logits: the loss must be
+        //   (sum over positives of -log p + alpha * sum over negatives of w * -log(1 - p)) / counted
+        // with each negative in exactly one of the two sums.
+        let (m, device) = model();
+        let ids = [65u16, 66, 67, 68, 69];
+        let logp = logp_of_targets(&m, &ids, &device);
+
+        // Token 2 (target of position 1) at half weight, token 4 at full.
+        let w = [0.0f32, 0.0, 0.5, 0.0, 1.0];
+        let weights = Tensor::<B, 1>::from_floats(w.as_slice(), &device).reshape([1, 5]);
+        let penalty = Unlikelihood { alpha: 2.0, epsilon: 1e-6 };
+        let (loss, metrics) =
+            m.next_token_loss_penalized(tokens(&device, &ids), weights, penalty, 0..m.num_layers());
+
+        let mut likelihood = 0.0f32;
+        let mut charge = 0.0f32;
+        let mut prob = 0.0f32;
+        for j in 0..4 {
+            let wj = w[j + 1];
+            if wj > 0.0 {
+                charge += wj * -((1.0 - logp[j].exp()).max(penalty.epsilon)).ln();
+                prob += logp[j].exp();
+            } else {
+                likelihood += -logp[j];
+            }
+        }
+        let expected = (likelihood + penalty.alpha * charge) / 4.0;
+        let got = loss.into_scalar();
+        assert!((got - expected).abs() < 1e-5 * expected.abs().max(1.0), "loss {got} vs hand {expected}");
+        assert_eq!(metrics.penalized_tokens, 2);
+        assert!((metrics.penalty - charge / 2.0).abs() < 1e-5, "{} vs {}", metrics.penalty, charge / 2.0);
+        assert!((metrics.penalized_prob - prob / 2.0).abs() < 1e-6);
+        assert_eq!(metrics.tokens_counted, 4);
+    }
+
+    #[test]
+    fn test_a_penalty_of_zero_is_the_plain_objective_with_metrics() {
+        // "Measure only" must train on the flagged tokens exactly as a plain
+        // run would. The first version excluded them from the likelihood
+        // while charging nothing, and a plain run's p(bad) *fell* -- the
+        // metric was measuring tokens the model was never shown.
+        let (m, device) = model();
+        let ids = [65u16, 66, 67, 68, 69];
+        let w = [0.0f32, 0.0, 1.0, 0.0, 0.5];
+        let weights = Tensor::<B, 1>::from_floats(w.as_slice(), &device).reshape([1, 5]);
+        let (plain, _) = m.next_token_loss(tokens(&device, &ids), 0..m.num_layers());
+        let (off, metrics) =
+            m.next_token_loss_penalized(tokens(&device, &ids), weights, Unlikelihood::off(), 0..m.num_layers());
+        assert_eq!(plain.into_scalar().to_bits(), off.into_scalar().to_bits());
+        assert_eq!(metrics.penalized_tokens, 2, "still counted");
+        assert!(metrics.penalized_prob > 0.0 && metrics.penalty > 0.0, "still measured");
+    }
+
+    #[test]
+    fn test_padding_is_never_a_negative_target() {
+        // A weight on a padded position must not conjure a negative: padding
+        // is outside both sums, whatever the label file says about it.
+        let (m, device) = model();
+        let pad = Special::Pad.id();
+        let ids = [65u16, 66, pad, pad];
+        let w = [0.0f32, 0.0, 1.0, 1.0];
+        let weights = Tensor::<B, 1>::from_floats(w.as_slice(), &device).reshape([1, 4]);
+        let (plain, _) = m.next_token_loss(tokens(&device, &ids), 0..m.num_layers());
+        let (penalized, metrics) =
+            m.next_token_loss_penalized(tokens(&device, &ids), weights, Unlikelihood::default(), 0..m.num_layers());
+        assert_eq!(metrics.penalized_tokens, 0);
+        assert_eq!(metrics.tokens_counted, 1);
+        assert_eq!(plain.into_scalar().to_bits(), penalized.into_scalar().to_bits());
+    }
+
+    #[test]
+    fn test_unlikelihood_is_zero_when_impossible_and_bounded_when_certain() {
+        // The property that makes this a penalty rather than a negative
+        // reward: nothing to gain below zero, and no way to reach -inf.
+        let device = Default::default();
+        let eps = 1e-6f32;
+        let term: Vec<f32> = unlikelihood(
+            Tensor::<B, 1>::from_floats([-40.0f32, 0.5f32.ln(), 0.0], &device),
+            eps,
+        )
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect();
+        assert!(term[0].abs() < 1e-12, "impossible token: {}", term[0]);
+        assert!((term[1] - 2f32.ln()).abs() < 1e-6, "p = 1/2: {}", term[1]);
+        assert!((term[2] - Unlikelihood { alpha: 1.0, epsilon: eps }.ceiling()).abs() < 1e-4, "certain token: {}", term[2]);
+        assert!(term[0] < term[1] && term[1] < term[2], "must increase with p");
+    }
+
+    #[test]
+    fn test_label_weights_follow_the_table() {
+        let device = Default::default();
+        let mut table = [0.0f32; 256];
+        table[1] = 1.0;
+        table[2] = 0.25;
+        let labels = vec![vec![0u8, 1, 2], vec![2, 0, 1]];
+        let w: Vec<f32> = label_weights::<B>(&labels, &table, &device)
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
+        assert_eq!(w, vec![0.0, 1.0, 0.25, 0.25, 0.0, 1.0]);
     }
 
     #[test]

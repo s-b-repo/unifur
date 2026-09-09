@@ -42,7 +42,7 @@ with an accurate "In this repository" block naming the module, types and flags
 that implement it.
 
 ```bash
-# Build and run the quality gate: 40 numerical certificates, non-zero exit on
+# Build and run the quality gate: 88 numerical certificates, non-zero exit on
 # any failure.
 cargo build --release
 ./target/release/dblocks verify
@@ -86,6 +86,12 @@ cargo build --release
 
 # Inspect the sigma schedule and block windows.
 ./target/release/dblocks sigmas --num-blocks 3
+
+# Language model: tokenize, label anti-patterns, train with the unlikelihood
+# charge, generate with a KV cache or with lookahead planning.
+./target/release/dblocks lm tokenize --input repo.txt --out repo.bin --label
+./target/release/dblocks lm train --corpus repo.bin --penalty 1.0
+./target/release/dblocks lm generate --prompt "def " --cached --checkpoint checkpoints/lm-<hash>.mpk
 ```
 
 Development loop:
@@ -109,6 +115,13 @@ cargo test --all && cargo clippy --all-targets && ./target/release/dblocks verif
 | Block distillation | `distill.rs` |
 | NF4 quantization + LoRA (QLoRA) | `quantize.rs` |
 | Adaptive depth, loop graph | `adaptive.rs`, `loopgraph.rs` |
+| Next-step and path prediction (beam search) | `planner.rs` |
+| Post-training accuracy: guidance, normalization, ensembling, scaling | `accuracy.rs` |
+| LR schedules, EMA, accumulation, clipping; per-sigma reweighting | `schedule.rs`, `reweight.rs` |
+| Causal language model, byte tokenizer, corpora | `lm.rs`, `tokenizer.rs`, `corpus.rs` |
+| Anti-pattern rules and labels for negative supervision | `antipattern.rs` |
+| Code-quality signals, window filter, quality regularizer | `codequality/` |
+| Quality-coder scaffolding (design only) | `quality_coder/` |
 | Quality gates: sampling *and* training phases | `quality.rs` |
 | Mixed-precision emulation and policy | `precision.rs` |
 | Datasets and streaming I/O | `data.rs`, `rawdata.rs`, `cifar.rs`, `tinyimagenet.rs` |

@@ -28,10 +28,11 @@ Two documents are authoritative about what is and is not implemented:
 
 ```bash
 cargo build --release
-./target/release/dblocks verify        # 74 certificates, non-zero exit on failure
+./target/release/dblocks verify        # 88 certificates, non-zero exit on failure
 ./target/release/dblocks train --steps 200
 ./target/release/dblocks sample --planned --plan-depth 2   # plan the trajectory
 ./target/release/dblocks lm generate --lookahead 2         # plan the tokens
+./target/release/dblocks lm train --corpus repo.bin --penalty 1   # unlearn labeled anti-patterns
 ./target/release/dblocks --help
 ```
 
@@ -53,6 +54,7 @@ cargo build --release
 - [Flow Matching](Flow-Matching.md) — rectified flow as an alternative objective
 - [Loss Reduction](Loss-Reduction.md) — schedules, EMA, uncertainty weighting, importance sampling
 - [Language Modeling](Language-Modeling.md) — byte tokenizer, causal trunk, KV cache, corpora
+- [Negative Supervision](Negative-Supervision.md) — anti-pattern rules, labeled corpora, the unlikelihood charge
 - [Next-Step Planning](Next-Step-Planning.md) — beam search over trajectories and tokens
 - [Accuracy Improvements](Accuracy-Improvements.md) — guidance, normalization, ensembling, compute scaling
 
@@ -68,6 +70,8 @@ cargo build --release
 - [Mathematical Foundation](Mathematical-Foundation.md) — the theory, and which parts are certified
 - [Architecture](Architecture.md) — ViT-DiT backbone and block partitioning
 - [Precision & I/O](Precision-IO.md) — mixed precision, streaming reads, profiling
+- [Quality Coder](Quality-Coder.md) — design document for the agentic code refiner (scaffolding only)
+- [Model Parallelism](Model-Parallelism.md) — why block-wise training is not model parallelism, and what is
 - [FAQ](FAQ.md)
 
 ---
@@ -83,6 +87,9 @@ cargo build --release
 | Next-step and path prediction | `planner.rs` |
 | Post-training accuracy techniques | `accuracy.rs` |
 | Causal language model, tokenizer, corpora | `lm.rs`, `tokenizer.rs`, `corpus.rs` |
+| Anti-pattern rules and labels for negative supervision | `antipattern.rs` |
+| Code-quality signals, window filter, quality regularizer | `codequality/` |
+| Quality-coder scaffolding: data adapters, eval harness | `quality_coder/` |
 | LR schedules, EMA, accumulation, clipping | `schedule.rs` |
 | Per-sigma uncertainty weighting, importance sampling | `reweight.rs` |
 | Consistency and cross-fork objectives | `consistency.rs` |
