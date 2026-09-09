@@ -61,6 +61,9 @@ pub struct StepMetrics {
     /// MoE load-balancing auxiliary loss of the executed span; `0.0` for a
     /// dense trunk.
     pub balance_loss: f32,
+    /// Per-sparse-layer routing statistics of the executed span, in execution
+    /// order; empty for a dense trunk (roadmap 23.6).
+    pub routing: Vec<crate::moe::RoutingStats>,
 }
 
 /// The pieces of one training step, kept separate so a caller can reweight
@@ -95,6 +98,10 @@ pub struct StepParts<B: Backend> {
     /// values — see the note in `training_step_on` for why that ordering is
     /// the one that keeps both the estimator and the uncertainty head honest.
     pub importance: Option<Tensor<B, 1>>,
+    /// The executed span's per-layer routing, still on the device. Its
+    /// `prob_mass` is what a global-batch balance term differentiates through
+    /// (roadmap 23.4).
+    pub routing: Vec<crate::moe::LayerRouting<B>>,
     pub metrics: StepMetrics,
 }
 
@@ -168,6 +175,39 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
     }
 
     /// Weight applied to the MoE load-balancing auxiliary loss.
+    /// Attach zero selection biases to every sparse layer that lacks one
+    /// (roadmap 23.5). Call after loading a checkpoint: Burn zips an `Option`
+    /// field with its record, so a bias missing on either side comes back as
+    /// `None`.
+    pub fn ensure_balance_biases(&mut self) {
+        let n = self.model.vit().num_layers();
+        self.model.vit_mut().for_each_sparse_layer_mut(0..n, |_, mut layer| layer.ensure_balance_bias());
+    }
+
+    /// Nudge the selection biases of block `block_idx`'s sparse layers against
+    /// the loads they just produced (roadmap 23.5). `loads` is the
+    /// [`StepMetrics::routing`] of a step on that block: one entry per sparse
+    /// layer, in execution order, which is the order the layers are visited.
+    pub fn nudge_balance_biases(
+        &mut self,
+        block_idx: usize,
+        loads: &[crate::moe::RoutingStats],
+        rate: f32,
+    ) {
+        let range = self.layer_range(block_idx);
+        self.model.vit_mut().for_each_sparse_layer_mut(range, |nth, mut layer| {
+            if let Some(stats) = loads.get(nth) {
+                layer.nudge_balance_bias(&stats.load, rate);
+            }
+        });
+    }
+
+    /// Selection biases of every sparse layer that has one, in layer order
+    /// (roadmap 23.5).
+    pub fn balance_biases(&self) -> Vec<Vec<f32>> {
+        self.model.vit().balance_biases()
+    }
+
     pub fn moe_aux_weight(&self) -> f64 {
         self.moe_aux_weight
     }
@@ -407,8 +447,10 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
 
         let (logits, aux) =
             self.denoise_span_with_aux(pixel_values, zt, sigmas, self.layer_range(block_idx));
-        let balance = aux.as_ref().map(|a| a.balance.clone());
-        let z = aux.map(|a| a.z);
+        let (balance, z, routing) = match aux {
+            Some(a) => (Some(a.balance), Some(a.z), a.layers),
+            None => (None, None, Vec::new()),
+        };
 
         // Per-sample cross entropy.
         let log_probs = log_softmax(logits, 1);
@@ -475,8 +517,9 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             ce_loss: ce_loss.into_scalar(),
             block_idx,
             balance_loss: m_balance,
+            routing: routing.iter().map(crate::moe::LayerRouting::to_host).collect(),
         };
-        StepParts { loss, metrics, per_sample, balance, z, importance }
+        StepParts { loss, metrics, per_sample, balance, z, importance, routing }
     }
 
     /// Euler-integrated classification (`diffusion_step`): integrate the

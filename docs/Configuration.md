@@ -100,6 +100,18 @@ See [Quality Gate](Quality-Gate.md).
 | `--moe-every` | — | Replace every *n*-th layer's MLP with an MoE layer |
 | `--moe-experts` | `4` | Experts per MoE layer |
 | `--moe-top-k` | `1` | Experts weighted per token |
+| `--mosme-spec` | — | Boxes-of-experts JSON; enables MoSME (conflicts with `--moe-every`) |
+| `--mosme-every` | `2` | Which trunk layers get expert boxes |
+| `--z-level` | `1e-3` | Router z-loss weight (ST-MoE); `0` disables it exactly |
+| `--balance-schedule` | `constant` | `constant` \| `anneal` — how the balance-loss weight evolves |
+| `--balance-weight` | `0.01` | Starting balance-loss weight |
+| `--balance-scope` | `micro` | `micro` \| `global` (Phase 23.4). `global` measures the expert load over the `--accumulate` window instead of each micro-batch alone, so the router is not pushed to balance every micro-batch by itself. Flat MoE only for now |
+| `--bias-balance-rate` | `0` | Loss-free bias balancing (Phase 23.5): move each router's selection bias by this much per step against its observed load. `0` is off and attaches no bias. DeepSeek-V3 uses `1e-3` |
+
+Routing diagnostics (Phase 23.6) need no flag: every MoE or MoSME run logs
+`load_entropy`, `token_entropy`, `min_load`, `max_load` and the per-layer
+`routing_load` array to the JSONL file, and the end-of-run per-block table
+gains `load H` and `token H` columns. See [MoE Routing](MoE-Routing.md).
 
 ### Output
 

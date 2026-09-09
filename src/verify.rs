@@ -1059,7 +1059,254 @@ fn moe_certificates() -> Vec<Certificate> {
     // The z-loss must actually register the shift; 0 if it does, 1 if not.
     let z_sees_the_shift = f64::from(u8::from(z_after <= z_before * 10.0));
 
+    // ------------------------------------------------------------------
+    // Routing diagnostics (roadmap 23.6). Two normalized entropies, and the
+    // point is that they can disagree: a balanced load says nothing about
+    // whether any token was *decided*. The middle row of the table in
+    // `RoutingStats` -- balanced load, hedging tokens -- is exactly what a
+    // per-micro-batch balance loss produces and exactly what its own value
+    // cannot show.
+    use crate::moe::{layer_routing, normalized_entropy, switch_loss_from_parts, RoutingStats};
+    let mut entropy_err = f64::from((normalized_entropy(&[0.25; 4]) - 1.0).abs())
+        .max(f64::from(normalized_entropy(&[1.0, 0.0, 0.0, 0.0]).abs()));
+    let (t, e) = (8usize, 4usize);
+    let round_robin: Vec<i64> = (0..t).map(|i| (i % e) as i64).collect();
+    let top1 = Tensor::<B, 1, Int>::from_ints(round_robin.as_slice(), &device).reshape([t, 1]);
+    // Balanced load, every token hedging uniformly: both entropies are 1.
+    let hedging = layer_routing(&Tensor::<B, 2>::full([t, e], 0.25, &device), &top1, e).to_host();
+    entropy_err = entropy_err
+        .max(f64::from((hedging.load_entropy - 1.0).abs()))
+        .max(f64::from((hedging.token_entropy - 1.0).abs()));
+    // Balanced load, every token certain: load entropy 1, token entropy 0.
+    let mut confident = vec![0.0f32; t * e];
+    for i in 0..t {
+        confident[i * e + i % e] = 1.0;
+    }
+    let specialized = layer_routing(
+        &Tensor::<B, 1>::from_floats(confident.as_slice(), &device).reshape([t, e]),
+        &top1,
+        e,
+    )
+    .to_host();
+    entropy_err = entropy_err
+        .max(f64::from((specialized.load_entropy - 1.0).abs()))
+        .max(f64::from(specialized.token_entropy.abs()));
+    // Collapse: every token to expert 0, load entropy 0.
+    let collapsed = layer_routing(
+        &Tensor::<B, 2>::full([t, e], 0.25, &device),
+        &Tensor::<B, 2, Int>::zeros([t, 1], &device),
+        e,
+    )
+    .to_host();
+    entropy_err = entropy_err.max(f64::from(collapsed.load_entropy.abs()));
+
+    // The statistics a real layer reports must be what its own routing
+    // probabilities imply, recomputed on the host from the router's logits.
+    let stats_layer = MoELayer::<B>::new(&MoEConfig::new(8, 4, 4).with_top_k(2), &device);
+    let sx = Tensor::<B, 3>::random([2, 3, 8], Distribution::Uniform(-1.0, 1.0), &device);
+    let sc = Tensor::<B, 2>::random([2, 4], Distribution::Uniform(-1.0, 1.0), &device);
+    let reported = stats_layer.forward(sx.clone(), sc.clone()).routing;
+    let host_probs: Vec<f32> = softmax(stats_layer.router_logits(&sx, &sc), 1)
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect();
+    let (st, se) = (6usize, 4usize);
+    let mut host_load = vec![0.0f32; se];
+    let mut host_entropy = 0.0f64;
+    for row in 0..st {
+        let r = &host_probs[row * se..(row + 1) * se];
+        let argmax = (0..se).max_by(|a, b| r[*a].partial_cmp(&r[*b]).unwrap()).unwrap();
+        host_load[argmax] += 1.0 / st as f32;
+        host_entropy -= r.iter().map(|&v| f64::from(v) * f64::from(v).ln()).sum::<f64>();
+    }
+    let host = RoutingStats::from_load(host_load, (host_entropy / st as f64) as f32, st);
+    let got = reported.to_host();
+    let mut stats_err = f64::from((got.token_entropy - host.token_entropy).abs())
+        .max(f64::from((got.load_entropy - host.load_entropy).abs()));
+    for (a, b) in got.load.iter().zip(&host.load) {
+        stats_err = stats_err.max(f64::from((a - b).abs()));
+    }
+    if got.tokens != st || got.experts() != se {
+        stats_err = 1.0;
+    }
+
+    // ------------------------------------------------------------------
+    // Global-batch load (roadmap 23.4). A window of one micro-batch is the
+    // micro-batch: the load goes to the host and back as f32, which is exact,
+    // and the recombination is the same two ops the fused loss uses.
+    let micro = stats_layer.forward(sx.clone(), sc.clone());
+    let mut one = crate::schedule::GlobalLoad::new(1);
+    let f_global = one.observe(0, &micro.routing.to_host().load);
+    let global = switch_loss_from_parts(
+        Tensor::<B, 1>::from_floats(f_global.as_slice(), &device).reshape([1, se]),
+        micro.routing.prob_mass.clone().reshape([1, se]),
+        se,
+    );
+    let window_one_err =
+        f64::from(u8::from(global.into_scalar().to_bits() != micro.balance.into_scalar().to_bits()));
+
+    // And the reason to want it: two micro-batches that each route entirely to
+    // a *different* expert are perfectly balanced together and perfectly
+    // imbalanced apart. Per micro-batch the Switch loss is `E` for both; over
+    // the window the second one costs `E/2`.
+    let (gt, ge) = (4usize, 4usize);
+    let onehot = |col: usize| {
+        let mut v = vec![0.0f32; gt * ge];
+        for row in 0..gt {
+            v[row * ge + col] = 1.0;
+        }
+        Tensor::<B, 1>::from_floats(v.as_slice(), &device).reshape([gt, ge])
+    };
+    let ones_col = Tensor::<B, 2>::ones([gt, 1], &device);
+    let (probs_a, top_a) = (onehot(0), Tensor::<B, 2, Int>::zeros([gt, 1], &device));
+    let (probs_b, top_b) = (onehot(1), Tensor::<B, 2, Int>::ones([gt, 1], &device));
+    let micro_a = f64::from(crate::moe::weighted_switch_loss(&probs_a, &top_a, &ones_col, ge).into_scalar());
+    let micro_b = f64::from(crate::moe::weighted_switch_loss(&probs_b, &top_b, &ones_col, ge).into_scalar());
+    let mut two = crate::schedule::GlobalLoad::new(2);
+    two.observe(0, &layer_routing(&probs_a, &top_a, ge).to_host().load);
+    let f_b = two.observe(0, &layer_routing(&probs_b, &top_b, ge).to_host().load);
+    let routing_b = layer_routing(&probs_b, &top_b, ge);
+    let global_b = f64::from(
+        switch_loss_from_parts(
+            Tensor::<B, 1>::from_floats(f_b.as_slice(), &device).reshape([1, ge]),
+            routing_b.prob_mass.reshape([1, ge]),
+            ge,
+        )
+        .into_scalar(),
+    );
+    let specialization_err = (micro_a - ge as f64)
+        .abs()
+        .max((micro_b - ge as f64).abs())
+        .max((global_b - ge as f64 / 2.0).abs());
+
+    // ------------------------------------------------------------------
+    // Loss-free bias balancing (roadmap 23.5). The bias must be able to move
+    // the *selection* without touching a selected expert's *gate*, and a bias
+    // of zero -- or one that is equal on every expert -- must change nothing
+    // at all, to the bit.
+    use crate::moe::TopKRouter;
+    let bias_cfg = MoEConfig::new(8, 4, 4).with_top_k(2);
+    let plain = MoELayer::<B>::new(&bias_cfg, &device);
+    let bx = Tensor::<B, 3>::random([2, 3, 8], Distribution::Uniform(-1.0, 1.0), &device);
+    let bc = Tensor::<B, 2>::random([2, 4], Distribution::Uniform(-1.0, 1.0), &device);
+    // Forcing every parameter before cloning: an un-forced `Param` draws its
+    // own weights on each clone (see `tensor_ext`).
+    let plain_out = plain.forward(bx.clone(), bc.clone());
+    let rebias = |bias: Tensor<B, 2>| {
+        MoELayer::from_parts(
+            TopKRouter::from_parts(plain.router().weight(), plain.router().bias())
+                .with_balance_bias(Some(bias)),
+            plain.experts().to_vec(),
+            plain.top_k(),
+            true,
+            plain.z_level(),
+        )
+    };
+    let bits = |t: Tensor<B, 3>| -> Vec<u32> {
+        t.into_data().convert::<f32>().iter::<f32>().map(f32::to_bits).collect()
+    };
+    let plain_bits = bits(plain_out.output.clone());
+    let plain_balance = plain_out.balance.into_scalar().to_bits();
+    let mut identity_err = 0.0f64;
+    for bias in [Tensor::<B, 2>::zeros([1, 4], &device), Tensor::<B, 2>::full([1, 4], 3.5, &device)] {
+        let out = rebias(bias).forward(bx.clone(), bc.clone());
+        if bits(out.output) != plain_bits || out.balance.into_scalar().to_bits() != plain_balance {
+            identity_err = 1.0;
+        }
+    }
+    // A large bias on expert 2 puts it in every token's top-2; the gate values
+    // are still the unbiased probabilities of whoever was selected.
+    let logits = plain.router_logits(&bx, &bc);
+    let probs = softmax(logits.clone(), 1);
+    let steered = TopKRouter::from_parts(plain.router().weight(), plain.router().bias())
+        .with_balance_bias(Some(Tensor::<B, 1>::from_floats([0.0f32, 0.0, 50.0, 0.0], &device).reshape([1, 4])));
+    let (vals, idx) = steered.select(&logits, &probs, 2);
+    let idx: Vec<i64> = idx.into_data().convert::<i64>().iter::<i64>().collect();
+    let vals: Vec<f32> = vals.into_data().convert::<f32>().iter::<f32>().collect();
+    let probs_host: Vec<f32> = probs.into_data().convert::<f32>().iter::<f32>().collect();
+    let mut steer_err = 0.0f64;
+    for row in 0..6 {
+        let picked = &idx[row * 2..row * 2 + 2];
+        if !picked.contains(&2) {
+            steer_err = 1.0;
+        }
+        for (slot, &expert) in picked.iter().enumerate() {
+            let expected = probs_host[row * 4 + expert as usize];
+            if vals[row * 2 + slot].to_bits() != expected.to_bits() {
+                steer_err = 1.0;
+            }
+        }
+    }
+    // One nudge against a fully collapsed load moves the overloaded expert by
+    // exactly -rate and every starved one by exactly +rate; a balanced load
+    // moves nothing.
+    let mut nudged = TopKRouter::<B>::new(4, 4, &device);
+    nudged.ensure_balance_bias();
+    nudged.nudge_balance_bias(&[1.0, 0.0, 0.0, 0.0], 1e-3);
+    nudged.nudge_balance_bias(&[0.25, 0.25, 0.25, 0.25], 1e-3);
+    let after: Vec<f32> = nudged
+        .balance_bias()
+        .expect("bias attached")
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect();
+    let want = [-1e-3f32, 1e-3, 1e-3, 1e-3];
+    let nudge_err = f64::from(u8::from(
+        after.iter().zip(&want).any(|(a, b)| a.to_bits() != b.to_bits()),
+    ));
+
     vec![
+        cert(
+            "moe",
+            "routing_entropies_read_as_specified",
+            "Normalized load entropy is 1 for a balanced load and 0 for collapse; per-token entropy is 1 for tokens that hedge uniformly and 0 for certain ones -- and a balanced load with hedging tokens scores 1 on both, which is what a balance loss alone cannot see.",
+            entropy_err,
+            1e-6,
+        ),
+        cert(
+            "moe",
+            "reported_routing_matches_host_recomputation",
+            "The load fractions and entropies a layer reports equal those recomputed on the host from its own routing probabilities.",
+            stats_err,
+            1e-5,
+        ),
+        cert(
+            "moe",
+            "global_window_of_one_is_the_micro_batch_loss",
+            "With a load window of one micro-batch, the global-batch balance loss equals the fused Switch loss bit for bit.",
+            window_one_err,
+            0.0,
+        ),
+        cert(
+            "moe",
+            "global_scope_allows_specialization_across_micro_batches",
+            "Two micro-batches routed entirely to different experts cost E each per micro-batch and E/2 over a two-batch window: balance is judged on the global batch, not on every micro-batch alone.",
+            specialization_err,
+            1e-6,
+        ),
+        cert(
+            "moe",
+            "zero_or_uniform_selection_bias_is_a_bitwise_identity",
+            "A router with a zero selection bias, or one equal on every expert, produces the same output and balance loss as a router with none, to the bit.",
+            identity_err,
+            0.0,
+        ),
+        cert(
+            "moe",
+            "selection_bias_steers_selection_not_gates",
+            "A large bias on one expert puts it in every token's top-k, while every selected expert's gate value is still its unbiased probability.",
+            steer_err,
+            0.0,
+        ),
+        cert(
+            "moe",
+            "one_nudge_moves_each_bias_by_exactly_the_rate",
+            "Against a collapsed load, one nudge lowers the overloaded expert's bias by exactly the rate and raises every starved one by it; a balanced load moves nothing.",
+            nudge_err,
+            0.0,
+        ),
         cert(
             "moe",
             "gates_partition_of_unity",

@@ -460,9 +460,33 @@ pub struct BlockHealth {
     grad_sum: f64,
     pub min_grad: f32,
     pub max_grad: f32,
+    /// Steps on which the block reported routing statistics (roadmap 23.6).
+    pub routed_steps: usize,
+    load_entropy_sum: f64,
+    token_entropy_sum: f64,
 }
 
 impl BlockHealth {
+    /// Mean normalized entropy of the expert *load* over routed steps: 1 is
+    /// uniform, 0 is collapse onto one expert.
+    pub fn mean_load_entropy(&self) -> f32 {
+        if self.routed_steps == 0 {
+            0.0
+        } else {
+            (self.load_entropy_sum / self.routed_steps as f64) as f32
+        }
+    }
+
+    /// Mean normalized per-token routing entropy over routed steps: 1 is a
+    /// token hedging uniformly, 0 is a confident, specialized decision.
+    pub fn mean_token_entropy(&self) -> f32 {
+        if self.routed_steps == 0 {
+            0.0
+        } else {
+            (self.token_entropy_sum / self.routed_steps as f64) as f32
+        }
+    }
+
     pub fn mean_loss(&self) -> f32 {
         if self.steps == 0 {
             0.0
@@ -546,6 +570,27 @@ impl TrainingHealth {
         }
     }
 
+    /// Fold one step's routing statistics in (roadmap 23.6). The two
+    /// entropies are averaged over the step's sparse layers first.
+    pub fn record_routing(&mut self, block_idx: usize, routing: &[crate::moe::RoutingStats]) {
+        if routing.is_empty() {
+            return;
+        }
+        if block_idx >= self.per_block.len() {
+            self.per_block.resize(block_idx + 1, BlockHealth::default());
+        }
+        let (load_entropy, token_entropy, _, _) = crate::moe::RoutingStats::summarize(routing);
+        let block = &mut self.per_block[block_idx];
+        block.routed_steps += 1;
+        block.load_entropy_sum += f64::from(load_entropy);
+        block.token_entropy_sum += f64::from(token_entropy);
+    }
+
+    /// Whether any block reported routing statistics.
+    pub fn has_routing(&self) -> bool {
+        self.per_block.iter().any(|b| b.routed_steps > 0)
+    }
+
     /// Record a failure not attached to any block (preflight, periodic).
     pub fn record_failure(&mut self, step: usize, failure: CheckFailure) {
         self.total_rejected += 1;
@@ -591,16 +636,21 @@ impl TrainingHealth {
 
     /// Per-block table for the end of a run.
     pub fn render(&self) -> String {
+        let routing = self.has_routing();
         let mut out = String::new();
         out.push_str(&format!(
-            "{:<7} {:>7} {:>10} {:>12} {:>12} {:>12} {:>9}\n",
+            "{:<7} {:>7} {:>10} {:>12} {:>12} {:>12} {:>9}",
             "block", "steps", "rejected", "mean loss", "mean |g|", "max |g|", "reject%"
         ));
-        out.push_str(&"-".repeat(74));
+        if routing {
+            out.push_str(&format!(" {:>8} {:>8}", "load H", "token H"));
+        }
+        out.push('\n');
+        out.push_str(&"-".repeat(if routing { 92 } else { 74 }));
         out.push('\n');
         for (i, b) in self.per_block.iter().enumerate() {
             out.push_str(&format!(
-                "{:<7} {:>7} {:>10} {:>12.4} {:>12.3e} {:>12.3e} {:>8.1}%\n",
+                "{:<7} {:>7} {:>10} {:>12.4} {:>12.3e} {:>12.3e} {:>8.1}%",
                 i,
                 b.steps,
                 b.rejected,
@@ -609,6 +659,18 @@ impl TrainingHealth {
                 b.max_grad,
                 100.0 * b.rejection_rate()
             ));
+            if routing {
+                if b.routed_steps > 0 {
+                    out.push_str(&format!(
+                        " {:>8.3} {:>8.3}",
+                        b.mean_load_entropy(),
+                        b.mean_token_entropy()
+                    ));
+                } else {
+                    out.push_str(&format!(" {:>8} {:>8}", "-", "-"));
+                }
+            }
+            out.push('\n');
         }
         if !self.failures.is_empty() {
             out.push_str(&format!("\nfirst {} failure(s):\n", self.failures.len()));

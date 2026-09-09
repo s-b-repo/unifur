@@ -472,7 +472,20 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         tokens: Tensor<B, 2, Int>,
         span: std::ops::Range<usize>,
     ) -> (Tensor<B, 1>, LmMetrics) {
-        self.objective(tokens, span, None)
+        let step = self.objective(tokens, span, None);
+        (step.loss, step.metrics)
+    }
+
+    /// The training step with everything a trainer needs: the loss, the
+    /// metrics, and the per-sparse-layer routing statistics of the span
+    /// (roadmap 23.6), in execution order.
+    pub fn next_token_step(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        negatives: Option<(Tensor<B, 2>, Unlikelihood)>,
+        span: std::ops::Range<usize>,
+    ) -> LmStep<B> {
+        self.objective(tokens, span, negatives)
     }
 
     /// Next-token loss with labeled targets **charged** rather than rewarded
@@ -490,7 +503,8 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         penalty: Unlikelihood,
         span: std::ops::Range<usize>,
     ) -> (Tensor<B, 1>, LmMetrics) {
-        self.objective(tokens, span, Some((weights, penalty)))
+        let step = self.objective(tokens, span, Some((weights, penalty)));
+        (step.loss, step.metrics)
     }
 
     fn objective(
@@ -498,7 +512,7 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         tokens: Tensor<B, 2, Int>,
         span: std::ops::Range<usize>,
         negatives: Option<(Tensor<B, 2>, Unlikelihood)>,
-    ) -> (Tensor<B, 1>, LmMetrics) {
+    ) -> LmStep<B> {
         let device = tokens.device();
         let [b, n] = tokens.dims();
         assert!(n >= 2, "next-token loss needs at least two positions");
@@ -569,6 +583,10 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         };
 
         let value: f32 = loss.clone().into_scalar();
+        let routing: Vec<crate::moe::RoutingStats> =
+            out.balance_loss.as_ref().map_or_else(Vec::new, |aux| aux.to_host());
+        let (_, routing_entropy, _, routing_max_load) =
+            crate::moe::RoutingStats::summarize(&routing);
         let metrics = LmMetrics {
             loss: value,
             perplexity: value.exp(),
@@ -580,6 +598,8 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             penalized_tokens,
             penalty,
             penalized_prob,
+            routing_entropy,
+            routing_max_load,
         };
 
         // The balance term is scaled; the z-loss already carries its own
@@ -589,7 +609,44 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             Some(aux) => loss + aux.balance.mul_scalar(0.01) + aux.z,
             None => loss,
         };
-        (loss, metrics)
+        LmStep { loss, metrics, routing }
+    }
+
+    /// Selection biases of every sparse layer that has one, in layer order
+    /// (roadmap 23.5).
+    pub fn balance_biases(&self) -> Vec<Vec<f32>> {
+        self.layers.iter().filter_map(|l| l.balance_bias_values()).collect()
+    }
+
+    /// Attach zero selection biases to every sparse layer that lacks one
+    /// (roadmap 23.5). Call after loading a checkpoint.
+    pub fn ensure_balance_biases(&mut self) {
+        for layer in &mut self.layers {
+            if let Some(mut sparse) = layer.sparse_mut() {
+                sparse.ensure_balance_bias();
+            }
+        }
+    }
+
+    /// Nudge the selection biases of the sparse layers in `span` against the
+    /// loads a step on that span produced (roadmap 23.5): `loads` is
+    /// [`LmStep::routing`], one entry per sparse layer in execution order.
+    pub fn nudge_balance_biases(
+        &mut self,
+        span: std::ops::Range<usize>,
+        loads: &[crate::moe::RoutingStats],
+        rate: f32,
+    ) {
+        let end = span.end.min(self.layers.len());
+        let mut nth = 0;
+        for layer in &mut self.layers[span.start..end] {
+            if let Some(mut sparse) = layer.sparse_mut() {
+                if let Some(stats) = loads.get(nth) {
+                    sparse.nudge_balance_bias(&stats.load, rate);
+                }
+                nth += 1;
+            }
+        }
     }
 
     /// Continue `prompt` for `max_new` tokens.
@@ -866,6 +923,16 @@ impl<B: Backend> KvCache<B> {
     }
 }
 
+/// One training step's loss, metrics and routing statistics.
+#[derive(Debug, Clone)]
+pub struct LmStep<B: Backend> {
+    pub loss: Tensor<B, 1>,
+    pub metrics: LmMetrics,
+    /// Per-sparse-layer routing statistics of the executed span, in execution
+    /// order; empty for a dense trunk (roadmap 23.6).
+    pub routing: Vec<crate::moe::RoutingStats>,
+}
+
 /// Diagnostics for one language-model step.
 #[derive(Debug, Clone, Copy)]
 pub struct LmMetrics {
@@ -884,6 +951,12 @@ pub struct LmMetrics {
     /// number negative supervision exists to drive down, reported whether or
     /// not it is being charged for.
     pub penalized_prob: f32,
+    /// Mean normalized per-token routing entropy over the span's sparse
+    /// layers (roadmap 23.6); 0 for a dense trunk.
+    pub routing_entropy: f32,
+    /// Mean, over the span's sparse layers, of the largest expert load
+    /// fraction; 0 for a dense trunk. `1/E` is balanced, `1` is collapse.
+    pub routing_max_load: f32,
 }
 
 /// How the next token is chosen.

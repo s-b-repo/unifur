@@ -18,10 +18,12 @@
 //! is what would catch a regression.
 
 use burn::{
-    module::Module,
+    module::{Module, Param},
     nn::{Linear, LinearConfig},
     tensor::{activation::softmax, backend::Backend, Int, Tensor},
 };
+use burn::tensor::ElementConversion;
+use serde::{Deserialize, Serialize};
 
 /// Router + expert-pool configuration.
 #[derive(Debug, Clone)]
@@ -41,6 +43,9 @@ pub struct MoEConfig {
     /// Router z-loss weight (ST-MoE). `1e-3` is the published default; `0.0`
     /// disables it and reproduces the pre-z-loss behaviour exactly.
     pub z_level: f64,
+    /// Attach a loss-free selection bias to the router (roadmap 23.5). Off
+    /// by default: a router without one routes exactly as it always has.
+    pub balance_bias: bool,
 }
 
 impl MoEConfig {
@@ -54,7 +59,14 @@ impl MoEConfig {
             intermediate_size: hidden_size.saturating_mul(2),
             route_on_tokens: true,
             z_level: 1e-3,
+            balance_bias: false,
         }
+    }
+
+    /// Give the router a loss-free selection bias (roadmap 23.5).
+    pub fn with_balance_bias(mut self, enabled: bool) -> Self {
+        self.balance_bias = enabled;
+        self
     }
 
     /// Router z-loss weight. `0.0` reproduces the pre-z-loss behaviour exactly.
@@ -96,9 +108,22 @@ impl MoEConfig {
 }
 
 /// Top-k gate network: softmax over per-token expert logits.
+///
+/// # The selection bias (roadmap 23.5)
+///
+/// An optional per-expert bias `[1, E]` that is added to the logits **only
+/// when choosing** the top-k experts, never when computing their gate values
+/// (Wang et al., *Auxiliary-Loss-Free Load Balancing*, 2408.15664). It is not
+/// a parameter in the optimizer's sense: it carries no gradient and is nudged
+/// between steps by [`Self::nudge_balance_bias`] from the observed load, so
+/// load balancing stops competing with the task loss for the router's weights.
+/// With no bias attached the router routes exactly as it always has, and with
+/// a bias of zero it routes bit-identically to that -- both are certified.
 #[derive(Module, Debug)]
 pub struct TopKRouter<B: Backend> {
     linear: Linear<B>,
+    /// `[1, width]`, non-trainable. `None` is the pre-23.5 router.
+    balance_bias: Option<Param<Tensor<B, 2>>>,
 }
 
 impl<B: Backend> TopKRouter<B> {
@@ -107,12 +132,95 @@ impl<B: Backend> TopKRouter<B> {
             linear: LinearConfig::new(in_features, out_features)
                 .with_bias(true)
                 .init(device),
+            balance_bias: None,
         }
     }
 
     /// Raw logits `[T, out_features]` for an already-assembled router input.
     pub fn logits(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
         self.linear.forward(input)
+    }
+
+    /// Choose the top-`k` experts and their gate values.
+    ///
+    /// Without a selection bias this is `probs.topk_with_indices(k, 1)`,
+    /// byte for byte the routing every certificate was measured on. With one,
+    /// the *indices* come from `logits + bias` and the *values* are gathered
+    /// from the unbiased probabilities: the bias steers who is chosen, not how
+    /// much they are trusted.
+    pub fn select(
+        &self,
+        logits: &Tensor<B, 2>,
+        probs: &Tensor<B, 2>,
+        k: usize,
+    ) -> (Tensor<B, 2>, Tensor<B, 2, Int>) {
+        match &self.balance_bias {
+            None => probs.clone().topk_with_indices(k, 1),
+            Some(bias) => {
+                let (_, idx) = (logits.clone() + bias.val()).topk_with_indices(k, 1);
+                (probs.clone().gather(1, idx.clone()), idx)
+            }
+        }
+    }
+
+    /// Attach a zero selection bias if there is none.
+    ///
+    /// Also the repair after a checkpoint load: Burn zips an `Option` field
+    /// with its record, so a router built with a bias and loaded from a record
+    /// without one -- or the reverse -- comes back with `None`.
+    pub fn ensure_balance_bias(&mut self) {
+        if self.balance_bias.is_none() {
+            let width = self.width();
+            let device = self.linear.weight.val().device();
+            let zeros = Tensor::<B, 2>::zeros([1, width], &device).detach();
+            self.balance_bias = Some(Param::from_tensor(zeros).set_require_grad(false));
+        }
+    }
+
+    pub fn has_balance_bias(&self) -> bool {
+        self.balance_bias.is_some()
+    }
+
+    /// The selection bias `[1, width]`, if attached.
+    pub fn balance_bias(&self) -> Option<Tensor<B, 2>> {
+        self.balance_bias.as_ref().map(|b| b.val())
+    }
+
+    /// Replace the selection bias wholesale (used when a router is widened).
+    pub fn with_balance_bias(mut self, bias: Option<Tensor<B, 2>>) -> Self {
+        self.balance_bias = bias.map(|b| Param::from_tensor(b.detach()).set_require_grad(false));
+        self
+    }
+
+    /// Move each expert's selection bias by `rate` **against** its load:
+    /// `b_e -= rate * sign(load_e - 1/E)`. An expert exactly at its share is
+    /// left alone. No-op without a bias.
+    pub fn nudge_balance_bias(&mut self, load: &[f32], rate: f32) {
+        let Some(param) = self.balance_bias.take() else {
+            return;
+        };
+        let width = self.width();
+        assert_eq!(load.len(), width, "one load fraction per expert required");
+        let share = 1.0 / width as f32;
+        let delta: Vec<f32> = load
+            .iter()
+            .map(|&l| {
+                let d = l - share;
+                if d > 0.0 {
+                    -rate
+                } else if d < 0.0 {
+                    rate
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        let device = param.val().device();
+        let delta = Tensor::<B, 1>::from_floats(delta.as_slice(), &device).reshape([1, width]);
+        // `map` keeps the `ParamId`; a fresh `Param` would orphan nothing here
+        // (there is no optimizer state on a non-grad tensor) but would change
+        // the record's keys on every step for no reason.
+        self.balance_bias = Some(param.map(|t| (t + delta).detach()).set_require_grad(false));
     }
 
     /// Output width, i.e. how many things this router chooses between.
@@ -147,7 +255,6 @@ impl<B: Backend> TopKRouter<B> {
     /// autodiff backend. Detaching is also the right semantics — the result is
     /// a fresh parameter, not a node in whatever graph produced its values.
     pub fn from_parts(weight: Tensor<B, 2>, bias: Option<Tensor<B, 1>>) -> Self {
-        use burn::module::Param;
         let weight = weight.detach();
         let [d_input, d_output] = weight.dims();
         let mut linear = LinearConfig::new(d_input, d_output)
@@ -155,7 +262,7 @@ impl<B: Backend> TopKRouter<B> {
             .init(&weight.device());
         linear.weight = Param::from_tensor(weight);
         linear.bias = bias.map(|b| Param::from_tensor(b.detach()));
-        Self { linear }
+        Self { linear, balance_bias: None }
     }
 }
 
@@ -259,6 +366,25 @@ pub fn weighted_switch_loss<B: Backend>(
     weights: &Tensor<B, 2>,
     num_experts: usize,
 ) -> Tensor<B, 1> {
+    let (f, p) = switch_loss_parts(probs, top1, weights, num_experts);
+    switch_loss_from_parts(f, p, num_experts)
+}
+
+/// The two halves of the Switch loss, `(f, p)`, each `[1, E]` (roadmap 23.4).
+///
+/// `f` is the weighted top-1 load fraction and is piecewise constant in the
+/// parameters (an arg-max), so it carries no gradient; `p` is the weighted mean
+/// routing probability and carries all of it. Keeping them apart is what lets
+/// `f` be replaced by a **global-batch** estimate: Zhu et al. (*Demons in the
+/// Detail*, 2501.11873) show that a per-micro-batch `f` pushes the router to
+/// balance *within each batch*, which actively inhibits specialization, and
+/// that the fix is `f` over the global batch with `p` still local.
+pub fn switch_loss_parts<B: Backend>(
+    probs: &Tensor<B, 2>,
+    top1: &Tensor<B, 2, Int>,
+    weights: &Tensor<B, 2>,
+    num_experts: usize,
+) -> (Tensor<B, 2>, Tensor<B, 2>) {
     let device = probs.device();
     let t = probs.dims()[0];
     let ids = Tensor::<B, 1, Int>::arange(0..num_experts as i64, &device)
@@ -269,7 +395,176 @@ pub fn weighted_switch_loss<B: Backend>(
     let onehot = top1.clone().equal(ids).float(); // [T, E]
     let f = (onehot * weights.clone()).sum_dim(0) / mass.clone().unsqueeze_dim::<2>(0);
     let p = (probs.clone() * weights.clone()).sum_dim(0) / mass.unsqueeze_dim::<2>(0);
+    (f, p)
+}
+
+/// `E * sum_e f_e p_e` from the halves of [`switch_loss_parts`], in the same
+/// arithmetic order the fused loss always used.
+pub fn switch_loss_from_parts<B: Backend>(
+    f: Tensor<B, 2>,
+    p: Tensor<B, 2>,
+    num_experts: usize,
+) -> Tensor<B, 1> {
     (f * p).sum().mul_scalar(num_experts as f32)
+}
+
+/// Mean per-row entropy of a `[T, E]` distribution, in nats.
+///
+/// A masked expert has probability exactly `0`, and `0 * log 0` is NaN; the
+/// clamp inside the logarithm makes it `0 * log(tiny) = 0`, which is the
+/// limit the entropy actually has there.
+pub fn entropy_of_rows<B: Backend>(probs: &Tensor<B, 2>) -> Tensor<B, 1> {
+    let logp = probs.clone().clamp_min(1e-30).log();
+    (probs.clone() * logp).sum_dim(1).neg().mean()
+}
+
+/// Per-layer routing signal that leaves the forward pass (roadmap 23.6).
+///
+/// Everything here stays on the device; the host sync happens once, in the
+/// trainer, on the steps it logs ([`Self::to_host`]).
+#[derive(Debug, Clone)]
+pub struct LayerRouting<B: Backend> {
+    /// `[E]`: fraction of tokens whose top-1 expert is `e`. Detached -- an
+    /// arg-max has no gradient to carry.
+    pub load: Tensor<B, 1>,
+    /// `[E]`: mean routing probability of `e` over the tokens. Differentiable;
+    /// this is the `p` of the Switch loss.
+    pub prob_mass: Tensor<B, 1>,
+    /// Mean per-token routing entropy in nats, detached.
+    pub entropy: Tensor<B, 1>,
+    pub experts: usize,
+    pub tokens: usize,
+}
+
+/// `(load, prob_mass, entropy)` for one layer's routing decision.
+pub fn layer_routing<B: Backend>(
+    probs: &Tensor<B, 2>,
+    top1: &Tensor<B, 2, Int>,
+    num_experts: usize,
+) -> LayerRouting<B> {
+    let tokens = probs.dims()[0];
+    let ones = Tensor::<B, 2>::ones([tokens, 1], &probs.device());
+    let (f, p) = switch_loss_parts(probs, top1, &ones, num_experts);
+    LayerRouting {
+        load: f.reshape([num_experts]).detach(),
+        prob_mass: p.reshape([num_experts]),
+        entropy: entropy_of_rows(probs).detach(),
+        experts: num_experts,
+        tokens,
+    }
+}
+
+impl<B: Backend> LayerRouting<B> {
+    /// Sync to the host and normalize.
+    pub fn to_host(&self) -> RoutingStats {
+        let load: Vec<f32> = self.load.clone().into_data().convert::<f32>().iter::<f32>().collect();
+        let entropy: f32 = self.entropy.clone().into_scalar().elem::<f32>();
+        RoutingStats::from_load(load, entropy, self.tokens)
+    }
+}
+
+/// One layer's routing health, on the host (roadmap 23.6).
+///
+/// Two normalized entropies, and the disagreement between them is the whole
+/// diagnostic:
+///
+/// | `load_entropy` | `token_entropy` | Reading |
+/// |---|---|---|
+/// | low | -- | **collapse**: a few experts take everything |
+/// | high | high | balanced but *undecided*: every token hedges over every expert -- the failure mode a per-micro-batch balance loss produces, invisible in the loss itself |
+/// | high | low | balanced **and** specialized: what routing is for |
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RoutingStats {
+    /// Top-1 load fraction per expert; sums to 1.
+    pub load: Vec<f32>,
+    /// Entropy of `load` divided by `ln E`: 1 is uniform, 0 is one expert.
+    pub load_entropy: f32,
+    /// Mean per-token routing entropy divided by `ln E`: 1 is a token that
+    /// hedges uniformly, 0 is a token that is certain.
+    pub token_entropy: f32,
+    /// Tokens the fractions were measured over.
+    pub tokens: usize,
+}
+
+impl RoutingStats {
+    pub fn from_load(load: Vec<f32>, token_entropy_nats: f32, tokens: usize) -> Self {
+        let e = load.len();
+        let norm = if e > 1 { (e as f32).ln() } else { 1.0 };
+        let load_entropy = if e > 1 { normalized_entropy(&load) } else { 1.0 };
+        let token_entropy = if e > 1 { (token_entropy_nats / norm).clamp(0.0, 1.0) } else { 1.0 };
+        Self { load, load_entropy, token_entropy, tokens }
+    }
+
+    pub fn experts(&self) -> usize {
+        self.load.len()
+    }
+
+    pub fn max_load(&self) -> f32 {
+        self.load.iter().copied().fold(0.0, f32::max)
+    }
+
+    pub fn min_load(&self) -> f32 {
+        self.load.iter().copied().fold(f32::INFINITY, f32::min).min(1.0)
+    }
+
+    /// Fold another measurement of the **same** layer in, weighted by tokens.
+    pub fn merge(&mut self, other: &RoutingStats) {
+        assert_eq!(self.load.len(), other.load.len(), "cannot merge stats over different expert counts");
+        let total = (self.tokens + other.tokens).max(1) as f32;
+        let (a, b) = (self.tokens as f32 / total, other.tokens as f32 / total);
+        for (x, y) in self.load.iter_mut().zip(&other.load) {
+            *x = a * *x + b * *y;
+        }
+        self.token_entropy = a * self.token_entropy + b * other.token_entropy;
+        self.load_entropy = normalized_entropy(&self.load);
+        self.tokens += other.tokens;
+    }
+
+    /// Means over a set of layers: `(load_entropy, token_entropy, min_load, max_load)`.
+    /// Zeros for an empty set.
+    pub fn summarize(layers: &[RoutingStats]) -> (f32, f32, f32, f32) {
+        if layers.is_empty() {
+            return (0.0, 0.0, 0.0, 0.0);
+        }
+        let n = layers.len() as f32;
+        (
+            layers.iter().map(|l| l.load_entropy).sum::<f32>() / n,
+            layers.iter().map(|l| l.token_entropy).sum::<f32>() / n,
+            layers.iter().map(RoutingStats::min_load).sum::<f32>() / n,
+            layers.iter().map(RoutingStats::max_load).sum::<f32>() / n,
+        )
+    }
+
+    /// The load fractions as a JSON array, for a metrics line.
+    pub fn load_json(layers: &[RoutingStats]) -> String {
+        let rows: Vec<String> = layers
+            .iter()
+            .map(|l| {
+                let cells: Vec<String> = l.load.iter().map(|v| crate::logging::jnum(*v)).collect();
+                format!("[{}]", cells.join(","))
+            })
+            .collect();
+        format!("[{}]", rows.join(","))
+    }
+}
+
+/// Entropy of a distribution divided by `ln(len)`, so 1 is uniform.
+pub fn normalized_entropy(p: &[f32]) -> f32 {
+    if p.len() <= 1 {
+        return 1.0;
+    }
+    let h: f64 = p
+        .iter()
+        .map(|&v| {
+            let v = f64::from(v);
+            if v > 0.0 {
+                -v * v.ln()
+            } else {
+                0.0
+            }
+        })
+        .sum();
+    ((h / (p.len() as f64).ln()) as f32).clamp(0.0, 1.0)
 }
 
 /// Router z-loss (Zoph et al., *ST-MoE*, 2022).
@@ -339,17 +634,18 @@ pub struct MoEOutput<B: Backend> {
     /// The z-loss term alone, unweighted — reported so a run can be diagnosed
     /// without re-deriving it from the total.
     pub z_loss: Tensor<B, 1>,
+    /// Per-expert load, probability mass and routing entropy (roadmap 23.6).
+    pub routing: LayerRouting<B>,
 }
 
 impl<B: Backend> MoELayer<B> {
     pub fn new(config: &MoEConfig, device: &B::Device) -> Self {
         let num_experts = config.num_experts.max(1);
         let top_k = config.top_k.clamp(1, num_experts);
-        let router = TopKRouter {
-            linear: LinearConfig::new(config.router_input_size(), num_experts)
-                .with_bias(true)
-                .init(device),
-        };
+        let mut router = TopKRouter::new(config.router_input_size(), num_experts, device);
+        if config.balance_bias {
+            router.ensure_balance_bias();
+        }
         let experts = (0..num_experts)
             .map(|_| ExpertMlp {
                 fc_in: LinearConfig::new(config.hidden_size, config.intermediate_size)
@@ -412,6 +708,24 @@ impl<B: Backend> MoELayer<B> {
         &self.experts
     }
 
+    pub fn router(&self) -> &TopKRouter<B> {
+        &self.router
+    }
+
+    pub fn router_mut(&mut self) -> &mut TopKRouter<B> {
+        &mut self.router
+    }
+
+    /// Attach a zero selection bias if there is none (roadmap 23.5).
+    pub fn ensure_balance_bias(&mut self) {
+        self.router.ensure_balance_bias();
+    }
+
+    /// Nudge the selection bias against the observed load (roadmap 23.5).
+    pub fn nudge_balance_bias(&mut self, load: &[f32], rate: f32) {
+        self.router.nudge_balance_bias(load, rate);
+    }
+
     /// Router logits for every token, `[b * n, num_experts]`.
     ///
     /// Exposed so callers (and tests) can reproduce the routing decision
@@ -450,8 +764,10 @@ impl<B: Backend> MoELayer<B> {
         let logits = self.router_logits(&x, &routing_cond); // [T, E]
         let probs = softmax(logits.clone(), 1);
 
-        // Top-k selection with renormalized gates.
-        let (gate_vals, gate_idx) = probs.clone().topk_with_indices(self.top_k, 1);
+        // Top-k selection with renormalized gates. The router decides who is
+        // chosen (with its selection bias, if any); the gate values are always
+        // the unbiased probabilities.
+        let (gate_vals, gate_idx) = self.router.select(&logits, &probs, self.top_k);
         let gate_sum = gate_vals.clone().sum_dim(1).clamp_min(1e-12);
         let gates_e = scatter_gates(gate_vals / gate_sum, gate_idx.clone(), self.num_experts);
 
@@ -473,8 +789,9 @@ impl<B: Backend> MoELayer<B> {
         let balance = weighted_switch_loss(&probs, &top1, &ones, self.num_experts);
         let z_loss = router_z_loss(&logits);
         let balance_loss = balance.clone() + z_loss.clone().mul_scalar(self.z_level as f32);
+        let routing = layer_routing(&probs, &top1, self.num_experts);
 
-        MoEOutput { output: out.reshape([b, n, h_size]), balance_loss, balance, z_loss }
+        MoEOutput { output: out.reshape([b, n, h_size]), balance_loss, balance, z_loss, routing }
     }
 }
 
@@ -485,6 +802,54 @@ mod tests {
     use burn::tensor::Distribution;
 
     type B = NdArray<f32>;
+
+    #[test]
+    fn test_routing_stats_merge_is_token_weighted_and_entropies_normalize() {
+        assert_eq!(normalized_entropy(&[0.5, 0.5]), 1.0);
+        assert_eq!(normalized_entropy(&[1.0, 0.0]), 0.0);
+        assert_eq!(normalized_entropy(&[1.0]), 1.0, "one expert has nothing to balance");
+
+        let mut a = RoutingStats::from_load(vec![1.0, 0.0], 0.0, 2);
+        let b = RoutingStats::from_load(vec![0.0, 1.0], 2f32.ln(), 6);
+        assert_eq!(a.load_entropy, 0.0);
+        assert!((b.token_entropy - 1.0).abs() < 1e-6);
+        a.merge(&b);
+        assert_eq!(a.tokens, 8);
+        assert!((a.load[0] - 0.25).abs() < 1e-6 && (a.load[1] - 0.75).abs() < 1e-6);
+        assert!((a.token_entropy - 0.75).abs() < 1e-6, "6 of 8 tokens hedged");
+        assert!(a.load_entropy > 0.8 && a.load_entropy < 0.82, "{}", a.load_entropy);
+
+        let (lh, th, min, max) = RoutingStats::summarize(&[a.clone(), b.clone()]);
+        assert!((lh - (a.load_entropy + b.load_entropy) / 2.0).abs() < 1e-6);
+        assert!((th - (0.75 + 1.0) / 2.0).abs() < 1e-6);
+        assert!((min - 0.125).abs() < 1e-6 && (max - 0.875).abs() < 1e-6);
+        assert_eq!(RoutingStats::summarize(&[]), (0.0, 0.0, 0.0, 0.0));
+        assert_eq!(RoutingStats::load_json(&[b]), "[[0,1]]");
+    }
+
+    #[test]
+    fn test_selection_bias_survives_growth_and_starts_at_zero() {
+        let device = Default::default();
+        let mut router = TopKRouter::<B>::new(3, 2, &device);
+        assert!(!router.has_balance_bias());
+        router.nudge_balance_bias(&[1.0, 0.0], 1.0);
+        assert!(router.balance_bias().is_none(), "a nudge without a bias is a no-op");
+        router.ensure_balance_bias();
+        let zeros: Vec<f32> = router.balance_bias().unwrap().into_data().convert::<f32>().iter::<f32>().collect();
+        assert_eq!(zeros, vec![0.0, 0.0]);
+        router.ensure_balance_bias();
+        router.nudge_balance_bias(&[0.9, 0.1], 0.5);
+        let moved: Vec<f32> = router.balance_bias().unwrap().into_data().convert::<f32>().iter::<f32>().collect();
+        assert_eq!(moved, vec![-0.5, 0.5]);
+        // Widening keeps the old entries and starts the new one at zero.
+        let wider = TopKRouter::from_parts(
+            Tensor::cat(vec![router.weight(), Tensor::<B, 2>::zeros([3, 1], &device)], 1),
+            router.bias().map(|b| Tensor::cat(vec![b, Tensor::<B, 1>::zeros([1], &device)], 0)),
+        )
+        .with_balance_bias(router.balance_bias().map(|b| Tensor::cat(vec![b, Tensor::<B, 2>::zeros([1, 1], &device)], 1)));
+        let grown: Vec<f32> = wider.balance_bias().unwrap().into_data().convert::<f32>().iter::<f32>().collect();
+        assert_eq!(grown, vec![-0.5, 0.5, 0.0]);
+    }
 
     fn row(values: &[f32]) -> Tensor<B, 2> {
         let device = Default::default();
@@ -500,6 +865,7 @@ mod tests {
             intermediate_size: 16,
             route_on_tokens: false,
             z_level: 1e-3,
+            balance_bias: false,
         }
     }
 

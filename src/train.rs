@@ -22,7 +22,7 @@ use crate::{
         TrainingHealth, TrainingPhase,
     },
     rawdata::RawImageDataset,
-    schedule::{Ema, GradientAccumulator, LossScales, LrSchedule},
+    schedule::{BalanceScope, Ema, GlobalLoad, GradientAccumulator, LossScales, LrSchedule},
     vit::ViTDiTConfig,
 };
 use crate::{
@@ -204,6 +204,13 @@ pub struct TrainConfig {
     /// own fixed `moe_aux_weight`, which is what every run did before this
     /// existed. See [`BalanceSchedule`] for why annealing it is worth doing.
     pub balance_schedule: Option<BalanceSchedule>,
+    /// Over which batch the balance loss's load fraction is measured
+    /// (roadmap 23.4). `Global` averages it over the accumulation window.
+    pub balance_scope: BalanceScope,
+    /// Loss-free bias balancing rate (roadmap 23.5): how far each router's
+    /// selection bias moves per step, against its load. `0.0` is off and
+    /// attaches no bias at all.
+    pub bias_balance_rate: f32,
 }
 
 impl Default for TrainConfig {
@@ -235,6 +242,8 @@ impl Default for TrainConfig {
             uncertainty: 0.0,
             importance_bins: 0,
             balance_schedule: None,
+            balance_scope: BalanceScope::Micro,
+            bias_balance_rate: 0.0,
         }
     }
 }
@@ -353,6 +362,29 @@ where
             .map_err(|err| anyhow::anyhow!("resume from {}: {err}", path.display()))?;
         println!("resumed from {}", path.display());
     }
+    if config.bias_balance_rate > 0.0 {
+        // A record from before the bias existed, or one written without it,
+        // loads as `None`; re-attach zeros so the run has a bias to nudge.
+        model.ensure_balance_biases();
+        println!(
+            "loss-free bias balancing: rate {:.1e} per step (roadmap 23.5)",
+            config.bias_balance_rate
+        );
+    }
+    if config.balance_scope == BalanceScope::Global {
+        anyhow::ensure!(
+            config.mosme.is_none(),
+            "--balance-scope global is implemented for flat MoE layers; a hierarchical \
+             (MoSME) trunk weights each box's balance term by its own gate, which one \
+             load window cannot express yet"
+        );
+        println!(
+            "balance loss: global-batch load over a window of {} micro-batch(es) (roadmap 23.4)",
+            config.accumulate.max(1)
+        );
+    }
+    let mut global_load =
+        (config.balance_scope == BalanceScope::Global).then(|| GlobalLoad::new(config.accumulate));
 
     // The teacher is frozen: either a separate checkpoint or a snapshot of the
     // starting model.
@@ -453,7 +485,7 @@ where
 
     for step in 0..config.steps {
         let batch = dataset.next(&mut rng, &device);
-        let (loss, mut fields) = compute_loss(
+        let (loss, mut fields, routing) = compute_loss(
             &model,
             teacher.as_ref(),
             &batch,
@@ -466,6 +498,7 @@ where
                 sampler: importance.as_mut(),
                 balance: config.balance_schedule,
                 step,
+                global_load: global_load.as_mut(),
             },
         );
         let block_idx = block_of(&fields);
@@ -551,6 +584,12 @@ where
             summary.final_lr = lr;
             model = optim.step(lr, model, summed);
 
+            // Loss-free balancing acts *after* the step, from the load this
+            // step observed, and touches nothing the optimizer owns.
+            if config.bias_balance_rate > 0.0 && !routing.is_empty() {
+                model.nudge_balance_biases(block_idx, &routing, config.bias_balance_rate);
+            }
+
             // `take()` only after every part is known present: evaluating it
             // inside the tuple pattern would move the head out even when the
             // match fails, silently disabling the feature for the rest of the
@@ -589,6 +628,7 @@ where
         }
 
         health.record(step, block_idx, scalar_loss, &verdict);
+        health.record_routing(block_idx, &routing);
         running.push(scalar_loss);
         loss_sum += scalar_loss as f64;
         summary.final_loss = scalar_loss;
@@ -738,6 +778,9 @@ pub struct Reweighting<'a, B: AutodiffBackend<FloatElem = f32>> {
     pub balance: Option<BalanceSchedule>,
     /// The step the schedule is evaluated at.
     pub step: usize,
+    /// Global-batch load windows, when the balance scope is global
+    /// (roadmap 23.4).
+    pub global_load: Option<&'a mut GlobalLoad>,
 }
 
 impl<B: AutodiffBackend<FloatElem = f32>> Reweighting<'_, B> {
@@ -818,11 +861,43 @@ impl<B: AutodiffBackend<FloatElem = f32>> Reweighting<'_, B> {
         // Applied here rather than inside the model because the weight depends
         // on the *step*, which the model has no business knowing. `StepParts`
         // hands the balance term back separately for exactly this.
-        let scheduled_balance = self.balance.map(|schedule| {
+        let mut scheduled_balance = self.balance.map(|schedule| {
             let w = schedule.at(self.step);
             extra.push(("balance_weight", jnum(w as f32)));
             w
         });
+
+        // --- global-batch load (roadmap 23.4) -----------------------------
+        // Replace each layer's micro-batch load `f` with the window mean and
+        // recombine it with this micro-batch's differentiable `p`. The window
+        // mean is a constant as far as the graph is concerned, exactly as the
+        // arg-max `f` always was.
+        let balance = match self.global_load.as_deref_mut() {
+            Some(window) if !parts.routing.is_empty() => {
+                let device = batch.pixel_values.device();
+                let mut total: Option<Tensor<B, 1>> = None;
+                for (layer, routing) in parts.routing.iter().enumerate() {
+                    let load: Vec<f32> = routing.load.clone().inner().into_data().convert::<f32>().iter::<f32>().collect();
+                    let global = window.observe(layer, &load);
+                    let e = routing.experts;
+                    let f = Tensor::<B, 1>::from_floats(global.as_slice(), &device).reshape([1, e]);
+                    let p = routing.prob_mass.clone().reshape([1, e]);
+                    let term = crate::moe::switch_loss_from_parts(f, p, e);
+                    total = Some(match total {
+                        None => term,
+                        Some(acc) => acc + term,
+                    });
+                }
+                extra.push(("balance_window", format!("{}", window.filled(0))));
+                // The model folded its micro-batch term into `parts.loss`, so
+                // the aggregate path below must run even without a schedule.
+                if scheduled_balance.is_none() {
+                    scheduled_balance = Some(model.moe_aux_weight());
+                }
+                total
+            }
+            _ => parts.balance.clone(),
+        };
 
         // Importance weights multiply the *final* per-sample values, after any
         // uncertainty transform, so the estimator stays unbiased for whatever
@@ -855,8 +930,7 @@ impl<B: AutodiffBackend<FloatElem = f32>> Reweighting<'_, B> {
             return match scheduled_balance {
                 None => (parts.loss, parts.metrics, extra),
                 Some(w) => {
-                    let loss =
-                        aggregate(parts.per_sample, parts.importance, parts.balance, parts.z, w);
+                    let loss = aggregate(parts.per_sample, parts.importance, balance, parts.z, w);
                     let value: f32 = loss.clone().into_scalar();
                     let metrics = crate::dblock::StepMetrics { loss: value, ..parts.metrics };
                     (loss, metrics, extra)
@@ -883,7 +957,7 @@ impl<B: AutodiffBackend<FloatElem = f32>> Reweighting<'_, B> {
         let balanced = aggregate(
             self.weighting.apply(parts.per_sample, log_variance),
             parts.importance,
-            parts.balance,
+            balance,
             parts.z,
             weight,
         );
@@ -902,13 +976,13 @@ fn compute_loss<B, R>(
     step: usize,
     rng: &mut R,
     reweight: &mut Reweighting<'_, B>,
-) -> (Tensor<B, 1>, Vec<(&'static str, String)>)
+) -> (Tensor<B, 1>, Vec<(&'static str, String)>, Vec<crate::moe::RoutingStats>)
 where
     B: AutodiffBackend<FloatElem = f32>,
     R: Rng,
 {
     use crate::logging::jnum;
-    match &config.objective {
+    let (loss, fields) = match &config.objective {
         Objective::Dblock => {
             let (loss, m, extra) = reweight.dblock_step(model, batch, config.gamma, rng);
             let mut fields = vec![
@@ -918,7 +992,16 @@ where
                 ("block", format!("{}", m.block_idx)),
             ];
             fields.extend(extra);
-            (loss, fields)
+            if !m.routing.is_empty() {
+                let (load_h, token_h, min_load, max_load) =
+                    crate::moe::RoutingStats::summarize(&m.routing);
+                fields.push(("load_entropy", jnum(load_h)));
+                fields.push(("token_entropy", jnum(token_h)));
+                fields.push(("min_load", jnum(min_load)));
+                fields.push(("max_load", jnum(max_load)));
+                fields.push(("routing_load", crate::moe::RoutingStats::load_json(&m.routing)));
+            }
+            return (loss, fields, m.routing);
         }
         Objective::Consistency(cfg) => {
             let (loss, m) =
@@ -966,7 +1049,8 @@ where
                 ],
             )
         }
-    }
+    };
+    (loss, fields, Vec::new())
 }
 
 /// Sliding-window mean over the last `window` values.
@@ -1028,6 +1112,9 @@ pub struct LmTrainConfig {
     /// Print (and log, if `log_path` is set) every this many steps.
     pub log_every: usize,
     pub log_path: Option<PathBuf>,
+    /// Loss-free bias balancing rate on the trunk's routers (roadmap 23.5);
+    /// `0.0` is off.
+    pub bias_balance_rate: f32,
 }
 
 impl Default for LmTrainConfig {
@@ -1041,6 +1128,7 @@ impl Default for LmTrainConfig {
             penalty: Unlikelihood::off(),
             log_every: 10,
             log_path: None,
+            bias_balance_rate: 0.0,
         }
     }
 }
@@ -1100,6 +1188,9 @@ pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
         .map(|path| crate::logging::MetricsLogger::open(path))
         .transpose()?;
     let span = 0..model.num_layers();
+    if config.bias_balance_rate > 0.0 {
+        model.ensure_balance_biases();
+    }
 
     let started = std::time::Instant::now();
     let mut report = LmTrainReport {
@@ -1129,15 +1220,11 @@ pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
         let tokens = Tensor::<B, 1, burn::tensor::Int>::from_ints(flat.as_slice(), device)
             .reshape([config.batch_size, context]);
 
-        let (loss, metrics) = match &table {
-            Some(table) => model.next_token_loss_penalized(
-                tokens,
-                label_weights::<B>(&labels, table, device),
-                config.penalty,
-                span.clone(),
-            ),
-            None => model.next_token_loss(tokens, span.clone()),
-        };
+        let negatives = table
+            .as_ref()
+            .map(|table| (label_weights::<B>(&labels, table, device), config.penalty));
+        let crate::lm::LmStep { loss, metrics, routing } =
+            model.next_token_step(tokens, negatives, span.clone());
 
         if !metrics.loss.is_finite() {
             // The same policy as the image loop: a pathological step is
@@ -1149,6 +1236,9 @@ pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
 
         let grads = GradientsParams::from_grads(loss.backward(), &model);
         model = optim.step(config.lr, model, grads);
+        if config.bias_balance_rate > 0.0 && !routing.is_empty() {
+            model.nudge_balance_biases(span.clone(), &routing, config.bias_balance_rate);
+        }
 
         if report.steps_taken == 0 {
             report.first_loss = metrics.loss;
@@ -1172,18 +1262,31 @@ pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
                     metrics.penalized_tokens, metrics.penalized_prob, metrics.penalty
                 ));
             }
+            if !routing.is_empty() {
+                line.push_str(&format!(
+                    " | routing: token H {:.3}, max load {:.3}",
+                    metrics.routing_entropy, metrics.routing_max_load
+                ));
+            }
             println!("{line}");
             if let Some(logger) = logger.as_mut() {
-                logger.log(
-                    step,
-                    &[
-                        ("loss", crate::logging::jnum(metrics.loss)),
-                        ("perplexity", crate::logging::jnum(metrics.perplexity)),
-                        ("penalized_tokens", metrics.penalized_tokens.to_string()),
-                        ("penalized_prob", crate::logging::jnum(metrics.penalized_prob)),
-                        ("penalty", crate::logging::jnum(metrics.penalty)),
-                    ],
-                )?;
+                let mut fields = vec![
+                    ("loss", crate::logging::jnum(metrics.loss)),
+                    ("perplexity", crate::logging::jnum(metrics.perplexity)),
+                    ("penalized_tokens", metrics.penalized_tokens.to_string()),
+                    ("penalized_prob", crate::logging::jnum(metrics.penalized_prob)),
+                    ("penalty", crate::logging::jnum(metrics.penalty)),
+                ];
+                if !routing.is_empty() {
+                    let (load_h, token_h, min_load, max_load) =
+                        crate::moe::RoutingStats::summarize(&routing);
+                    fields.push(("load_entropy", crate::logging::jnum(load_h)));
+                    fields.push(("token_entropy", crate::logging::jnum(token_h)));
+                    fields.push(("min_load", crate::logging::jnum(min_load)));
+                    fields.push(("max_load", crate::logging::jnum(max_load)));
+                    fields.push(("routing_load", crate::moe::RoutingStats::load_json(&routing)));
+                }
+                logger.log(step, &fields)?;
             }
         }
     }

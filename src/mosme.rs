@@ -55,7 +55,10 @@ use crate::{
         BalanceWeights, BoxEntry, BoxLayout, ExpertEntry, ExpertIndex, ExpertKind, MosmeSpec,
         RoutingSpec, SiteKind, WeightLocator,
     },
-    moe::{scatter_gates, weighted_switch_loss, ExpertMlp, MoEConfig, MoELayer, TopKRouter},
+    moe::{
+        entropy_of_rows, layer_routing, scatter_gates, weighted_switch_loss,
+        ExpertMlp, LayerRouting, MoEConfig, MoELayer, TopKRouter,
+    },
 };
 
 /// Configuration of a hierarchical expert site.
@@ -66,6 +69,8 @@ pub struct MosmeConfig {
     pub intermediate_size: usize,
     pub route_on_tokens: bool,
     pub spec: MosmeSpec,
+    /// Attach loss-free selection biases to every router (roadmap 23.5).
+    pub balance_bias: bool,
 }
 
 impl MosmeConfig {
@@ -76,11 +81,18 @@ impl MosmeConfig {
             intermediate_size: hidden_size.saturating_mul(2),
             route_on_tokens: spec.route_on_tokens,
             spec,
+            balance_bias: false,
         }
     }
 
     pub fn with_intermediate_size(mut self, size: usize) -> Self {
         self.intermediate_size = size;
+        self
+    }
+
+    /// Give every router a loss-free selection bias (roadmap 23.5).
+    pub fn with_balance_bias(mut self, enabled: bool) -> Self {
+        self.balance_bias = enabled;
         self
     }
 
@@ -164,6 +176,34 @@ impl<B: Backend> HierarchicalGates<B> {
     /// row of `box_gates` does.
     pub fn box_traffic(&self) -> Tensor<B, 2> {
         self.box_gates.clone().mean_dim(0)
+    }
+
+    /// The **dense** composed distribution `box_probs[:, i] * expert_probs[i]`
+    /// over the global expert index, `[T, sum_i E_i]`. Each row sums to 1: the
+    /// box softmax sums to 1 over boxes and each expert softmax to 1 within
+    /// its box, so their product is a distribution over every expert.
+    pub fn composed_probs_flat(&self) -> Tensor<B, 2> {
+        Tensor::cat(
+            self.expert_probs
+                .iter()
+                .enumerate()
+                .map(|(i, p)| self.box_probs.clone().narrow(1, i, 1) * p.clone())
+                .collect(),
+            1,
+        )
+    }
+
+    /// Load, probability mass and routing entropy over the global expert
+    /// index (roadmap 23.6). The top-1 expert is the arg-max of the composed
+    /// *gates*, i.e. the expert that actually won; the mass and the entropy
+    /// come from the dense composed distribution.
+    pub fn layer_routing(&self) -> LayerRouting<B> {
+        let probs = self.composed_probs_flat();
+        let top1 = self.composed_flat().argmax(1); // [T, 1]
+        let total = probs.dims()[1];
+        let mut routing = layer_routing(&probs, &top1, total);
+        routing.entropy = entropy_of_rows(&probs).detach();
+        routing
     }
 
     /// Hierarchical load balancing.
@@ -264,14 +304,63 @@ impl<B: Backend> HierarchicalRouter<B> {
             .map(|i| mask_param(&layout, i, device))
             .collect();
 
-        Self {
+        let mut router = Self {
             box_router: TopKRouter::new(input, num_boxes, device),
             expert_routers,
             masks,
             top_box: config.spec.top_box.max(1),
             top_expert: config.spec.top_expert.max(1),
             route_on_tokens: config.route_on_tokens,
+        };
+        if config.balance_bias {
+            router.ensure_balance_bias();
         }
+        router
+    }
+
+    /// Attach zero selection biases to the box router and every expert
+    /// router that lacks one (roadmap 23.5).
+    pub fn ensure_balance_bias(&mut self) {
+        self.box_router.ensure_balance_bias();
+        for router in &mut self.expert_routers {
+            router.ensure_balance_bias();
+        }
+    }
+
+    pub fn has_balance_bias(&self) -> bool {
+        self.box_router.has_balance_bias()
+    }
+
+    /// The expert-level selection biases, one vector per box, on the host.
+    /// Empty when no bias is attached.
+    pub fn balance_biases(&self) -> Vec<Vec<f32>> {
+        self.expert_routers
+            .iter()
+            .filter_map(|r| r.balance_bias())
+            .map(|b| b.into_data().convert::<f32>().iter::<f32>().collect())
+            .collect()
+    }
+
+    /// Nudge every selection bias against the observed load, given the load
+    /// over the **global** expert index (roadmap 23.5). Each box's expert
+    /// router sees its own slice, renormalized to the traffic that box
+    /// received; the box router sees the per-box totals.
+    pub fn nudge_balance_bias(&mut self, load_flat: &[f32], rate: f32) {
+        assert_eq!(load_flat.len(), self.total_experts(), "one load fraction per expert required");
+        let mut offset = 0;
+        let mut box_load = Vec::with_capacity(self.num_boxes());
+        for router in &mut self.expert_routers {
+            let width = router.width();
+            let slice = &load_flat[offset..offset + width];
+            let total: f32 = slice.iter().sum();
+            box_load.push(total);
+            if total > 0.0 {
+                let local: Vec<f32> = slice.iter().map(|v| v / total).collect();
+                router.nudge_balance_bias(&local, rate);
+            }
+            offset += width;
+        }
+        self.box_router.nudge_balance_bias(&box_load, rate);
     }
 
     pub fn num_boxes(&self) -> usize {
@@ -345,7 +434,7 @@ impl<B: Backend> HierarchicalRouter<B> {
         let box_logits = self.box_router.logits(input.clone()); // [T, K]
         let box_probs = softmax(box_logits.clone(), 1);
         let kb = self.top_box.clamp(1, num_boxes);
-        let (box_vals, box_idx) = box_probs.clone().topk_with_indices(kb, 1);
+        let (box_vals, box_idx) = self.box_router.select(&box_logits, &box_probs, kb);
         let box_sum = box_vals.clone().sum_dim(1).clamp_min(1e-12);
         let box_gates = scatter_gates(box_vals / box_sum, box_idx.clone(), num_boxes);
         let top_box_idx = box_idx.narrow(1, 0, 1);
@@ -368,7 +457,7 @@ impl<B: Backend> HierarchicalRouter<B> {
             // enabled entries either way. That avoids a host sync to count
             // them on every forward pass.
             let ke = self.top_expert.clamp(1, width);
-            let (vals, idx) = probs.clone().topk_with_indices(ke, 1);
+            let (vals, idx) = self.expert_routers[i].select(&logits, &probs, ke);
             let sum = vals.clone().sum_dim(1).clamp_min(1e-12);
 
             expert_gates.push(scatter_gates(vals / sum, idx.clone(), width));
@@ -492,7 +581,12 @@ fn grow_router<B: Backend>(
     let bias = router
         .bias()
         .map(|b| Tensor::cat(vec![b, Tensor::<B, 1>::zeros([width - old], device)], 0));
-    Ok(TopKRouter::from_parts(weight, bias))
+    // The selection bias widens with zeros too: a new expert starts with no
+    // history to be nudged by.
+    let balance_bias = router
+        .balance_bias()
+        .map(|b| Tensor::cat(vec![b, Tensor::<B, 2>::zeros([1, width - old], device)], 1));
+    Ok(TopKRouter::from_parts(weight, bias).with_balance_bias(balance_bias))
 }
 
 /// Broadcast a per-example condition `[b, cond]` to per-token `[b * n, cond]`.
@@ -554,6 +648,16 @@ impl<B: Backend> MosmeFeedForward<B> {
 
     pub fn router_mut(&mut self) -> &mut HierarchicalRouter<B> {
         &mut self.router
+    }
+
+    /// See [`HierarchicalRouter::ensure_balance_bias`].
+    pub fn ensure_balance_bias(&mut self) {
+        self.router.ensure_balance_bias();
+    }
+
+    /// See [`HierarchicalRouter::nudge_balance_bias`].
+    pub fn nudge_balance_bias(&mut self, load_flat: &[f32], rate: f32) {
+        self.router.nudge_balance_bias(load_flat, rate);
     }
 
     pub fn expert(&self, box_idx: usize, expert_idx: usize) -> Option<&ExpertMlp<B>> {

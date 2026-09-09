@@ -453,29 +453,49 @@ steps with `max |g|` reaching **8.2e4**.
       row of `E` equal logits is optimal at `-ln E`, not at 0); and a per-row
       constant shift leaves every routing probability unchanged while the z-loss
       registers it — which is *why* logit drift needs its own term
-- [ ] **23.4** Global-batch load balancing — Zhu et al., *Demons in the Detail*
+- [x] **23.4** Global-batch load balancing — Zhu et al., *Demons in the Detail*
       (2501.11873): computing the balance loss per **micro-batch** pushes the
       router to spread tokens evenly *within each batch*, which actively
-      **inhibits expert specialization**. Their fix computes it over the global
-      batch. Doing it here needs the per-expert counts to escape the forward
-      pass — `FeedForward::forward` currently returns only a scalar — so it is a
-      signature change through `vit.rs`, `dblock.rs` and `train.rs`. 23.2 is the
-      tractable half of the same idea
-- [ ] **23.5** Loss-free bias balancing — DeepSeek (2408.15664): a per-expert
-      bias added to the routing scores *before* top-k, nudged by recent load with
-      **no gradient**, so load balancing stops competing with the task loss. Needs
-      state that mutates between steps inside a Burn module; the crate's
-      `ModuleMapper` pattern (`quantize::Nf4Quantizer`, `schedule::EmaMapper`)
-      is the way in
-- [ ] **23.6** Routing entropy diagnostics — two normalized entropies per level:
-      **load entropy** over the marginal expert usage (low = collapse) and
-      **per-token routing entropy** (low = confident, specialized routing). They
-      can disagree, and the disagreement is the whole diagnostic: balanced load
-      with *high* per-token entropy is precisely the 23.4 failure mode, and it is
-      invisible in the balance loss. Same plumbing blocker as 23.4
+      **inhibits expert specialization**. The Switch loss is now split into its
+      halves (`moe::switch_loss_parts`): the load fraction `f` is an arg-max
+      with no gradient, so *where* it is measured is a free choice, and
+      `--balance-scope global` measures it over a window of the last
+      `--accumulate` micro-batches (`schedule::GlobalLoad`) while `p` stays this
+      micro-batch's. Certified: a window of one is the fused loss **bit for
+      bit**, and two micro-batches routed entirely to different experts cost
+      `E` each alone but `E/2` over the window. Flat MoE only: a MoSME trunk
+      weights each box's term by its own gate, which one window per layer
+      cannot express, and the run refuses the combination rather than
+      approximating it
+- [x] **23.5** Loss-free bias balancing — DeepSeek (2408.15664): a per-expert
+      bias added to the routing logits **only when choosing** the top-k, never
+      in the gate values, and moved by `±rate` per step against the observed
+      load with **no gradient** (`TopKRouter::nudge_balance_bias`,
+      `--bias-balance-rate`), so load balancing stops competing with the task
+      loss for the router's weights. The mutation goes through `&mut` accessors
+      on the crate-visible layers rather than a path-parsing `ModuleMapper`,
+      which would have had to align record paths with a second ordering
+      convention. Certified: a zero or uniform bias is a bitwise identity, a
+      bias steers selection without touching a selected expert's gate, one nudge
+      moves each bias by exactly the rate, growth widens it with zeros. One
+      hazard written down in the code: Burn zips an `Option` field with its
+      record, so a bias missing on either side of a checkpoint load comes back
+      as `None` — the trainer re-attaches zeros after every load
+- [x] **23.6** Routing entropy diagnostics — two normalized entropies per layer
+      (`moe::RoutingStats`): **load entropy** over the top-1 expert usage (low =
+      collapse) and **per-token routing entropy** (low = confident, specialized
+      routing). They can disagree, and the disagreement is the whole diagnostic:
+      balanced load with *high* per-token entropy is precisely the 23.4 failure
+      mode, and it is invisible in the balance loss. The per-layer load,
+      probability mass and entropy now leave the forward pass on the device
+      (`vit::RouterAux::layers`), reach the JSONL log, the LM metrics and the
+      end-of-run per-block table (`load H` / `token H`), and are certified to
+      read as specified — including the disagreement case — and to match a host
+      recomputation from the router's own probabilities
 
-**Status**: The two items that fit the current plumbing ship — **and neither
-helped**, which is worth recording as plainly as a success.
+**Status**: Done. The first two items shipped early — **and neither helped**,
+which is worth recording as plainly as a success; the last three shipped once
+the plumbing existed, and their measurement is below the original table.
 
 400 steps, 3 blocks, seed 42, MoSME with 2 boxes / 5 experts on every second
 trunk layer. All runs visited the blocks identically (138 / 145 / 117):
@@ -508,10 +528,7 @@ CPU steps from random initialization is nowhere near enough for it to bite; the
 certificates show the term behaves as specified. It is insurance, correctly
 priced at `1e-3`, against something that has not happened yet.
 
-The remaining three items are designed and their specific blockers named; 23.6
-is the one to build first, because it is what would let 23.4 and 23.5 be
-*evaluated* rather than assumed — and, on this evidence, what would tell us
-whether the experts are specializing at all.
+<!-- 23.4-23.6 MEASUREMENT -->
 
 ## Phase 21: Next-Step and Path Prediction
 

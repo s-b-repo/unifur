@@ -321,6 +321,7 @@ fn integration_moe_trunk_trains_with_its_balance_loss() {
     let device = Default::default();
     <B as burn::tensor::backend::Backend>::seed(&device, 7);
     let cfg = ViTDiTConfig::tiny(10).with_moe(MoeTrunkConfig {
+        balance_bias: false,
         num_experts: 4,
         top_k: 2,
         every_n_layers: 2,
@@ -721,6 +722,85 @@ fn integration_lookahead_costs_more_than_greedy_planning() {
         greedy_stats.model_calls
     );
     assert_eq!(greedy_trace.budget_exhausted_steps, 0, "greedy planning is never cut short");
+}
+
+#[test]
+fn integration_global_scope_and_bias_balancing_train_a_moe_trunk() {
+    // Roadmap 23.4-23.6 end to end on the image trunk: a flat-MoE model
+    // trains with the global-batch load window and loss-free bias balancing
+    // on, reports routing statistics per block, and its selection biases move
+    // away from zero while the weights it does not own stay untouched by them.
+    use diffusionblocks::schedule::BalanceScope;
+    use diffusionblocks::train::{train, TrainConfig};
+    use diffusionblocks::vit::MoeTrunkConfig;
+
+    // The full 32x32 preset: `with_image_size` accepts only the two dataset
+    // sizes, so a smaller model is not on offer through `TrainConfig`.
+    let config = TrainConfig {
+        image_size: 32,
+        num_labels: 10,
+        batch_size: 4,
+        num_blocks: 2,
+        steps: 6,
+        log_every: 1,
+        accumulate: 2,
+        moe: Some(MoeTrunkConfig { num_experts: 4, top_k: 2, every_n_layers: 1, z_level: 1e-3, balance_bias: true }),
+        balance_scope: BalanceScope::Global,
+        bias_balance_rate: 1e-3,
+        checks: diffusionblocks::quality::TrainingChecks::none(),
+        ..TrainConfig::default()
+    };
+    let (model, summary) = train(&config).unwrap();
+    assert_eq!(summary.steps_taken + summary.steps_skipped, 6);
+    assert!(summary.health.has_routing(), "routing statistics must reach the health report");
+    let rendered = summary.health.render();
+    assert!(rendered.contains("load H") && rendered.contains("token H"), "{rendered}");
+
+    let biases = model.balance_biases();
+    assert!(!biases.is_empty(), "every sparse layer carries a selection bias");
+    let moved = biases.iter().flatten().filter(|b| **b != 0.0).count();
+    assert!(moved > 0, "six steps of nudging must move some bias: {biases:?}");
+    // Every entry is an integer multiple of the rate: the bias only ever moves
+    // by exactly +-rate per step.
+    for b in biases.iter().flatten() {
+        let steps = b / 1e-3;
+        assert!((steps - steps.round()).abs() < 1e-3, "bias {b} is not a multiple of the rate");
+    }
+}
+
+#[test]
+fn integration_lm_trainer_nudges_its_router_biases() {
+    // The same mechanism on the language path, through `train_lm`.
+    use diffusionblocks::corpus::TokenCorpus;
+    use diffusionblocks::lm::{LanguageModel, LmConfig};
+    use diffusionblocks::train::{train_lm, LmTrainConfig};
+    use diffusionblocks::vit::MoeTrunkConfig;
+
+    let device: Device = Default::default();
+    let dir = std::env::temp_dir().join("dblocks-lm-bias-integration");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("text.txt");
+    std::fs::write(&source, "the quick brown fox jumps over the lazy dog. ".repeat(20)).unwrap();
+    let corpus_path = dir.join("text.bin");
+    TokenCorpus::tokenize_file(&source, &corpus_path).unwrap();
+    let mut corpus = TokenCorpus::in_memory(&corpus_path).unwrap();
+
+    let config = LmConfig {
+        moe: Some(MoeTrunkConfig { num_experts: 3, top_k: 1, every_n_layers: 2, z_level: 1e-3, balance_bias: true }),
+        ..LmConfig::tiny()
+    };
+    let model = LanguageModel::<B>::new(&config, &device);
+    let (trained, report) = train_lm(
+        model,
+        &mut corpus,
+        &LmTrainConfig { steps: 4, batch_size: 2, log_every: 0, bias_balance_rate: 1e-3, ..Default::default() },
+        &device,
+    )
+    .unwrap();
+    assert_eq!(report.steps_taken, 4);
+    let biases = trained.balance_biases();
+    assert_eq!(biases.len(), 2, "two of four tiny layers are sparse");
+    assert!(biases.iter().flatten().any(|b| *b != 0.0), "{biases:?}");
 }
 
 #[test]

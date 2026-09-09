@@ -235,6 +235,9 @@ enum LmAction {
     },
 }
 
+// The variants cannot be boxed without a second round of destructuring, and
+// `Train` legitimately carries every training flag.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Block-wise training.
@@ -333,6 +336,17 @@ enum Command {
         /// Starting weight for `--balance-schedule`.
         #[arg(long, default_value_t = 0.01)]
         balance_weight: f64,
+        /// Over which batch the balance loss measures expert load
+        /// (roadmap 23.4): micro | global. `global` averages the load over
+        /// the `--accumulate` window so the router is not pushed to balance
+        /// every micro-batch on its own, which inhibits specialization.
+        #[arg(long, default_value = "micro")]
+        balance_scope: String,
+        /// Loss-free bias balancing (roadmap 23.5): move each router's
+        /// selection bias by this much per step against its observed load.
+        /// `0` is off. DeepSeek-V3 uses 1e-3.
+        #[arg(long, default_value_t = 0.0)]
+        bias_balance_rate: f32,
         /// Router z-loss weight (ST-MoE). Penalizes large routing logits,
         /// which the balance loss cannot see — the softmax is invariant to a
         /// per-row constant shift. `0.0` disables it exactly.
@@ -727,6 +741,7 @@ fn cmd_lm(action: LmAction) -> Result<()> {
                 penalty: Unlikelihood::new(penalty),
                 log_every,
                 log_path: log,
+                bias_balance_rate: 0.0,
             };
             let (model, report) = train::train_lm(model, &mut corpus, &config, &device)?;
             println!(
@@ -978,6 +993,8 @@ fn cmd_train(command: Command) -> Result<()> {
         normalize_block_loss,
         balance_schedule,
         balance_weight,
+        balance_scope,
+        bias_balance_rate,
         z_level,
         uncertainty,
         importance_bins,
@@ -1033,6 +1050,7 @@ fn cmd_train(command: Command) -> Result<()> {
             top_k: moe_top_k,
             every_n_layers: every,
             z_level,
+            balance_bias: bias_balance_rate > 0.0,
         }),
         mosme: mosme_spec
             .as_deref()
@@ -1043,7 +1061,9 @@ fn cmd_train(command: Command) -> Result<()> {
                 // records how a model was trained, and a sweep over this knob
                 // should not require rewriting the file each time.
                 spec.balance.z_level = z_level;
-                MosmeTrunkConfig::new(spec).with_every_n_layers(mosme_every)
+                MosmeTrunkConfig::new(spec)
+                    .with_every_n_layers(mosme_every)
+                    .with_balance_bias(bias_balance_rate > 0.0)
             }),
         lr_schedule: LrSchedule::parse(&lr_schedule, lr, steps)?,
         accumulate,
@@ -1057,6 +1077,8 @@ fn cmd_train(command: Command) -> Result<()> {
             balance_weight,
             steps,
         )?),
+        balance_scope: diffusionblocks::schedule::BalanceScope::parse(&balance_scope)?,
+        bias_balance_rate,
     };
 
     println!(

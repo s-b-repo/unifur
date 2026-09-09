@@ -20,6 +20,10 @@ multiple expert sub-networks that specialize in different noise regimes.
 > **Router z-loss** (`moe::router_z_loss`, `--z-level`) and **balance-weight
 > annealing** (`--balance-schedule anneal`) address the two routing pathologies
 > the literature is clearest about — see [Routing Quality](#routing-quality).
+> Routing diagnostics (`moe::RoutingStats`, logged on every sparse run),
+> global-batch load (`--balance-scope global`) and loss-free bias balancing
+> (`--bias-balance-rate`) close roadmap 23.4–23.6 — see
+> [What shipped](#what-shipped-and-what-it-reports).
 >
 > The Switch load-balancing loss of the executed span is summed and added to
 > the objective automatically (`DblockConfig::moe_aux_weight`, default 0.01),
@@ -278,10 +282,14 @@ Leave `--z-level` at its default — it is cheap insurance against a slow failur
 mode that 400 CPU steps cannot produce — and reach for `--balance-schedule
 anneal` only once a routing diagnostic exists to tell you whether it helped.
 
-### What is still missing
+### What shipped, and what it reports
 
-The diagnostic. A balance loss tells you whether the *load* is even; it says
-nothing about whether routing is *confident*. Two normalized entropies would:
+The three items the survey above named are now in the trunk (roadmap 23.4–23.6).
+
+**Diagnostics (23.6).** A balance loss tells you whether the *load* is even; it
+says nothing about whether routing is *confident*. Every sparse layer now
+reports, per step, its top-1 load fraction per expert and two normalized
+entropies (`moe::RoutingStats`):
 
 | Load entropy | Per-token entropy | Reading |
 |---|---|---|
@@ -289,8 +297,38 @@ nothing about whether routing is *confident*. Two normalized entropies would:
 | high | high | **balanced but unspecialized** — the failure mode above |
 | high | low | balanced *and* specialized — what you want |
 
-The middle row is invisible in every number this crate currently reports, which
-is why roadmap 23.6 is the item to build before evaluating 23.4 or 23.5.
+The middle row is what a per-micro-batch balance loss produces and what its own
+value cannot show. The numbers reach the JSONL log (`load_entropy`,
+`token_entropy`, `min_load`, `max_load`, `routing_load`), the language-model
+step (`LmMetrics::routing_entropy` / `routing_max_load`), and the end-of-run
+per-block table as `load H` / `token H`. Both entropies are certified to read
+as specified — including the disagreement case — and the reported values are
+certified against a host recomputation from the router's own probabilities.
+
+**Global-batch load (23.4).** `--balance-scope global` replaces each layer's
+micro-batch load `f` with its mean over the last `--accumulate` micro-batches,
+recombined with *this* micro-batch's differentiable `p`
+(`moe::switch_loss_parts`, `schedule::GlobalLoad`). Zhu et al.'s point is
+exactly that `f` is an arg-max with no gradient of its own, so where it is
+measured is a free choice — and measuring it per micro-batch pushes the router
+to balance every batch on its own. Two certificates pin it: a window of one is
+the fused Switch loss bit for bit, and two micro-batches routed entirely to
+different experts cost `E` each alone but `E/2` over the window. Flat MoE only
+for now; a MoSME trunk weights each box's term by its own gate, which one
+window per layer cannot express yet.
+
+**Loss-free bias balancing (23.5).** `--bias-balance-rate u` attaches a
+non-trainable per-expert bias to every router that is added to the logits
+**only when choosing** the top-k — the gate values are always the unbiased
+probabilities — and moves it by `±u` per step against the observed load
+(`TopKRouter::nudge_balance_bias`, DeepSeek's rule with `u = 1e-3`). Load
+balancing then stops competing with the task loss for the router's weights.
+Certified: a zero or uniform bias is a bitwise identity, a bias steers selection
+without touching a selected expert's gate, one nudge moves each bias by exactly
+the rate, and growth widens the bias with zeros. One hazard is documented in
+the code: Burn zips an `Option` field with its record, so a bias missing on
+either side of a checkpoint load comes back as `None` — the trainer re-attaches
+zeros after every load.
 
 ---
 

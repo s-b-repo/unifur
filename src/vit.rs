@@ -73,11 +73,13 @@ pub struct MoeTrunkConfig {
     pub every_n_layers: usize,
     /// Router z-loss weight (ST-MoE); `0.0` disables it exactly.
     pub z_level: f64,
+    /// Loss-free selection biases on the routers (roadmap 23.5).
+    pub balance_bias: bool,
 }
 
 impl Default for MoeTrunkConfig {
     fn default() -> Self {
-        Self { num_experts: 4, top_k: 1, every_n_layers: 2, z_level: 1e-3 }
+        Self { num_experts: 4, top_k: 1, every_n_layers: 2, z_level: 1e-3, balance_bias: false }
     }
 }
 
@@ -90,15 +92,22 @@ pub struct MosmeTrunkConfig {
     pub spec: crate::expert_index::MosmeSpec,
     /// Replace the feed-forward of every `every_n_layers`-th layer.
     pub every_n_layers: usize,
+    /// Loss-free selection biases on every router (roadmap 23.5).
+    pub balance_bias: bool,
 }
 
 impl MosmeTrunkConfig {
     pub fn new(spec: crate::expert_index::MosmeSpec) -> Self {
-        Self { spec, every_n_layers: 2 }
+        Self { spec, every_n_layers: 2, balance_bias: false }
     }
 
     pub fn with_every_n_layers(mut self, n: usize) -> Self {
         self.every_n_layers = n;
+        self
+    }
+
+    pub fn with_balance_bias(mut self, enabled: bool) -> Self {
+        self.balance_bias = enabled;
         self
     }
 
@@ -630,12 +639,48 @@ pub struct RouterAux<B: Backend> {
     pub balance: Tensor<B, 1>,
     /// Router z-loss, already multiplied by its configured `z_level`.
     pub z: Tensor<B, 1>,
+    /// One entry per sparse layer executed, in execution order: the load,
+    /// probability mass and routing entropy that the scalar losses summarize
+    /// away (roadmap 23.6). Still on the device; see
+    /// [`crate::moe::LayerRouting::to_host`].
+    pub layers: Vec<crate::moe::LayerRouting<B>>,
 }
 
 impl<B: Backend> RouterAux<B> {
-    /// Sum two layers' contributions.
-    pub fn combine(self, other: Self) -> Self {
-        Self { balance: self.balance + other.balance, z: self.z + other.z }
+    /// Sum two spans' losses and keep both spans' per-layer routing, in order.
+    pub fn combine(mut self, other: Self) -> Self {
+        self.layers.extend(other.layers);
+        Self { balance: self.balance + other.balance, z: self.z + other.z, layers: self.layers }
+    }
+
+    /// Per-layer routing statistics, synced to the host.
+    pub fn to_host(&self) -> Vec<crate::moe::RoutingStats> {
+        self.layers.iter().map(crate::moe::LayerRouting::to_host).collect()
+    }
+}
+
+/// Mutable access to one sparse feed-forward, whichever kind it is.
+pub(crate) enum SparseLayerMut<'a, B: Backend> {
+    Flat(&'a mut crate::moe::MoELayer<B>),
+    Hierarchical(&'a mut crate::mosme::MosmeFeedForward<B>),
+}
+
+impl<B: Backend> SparseLayerMut<'_, B> {
+    /// Attach zero selection biases where missing (roadmap 23.5).
+    pub(crate) fn ensure_balance_bias(&mut self) {
+        match self {
+            Self::Flat(layer) => layer.ensure_balance_bias(),
+            Self::Hierarchical(layer) => layer.ensure_balance_bias(),
+        }
+    }
+
+    /// Nudge the selection biases against `load` over this layer's global
+    /// expert index (roadmap 23.5).
+    pub(crate) fn nudge_balance_bias(&mut self, load: &[f32], rate: f32) {
+        match self {
+            Self::Flat(layer) => layer.nudge_balance_bias(load, rate),
+            Self::Hierarchical(layer) => layer.nudge_balance_bias(load, rate),
+        }
     }
 }
 
@@ -652,12 +697,16 @@ impl<B: Backend> FeedForward<B> {
             Self::Sparse(moe) => {
                 let out = moe.forward(x, conditioning.clone());
                 let z = out.z_loss.mul_scalar(moe.z_level() as f32);
-                (out.output, Some(RouterAux { balance: out.balance, z }))
+                (out.output, Some(RouterAux { balance: out.balance, z, layers: vec![out.routing] }))
             }
             Self::Hierarchical(mosme) => {
                 let out = mosme.forward(x, conditioning.clone());
                 let z = out.balance.z_loss.clone().mul_scalar(mosme.z_level() as f32);
-                (out.output, Some(RouterAux { balance: out.balance.total.clone(), z }))
+                let routing = out.gates.layer_routing();
+                (
+                    out.output,
+                    Some(RouterAux { balance: out.balance.total.clone(), z, layers: vec![routing] }),
+                )
             }
         }
     }
@@ -696,14 +745,16 @@ impl<B: Backend> DbLayer<B> {
                     config.cond_hidden_size,
                     mosme.spec.clone(),
                 )
-                .with_intermediate_size(config.intermediate_size);
+                .with_intermediate_size(config.intermediate_size)
+                .with_balance_bias(mosme.balance_bias);
                 FeedForward::Hierarchical(crate::mosme::MosmeFeedForward::new(&cfg, device))
             }
             (_, Some(moe)) if moe.applies_to(layer_idx) => {
                 let cfg = crate::moe::MoEConfig::new(h, config.cond_hidden_size, moe.num_experts)
                     .with_z_level(moe.z_level)
                     .with_top_k(moe.top_k)
-                    .with_intermediate_size(config.intermediate_size);
+                    .with_intermediate_size(config.intermediate_size)
+                    .with_balance_bias(moe.balance_bias);
                 FeedForward::Sparse(crate::moe::MoELayer::new(&cfg, device))
             }
             _ => FeedForward::Dense(Mlp::new(
@@ -730,6 +781,32 @@ impl<B: Backend> DbLayer<B> {
                 .init(device),
             ada_ln: AdaLN::new(config.cond_hidden_size, 6 * h, device),
             causal: config.causal,
+        }
+    }
+
+    /// This layer's selection biases over its global expert index, if it is
+    /// sparse and has them (roadmap 23.5). Hierarchical layers concatenate
+    /// their boxes' expert-level biases.
+    pub(crate) fn balance_bias_values(&self) -> Option<Vec<f32>> {
+        match &self.mlp {
+            FeedForward::Dense(_) => None,
+            FeedForward::Sparse(layer) => layer
+                .router()
+                .balance_bias()
+                .map(|b| b.into_data().convert::<f32>().iter::<f32>().collect()),
+            FeedForward::Hierarchical(layer) => {
+                let boxes = layer.router().balance_biases();
+                (!boxes.is_empty()).then(|| boxes.concat())
+            }
+        }
+    }
+
+    /// The sparse feed-forward, if this layer has one.
+    pub(crate) fn sparse_mut(&mut self) -> Option<SparseLayerMut<'_, B>> {
+        match &mut self.mlp {
+            FeedForward::Dense(_) => None,
+            FeedForward::Sparse(layer) => Some(SparseLayerMut::Flat(layer)),
+            FeedForward::Hierarchical(layer) => Some(SparseLayerMut::Hierarchical(layer)),
         }
     }
 
@@ -868,6 +945,28 @@ impl<B: Backend> ViTDiTModel<B> {
     /// Number of transformer layers.
     pub fn num_layers(&self) -> usize {
         self.layers.len()
+    }
+
+    /// Selection biases of every sparse layer that has one, in layer order.
+    pub fn balance_biases(&self) -> Vec<Vec<f32>> {
+        self.layers.iter().filter_map(DbLayer::balance_bias_values).collect()
+    }
+
+    /// Visit every sparse layer in `range`, in execution order -- the same
+    /// order [`RouterAux::layers`] reports them in, so the two can be paired.
+    pub(crate) fn for_each_sparse_layer_mut(
+        &mut self,
+        range: std::ops::Range<usize>,
+        mut f: impl FnMut(usize, SparseLayerMut<'_, B>),
+    ) {
+        let end = range.end.min(self.layers.len());
+        let mut nth = 0;
+        for i in range.start..end {
+            if let Some(layer) = self.layers[i].sparse_mut() {
+                f(nth, layer);
+                nth += 1;
+            }
+        }
     }
 
     /// Compute embeddings + conditioning shared by every layer subset.
@@ -1092,6 +1191,10 @@ impl<B: Backend> ViTDiTForImageClassification<B> {
     }
 
     /// Access the trunk (for block partitioning logic).
+    pub(crate) fn vit_mut(&mut self) -> &mut ViTDiTModel<B> {
+        &mut self.vit
+    }
+
     pub fn vit(&self) -> &ViTDiTModel<B> {
         &self.vit
     }
@@ -1164,7 +1267,7 @@ mod tests {
     #[test]
     fn test_moe_trunk_placement_and_balance_loss() {
         let device = Default::default();
-        let moe = MoeTrunkConfig { num_experts: 4, top_k: 2, every_n_layers: 2, z_level: 1e-3 };
+        let moe = MoeTrunkConfig { num_experts: 4, top_k: 2, every_n_layers: 2, z_level: 1e-3, balance_bias: false };
 
         // Placement is arithmetic, so check it directly before building
         // anything: every second layer, i.e. layers 1 and 3 of 4.
@@ -1267,7 +1370,7 @@ mod tests {
         use crate::expert_index::MosmeSpec;
         let device = Default::default();
         let cfg = ViTDiTConfig::tiny(10)
-            .with_moe(MoeTrunkConfig { num_experts: 4, top_k: 1, every_n_layers: 1, z_level: 1e-3 })
+            .with_moe(MoeTrunkConfig { num_experts: 4, top_k: 1, every_n_layers: 1, z_level: 1e-3, balance_bias: false })
             .with_mosme(MosmeTrunkConfig::new(MosmeSpec::flat(2)).with_every_n_layers(1));
         let model = ViTDiTForImageClassification::<B>::new(&cfg, &device);
 

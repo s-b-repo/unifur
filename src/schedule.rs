@@ -279,6 +279,92 @@ impl<B: AutodiffBackend<FloatElem = f32>> burn::module::ModuleVisitor<B> for Sum
     }
 }
 
+/// Over which batch the Switch loss's load fraction `f` is measured
+/// (roadmap 23.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BalanceScope {
+    /// `f` from the micro-batch in hand -- what every run did before this
+    /// existed, and the setting Zhu et al. show inhibits specialization.
+    #[default]
+    Micro,
+    /// `f` averaged over a window of recent micro-batches (the accumulation
+    /// window), with `p` still local. Only the load estimate changes; the
+    /// gradient still flows through this micro-batch's routing probabilities.
+    Global,
+}
+
+impl BalanceScope {
+    pub fn parse(name: &str) -> anyhow::Result<Self> {
+        match name {
+            "micro" => Ok(Self::Micro),
+            "global" => Ok(Self::Global),
+            other => anyhow::bail!("unknown balance scope {other:?}; expected micro | global"),
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Micro => "micro",
+            Self::Global => "global",
+        }
+    }
+}
+
+/// A sliding window of per-expert load fractions, one window per sparse
+/// layer, whose mean stands in for the global-batch `f` (roadmap 23.4).
+///
+/// The window holds the last `k` micro-batches *including* the current one,
+/// so with `k = 1` it is exactly the micro-batch load and the loss reduces to
+/// the plain Switch loss -- certified at tolerance zero. `k` is the gradient
+/// accumulation count by default: the optimizer step is taken over those
+/// micro-batches, so that is the batch the load should be measured over.
+#[derive(Debug, Clone)]
+pub struct GlobalLoad {
+    windows: Vec<std::collections::VecDeque<Vec<f32>>>,
+    k: usize,
+}
+
+impl GlobalLoad {
+    pub fn new(k: usize) -> Self {
+        Self { windows: Vec::new(), k: k.max(1) }
+    }
+
+    pub fn window(&self) -> usize {
+        self.k
+    }
+
+    /// Fold `load` for sparse layer `layer` in and return the window mean.
+    pub fn observe(&mut self, layer: usize, load: &[f32]) -> Vec<f32> {
+        while self.windows.len() <= layer {
+            self.windows.push(std::collections::VecDeque::new());
+        }
+        let window = &mut self.windows[layer];
+        // An expert count that changed under us (a grown model) invalidates
+        // the history: start the window over rather than average mismatched
+        // vectors.
+        if window.front().is_some_and(|front| front.len() != load.len()) {
+            window.clear();
+        }
+        window.push_back(load.to_vec());
+        while window.len() > self.k {
+            window.pop_front();
+        }
+        let n = window.len() as f32;
+        let mut mean = vec![0.0f32; load.len()];
+        for entry in window.iter() {
+            for (m, v) in mean.iter_mut().zip(entry) {
+                *m += v / n;
+            }
+        }
+        mean
+    }
+
+    /// Micro-batches currently in layer `layer`'s window.
+    pub fn filled(&self, layer: usize) -> usize {
+        self.windows.get(layer).map_or(0, |w| w.len())
+    }
+}
+
 /// How the auxiliary balance-loss weight evolves over a run.
 ///
 /// # Why this is not just a constant
@@ -656,6 +742,25 @@ impl LossScales {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_global_load_window_means_the_last_k_and_resets_on_a_width_change() {
+        let mut window = GlobalLoad::new(2);
+        assert_eq!(window.window(), 2);
+        assert_eq!(window.observe(0, &[1.0, 0.0]), vec![1.0, 0.0]);
+        assert_eq!(window.observe(0, &[0.0, 1.0]), vec![0.5, 0.5]);
+        assert_eq!(window.observe(0, &[0.0, 1.0]), vec![0.0, 1.0], "the first entry fell out");
+        assert_eq!(window.filled(0), 2);
+        // A second layer has its own window.
+        assert_eq!(window.observe(1, &[0.25, 0.75]), vec![0.25, 0.75]);
+        assert_eq!(window.filled(1), 1);
+        // A grown layer starts over rather than averaging mismatched vectors.
+        assert_eq!(window.observe(0, &[0.0, 0.0, 1.0]), vec![0.0, 0.0, 1.0]);
+        assert_eq!(window.filled(0), 1);
+        assert_eq!(BalanceScope::parse("global").unwrap(), BalanceScope::Global);
+        assert_eq!(BalanceScope::parse("micro").unwrap().name(), "micro");
+        assert!(BalanceScope::parse("batch").is_err());
+    }
     use rand::SeedableRng;
 
     #[test]
