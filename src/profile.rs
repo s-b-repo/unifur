@@ -57,6 +57,27 @@ impl ScopeStats {
 
     /// Nearest-rank percentile: the smallest sample at or above `q` of the
     /// distribution. `q` is clamped to `[0, 1]`.
+    /// Sample standard deviation of the samples (roadmap Phase 28).
+    pub fn std(&self) -> Duration {
+        let values: Vec<f64> = self.samples.iter().map(|&s| s as f64).collect();
+        crate::experiment::Summary::of(&values)
+            .map(|s| if s.std.is_nan() { 0.0 } else { s.std })
+            .map_or(Duration::ZERO, |ns| Duration::from_nanos(ns as u64))
+    }
+
+    /// Half-width of the 95% t-interval on the mean; zero below two samples.
+    pub fn ci95_half_width(&self) -> Duration {
+        let values: Vec<f64> = self.samples.iter().map(|&s| s as f64).collect();
+        crate::experiment::Summary::of(&values)
+            .map(|s| if s.ci95_half_width.is_nan() { 0.0 } else { s.ci95_half_width })
+            .map_or(Duration::ZERO, |ns| Duration::from_nanos(ns as u64))
+    }
+
+    /// Every sample in nanoseconds, in the order recorded.
+    pub fn samples_nanos(&self) -> Vec<u64> {
+        self.samples.clone()
+    }
+
     pub fn percentile(&self, q: f64) -> Duration {
         if self.samples.is_empty() {
             return Duration::ZERO;

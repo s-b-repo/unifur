@@ -212,7 +212,7 @@ invariants, not assumptions.
 
 - [x] **14.1–14.5** Every load-bearing identity is stated as a theorem and
       checked as a residual against a tolerance in `verify.rs`
-- [x] **14.6** Numerical verification — 88 certificates across 17 groups, run by
+- [x] **14.6** Numerical verification — 95 certificates across 18 groups, run by
       `dblocks verify` (non-zero exit on failure) and by the test suite
 
 **Status**: See [Quality gate](#quality-gate) below.
@@ -702,6 +702,72 @@ that unlearning 24 idioms makes a model write good code. The rules are a
 reviewable, extensible floor; a learned detector would be the next step and
 needs labeled data this repository does not have.
 
+## Phase 28: Reproducibility and Audit
+
+Issue #1 asked for a research-grade audit: every claim classified, every
+number traceable to the machine, build, data and seed that produced it, and
+the training state complete enough to reproduce a run. The GPU experiments it
+lists stay blocked; the protocol and the state they need do not.
+
+- [x] **28.1** Training-state checkpoints (`checkpoint::TrainState`): beside
+      every model file the trainer writes a `.state/` directory with
+      `state.json` (step, seed, the host RNG serialized whole, the config as
+      JSON, the build's git revision / rustc / Burn version, a sha256 of the
+      dataset, and a sha256 of every file), the AdamW record, the EMA shadow
+      and the uncertainty head with its optimizer. `--resume` restores all of
+      it, **verifies every hash first** and refuses a corrupted file or a
+      different dataset by name; a model with no state beside it still resumes
+      weights-only and says so. The host RNG is `ChaCha12Rng` (serde), and the
+      **device** RNG is reseeded every step from `(seed, step)` -- it is a
+      process-wide global, so snapshotting the host RNG alone could never have
+      made a resume exact. Certified end to end: six steps equal three plus a
+      resumed three **bit for bit** in weights, EMA shadow and logged losses,
+      with EMA, the uncertainty head, importance sampling, loss normalization
+      and dropout on; the same for `train_lm`
+- [x] **28.2** Experiment records (`experiment.rs`): environment (host, CPU,
+      OS, git revision, compiler, Burn version, profile), config, seeds,
+      **every raw trial** with warm-ups flagged rather than dropped, and a
+      summary with the 95% **t**-interval -- the interval three to thirty
+      repeats justify, not the normal one. Records are appended to JSONL that
+      is never truncated. `dblocks bench --warmup --json` writes one per
+      solver x strategy and per scaling point and prints the interval in its
+      table; `dblocks experiment show | compare` reads them back. Certified
+      (`experiment` group): the interval is exactly `t s/sqrt(n)` around the
+      mean, more trials narrow it, the median is the middle element, and the
+      t table is monotone and bounded by the normal quantile
+- [x] **28.3** Sweeps as a protocol (`sweep.rs`, `dblocks sweep --grid`):
+      every cell trained once per seed from an otherwise identical
+      configuration, one record per cell with the per-seed final losses as
+      trials and every per-seed outcome kept; records land as each cell
+      finishes so an interrupted sweep keeps what it did. The GPU comparisons
+      the roadmap lists -- `K`, learning rate, consistency weight, overlap,
+      objective, expert counts, balance scope -- are each one invocation
+- [x] **28.4** Error-propagation audit (`audit.rs`, `dblocks audit
+      propagation`): per block, the local loss at the window midpoint, the
+      boundary mismatch with the next block's `x0` estimate on the same latent,
+      a finite-difference sensitivity proxy `||H(z+e) - H(z)|| / ||e||` for the
+      block's one-step map, and the downstream amplification -- the product of
+      the later blocks' sensitivities -- plus the end-to-end cross-entropy and
+      accuracy. This is the measurement Proposition 5 assumes and never had
+- [x] **28.5** Claims register (`docs/Claims.md`) and mathematical corrections:
+      every claim classified VERIFIED / PLAUSIBLE / REJECTED / UNKNOWN with its
+      evidence or its harness. Theorem 4's statement now matches its own proof
+      (`(sum sqrt(delta))^2 <= BM sum delta`, not `sum delta`) and states the
+      Lipschitz assumption it silently used; Theorem 5 is a proposition
+      *given* per-block Lipschitz constants with `L ~ 1` marked heuristic;
+      Theorem 6 is relabeled a heuristic -- the strong-convexity rate does not
+      apply to a neural loss, and the "K x speedup" is an open experiment;
+      Theorem 7 keeps its proof and gains the note that it bounds agreement by
+      accuracy, not the reverse. Every default hyperparameter is listed as
+      untuned
+- [x] **28.6** `dblocks lm bench`: the tiny model trained a few steps per
+      trunk variant (dense, MoE, MoE with loss-free bias) with the loss per
+      seed and the milliseconds per step recorded. Extended per axis as the
+      Phase 25-27 mechanisms land
+
+**Status**: Done. What it does *not* do is run the GPU experiments; what it
+does is make each of them a command whose output carries its own provenance.
+
 ## Mutation testing the gate
 
 A certificate that recomputes a formula proves the formula, which was never in
@@ -770,13 +836,14 @@ from current behaviour. The command exits non-zero on any failure, and
 | `precision` | Relative error ≤ 2⁻ᵖ; rounding idempotence |
 | `quantize` | NF4 error ≤ half the widest level gap; exact zero; LoRA identity at init |
 | `loopgraph` | ACT weights are a partition of unity; the budget is hard under adversarial signals |
-| `moe` | Gates are a distribution; the balance loss lies in `[1, E]` on the diagonal; `max_e x_e <= logsumexp <= max_e x_e + ln E`; the z-loss is the squared distance of the log-sum-exp from zero; a per-row shift moves the z-loss but no routing probability |
+| `moe` | Gates are a distribution; the balance loss lies in `[1, E]` on the diagonal; `max_e x_e <= logsumexp <= max_e x_e + ln E`; the z-loss is the squared distance of the log-sum-exp from zero; a per-row shift moves the z-loss but no routing probability; routing entropies read as specified, including the balanced-but-hedging case; reported statistics match a host recomputation; a load window of one is the fused loss bit for bit and a two-batch window allows cross-batch specialization; a zero or uniform selection bias is a bitwise identity, a bias steers selection not gates, and one nudge moves each bias by exactly the rate |
 | `mosme` | Two-level gates compose into a distribution; one box reduces *exactly* to flat MoE; adding a disabled expert is bit-identical; a `-inf` mask gives an exactly zero gate |
 | `lm` | Tokenization is lossless; causal attention leaks *exactly* nothing backwards; an untrained tied head starts at `ln(vocab)`; top-1 sampling is greedy decoding; the KV cache matches full recompute under every chunking, and cached decoding emits identical tokens |
 | `antipattern` | Every rule matches its examples and none of its counterexamples; labels follow tokens through both readers; zero weights or zero alpha reproduce the plain loss bit for bit; the unlikelihood term is 0 at `p = 0` and bounded at `p = 1`; the objective recomputed from the logits with each target in exactly one sum; a penalized optimizer step ends strictly below the plain step, which raises `p(bad)` |
 | `codequality` | A regularizer at strength 0 is an exact zero; the identity filter policies keep every window at weight 1; analyzers are pure functions of the source; the geometric mean collapses on a zero dimension; the external analyzer without its feature is a no-op; down-weights lie in the closed interval |
 | `planner` | The budget is never exceeded, even against an `expand` that ignores its allowance; depth 0 *is* the greedy policy; `beam(1)` reproduces greedy exactly; only a plan's first step is committed; planned sigmas fall monotonically without undershooting; lookahead defeats a myopic trap |
 | `optim` | Accumulation over `k` steps equals one `k`x batch and fires on that cadence; the EMA is a convex combination that never extrapolates; the LR schedule is bounded, its ramp monotone; the uncertainty optimum is `ln L` and its gradient scale is 1 for every loss magnitude; importance sampling is unbiased with weights bounded by the smoothing floor |
+| `experiment` | A record's 95% interval is the t interval on the mean; more trials narrow it; the median is the middle element; the t table is monotone and bounded by the normal quantile |
 | `accuracy` | Guidance at scale 1 is bitwise identity and affine in the estimates elsewhere; every logit normalization preserves the arg-max; ensembles emit distributions and N copies of one member are that member; the scaling frontier is exactly the undominated set |
 | `model` | Softmax partition; `x0` inside the label-embedding convex hull; unit-norm embeddings; DiT zero-init |
 | `autodiff` | Finite-difference gradient check on the distillation loss; Gibbs' inequality |
@@ -869,9 +936,10 @@ See [`docs/Quality-Gate.md`](docs/Quality-Gate.md).
 
 ## Test inventory
 
-397 unit + 23 integration tests, all passing; `cargo clippy --all-targets`
-clean; `cargo doc` warning-free. 88 numerical certificates in 17 groups, plus
-five-phase verification inside every training run.
+407 unit + 27 integration tests, all passing; `cargo clippy --all-targets`
+clean; `cargo doc` warning-free. 95 numerical certificates in 18 groups, plus
+five-phase verification inside every training run and a bit-identity test
+for resumed training.
 
 ## How to Contribute
 

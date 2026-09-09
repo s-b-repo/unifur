@@ -34,9 +34,10 @@ use burn::tensor::{
     Distribution, Int, Tensor,
 };
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 
 /// Distillation hyperparameters.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct DistillConfig {
     /// Softmax temperature for the KL term.
     pub temperature: f64,

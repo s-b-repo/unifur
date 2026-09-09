@@ -9,6 +9,8 @@ readme = "README.md"
 keywords = ["deep-learning", "diffusion", "burn", "block-wise-training", "transformers"]
 categories = ["science", "mathematics"]
 
+build = "build.rs"
+
 [lib]
 name = "diffusionblocks"
 path = "src/lib.rs"
@@ -31,6 +33,11 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 rand = "0.9"
+# Already present transitively via rand (it is what `StdRng` wraps). Named
+# directly, with its `serde` feature, so the training loops can snapshot and
+# restore their host RNG exactly: a resumed run must draw the same numbers the
+# uninterrupted run would have (roadmap Phase 28).
+rand_chacha = { version = "0.9", features = ["serde"] }
 sha2 = "0.10"
 
 [dev-dependencies]

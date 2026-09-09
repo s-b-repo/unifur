@@ -28,11 +28,13 @@ Two documents are authoritative about what is and is not implemented:
 
 ```bash
 cargo build --release
-./target/release/dblocks verify        # 88 certificates, non-zero exit on failure
+./target/release/dblocks verify        # 95 certificates, non-zero exit on failure
 ./target/release/dblocks train --steps 200
 ./target/release/dblocks sample --planned --plan-depth 2   # plan the trajectory
 ./target/release/dblocks lm generate --lookahead 2         # plan the tokens
 ./target/release/dblocks lm train --corpus repo.bin --penalty 1   # unlearn labeled anti-patterns
+./target/release/dblocks sweep --grid "lr=1e-4,1e-3 num_blocks=2,3" --json sweep.jsonl
+./target/release/dblocks audit propagation --checkpoint checkpoints/dblocks-<hash>.mpk
 ./target/release/dblocks --help
 ```
 
@@ -68,6 +70,7 @@ cargo build --release
 
 ### Reference
 - [Mathematical Foundation](Mathematical-Foundation.md) — the theory, and which parts are certified
+- [Claims](Claims.md) — every claim classified VERIFIED / PLAUSIBLE / REJECTED / UNKNOWN, with the harness that settles each
 - [Architecture](Architecture.md) — ViT-DiT backbone and block partitioning
 - [Precision & I/O](Precision-IO.md) — mixed precision, streaming reads, profiling
 - [Quality Coder](Quality-Coder.md) — design document for the agentic code refiner (scaffolding only)
@@ -102,7 +105,8 @@ cargo build --release
 | Quality gates — sampling *and* training | `quality.rs` |
 | Mixed-precision emulation | `precision.rs` |
 | Datasets and streaming I/O | `data.rs`, `rawdata.rs`, `cifar.rs`, `tinyimagenet.rs` |
-| Training loop, checkpoints, logging | `train.rs`, `checkpoint.rs`, `logging.rs` |
+| Training loop, checkpoints and training state, logging | `train.rs`, `checkpoint.rs`, `logging.rs` |
+| Experiment records, sweeps, propagation audit | `experiment.rs`, `sweep.rs`, `audit.rs` |
 | Inference API, profiler | `infer.rs`, `profile.rs` |
 | Numerical certificate suite | `verify.rs` |
 

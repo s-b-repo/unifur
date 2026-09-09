@@ -235,13 +235,49 @@ and saving the same model twice writes one file.
 
 ```bash
 --out-dir checkpoints        # where to write
---async-save                 # serialize on a background thread
+--checkpoint-every 500       # also checkpoint every n steps
+--async-save                 # serialize the weights on a background thread (weights only)
 --resume                     # newest checkpoint in --out-dir
 --resume path/to/ckpt.mpk    # a specific one
 ```
 
 Bare `--resume` on an empty directory starts fresh and says so, rather than
 failing — a first run has nothing to resume from.
+
+### The training state beside the model (Phase 28)
+
+A model file alone cannot continue a run: the optimizer's moments, the
+schedules' positions, the RNG, the EMA shadow and every host-side estimator
+would restart, and the "resumed" run would quietly be a different one. The
+trainer therefore writes a directory next to every model file it saves:
+
+```text
+checkpoints/dblocks-3f9c…​.mpk          the weights (content-addressed, as before)
+checkpoints/dblocks-3f9c…​.state/
+    state.json      step, seed, host RNG, config, build (git revision, rustc,
+                    Burn version), dataset identity (sha256 of the data),
+                    sha256 of every file below, host-side estimators
+    optimizer.mpk   AdamW moments
+    ema.mpk         the EMA shadow, when --ema-decay is on
+    head.mpk, head-optimizer.mpk   the uncertainty head and its optimizer
+```
+
+`--resume` restores all of it and **verifies every file's hash first**: a
+truncated or edited file is refused by name rather than loaded. It also
+refuses a checkpoint whose dataset hash differs from the data it was asked to
+continue on, and warns when the configuration differs in anything but the
+step count and paths. A model file with no state directory (one written by an
+earlier version, or with `--async-save`) still resumes — weights only, and it
+says so.
+
+The guarantee is bit-identity: six steps in one run and three steps plus a
+resumed three produce the same weights, the same EMA shadow and the same
+logged losses. `integration_resume_is_bit_identical_for_the_image_trainer`
+holds that line with EMA, the uncertainty head, importance sampling, loss
+normalization and dropout all on. What makes it possible is that the
+**device** RNG is reseeded at the top of every step from `(seed, step)`: the
+backend's random stream is a process-wide global, and snapshotting the host
+RNG alone would have left it at a different position.
 
 ---
 
@@ -281,7 +317,17 @@ not apply to training — see [Precision & I/O](Precision-IO.md).
 `--seed` seeds both the host RNG (block choice, sigma draws, data sampling) and
 the on-device RNG (initialization, dropout). Two runs with the same config and
 seed produce bit-identical checkpoints — the same content hash, which is a
-convenient way to check.
+convenient way to check — and a resumed run is bit-identical to an
+uninterrupted one (above).
+
+What a run was is recorded, not remembered: the state file carries the git
+revision the binary was built from (`-dirty` if the tree had changes), the
+compiler, the Burn version, and a hash of the dataset. `dblocks bench --json`,
+`dblocks sweep --json` and `dblocks lm bench --json` write the same
+provenance into every experiment record, with every raw trial, so a number
+can be traced to the machine, build, data and seed that produced it. None of
+the defaults in `TrainConfig` has been tuned; [Claims](Claims.md) lists them
+as UNKNOWN with the sweep that would settle each.
 
 Stochastic solvers take their noise from the caller's RNG rather than the
 backend's, so a seeded DDIM trajectory replays exactly.

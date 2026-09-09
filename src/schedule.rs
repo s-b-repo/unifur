@@ -20,6 +20,7 @@
 //! - [`LossScales`] — per-block loss normalization, which is the direct answer
 //!   to the imbalance above.
 
+use serde::{Deserialize, Serialize};
 use burn::{
     module::{AutodiffModule, Module, ModuleMapper, Param},
     optim::GradientsParams,
@@ -27,7 +28,7 @@ use burn::{
 };
 
 /// How the learning rate varies over a run.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum LrSchedule {
     /// What the crate did before this module existed.
     Constant { lr: f64 },
@@ -281,7 +282,7 @@ impl<B: AutodiffBackend<FloatElem = f32>> burn::module::ModuleVisitor<B> for Sum
 
 /// Over which batch the Switch loss's load fraction `f` is measured
 /// (roadmap 23.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum BalanceScope {
     /// `f` from the micro-batch in hand -- what every run did before this
     /// existed, and the setting Zhu et al. show inhibits specialization.
@@ -386,7 +387,7 @@ impl GlobalLoad {
 /// is the risk, decay it once it is not.
 ///
 /// [`Self::Constant`] reproduces the old behaviour exactly.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum BalanceSchedule {
     /// One weight for the whole run.
     Constant { weight: f64 },
@@ -547,6 +548,13 @@ impl<M: Clone> Ema<M> {
         self.updates
     }
 
+    /// Rebuild from a restored shadow and its update count (roadmap Phase
+    /// 28): a resumed run must continue the average, not restart it from the
+    /// live weights, or the warm-up ramp in [`Self::effective_decay`] replays.
+    pub fn from_parts(shadow: M, decay: f64, updates: usize) -> Self {
+        Self { shadow, decay: decay.clamp(0.0, 1.0), updates }
+    }
+
     pub fn shadow(&self) -> &M {
         &self.shadow
     }
@@ -664,7 +672,7 @@ impl<B: Backend<FloatElem = f32>> ModuleMapper<B> for EmaMapper<B> {
 /// large in its sigma window. The scale is bounded in both directions: an
 /// unbounded reciprocal would let a block whose loss briefly collapses acquire
 /// an enormous weight.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LossScales {
     means: Vec<f64>,
     counts: Vec<usize>,

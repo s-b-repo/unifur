@@ -8,6 +8,8 @@
 //! checkpointing, resume) is shared, so a new objective cannot accidentally
 //! come with a subtly different training procedure.
 
+use serde::{Deserialize, Serialize};
+use anyhow::Context;
 use std::path::PathBuf;
 
 use crate::{
@@ -38,7 +40,33 @@ use burn::{
     optim::{AdamWConfig, GradientsParams, Optimizer},
     tensor::{backend::AutodiffBackend, Distribution, Tensor},
 };
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha12Rng;
+
+use crate::checkpoint::{self, DatasetIdentity, TrainState};
+
+/// The device RNG seed for one step: a function of `(seed, step)` only.
+///
+/// The backend's random stream is a process-wide global that every
+/// `Tensor::random` and dropout draw from. Snapshotting the *host* RNG alone
+/// cannot make a resumed run bit-identical to the uninterrupted one -- the
+/// device stream would be at a different position. Reseeding it at the top of
+/// every step from `(seed, step)` makes the stream a pure function of where the
+/// run is, which is what makes `--resume` exact (roadmap Phase 28).
+pub fn step_seed(seed: u64, step: usize) -> u64 {
+    // splitmix64 over the pair: cheap, and every bit of the step reaches
+    // every bit of the seed.
+    let mut z = seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+type TrainBackend<C> = Autodiff<NdArray<f32>, C>;
+type ModelOptim<C> =
+    burn::optim::adaptor::OptimizerAdaptor<burn::optim::AdamW, DblockClassifier<TrainBackend<C>>, TrainBackend<C>>;
+type HeadOptim<C> =
+    burn::optim::adaptor::OptimizerAdaptor<burn::optim::AdamW, LogVarianceHead<TrainBackend<C>>, TrainBackend<C>>;
 
 /// Autodiff-enabled ndarray backend used for CPU training.
 pub type DefaultTrainBackend = Autodiff<NdArray<f32>>;
@@ -47,7 +75,7 @@ pub type DefaultTrainBackend = Autodiff<NdArray<f32>>;
 pub type CheckpointedTrainBackend = Autodiff<NdArray<f32>, BalancedCheckpointing>;
 
 /// Which dataset to train on.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DatasetChoice {
     /// Random images shaped like CIFAR-100; needs no download.
     Synthetic,
@@ -110,7 +138,7 @@ impl AnyDataset {
 }
 
 /// Which loss a training step computes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Objective {
     /// EDM-weighted cross-entropy on one random block (original paper).
     Dblock,
@@ -153,7 +181,7 @@ impl Objective {
 pub use crate::quality::GradNormGate;
 
 /// Training hyperparameters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainConfig {
     pub image_size: usize,
     pub num_labels: usize,
@@ -211,6 +239,13 @@ pub struct TrainConfig {
     /// selection bias moves per step, against its load. `0.0` is off and
     /// attaches no bias at all.
     pub bias_balance_rate: f32,
+    /// Where the trainer writes its checkpoints -- the content-addressed model
+    /// file plus the training-state directory beside it (roadmap Phase 28).
+    /// `None` writes nothing; the caller may still save the returned model.
+    pub out_dir: Option<PathBuf>,
+    /// Also checkpoint every this many steps (`0` = only at the end). A step
+    /// inside an accumulation cycle defers to the next cycle boundary.
+    pub checkpoint_every: usize,
 }
 
 impl Default for TrainConfig {
@@ -244,6 +279,8 @@ impl Default for TrainConfig {
             balance_schedule: None,
             balance_scope: BalanceScope::Micro,
             bias_balance_rate: 0.0,
+            out_dir: None,
+            checkpoint_every: 0,
         }
     }
 }
@@ -276,7 +313,7 @@ impl TrainConfig {
 }
 
 /// Outcome of a training run.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TrainSummary {
     pub steps_taken: usize,
     /// Steps rejected by a quality check at any phase.
@@ -294,6 +331,13 @@ pub struct TrainSummary {
     pub steps_clipped: usize,
     /// Final learning rate the schedule produced.
     pub final_lr: f64,
+    /// The final checkpoint, when `out_dir` was set: the model file, with the
+    /// training state in the directory beside it.
+    pub checkpoint: Option<PathBuf>,
+    /// The step a resumed run continued from; 0 for a fresh run.
+    pub resumed_from_step: usize,
+    /// Every periodic checkpoint written, as `(steps completed, model path)`.
+    pub periodic_checkpoints: Vec<(usize, PathBuf)>,
 }
 
 impl TrainSummary {
@@ -356,11 +400,60 @@ where
     let hidden_size = vit_config.hidden_size;
     let mut model =
         DblockClassifier::<Autodiff<NdArray<f32>, C>>::new(&vit_config, &dblock_config, &device);
+    // Hashed once, before anything else happens: it is both what the state
+    // file records and what a resume is checked against.
+    let dataset_identity = dataset_identity(config)?;
+    let config_json = serde_json::to_value(config).context("serialize training config")?;
+    let mut restored: Option<TrainState> = None;
     if let Some(path) = &config.resume {
         model = model
             .load_file(path, &Recorder::new(), &device)
             .map_err(|err| anyhow::anyhow!("resume from {}: {err}", path.display()))?;
-        println!("resumed from {}", path.display());
+        match TrainState::for_model(path)? {
+            Some(state) => {
+                let dir = TrainState::dir_for(path);
+                anyhow::ensure!(
+                    state.kind == "dblock",
+                    "{} holds `{}` training state, not a dblock run",
+                    dir.display(),
+                    state.kind
+                );
+                state.verify_files(&dir)?;
+                anyhow::ensure!(
+                    state.dataset.matches(&dataset_identity),
+                    "refusing to resume: the checkpoint was trained on {} ({} bytes, sha256 {}), this run \
+                     opened {} ({} bytes, sha256 {})",
+                    state.dataset.description,
+                    state.dataset.bytes,
+                    state.dataset.sha256.as_deref().unwrap_or("-"),
+                    dataset_identity.description,
+                    dataset_identity.bytes,
+                    dataset_identity.sha256.as_deref().unwrap_or("-")
+                );
+                let differences = state.config_differences(&config_json);
+                if !differences.is_empty() {
+                    println!(
+                        "warning: resuming with a different configuration in {}",
+                        differences.join(", ")
+                    );
+                }
+                println!(
+                    "resumed from {} at step {} (training state verified: {} file(s))",
+                    path.display(),
+                    state.step,
+                    1 + usize::from(state.optimizer.is_some())
+                        + usize::from(state.ema.is_some())
+                        + usize::from(state.head.is_some())
+                        + usize::from(state.head_optimizer.is_some())
+                );
+                restored = Some(state);
+            }
+            None => println!(
+                "resumed weights from {}; no training state beside it, so the optimizer, \
+                 schedules and RNG start fresh",
+                path.display()
+            ),
+        }
     }
     if config.bias_balance_rate > 0.0 {
         // A record from before the bias existed, or one written without it,
@@ -424,7 +517,7 @@ where
     }
 
     let mut dataset = open_dataset(config)?;
-    let mut rng = StdRng::seed_from_u64(config.seed);
+    let mut rng = ChaCha12Rng::seed_from_u64(config.seed);
 
     // Burn optimizers are functional: step() consumes the model record and
     // returns an updated one, so we reassign the binding every step.
@@ -472,10 +565,126 @@ where
     }
 
     let mut summary = TrainSummary::default();
-    let mut loss_sum = 0.0f64;
     let mut accumulator = GradientAccumulator::new(config.accumulate);
     let mut scales = LossScales::new(config.num_blocks);
     let mut ema = config.ema_decay.map(|d| Ema::new(&model, d));
+    let mut loss_sum = 0.0f64;
+    let mut elapsed_before = 0.0f64;
+    let mut start_step = 0usize;
+    if let Some(state) = &restored {
+        let dir = TrainState::dir_for(config.resume.as_ref().expect("resume path"));
+        if let Some(file) = &state.optimizer {
+            optim = optim.load_record(checkpoint::load_record::<TrainBackend<C>, _>(&dir, file, &device)?);
+        }
+        match (&state.head, logvar_head.take()) {
+            (Some(file), Some(head)) => {
+                logvar_head =
+                    Some(head.load_record(checkpoint::load_record::<TrainBackend<C>, _>(&dir, file, &device)?));
+                if let (Some(file), Some(head_optim)) = (&state.head_optimizer, logvar_optim.take()) {
+                    logvar_optim = Some(
+                        head_optim.load_record(checkpoint::load_record::<TrainBackend<C>, _>(&dir, file, &device)?),
+                    );
+                }
+            }
+            (_, head) => logvar_head = head,
+        }
+        let extras: DblockExtras =
+            serde_json::from_value(state.extras.clone()).context("parse dblock training state")?;
+        if let (Some(file), Some(current)) = (&state.ema, ema.take()) {
+            let shadow = current
+                .shadow()
+                .clone()
+                .load_record(checkpoint::load_record::<TrainBackend<C>, _>(&dir, file, &device)?);
+            ema = Some(Ema::from_parts(shadow, current.decay(), extras.ema_updates.unwrap_or(0)));
+        }
+        scales = extras.scales;
+        if importance.is_some() {
+            importance = extras.importance.or(importance);
+        }
+        health = extras.health;
+        running = extras.running;
+        summary.steps_taken = extras.steps_taken;
+        summary.steps_skipped = extras.steps_skipped;
+        summary.steps_clipped = extras.steps_clipped;
+        summary.periodic_verifications = extras.periodic_verifications;
+        summary.final_lr = extras.final_lr;
+        loss_sum = extras.loss_sum;
+        elapsed_before = extras.elapsed_secs;
+        rng = serde_json::from_value(state.host_rng.clone()).context("restore host RNG")?;
+        start_step = state.step;
+        summary.resumed_from_step = start_step;
+    }
+    let save_state = |step: usize,
+                      model: &DblockClassifier<TrainBackend<C>>,
+                      optim: &ModelOptim<C>,
+                      head: Option<&LogVarianceHead<TrainBackend<C>>>,
+                      head_optim: Option<&HeadOptim<C>>,
+                      ema: Option<&Ema<DblockClassifier<TrainBackend<C>>>>,
+                      rng: &ChaCha12Rng,
+                      extras: &DblockExtras|
+     -> anyhow::Result<Option<PathBuf>> {
+        let Some(dir) = &config.out_dir else {
+            return Ok(None);
+        };
+        let model_path = checkpoint::save_content_addressed(model.clone(), dir, "dblocks")?;
+        let state_dir = TrainState::dir_for(&model_path);
+        // Rewritten from scratch: a directory left by an earlier save of the
+        // same weights (a dedupe hit) must not keep stale companions.
+        if state_dir.exists() {
+            std::fs::remove_dir_all(&state_dir)
+                .with_context(|| format!("clear {}", state_dir.display()))?;
+        }
+        let optimizer = Some(checkpoint::save_record::<TrainBackend<C>, _>(optim.to_record(), &state_dir, "optimizer")?);
+        let head_file = head
+            .map(|h| checkpoint::save_record::<TrainBackend<C>, _>(h.clone().into_record(), &state_dir, "head"))
+            .transpose()?;
+        let head_optimizer = head_optim
+            .map(|o| checkpoint::save_record::<TrainBackend<C>, _>(o.to_record(), &state_dir, "head-optimizer"))
+            .transpose()?;
+        let ema_file = ema
+            .map(|e| checkpoint::save_record::<TrainBackend<C>, _>(e.shadow().clone().into_record(), &state_dir, "ema"))
+            .transpose()?;
+        let state = TrainState {
+            format_version: checkpoint::STATE_FORMAT_VERSION,
+            kind: "dblock".into(),
+            step,
+            seed: config.seed,
+            host_rng: serde_json::to_value(rng).context("serialize host RNG")?,
+            config: config_json.clone(),
+            build: checkpoint::BuildInfo::current(),
+            dataset: dataset_identity.clone(),
+            model: checkpoint::model_entry(&model_path)?,
+            optimizer,
+            ema: ema_file,
+            head: head_file,
+            head_optimizer,
+            extras: serde_json::to_value(extras).context("serialize training extras")?,
+            saved_unix_secs: checkpoint::unix_now(),
+        };
+        state.write(&state_dir)?;
+        Ok(Some(model_path))
+    };
+    let extras_now = |scales: &LossScales,
+                      importance: &Option<SigmaImportanceSampler>,
+                      health: &TrainingHealth,
+                      running: &RunningAvg,
+                      summary: &TrainSummary,
+                      loss_sum: f64,
+                      elapsed: f64,
+                      ema: &Option<Ema<DblockClassifier<TrainBackend<C>>>>| DblockExtras {
+        scales: scales.clone(),
+        importance: importance.clone(),
+        health: health.clone(),
+        running: running.clone(),
+        steps_taken: summary.steps_taken,
+        steps_skipped: summary.steps_skipped,
+        steps_clipped: summary.steps_clipped,
+        periodic_verifications: summary.periodic_verifications,
+        final_lr: summary.final_lr,
+        loss_sum,
+        elapsed_secs: elapsed,
+        ema_updates: ema.as_ref().map(Ema::updates),
+    };
     if config.accumulate > 1 {
         println!(
             "gradient accumulation: {} micro-batches per step",
@@ -483,7 +692,9 @@ where
         );
     }
 
-    for step in 0..config.steps {
+    for step in start_step..config.steps {
+        // The device stream is a pure function of (seed, step): see `step_seed`.
+        <TrainBackend<C> as burn::tensor::backend::Backend>::seed(&device, step_seed(config.seed, step));
         let batch = dataset.next(&mut rng, &device);
         let (loss, mut fields, routing) = compute_loss(
             &model,
@@ -700,6 +911,40 @@ where
                 logger.log(step, &fields)?;
             }
         }
+
+        // --- periodic checkpoint (roadmap Phase 28) ------------------------
+        // Only at an accumulation-cycle boundary: a half-folded gradient
+        // buffer is not part of the saved state, and dropping it would make
+        // the resumed run diverge.
+        let due = config.checkpoint_every > 0
+            && (step + 1) % config.checkpoint_every == 0
+            && step + 1 < config.steps
+            && !accumulator.has_pending();
+        if due {
+            let extras = extras_now(
+                &scales,
+                &importance,
+                &health,
+                &running,
+                &summary,
+                loss_sum,
+                elapsed_before + start.elapsed().as_secs_f64(),
+                &ema,
+            );
+            if let Some(path) = save_state(
+                step + 1,
+                &model,
+                &optim,
+                logvar_head.as_ref(),
+                logvar_optim.as_ref(),
+                ema.as_ref(),
+                &rng,
+                &extras,
+            )? {
+                println!("step {step}: checkpoint {}", path.display());
+                summary.periodic_checkpoints.push((step + 1, path));
+            }
+        }
     }
 
     let completed = summary.steps_taken + summary.steps_skipped;
@@ -708,7 +953,30 @@ where
     } else {
         (loss_sum / completed as f64) as f32
     };
-    summary.elapsed_secs = start.elapsed().as_secs_f64();
+    summary.elapsed_secs = elapsed_before + start.elapsed().as_secs_f64();
+
+    // The final checkpoint carries the state as of `config.steps`, so a later
+    // `--resume --steps N+M` continues rather than restarts.
+    let extras = extras_now(
+        &scales,
+        &importance,
+        &health,
+        &running,
+        &summary,
+        loss_sum,
+        summary.elapsed_secs,
+        &ema,
+    );
+    summary.checkpoint = save_state(
+        config.steps,
+        &model,
+        &optim,
+        logvar_head.as_ref(),
+        logvar_optim.as_ref(),
+        ema.as_ref(),
+        &rng,
+        &extras,
+    )?;
 
     let dead = health.dead_blocks();
     if !dead.is_empty() {
@@ -720,12 +988,42 @@ where
     summary.health = health;
 
     // The averaged weights are usually the better evaluation model, and are
-    // what gets returned when EMA is enabled.
+    // what gets returned when EMA is enabled. The checkpoint holds the *live*
+    // weights and the shadow separately, so resuming continues the average.
     if let Some(ema) = ema {
         println!("returning EMA weights ({} updates)", ema.updates());
         return Ok((ema.into_shadow(), summary));
     }
     Ok((model, summary))
+}
+
+/// Host-side trainer state saved beside the model (roadmap Phase 28).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DblockExtras {
+    scales: LossScales,
+    importance: Option<SigmaImportanceSampler>,
+    health: TrainingHealth,
+    running: RunningAvg,
+    steps_taken: usize,
+    steps_skipped: usize,
+    steps_clipped: usize,
+    periodic_verifications: usize,
+    final_lr: f64,
+    loss_sum: f64,
+    elapsed_secs: f64,
+    ema_updates: Option<usize>,
+}
+
+/// What a run's data is, for the training state (roadmap Phase 28).
+fn dataset_identity(config: &TrainConfig) -> anyhow::Result<DatasetIdentity> {
+    Ok(match &config.dataset {
+        DatasetChoice::Synthetic => DatasetIdentity::synthetic(format!(
+            "synthetic {}x{} images, {} labels",
+            config.image_size, config.image_size, config.num_labels
+        )),
+        DatasetChoice::Cifar100 { dir, .. } => DatasetIdentity::of_path(dir, "cifar100")?,
+        DatasetChoice::TinyImagenet { dir, .. } => DatasetIdentity::of_path(dir, "tiny-imagenet")?,
+    })
 }
 
 /// Block index recorded in a step's metric fields, or 0 when the objective
@@ -1054,6 +1352,7 @@ where
 }
 
 /// Sliding-window mean over the last `window` values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunningAvg {
     window: std::collections::VecDeque<f32>,
     sum: f32,
@@ -1099,7 +1398,7 @@ impl RunningAvg {
 // -------------------------------------------------------- language model --
 
 /// Configuration for [`train_lm`] (roadmap Phase 24).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LmTrainConfig {
     pub steps: usize,
     pub batch_size: usize,
@@ -1115,6 +1414,16 @@ pub struct LmTrainConfig {
     /// Loss-free bias balancing rate on the trunk's routers (roadmap 23.5);
     /// `0.0` is off.
     pub bias_balance_rate: f32,
+    /// Where checkpoints go (model file + training state), `None` for nowhere
+    /// (roadmap Phase 28).
+    pub out_dir: Option<PathBuf>,
+    /// Also checkpoint every this many steps (`0` = only at the end).
+    pub checkpoint_every: usize,
+    /// A model file from an earlier run; its training state, if present, is
+    /// restored and verified.
+    pub resume: Option<PathBuf>,
+    /// The model's shape, recorded in the state so a resume can be checked.
+    pub model_config: Option<crate::lm::LmConfig>,
 }
 
 impl Default for LmTrainConfig {
@@ -1129,6 +1438,10 @@ impl Default for LmTrainConfig {
             log_every: 10,
             log_path: None,
             bias_balance_rate: 0.0,
+            out_dir: None,
+            checkpoint_every: 0,
+            resume: None,
+            model_config: None,
         }
     }
 }
@@ -1150,6 +1463,12 @@ pub struct LmTrainReport {
     pub penalized_tokens: usize,
     pub tokens_seen: usize,
     pub elapsed_secs: f64,
+    /// The final checkpoint, when `out_dir` was set.
+    pub checkpoint: Option<PathBuf>,
+    /// The step a resumed run continued from; 0 for a fresh run.
+    pub resumed_from_step: usize,
+    /// Every periodic checkpoint written, as `(steps completed, model path)`.
+    pub periodic_checkpoints: Vec<(usize, PathBuf)>,
 }
 
 /// Train a causal language model on `corpus`, charging labeled anti-patterns
@@ -1181,13 +1500,53 @@ pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
     let mut optim = AdamWConfig::new()
         .with_weight_decay(config.weight_decay as f32)
         .init();
-    let mut rng = StdRng::seed_from_u64(config.seed);
+    let mut rng = ChaCha12Rng::seed_from_u64(config.seed);
     let mut logger = config
         .log_path
         .as_ref()
         .map(|path| crate::logging::MetricsLogger::open(path))
         .transpose()?;
     let span = 0..model.num_layers();
+
+    // Training state (roadmap Phase 28): identity of the data, the config as
+    // JSON, and whatever an earlier run left beside the model being resumed.
+    let mut sources = vec![corpus.path().to_path_buf()];
+    if corpus.has_labels() {
+        sources.push(crate::corpus::labels_path(corpus.path()));
+    }
+    let dataset_identity = DatasetIdentity::of_paths(&sources, "corpus")?;
+    let config_json = serde_json::to_value(config).context("serialize LM training config")?;
+    let mut restored: Option<TrainState> = None;
+    if let Some(path) = &config.resume {
+        model = checkpoint::load::<B, _>(model, path, device)?;
+        match TrainState::for_model(path)? {
+            Some(state) => {
+                let dir = TrainState::dir_for(path);
+                anyhow::ensure!(state.kind == "lm", "{} holds `{}` training state, not an lm run", dir.display(), state.kind);
+                state.verify_files(&dir)?;
+                anyhow::ensure!(
+                    state.dataset.matches(&dataset_identity),
+                    "refusing to resume: the checkpoint was trained on a different corpus ({} bytes, sha256 {}) \
+                     than {} ({} bytes, sha256 {})",
+                    state.dataset.bytes,
+                    state.dataset.sha256.as_deref().unwrap_or("-"),
+                    corpus.path().display(),
+                    dataset_identity.bytes,
+                    dataset_identity.sha256.as_deref().unwrap_or("-")
+                );
+                let differences = state.config_differences(&config_json);
+                if !differences.is_empty() {
+                    println!("warning: resuming with a different configuration in {}", differences.join(", "));
+                }
+                println!("resumed from {} at step {} (training state verified)", path.display(), state.step);
+                restored = Some(state);
+            }
+            None => println!(
+                "resumed weights from {}; no training state beside it, so the optimizer and RNG start fresh",
+                path.display()
+            ),
+        }
+    }
     if config.bias_balance_rate > 0.0 {
         model.ensure_balance_biases();
     }
@@ -1204,10 +1563,81 @@ pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
         penalized_tokens: 0,
         tokens_seen: 0,
         elapsed_secs: 0.0,
+        checkpoint: None,
+        resumed_from_step: 0,
+        periodic_checkpoints: Vec::new(),
     };
     let mut loss_sum = 0.0f64;
+    let mut elapsed_before = 0.0f64;
+    let mut start_step = 0usize;
+    if let Some(state) = &restored {
+        let dir = TrainState::dir_for(config.resume.as_ref().expect("resume path"));
+        if let Some(file) = &state.optimizer {
+            optim = optim.load_record(checkpoint::load_record::<B, _>(&dir, file, device)?);
+        }
+        let extras: LmExtras = serde_json::from_value(state.extras.clone()).context("parse lm training state")?;
+        report.steps_taken = extras.steps_taken;
+        report.steps_skipped = extras.steps_skipped;
+        report.first_loss = extras.first_loss;
+        report.first_penalized_prob = extras.first_penalized_prob;
+        report.penalized_tokens = extras.penalized_tokens;
+        report.tokens_seen = extras.tokens_seen;
+        loss_sum = extras.loss_sum;
+        elapsed_before = extras.elapsed_secs;
+        rng = serde_json::from_value(state.host_rng.clone()).context("restore host RNG")?;
+        start_step = state.step;
+        report.resumed_from_step = start_step;
+    }
+    let save_state = |step: usize,
+                      model: &LanguageModel<B>,
+                      optim: &burn::optim::adaptor::OptimizerAdaptor<burn::optim::AdamW, LanguageModel<B>, B>,
+                      rng: &ChaCha12Rng,
+                      report: &LmTrainReport,
+                      loss_sum: f64,
+                      elapsed: f64|
+     -> anyhow::Result<Option<PathBuf>> {
+        let Some(dir) = &config.out_dir else {
+            return Ok(None);
+        };
+        let model_path = checkpoint::save_content_addressed(model.clone(), dir, "lm")?;
+        let state_dir = TrainState::dir_for(&model_path);
+        if state_dir.exists() {
+            std::fs::remove_dir_all(&state_dir).with_context(|| format!("clear {}", state_dir.display()))?;
+        }
+        let optimizer = Some(checkpoint::save_record::<B, _>(optim.to_record(), &state_dir, "optimizer")?);
+        let extras = LmExtras {
+            steps_taken: report.steps_taken,
+            steps_skipped: report.steps_skipped,
+            first_loss: report.first_loss,
+            first_penalized_prob: report.first_penalized_prob,
+            penalized_tokens: report.penalized_tokens,
+            tokens_seen: report.tokens_seen,
+            loss_sum,
+            elapsed_secs: elapsed,
+        };
+        let state = TrainState {
+            format_version: checkpoint::STATE_FORMAT_VERSION,
+            kind: "lm".into(),
+            step,
+            seed: config.seed,
+            host_rng: serde_json::to_value(rng).context("serialize host RNG")?,
+            config: config_json.clone(),
+            build: checkpoint::BuildInfo::current(),
+            dataset: dataset_identity.clone(),
+            model: checkpoint::model_entry(&model_path)?,
+            optimizer,
+            ema: None,
+            head: None,
+            head_optimizer: None,
+            extras: serde_json::to_value(&extras).context("serialize lm training extras")?,
+            saved_unix_secs: checkpoint::unix_now(),
+        };
+        state.write(&state_dir)?;
+        Ok(Some(model_path))
+    };
 
-    for step in 0..config.steps {
+    for step in start_step..config.steps {
+        <B as burn::tensor::backend::Backend>::seed(device, step_seed(config.seed, step));
         let (windows, labels) = if labeled {
             corpus.sample_batch_labeled(config.batch_size, context - 1, &mut rng)?
         } else {
@@ -1289,12 +1719,34 @@ pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
                 logger.log(step, &fields)?;
             }
         }
+
+        if config.checkpoint_every > 0 && (step + 1) % config.checkpoint_every == 0 && step + 1 < config.steps {
+            let elapsed = elapsed_before + started.elapsed().as_secs_f64();
+            if let Some(path) = save_state(step + 1, &model, &optim, &rng, &report, loss_sum, elapsed)? {
+                println!("step {step}: checkpoint {}", path.display());
+                report.periodic_checkpoints.push((step + 1, path));
+            }
+        }
     }
 
     anyhow::ensure!(report.steps_taken > 0, "every step produced a non-finite loss");
     report.mean_loss = (loss_sum / report.steps_taken as f64) as f32;
-    report.elapsed_secs = started.elapsed().as_secs_f64();
+    report.elapsed_secs = elapsed_before + started.elapsed().as_secs_f64();
+    report.checkpoint = save_state(config.steps, &model, &optim, &rng, &report, loss_sum, report.elapsed_secs)?;
     Ok((model, report))
+}
+
+/// Host-side LM trainer state saved beside the model (roadmap Phase 28).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LmExtras {
+    steps_taken: usize,
+    steps_skipped: usize,
+    first_loss: f32,
+    first_penalized_prob: f32,
+    penalized_tokens: usize,
+    tokens_seen: usize,
+    loss_sum: f64,
+    elapsed_secs: f64,
 }
 
 #[cfg(test)]
@@ -1552,7 +2004,7 @@ mod tests {
         let pixels =
             Tensor::<A, 4>::random([2, 3, 32, 32], Distribution::Uniform(-0.5, 0.5), &device);
         let labels = Tensor::<A, 1, burn::tensor::Int>::from_ints([1i64, 5].as_slice(), &device);
-        let mut rng = StdRng::seed_from_u64(0);
+        let mut rng = ChaCha12Rng::seed_from_u64(0);
         let (loss, _) = model.training_step(pixels, labels, 0.05, &mut rng);
 
         let grads = GradientsParams::from_grads(loss.backward(), &model);

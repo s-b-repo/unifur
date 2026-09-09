@@ -30,7 +30,10 @@
 //! - [`schedule`]: LR schedules, EMA, gradient accumulation and clipping
 //! - [`reweight`]: per-sigma uncertainty weighting and importance sampling
 //! - [`train`]: block-wise training loop
-//! - [`checkpoint`]: content-addressed checkpoint saving
+//! - [`checkpoint`]: content-addressed checkpoints and training-state sidecars
+//! - [`experiment`]: experiment records with environment, seeds, raw trials and t-intervals
+//! - [`sweep`]: hyperparameter grids trained per seed into experiment records
+//! - [`audit`]: error-propagation audit of a block-wise model
 //! - [`solver`]: ODE solvers (Euler / Heun / DDIM / DPM-Solver++ 2M & 3M)
 //! - [`multi_block`]: sequential / parallel / hybrid / adaptive strategies
 //! - [`precision`]: reduced-precision emulation + mixed-precision policy
@@ -58,6 +61,7 @@
 
 pub mod accuracy;
 pub mod adaptive;
+pub mod audit;
 pub mod antipattern;
 pub mod checkpoint;
 pub mod cifar;
@@ -67,6 +71,7 @@ pub mod corpus;
 pub mod data;
 pub mod dblock;
 pub mod distill;
+pub mod experiment;
 pub mod expert_index;
 pub mod flow;
 pub mod infer;
@@ -88,6 +93,7 @@ pub mod schedule;
 pub mod sigma;
 pub mod solver;
 pub mod stats;
+pub mod sweep;
 pub mod tensor_ext;
 pub mod tinyimagenet;
 pub mod tokenizer;

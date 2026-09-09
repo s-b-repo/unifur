@@ -7,7 +7,9 @@ and convergence proofs.
 > **In this repository.** The theory below is checked, not just stated.
 > `src/verify.rs` turns each load-bearing identity into a **residual** compared
 > against a tolerance derived from the arithmetic, run by `dblocks verify` and
-> by `cargo test`.
+> by `cargo test`. Results 4–6 were audited in Phase 28 and relabeled where
+> their assumptions did not hold for a neural trunk; every claim's status is
+> listed in [Claims](Claims.md).
 >
 > | Claim here | Certificate |
 > |---|---|
@@ -244,17 +246,27 @@ where $C$ is a constant independent of $\theta$. Therefore $\mathcal{L}(\theta) 
 
 ### Multi-Micro-Block Lossless Decomposition
 
-**Theorem 4 (Compositional Losslessness).** *If each micro-block $\mu_b^m$ is $\delta_{b,m}$-lossless, then the full network is $\sum_{b,m} \delta_{b,m}$-lossless.*
+**Proposition 4 (Compositional Losslessness).** *If each micro-block $\mu_b^m$ is $\delta_{b,m}$-lossless **and each is 1-Lipschitz on the states it receives**, then the full network is $\left(\sum_{b,m} \sqrt{\delta_{b,m}}\right)^2$-lossless, and in particular $BM \cdot \sum_{b,m} \delta_{b,m}$-lossless.*
 
-**Proof.** By the triangle inequality for the $L^2$ norm:
+> **Corrected (Phase 28 audit).** An earlier version stated the bound as
+> $\sum_{b,m}\delta_{b,m}$ while its own proof derived $BM\cdot\sum\delta_{b,m}$;
+> the statement now matches the proof. The Lipschitz assumption was also
+> missing: the triangle inequality below compares each micro-block's error on
+> the state it *actually* receives with its error on the ideal state, which
+> needs the later blocks not to amplify the earlier ones' errors. Without it
+> nothing bounds $\|y - z\|$ in terms of the $\delta$s at all.
 
-$$\| y - z \| \leq \sum_{b,m} \| \mu_b^m(h_{b,m}) - h_{b,m}^* \|$$
+**Proof.** Write $h_{b,m}^*$ for the ideal state after micro-block $(b,m)$ and telescope the error over the chain; with each downstream map 1-Lipschitz, the triangle inequality for the $L^2$ norm gives
 
-where $h_{b,m}^*$ is the target after micro-block $(b,m)$. Taking expectations:
+$$\| y - z \| \leq \sum_{b,m} \| \mu_b^m(h_{b,m}^*) - h_{b,m+1}^* \|.$$
 
-$$\mathbb{E}[\| y - z \|^2] \leq \left( \sum_{b,m} \sqrt{\delta_{b,m}} \right)^2 \leq BM \cdot \sum_{b,m} \delta_{b,m}$$
+Taking expectations and applying Minkowski's inequality to the sum of $L^2$ norms:
 
-Therefore the full network is $BM \cdot \sum_{b,m} \delta_{b,m}$-lossless. $\square$
+$$\sqrt{\mathbb{E}[\| y - z \|^2]} \leq \sum_{b,m} \sqrt{\delta_{b,m}}, \qquad\text{so}\qquad \mathbb{E}[\| y - z \|^2] \leq \left( \sum_{b,m} \sqrt{\delta_{b,m}} \right)^2 \leq BM \cdot \sum_{b,m} \delta_{b,m},$$
+
+the last step by Cauchy–Schwarz. $\square$
+
+*Status: PLAUSIBLE for the trained trunk — the Lipschitz constants of its blocks are not measured. `dblocks audit propagation` measures a finite-difference sensitivity proxy per block precisely so this assumption can be checked on a checkpoint rather than assumed.*
 
 ---
 
@@ -262,7 +274,7 @@ Therefore the full network is $BM \cdot \sum_{b,m} \delta_{b,m}$-lossless. $\squ
 
 ### Block-wise Convergence
 
-**Theorem 5 (Block-wise Convergence).** *Let $\mathcal{L}_b$ be the loss for block $b$. If each block is trained to convergence:*
+**Proposition 5 (Block-wise Error Propagation, under Lipschitz constants).** *Let $\mathcal{L}_b$ be the loss for block $b$ and let every block $H_b$ be $L_b$-Lipschitz on the states it receives. If each block is trained to convergence:*
 
 $$\mathcal{L}_b(\theta_b) \to \mathcal{L}_b^*$$
 
@@ -290,35 +302,51 @@ $$\mathcal{L}_{\text{full}} \leq (1+\alpha)^{2(B-1)} \sum_{b=0}^{B-1} \mathcal{L
 
 For small $\alpha$ and moderate $B$, $(1+\alpha)^{2(B-1)} \approx e^{2\alpha(B-1)} \approx 1 + 2\alpha(B-1)$. $\square$
 
+> **Relabeled (Phase 28 audit).** This was stated as a theorem with the
+> Lipschitz assumption introduced mid-proof. The inequality is a proposition
+> *given* the constants $L_b$; the step "residual networks typically have
+> $L \approx 1$" is a **heuristic**, not a property this trunk has been shown to
+> have — an adaLN-modulated block with a learned gate has no such bound in
+> general. *Status: PLAUSIBLE.* The per-block sensitivity proxy from
+> `dblocks audit propagation` is the measurement that would make the
+> $L_b \le 1 + \alpha$ premise a number rather than a hope.
+
 ### Parallel Training Convergence
 
-**Theorem 6 (Parallel Training Convergence).** *Let $K$ be the number of blocks trained in parallel. The convergence rate of parallel training is:*
+**Heuristic 6 (Parallel Training Convergence).** *Let $K$ be the number of blocks trained in parallel. If the loss were $\mu$-strongly convex and $1$-smooth in every block's parameters, block-coordinate descent that updates $K$ of $B$ blocks per step with unit step size would satisfy*
 
-$$\mathcal{L}^{(t)} \leq \left(1 - \frac{K}{B} \mu \right)^t \mathcal{L}^{(0)}$$
+$$\mathcal{L}^{(t)} - \mathcal{L}^* \leq \left(1 - \frac{K}{B} \mu \right)^t \left(\mathcal{L}^{(0)} - \mathcal{L}^*\right).$$
 
-*where $\mu$ is the strong convexity parameter of the loss.*
+> **Relabeled (Phase 28 audit).** This was stated as a theorem. It is the
+> standard rate for randomized block-coordinate descent on a strongly convex,
+> smooth objective, and **a neural-network training loss is neither**: it is
+> non-convex, and the gap is to the optimum $\mathcal{L}^*$, not to zero, as
+> the earlier statement had it. What the argument does establish is narrower
+> and worth keeping: with $K$ of $B$ blocks updated per step, each block
+> receives gradient on a fraction $K/B$ of the steps, so *if* per-block
+> progress is comparable, covering every block takes $\lceil B/K \rceil$ steps
+> instead of $B$ — the "gradient signal per block" row of the benefits table,
+> which is a bookkeeping fact, not a convergence rate. Whether parallel
+> training reaches a given quality with less compute or less wall-clock is an
+> **empirical** question; `dblocks sweep --grid num_blocks=...` and the
+> `bench` records are the harness for it, and the runs are GPU-blocked
+> (roadmap 2.9). *Status: UNKNOWN.*
 
-**Proof.** In each step, $K$ out of $B$ blocks are updated. The expected progress per step is:
-
-$$\mathbb{E}[\mathcal{L}^{(t+1)}] \leq \left(1 - \frac{K}{B} \mu \right) \mathcal{L}^{(t)}$$
-
-By induction, the result follows. $\square$
+**Sketch (convex case only).** With $K$ of $B$ blocks chosen uniformly, the expected per-step decrease of a $\mu$-strongly convex, $1$-smooth objective under an exact block gradient step is at least $\frac{K}{B}\mu\,(\mathcal{L}^{(t)} - \mathcal{L}^*)$; induction gives the rate. $\square$
 
 ### Consistency Loss Convergence
 
-**Theorem 7 (Consistency Loss Bound).** *The consistency loss between adjacent blocks is bounded by:*
+**Proposition 7 (Consistency Loss Bound).** *Let $\mathcal{L}_b = \mathbb{E}\|D_b(z_t,\sigma) - z\|^2$ and $\mathcal{L}_{b+1}$ likewise, both over the same $(z, z_t, \sigma)$. The unweighted boundary consistency loss $\mathcal{L}_{\text{cons}} = \mathbb{E}\|D_b(z_t,\sigma) - D_{b+1}(z_t,\sigma)\|^2$ satisfies*
 
-$$\mathcal{L}_{\text{cons}} \leq \mathcal{L}_b + \mathcal{L}_{b+1} + 2\sqrt{\mathcal{L}_b \mathcal{L}_{b+1}}$$
+$$\mathcal{L}_{\text{cons}} \leq \mathcal{L}_b + \mathcal{L}_{b+1} + 2\sqrt{\mathcal{L}_b \mathcal{L}_{b+1}}.$$
 
-**Proof.** By the triangle inequality:
+**Proof.** By the triangle inequality, pointwise:
 
-$$\| D_b(z_t, \sigma) - D_{b+1}(z_t, \sigma) \| \leq \| D_b(z_t, \sigma) - z \| + \| D_{b+1}(z_t, \sigma) - z \|$$
+$$\| D_b(z_t, \sigma) - D_{b+1}(z_t, \sigma) \| \leq \| D_b(z_t, \sigma) - z \| + \| D_{b+1}(z_t, \sigma) - z \|.$$
 
-Squaring and taking expectations:
+Squaring, $\|a - c\|^2 \le \|a - z\|^2 + \|c - z\|^2 + 2\|a - z\|\|c - z\|$; taking expectations, the cross term is bounded by Cauchy–Schwarz, $\mathbb{E}[\|a-z\|\|c-z\|] \le \sqrt{\mathcal{L}_b \mathcal{L}_{b+1}}$. $\square$
 
-$$\mathcal{L}_{\text{cons}} \leq \mathcal{L}_b + \mathcal{L}_{b+1} + 2\sqrt{\mathcal{L}_b \mathcal{L}_{b+1}}$$
-
-by Cauchy-Schwarz. $\square$
+*Status: VERIFIED as an inequality (it is elementary); note that it bounds the consistency loss by the task losses, i.e. it says two accurate blocks agree, not that agreement makes blocks accurate. Whether the consistency term improves end-to-end quality is the empirical question roadmap 3.6–3.7 leaves GPU-blocked.*
 
 ---
 

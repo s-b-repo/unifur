@@ -45,11 +45,12 @@
 //!   in `lambda` to machine precision at any step size. That exactness is
 //!   asserted as a certificate rather than assumed (see [`crate::verify`]).
 
+use serde::{Deserialize, Serialize};
 use burn::tensor::{Tensor, backend::Backend};
 use rand::Rng;
 
 /// Available ODE solvers.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub enum SolverKind {
     #[default]
     Euler,

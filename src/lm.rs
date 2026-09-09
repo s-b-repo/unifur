@@ -27,6 +27,7 @@
 //! `denoise_span` does for images. So the block-wise objectives — and the
 //! gradient routing that comes free with them — apply here without change.
 
+use serde::{Deserialize, Serialize};
 use burn::{
     module::{Module, Param},
     nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig},
@@ -66,7 +67,7 @@ use crate::{
 /// currently larger, which is a tug of war rather than a signal. With
 /// `alpha = 0` nothing is removed either: the objective is then exactly the
 /// plain loss, and the flagged targets are only measured.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Unlikelihood {
     /// Coefficient on the penalty. `0` disables the charge while the metrics
     /// are still reported, which is how a plain run measures what it is
@@ -131,7 +132,7 @@ pub fn label_weights<B: Backend>(
 }
 
 /// Shape of a causal language model.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LmConfig {
     pub vocab_size: usize,
     /// Longest sequence the position table covers.

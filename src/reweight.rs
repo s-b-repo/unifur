@@ -30,6 +30,7 @@
 //! checkpoint would stop loading. They are owned by the training loop instead,
 //! and a run that does not enable them pays nothing — not even a record field.
 
+use serde::{Deserialize, Serialize};
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
@@ -232,7 +233,7 @@ impl UncertaintyWeighting {
 /// sampled again, its estimate never updates, and — worse — if the true loss
 /// there later grows, the importance weight `p/q` for that bin is enormous. A
 /// starved bin is not merely unvisited; it is a variance bomb.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SigmaImportanceSampler {
     /// Running mean loss magnitude per bin.
     means: Vec<f64>,

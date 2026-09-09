@@ -34,7 +34,9 @@ clearly; they do not describe files that exist here. The shipped code lives in
 
 Everything implementable without a GPU, a cluster, or a new dependency is
 implemented. See [`TODO.md`](TODO.md) for per-item status, the list of bugs
-found and fixed along the way, and the exact blocker on each remaining item.
+found and fixed along the way, and the exact blocker on each remaining item;
+[`docs/Claims.md`](docs/Claims.md) classifies every claim as VERIFIED,
+PLAUSIBLE, REJECTED or UNKNOWN and names the harness that would settle it.
 [`docs/Quality-Gate.md`](docs/Quality-Gate.md) covers how correctness is
 verified at the implementation, run and step level, and
 [`docs/Home.md`](docs/Home.md) indexes the wiki — every page there now opens
@@ -42,7 +44,7 @@ with an accurate "In this repository" block naming the module, types and flags
 that implement it.
 
 ```bash
-# Build and run the quality gate: 88 numerical certificates, non-zero exit on
+# Build and run the quality gate: 95 numerical certificates, non-zero exit on
 # any failure.
 cargo build --release
 ./target/release/dblocks verify
@@ -78,8 +80,19 @@ cargo build --release
 ./target/release/dblocks sample --solver dpmpp3m --strategy adaptive --k 3 \
     --gate tightening --precision bf16 --precision-switch 1.0
 
-# Sweep every solver against every strategy, reporting cost honestly.
-./target/release/dblocks bench --repeats 3
+# Sweep every solver against every strategy, reporting cost honestly -- with
+# a 95% interval, and every raw trial plus the environment in a JSONL record.
+./target/release/dblocks bench --repeats 3 --warmup 1 --json bench.jsonl
+
+# Hyperparameter grids as a protocol (one run per seed, records per cell), an
+# error-propagation audit of a checkpoint, and record comparison.
+./target/release/dblocks sweep --grid "lr=1e-4,1e-3 num_blocks=2,3" --seeds 1,2,3 --json sweep.jsonl
+./target/release/dblocks audit propagation --checkpoint checkpoints/dblocks-<hash>.mpk
+./target/release/dblocks experiment compare --a before.jsonl --b after.jsonl
+
+# Resume exactly: the training state (optimizer, schedules, RNG, EMA) lives
+# beside every model file and is verified before use.
+./target/release/dblocks train --steps 2000 --checkpoint-every 500 --resume
 
 # Batched inference with top-k output and per-batch profiling.
 ./target/release/dblocks infer --top-k 3 --solver heun
@@ -125,7 +138,8 @@ cargo test --all && cargo clippy --all-targets && ./target/release/dblocks verif
 | Quality gates: sampling *and* training phases | `quality.rs` |
 | Mixed-precision emulation and policy | `precision.rs` |
 | Datasets and streaming I/O | `data.rs`, `rawdata.rs`, `cifar.rs`, `tinyimagenet.rs` |
-| Training loop, checkpoints, logging | `train.rs`, `checkpoint.rs`, `logging.rs` |
+| Training loop, checkpoints and training state, logging | `train.rs`, `checkpoint.rs`, `logging.rs` |
+| Experiment records, sweeps, propagation audit | `experiment.rs`, `sweep.rs`, `audit.rs` |
 | Inference API, profiler | `infer.rs`, `profile.rs` |
 | **Numerical certificate suite** | `verify.rs` |
 
@@ -331,17 +345,18 @@ RECONVERGE:
 
 ### Mathematical Foundation
 
-Rigorous mathematical treatment of multi-micro-block denoising:
+Mathematical treatment of multi-micro-block denoising, audited in Phase 28
+(every claim's status is in [docs/Claims.md](docs/Claims.md)):
 
 - **Theorem 1**: DiffusionBlocks ODE Equivalence — block-wise dynamics as reverse ODE
 - **Theorem 2**: Tweedie's Formula — optimal denoiser via score function
 - **Theorem 3**: Convergence to Lossless — score matching → optimal denoiser
-- **Theorem 4**: Compositional Losslessness — micro-block losslessness adds up
-- **Theorem 5**: Block-wise Convergence — error propagation bounded
-- **Theorem 6**: Parallel Training Convergence — K× speedup with K blocks
-- **Theorem 7**: Consistency Loss Bound — adjacent block agreement
+- **Proposition 4**: Compositional Losslessness — `(Σ√δ)²`, under 1-Lipschitz blocks (statement corrected to match its proof)
+- **Proposition 5**: Block-wise Error Propagation — bounded *given* per-block Lipschitz constants; `L ≈ 1` is a heuristic
+- **Heuristic 6**: Parallel Training Convergence — the strong-convexity rate does not apply to a neural loss; what remains is the `K/B` update-fraction bookkeeping, and the speed-up claim is an open experiment
+- **Proposition 7**: Consistency Loss Bound — two accurate blocks agree (an inequality, not a quality claim)
 
-See [docs/Mathematical-Foundation.md](docs/Mathematical-Foundation.md) for full proofs.
+See [docs/Mathematical-Foundation.md](docs/Mathematical-Foundation.md) for the proofs and the audit notes.
 
 DiffusionBlocks++ supports multiple denoising strategies that can be combined:
 

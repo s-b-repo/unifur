@@ -6,6 +6,7 @@
 //! restricted to the `time_conditioning = true` configuration used by
 //! DiffusionBlocks.
 
+use serde::{Deserialize, Serialize};
 use crate::tensor_ext::{exact_gelu, l2_normalize_rows, silu};
 use burn::{
     module::{Module, Param},
@@ -65,7 +66,7 @@ pub struct ViTDiTConfig {
 /// the standard Switch/GLaM placement, and it keeps the dense path available
 /// for the features every expert needs. `every_n_layers = 2` replaces every
 /// second layer's MLP.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct MoeTrunkConfig {
     pub num_experts: usize,
     pub top_k: usize,
@@ -87,7 +88,7 @@ impl Default for MoeTrunkConfig {
 ///
 /// Deliberately not `Copy`: the spec carries box and expert names, which is
 /// the whole point of it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MosmeTrunkConfig {
     pub spec: crate::expert_index::MosmeSpec,
     /// Replace the feed-forward of every `every_n_layers`-th layer.

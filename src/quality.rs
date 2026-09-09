@@ -28,6 +28,7 @@
 //! Failing samples can then keep their previous latent (see
 //! `crate::multi_block`) or be filtered from training batches.
 
+use serde::{Deserialize, Serialize};
 use burn::tensor::{Tensor, backend::Backend};
 
 /// Thresholds for the quality checks. Set a threshold to `None`/`f32::INFINITY`
@@ -299,7 +300,7 @@ pub fn filter_indices(report: &GateReport) -> Vec<usize> {
 /// Naming the phase matters: "loss was NaN" and "a parameter went non-finite
 /// after the update" call for different responses, and a run that reports only
 /// "step rejected" cannot distinguish them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrainingPhase {
     /// Before the first step: schedule and preconditioning invariants.
     Preflight,
@@ -333,7 +334,7 @@ impl TrainingPhase {
 /// visits a different block each step -- a clipped bad step still writes to
 /// that block's parameters, while a skipped one leaves them for a healthier
 /// draw.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct GradNormGate {
     pub min_norm: f32,
     pub max_norm: f32,
@@ -346,7 +347,7 @@ impl Default for GradNormGate {
 }
 
 /// Which verification runs at which phase of a training step.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainingChecks {
     /// Run the schedule/preconditioning certificates before step 0.
     pub preflight: bool,
@@ -398,7 +399,7 @@ impl TrainingChecks {
 }
 
 /// One phase's failure.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CheckFailure {
     pub phase: TrainingPhase,
     pub detail: String,
@@ -452,7 +453,7 @@ impl StepVerdict {
 /// Block-wise training visits one block per step, so a block that has gone
 /// dead -- or one that is absorbing all the instability -- is invisible in the
 /// aggregate loss curve but obvious here.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct BlockHealth {
     pub steps: usize,
     pub rejected: usize,
@@ -513,7 +514,7 @@ impl BlockHealth {
 }
 
 /// Running quality state of a training run.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TrainingHealth {
     per_block: Vec<BlockHealth>,
     consecutive_rejections: usize,

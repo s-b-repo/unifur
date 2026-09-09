@@ -122,6 +122,7 @@ gains `load H` and `token H` columns. See [MoE Routing](MoE-Routing.md).
 | `--resume [PATH]` | — | Bare: newest in `--out-dir`; with a path: that file |
 | `--log-file` | — | Append-mode JSONL metrics |
 | `--log-every` | `20` | Steps between log lines |
+| `--checkpoint-every` | `0` | Also write a checkpoint (model + training state) every n steps (Phase 28). `--resume` restores and verifies that state |
 
 ---
 
@@ -165,10 +166,47 @@ schedule outright, so combining them would silently pick one.
 
 ## `dblocks bench`
 
-Adds `--repeats` (default 3) to the model flags above. Also reports a
-**test-time compute scaling curve** over step counts and planner depths, with
-the Pareto frontier marked and the marginal accuracy per extra layer — see
-[Accuracy Improvements](Accuracy-Improvements.md).
+Adds to the model flags above:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--repeats` | `3` | Measured repetitions per configuration; the table shows the mean and the 95% t-interval half-width |
+| `--warmup` | `1` | Untimed repetitions first; recorded and flagged, left out of the summary (Phase 28) |
+| `--json` | — | Append one experiment record per configuration (environment, config, seed, every raw trial, summary) to this JSONL file; never truncates |
+
+Also reports a **test-time compute scaling curve** over step counts and
+planner depths, with the Pareto frontier marked and the marginal accuracy per
+extra layer — see [Accuracy Improvements](Accuracy-Improvements.md).
+
+## `dblocks sweep` (Phase 28)
+
+Train a grid of configurations, one run per seed, into experiment records.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--grid` | — | `lr=1e-4,3e-4 num_blocks=2,3 consistency=0,0.1`: axes separated by whitespace, values by commas. Keys: `lr steps batch_size num_blocks gamma weight_decay accumulate clip_norm ema_decay uncertainty importance_bins normalize_block_loss objective consistency lr_schedule moe_experts moe_top_k balance_scope bias_balance_rate` |
+| `--seeds` | `1,2,3` | Every cell runs once per seed; the trials are the per-seed final losses |
+| `--steps` | `50` | |
+| `--dataset` / `--data-dir` | `synthetic` | As for `train` |
+| `--batch-size` | `16` | |
+| `--json` | — | Append each cell's record as soon as it finishes |
+
+## `dblocks audit propagation` (Phase 28)
+
+Per block, on one batch: local loss at the window midpoint, boundary mismatch
+with the next block's `x0` estimate, the finite-difference sensitivity
+`‖H(z+ε) − H(z)‖/‖ε‖` of the block's one-step map, and the downstream
+amplification (product of the later blocks' sensitivities); plus the model's
+own end-to-end cross-entropy and accuracy. Takes the model flags, `--batch-size`
+(16), `--epsilon` (1e-2) and `--json`. On random weights it describes the
+initialization; with `--checkpoint` it describes the model.
+
+## `dblocks experiment` (Phase 28)
+
+| Command | Meaning |
+|---|---|
+| `show --path log.jsonl` | Every record: name, unit, trials, warm-ups, mean ± 95% interval, median; the environment of the first |
+| `compare --a x.jsonl --b y.jsonl` | Match records by name and print both summaries, the ratio of means and whether the intervals overlap |
 
 ## `dblocks lm`
 
@@ -237,7 +275,23 @@ Language-model paths (Phases 19, 21b and 24).
 | `--seed` | `42` | |
 | `--log-every` | `10` | |
 | `--log` | — | Append-mode JSONL metrics (`loss`, `perplexity`, `penalized_tokens`, `penalized_prob`, `penalty`) |
-| `--out-dir` | `checkpoints` | Content-addressed checkpoint, stem `lm` |
+| `--out-dir` | `checkpoints` | Content-addressed checkpoint, stem `lm`, with the training state beside it |
+| `--checkpoint-every` | `0` | Also checkpoint every n steps (Phase 28) |
+| `--resume` | — | A model from `lm train`; its training state is restored and verified |
+
+### `dblocks lm bench` (Phase 28)
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--corpus` | — | Corpus from `lm tokenize` |
+| `--steps` | `30` | Steps per variant per seed |
+| `--seeds` | `1,2` | |
+| `--batch-size` | `4` | |
+| `--json` | — | Append one record per variant |
+
+Trains the tiny model under each trunk variant (`dense`, `moe`, `moe+bias`) and
+reports the final loss per seed with its interval and the milliseconds per
+step. On CPU this measures what the mechanisms cost, not what they buy.
 
 ### `dblocks lm generate`
 

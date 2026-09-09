@@ -193,6 +193,30 @@ enum LmAction {
         log: Option<PathBuf>,
         #[arg(long, default_value = "checkpoints")]
         out_dir: PathBuf,
+        /// Also write a checkpoint (model + training state) every n steps.
+        #[arg(long, default_value_t = 0)]
+        checkpoint_every: usize,
+        /// Resume from a model written by `lm train`; its training state,
+        /// when present, is restored and verified.
+        #[arg(long)]
+        resume: Option<PathBuf>,
+    },
+    /// Train the tiny model a few steps under each trunk variant (dense,
+    /// flat MoE, MoE with loss-free bias balancing) and record the loss and
+    /// step time per seed as experiment records (roadmap Phase 28). On CPU
+    /// this measures the mechanisms' cost, not their quality.
+    Bench {
+        #[arg(long)]
+        corpus: PathBuf,
+        #[arg(long, default_value_t = 30)]
+        steps: usize,
+        #[arg(long, default_value = "1,2")]
+        seeds: String,
+        #[arg(long, default_value_t = 4)]
+        batch_size: usize,
+        /// Append one record per variant here.
+        #[arg(long)]
+        json: Option<PathBuf>,
     },
     /// Generate a continuation from an untrained model.
     ///
@@ -291,9 +315,14 @@ enum Command {
         #[arg(long, default_value_t = false)]
         async_save: bool,
         /// Resume from this checkpoint, or from the newest one in `--out-dir`
-        /// when passed without a value.
+        /// when passed without a value. The training state beside the model
+        /// (optimizer, schedules, RNG, EMA, estimators) is restored and
+        /// verified when present, so the continuation is exact.
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         resume: Option<String>,
+        /// Also write a checkpoint (model + training state) every n steps.
+        #[arg(long, default_value_t = 0)]
+        checkpoint_every: usize,
         /// Disable every training-time quality check.
         #[arg(long, default_value_t = false)]
         no_checks: bool,
@@ -440,6 +469,48 @@ enum Command {
         /// Repetitions per configuration, for stable timings.
         #[arg(long, default_value_t = 3)]
         repeats: usize,
+        /// Untimed repetitions before the measured ones; recorded and flagged
+        /// in the JSON record, left out of the summary (roadmap Phase 28).
+        #[arg(long, default_value_t = 1)]
+        warmup: usize,
+        /// Append one experiment record per configuration (environment,
+        /// config, seed, every raw trial, summary with a 95% t-interval) to
+        /// this JSONL file. Never truncates it.
+        #[arg(long)]
+        json: Option<PathBuf>,
+    },
+    /// Train a grid of configurations, one run per seed, into experiment
+    /// records (roadmap Phase 28; issue 1 sections 5 and 8). The protocol the
+    /// GPU-blocked comparisons will run through.
+    Sweep {
+        /// `lr=1e-4,3e-4 num_blocks=2,3 consistency=0,0.1` -- axes separated
+        /// by whitespace, values by commas.
+        #[arg(long)]
+        grid: String,
+        /// Seeds to repeat every cell with.
+        #[arg(long, default_value = "1,2,3")]
+        seeds: String,
+        #[arg(long, default_value_t = 50)]
+        steps: usize,
+        #[arg(long, default_value = "synthetic")]
+        dataset: String,
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = 16)]
+        batch_size: usize,
+        /// Append every cell's record here as soon as it finishes.
+        #[arg(long)]
+        json: Option<PathBuf>,
+    },
+    /// Audits that measure what the theory assumes (roadmap Phase 28).
+    Audit {
+        #[command(subcommand)]
+        action: AuditAction,
+    },
+    /// Read and compare experiment records.
+    Experiment {
+        #[command(subcommand)]
+        action: ExperimentAction,
     },
     /// Classify a batch through the inference API and print top-k results.
     Infer {
@@ -485,6 +556,41 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum AuditAction {
+    /// Per block: local loss, boundary mismatch with the next block, a
+    /// finite-difference sensitivity proxy, and the downstream amplification
+    /// of an error made there (issue 1 section 7).
+    Propagation {
+        #[command(flatten)]
+        model: ModelArgs,
+        #[arg(long, default_value_t = 16)]
+        batch_size: usize,
+        /// Standard deviation of the latent perturbation.
+        #[arg(long, default_value_t = 1e-2)]
+        epsilon: f64,
+        /// Write the report as JSON here as well.
+        #[arg(long)]
+        json: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ExperimentAction {
+    /// Print every record in a log: name, unit, trials, summary.
+    Show {
+        #[arg(long)]
+        path: PathBuf,
+    },
+    /// Match records by name across two logs and compare their summaries.
+    Compare {
+        #[arg(long)]
+        a: PathBuf,
+        #[arg(long)]
+        b: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
 enum ExpertsAction {
     /// Write a starter spec, e.g.
     /// `--box coding:rust,python,secure --box cyber:netsec,malware`.
@@ -519,9 +625,14 @@ fn main() -> Result<()> {
         Command::Verify { group } => cmd_verify(group.as_deref()),
         command @ Command::Train { .. } => cmd_train(command),
         command @ Command::Sample { .. } => cmd_sample(command),
-        Command::Bench { model, num_inference_steps, batch_size, repeats } => {
-            cmd_bench(model, num_inference_steps, batch_size, repeats)
+        Command::Bench { model, num_inference_steps, batch_size, repeats, warmup, json } => {
+            cmd_bench(model, num_inference_steps, batch_size, repeats, warmup, json)
         }
+        Command::Sweep { grid, seeds, steps, dataset, data_dir, batch_size, json } => {
+            cmd_sweep(&grid, &seeds, steps, &dataset, data_dir, batch_size, json)
+        }
+        Command::Audit { action } => cmd_audit(action),
+        Command::Experiment { action } => cmd_experiment(action),
         Command::Infer { model, batch_size, num_inference_steps, top_k, solver } => {
             cmd_infer(model, batch_size, num_inference_steps, top_k, &solver)
         }
@@ -692,6 +803,8 @@ fn cmd_lm(action: LmAction) -> Result<()> {
             log_every,
             log,
             out_dir,
+            checkpoint_every,
+            resume,
         } => {
             type Train = train::DefaultTrainBackend;
             let device: <Train as burn::tensor::backend::BackendTypes>::Device = Default::default();
@@ -742,6 +855,10 @@ fn cmd_lm(action: LmAction) -> Result<()> {
                 log_every,
                 log_path: log,
                 bias_balance_rate: 0.0,
+                out_dir: Some(out_dir.clone()),
+                checkpoint_every,
+                resume,
+                model_config: Some(model_config.clone()),
             };
             let (model, report) = train::train_lm(model, &mut corpus, &config, &device)?;
             println!(
@@ -759,8 +876,72 @@ fn cmd_lm(action: LmAction) -> Result<()> {
                     report.penalized_tokens, report.first_penalized_prob, report.last_penalized_prob
                 );
             }
-            let path = checkpoint::save_content_addressed(model, &out_dir, "lm")?;
-            println!("checkpoint saved: {}", path.display());
+            let path = match report.checkpoint {
+                Some(path) => path,
+                None => checkpoint::save_content_addressed(model, &out_dir, "lm")?,
+            };
+            println!("checkpoint saved: {} (training state beside it)", path.display());
+            Ok(())
+        }
+        LmAction::Bench { corpus: corpus_path, steps, seeds, batch_size, json } => {
+            use diffusionblocks::experiment::{Record, RunLog};
+            use diffusionblocks::vit::MoeTrunkConfig;
+            type Train = train::DefaultTrainBackend;
+            let device: <Train as burn::tensor::backend::BackendTypes>::Device = Default::default();
+            let seeds = parse_seeds(&seeds)?;
+            let mut corpus = TokenCorpus::in_memory(&corpus_path)?;
+            let moe = MoeTrunkConfig { num_experts: 3, top_k: 1, every_n_layers: 2, z_level: 1e-3, balance_bias: false };
+            let variants: Vec<(&str, LmConfig, f32)> = vec![
+                ("dense", LmConfig::tiny(), 0.0),
+                ("moe", LmConfig { moe: Some(moe), ..LmConfig::tiny() }, 0.0),
+                ("moe+bias", LmConfig { moe: Some(MoeTrunkConfig { balance_bias: true, ..moe }), ..LmConfig::tiny() }, 1e-3),
+            ];
+            println!("{:<10} {:>6} {:>12} {:>12} {:>10}", "variant", "seeds", "final loss", "±ci95", "ms/step");
+            println!("{}", "-".repeat(54));
+            let mut records = Vec::new();
+            for (name, model_config, rate) in variants {
+                let train_config = train::LmTrainConfig {
+                    steps,
+                    batch_size,
+                    log_every: 0,
+                    bias_balance_rate: rate,
+                    model_config: Some(model_config.clone()),
+                    ..Default::default()
+                };
+                let mut record = Record::new(
+                    format!("lm-bench/{name}"),
+                    "loss",
+                    serde_json::to_value(&train_config).map_err(|e| anyhow::anyhow!("{e}"))?,
+                    seeds.clone(),
+                );
+                let mut ms_per_step = Vec::new();
+                for &seed in &seeds {
+                    <Train as burn::tensor::backend::Backend>::seed(&device, seed);
+                    let model = LanguageModel::<Train>::new(&model_config, &device);
+                    let cfg = train::LmTrainConfig { seed, ..train_config.clone() };
+                    let (_, report) = train::train_lm(model, &mut corpus, &cfg, &device)?;
+                    record.push(f64::from(report.last_loss), false);
+                    ms_per_step.push(1e3 * report.elapsed_secs / report.steps_taken.max(1) as f64);
+                }
+                let mean_ms = ms_per_step.iter().sum::<f64>() / ms_per_step.len() as f64;
+                record.extra = serde_json::json!({ "ms_per_step": ms_per_step, "forward_passes_per_token": 1 });
+                let summary = record.summary.expect("at least one seed");
+                println!(
+                    "{:<10} {:>6} {:>12.4} {:>12.4} {:>10.1}",
+                    name,
+                    summary.n,
+                    summary.mean,
+                    if summary.ci95_half_width.is_nan() { 0.0 } else { summary.ci95_half_width },
+                    mean_ms
+                );
+                records.push(record);
+            }
+            if let Some(path) = &json {
+                for r in &records {
+                    RunLog::append(path, r)?;
+                }
+                println!("{} record(s) appended to {}", records.len(), path.display());
+            }
             Ok(())
         }
         LmAction::Generate {
@@ -980,6 +1161,7 @@ fn cmd_train(command: Command) -> Result<()> {
         grad_checkpointing,
         async_save,
         resume,
+        checkpoint_every,
         no_checks,
         no_preflight,
         verify_every,
@@ -1079,6 +1261,10 @@ fn cmd_train(command: Command) -> Result<()> {
         )?),
         balance_scope: diffusionblocks::schedule::BalanceScope::parse(&balance_scope)?,
         bias_balance_rate,
+        // The trainer writes the checkpoint itself so the training state lands
+        // beside it. `--async-save` keeps the old weights-only background save.
+        out_dir: (!async_save).then(|| out_path.clone()),
+        checkpoint_every,
     };
 
     println!(
@@ -1087,12 +1273,15 @@ fn cmd_train(command: Command) -> Result<()> {
     );
 
     let path = if grad_checkpointing {
-        let model = train::train_synthetic_generic::<
+        let (model, summary) = train::train_generic::<
             burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing,
         >(&config)?;
-        checkpoint::save_content_addressed_async(model, out_path, "dblocks")
-            .join()
-            .expect("save thread")?
+        match summary.checkpoint {
+            Some(path) => path,
+            None => checkpoint::save_content_addressed_async(model, out_path, "dblocks")
+                .join()
+                .expect("save thread")?,
+        }
     } else {
         let (model, summary) = train::train(&config)?;
         println!(
@@ -1119,12 +1308,14 @@ fn cmd_train(command: Command) -> Result<()> {
             );
         }
         print!("\nper-block quality:\n{}", summary.health.render());
-        if async_save {
-            checkpoint::save_content_addressed_async(model, out_path, "dblocks")
-                .join()
-                .expect("save thread")?
-        } else {
-            checkpoint::save_content_addressed(model, &out_path, "dblocks")?
+        match summary.checkpoint {
+            Some(path) => path,
+            None => {
+                println!("note: --async-save writes the weights only, without a training state");
+                checkpoint::save_content_addressed_async(model, out_path, "dblocks")
+                    .join()
+                    .expect("save thread")?
+            }
         }
     };
     println!("checkpoint saved: {}", path.display());
@@ -1348,7 +1539,22 @@ fn cmd_bench(
     num_inference_steps: usize,
     batch_size: usize,
     repeats: usize,
+    warmup: usize,
+    json: Option<PathBuf>,
 ) -> Result<()> {
+    use diffusionblocks::experiment::{Record, RunLog};
+    let bench_config = serde_json::json!({
+        "image_size": model_args.image_size,
+        "num_labels": model_args.num_labels,
+        "num_hidden_layers": model_args.num_hidden_layers,
+        "num_blocks": model_args.num_blocks,
+        "checkpoint": model_args.checkpoint.as_ref().map(|p| p.display().to_string()),
+        "num_inference_steps": num_inference_steps,
+        "batch_size": batch_size,
+        "repeats": repeats,
+        "warmup": warmup,
+    });
+    let mut records: Vec<Record> = Vec::new();
     let model = model_args.build(Some(num_inference_steps))?;
     let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
     let mut rng = StdRng::seed_from_u64(model_args.seed);
@@ -1407,10 +1613,16 @@ fn cmd_bench(
 
             let mut last = None;
             let scope = format!("{}/{label}", kind.name());
-            for _ in 0..repeats.max(1) {
+            let mut record = Record::new(format!("bench/{scope}"), "ms", bench_config.clone(), vec![model_args.seed]);
+            for trial in 0..warmup + repeats.max(1) {
+                let is_warmup = trial < warmup;
                 let start = std::time::Instant::now();
                 let out = model.sample_multi_block(&batch.pixel_values, &config, &mut rng);
-                profiler.record(&scope, start.elapsed());
+                let elapsed = start.elapsed();
+                record.push(elapsed.as_secs_f64() * 1e3, is_warmup);
+                if !is_warmup {
+                    profiler.record(&scope, elapsed);
+                }
                 last = Some(out);
             }
 
@@ -1423,19 +1635,29 @@ fn cmd_bench(
                 .iter()
                 .collect();
             let agree = preds.iter().zip(&reference).filter(|(a, b)| a == b).count();
+            record.extra = serde_json::json!({
+                "model_calls": stats.model_calls,
+                "layers_executed": stats.layers_executed,
+                "agree": agree,
+                "of": reference.len(),
+            });
+            records.push(record);
 
+            let timing = profiler.stats(&scope).unwrap();
             println!(
-                "{:<10} {:<12} {:>10} {:>12} {:>8} {:>9}/{}",
+                "{:<10} {:<12} {:>10} {:>12} {:>8} {:>9}/{}  ±{}",
                 kind.name(),
                 label,
-                format_duration(profiler.stats(&scope).unwrap().mean()),
+                format_duration(timing.mean()),
                 stats.model_calls,
                 stats.layers_executed,
                 agree,
-                reference.len()
+                reference.len(),
+                format_duration(timing.ci95_half_width())
             );
         }
     }
+    println!("(± is the half-width of the 95% t-interval over {} measured repeat(s))", repeats.max(1));
 
     println!(
         "\nAgreement is measured against sequential Euler on the SAME weights.\n\
@@ -1457,11 +1679,16 @@ fn cmd_bench(
             logit_norm: LogitNorm::None,
         };
         let (logits, stats) = model.sample_multi_block(&batch.pixel_values, &config, &mut rng);
+        let acc = diffusionblocks::accuracy::accuracy(&logits, &batch.labels);
+        let mut record = Record::new(format!("bench/scaling/sequential/steps={steps}"), "accuracy", bench_config.clone(), vec![model_args.seed]);
+        record.push(acc, false);
+        record.extra = serde_json::json!({ "model_calls": stats.model_calls, "layers_executed": stats.layers_executed });
+        records.push(record);
         curve.push(ScalingPoint::new(
             format!("sequential/steps={steps}"),
             stats.model_calls,
             stats.layers_executed,
-            diffusionblocks::accuracy::accuracy(&logits, &batch.labels),
+            acc,
         ));
     }
     for depth in [0usize, 1, 2] {
@@ -1472,16 +1699,27 @@ fn cmd_bench(
             ..PlannedConfig::default()
         };
         let (logits, stats, _) = model.sample_planned(&batch.pixel_values, &config, &mut rng);
+        let acc = diffusionblocks::accuracy::accuracy(&logits, &batch.labels);
+        let mut record = Record::new(format!("bench/scaling/planned/depth={depth}"), "accuracy", bench_config.clone(), vec![model_args.seed]);
+        record.push(acc, false);
+        record.extra = serde_json::json!({ "model_calls": stats.model_calls, "layers_executed": stats.layers_executed });
+        records.push(record);
         curve.push(ScalingPoint::new(
             format!("planned/depth={depth}"),
             stats.model_calls,
             stats.layers_executed,
-            diffusionblocks::accuracy::accuracy(&logits, &batch.labels),
+            acc,
         ));
     }
 
     println!("\nTest-time compute scaling (* marks the Pareto frontier):");
     print!("{}", curve.render());
+    if let Some(path) = &json {
+        for record in &records {
+            RunLog::append(path, record)?;
+        }
+        println!("\n{} experiment record(s) appended to {}", records.len(), path.display());
+    }
     for (label, rate) in curve.marginal_returns() {
         println!("  {label}: {:+.5} top-1 per extra layer", rate);
     }
@@ -1490,6 +1728,123 @@ fn cmd_bench(
          measurement, not a result. Run it on trained weights to size a budget."
     );
     Ok(())
+}
+
+fn parse_seeds(text: &str) -> Result<Vec<u64>> {
+    let seeds: Vec<u64> = text
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().parse::<u64>().map_err(|e| anyhow::anyhow!("seed {s:?}: {e}")))
+        .collect::<Result<_>>()?;
+    anyhow::ensure!(!seeds.is_empty(), "at least one seed is needed");
+    Ok(seeds)
+}
+
+fn cmd_sweep(
+    grid: &str,
+    seeds: &str,
+    steps: usize,
+    dataset: &str,
+    data_dir: Option<PathBuf>,
+    batch_size: usize,
+    json: Option<PathBuf>,
+) -> Result<()> {
+    use diffusionblocks::sweep::{self, Grid};
+    let grid = Grid::parse(grid)?;
+    let seeds = parse_seeds(seeds)?;
+    let base = TrainConfig {
+        steps,
+        batch_size,
+        log_every: steps.max(1),
+        dataset: DatasetChoice::parse(dataset, data_dir, false)?,
+        ..TrainConfig::default()
+    };
+    let cells = grid.cells();
+    println!(
+        "sweep: {} cell(s) x {} seed(s) x {steps} steps on {dataset}{}",
+        cells.len(),
+        seeds.len(),
+        json.as_ref().map(|p| format!(" -> {}", p.display())).unwrap_or_default()
+    );
+    let records = sweep::run_grid(&base, &grid, &seeds, json.as_deref())?;
+    print!("\n{}", sweep::render(&records));
+    println!(
+        "\nEvery cell differs from every other only in what the grid names; the trials are the\n\
+         per-seed final losses and the interval is the 95% t-interval over seeds."
+    );
+    Ok(())
+}
+
+fn cmd_audit(action: AuditAction) -> Result<()> {
+    match action {
+        AuditAction::Propagation { model: model_args, batch_size, epsilon, json } => {
+            let model = model_args.build(None)?;
+            let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
+            let mut rng = StdRng::seed_from_u64(model_args.seed);
+            let mut dataset = SyntheticDataset::new(model_args.image_size, model_args.num_labels, batch_size, model_args.seed);
+            let batch = dataset.next_batch(&mut rng, &device);
+            let report = diffusionblocks::audit::propagation(&model, &batch.pixel_values, &batch.labels, epsilon);
+            print!("{}", report.render());
+            println!(
+                "sensitivity is ||H(z+e) - H(z)|| / ||e|| for the block's one-step map; amplification is the\n\
+                 product of the later blocks' sensitivities. On random weights these describe the\n\
+                 initialization; pass --checkpoint to audit a trained model."
+            );
+            if let Some(path) = json {
+                std::fs::write(&path, report.to_json()?)
+                    .map_err(|err| anyhow::anyhow!("write {}: {err}", path.display()))?;
+                println!("report written to {}", path.display());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn cmd_experiment(action: ExperimentAction) -> Result<()> {
+    use diffusionblocks::experiment::{compare, render_comparison, RunLog};
+    match action {
+        ExperimentAction::Show { path } => {
+            let records = RunLog::read(&path)?;
+            println!("{:<40} {:>6} {:>4} {:>4} {:>14} {:>12}", "name", "unit", "n", "warm", "mean ± ci95", "median");
+            println!("{}", "-".repeat(86));
+            for r in &records {
+                let warm = r.trials.iter().filter(|t| t.warmup).count();
+                match r.summary {
+                    Some(s) => println!(
+                        "{:<40} {:>6} {:>4} {:>4} {:>14} {:>12.4}",
+                        r.name,
+                        r.unit,
+                        s.n,
+                        warm,
+                        format!("{:.4}±{:.4}", s.mean, if s.ci95_half_width.is_nan() { 0.0 } else { s.ci95_half_width }),
+                        s.median
+                    ),
+                    None => println!("{:<40} {:>6} {:>4} {:>4} {:>14} {:>12}", r.name, r.unit, 0, warm, "-", "-"),
+                }
+            }
+            if let Some(first) = records.first() {
+                let e = &first.environment;
+                println!(
+                    "\n{} record(s); first taken on {} ({} cpu(s)), {} {}, build {} ({})",
+                    records.len(),
+                    e.cpu_model,
+                    e.logical_cpus,
+                    e.os_name,
+                    e.os_release,
+                    e.build.git_revision,
+                    e.build.profile
+                );
+            }
+            Ok(())
+        }
+        ExperimentAction::Compare { a, b } => {
+            let rows = compare(&RunLog::read(&a)?, &RunLog::read(&b)?);
+            anyhow::ensure!(!rows.is_empty(), "no record names in common between {} and {}", a.display(), b.display());
+            print!("{}", render_comparison(&rows));
+            println!("\noverlap = the two 95% intervals overlap: not evidence of no difference, only of not enough trials to show one.");
+            Ok(())
+        }
+    }
 }
 
 fn cmd_infer(

@@ -24,11 +24,12 @@
 //! small.
 
 use crate::dblock::DblockClassifier;
+use serde::{Deserialize, Serialize};
 use burn::tensor::{Int, Tensor, backend::Backend};
 use rand::Rng;
 
 /// Weight schedule for combining consistency terms with the main loss.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum ConsistencySchedule {
     /// Constant weight (no ramp).
     Constant { weight: f64 },
@@ -61,7 +62,7 @@ impl ConsistencySchedule {
 }
 
 /// Weights of the four consistency terms.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ConsistencyWeights {
     pub boundary: f64,
     pub self_consistency: f64,
@@ -96,7 +97,7 @@ impl ConsistencyWeights {
 }
 
 /// Configuration for [`DblockClassifier::consistency_step`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct ConsistencyConfig {
     pub gamma: f64,
     pub weights: ConsistencyWeights,
