@@ -1108,89 +1108,45 @@ uv run python -m diffusionblocks.main test cifar100 \
 
 ## Roadmap & TODO
 
-### Phase 1: Core DiffusionBlocks (Original Paper)
-- [ ] Port ViT baseline (image classification)
-- [ ] Port DiffusionBlocks training loop
-- [ ] Port EDM noise schedule and loss
-- [ ] Reproduce CIFAR-100 results
-- [ ] Reproduce Tiny ImageNet results
+The roadmap of record is [`TODO.md`](TODO.md): one section per phase with
+every item's status, the measured `Status` paragraph, the bugs found along
+the way, and the `Remaining` table naming the blocker (GPU compute, cluster
+hardware, or a dependency this crate does not take) on each open item. The
+table below is generated from it; "blocked" items are all in that table.
 
-### Phase 2: Parallel Depth Denoising
-- [ ] Implement parallel trajectory sampling (K blocks at a time)
-- [ ] Implement fork-reconverge protocol
-- [ ] Implement gradient routing (only active blocks)
-- [ ] Overlapping sigma windows with consensus
-- [ ] Cross-fork training (non-adjacent block pairs)
-- [ ] Benchmark: K=1 vs K=2 vs K=3 on CIFAR-100
+| Phase | Items (done / partial / blocked) | Status |
+|---|---|---|
+| 1. Core DiffusionBlocks (Original Paper Port) | 5 / 0 / 3 | Core port complete, both datasets loadable; reproduction runs pending hardware. |
+| 2. Parallel Depth Denoising | 8 / 0 / 2 | Mechanisms and benchmark harness complete; quality numbers pending hardware. |
+| 3. Consistency Training | 5 / 0 / 2 | Implemented; ablations pending hardware. |
+| 4. Inference Solvers | 8 / 0 / 0 | 5 solvers, order-certified, benchmarked. |
+| 5. Flow Matching | 4 / 0 / 1 | Objective, sampler and trainer shipped. |
+| 6. MoE Routing | 5 / 0 / 1 | Layer, trunk integration and losses tested. |
+| 7. Block Distillation | 6 / 0 / 1 | Implemented; the self-distillation identity is unit-tested. |
+| 8. Adaptive Depth | 6 / 0 / 1 | see TODO.md |
+| 9. QLoRA / Quantization | 5 / 0 / 0 | Error bound, exact-zero and identity-at-init all certified. |
+| 10. Multi-Block Denoising | 7 / 0 / 0 | see TODO.md |
+| 11. Hybrid Loop Graph Dynamic Transformers | 5 / 0 / 0 | Termination, budget and partition-of-unity are certified invariants, not assumptions. |
+| 12. Quality Gate | 7 / 0 / 1 | see TODO.md |
+| 13. I/O & Performance | 4 / 2 / 0 | see TODO.md |
+| 14. Mathematical Foundation | 2 / 0 / 0 | See [Quality gate](#quality-gate) below. |
+| 15. Production Features | 5 / 0 / 3 | see TODO.md |
+| 16. Tests & Documentation | 13 / 0 / 0 | see TODO.md |
+| 17. Applications & Demos | 0 / 0 / 1 | see TODO.md |
+| 18. Mixture of Specialized Micro Experts | 14 / 0 / 1 | All three expert granularities ship — MLP sub-layer, LoRA adapter, and whole micro-model — sharing one router, one balance loss and one manifest. |
+| 19. Language Modeling | 9 / 0 / 1 | Done except the GPU benchmarks. |
+| 20. Loss Reduction and Convergence | 8 / 0 / 0 | Done. |
+| 21. Next-Step and Path Prediction | 6 / 0 / 0 | Done. |
+| 22. Accuracy Improvements | 5 / 0 / 2 | Five of six shipped, plus a new item. |
+| 23. MoE Routing Quality | 6 / 0 / 0 | Done. |
+| 24. Negative Supervision for Code | 6 / 2 / 0 | Done. |
+| 28. Reproducibility and Audit | 6 / 0 / 0 | Done. |
+| 29. Multi-Source Training | 5 / 0 / 0 | Done. |
+| 30. Cyber Policy -- Blockers, Refusals and Approvals | 4 / 0 / 0 | Done as a mechanism. |
+| 31. Direction Ablation and Negative Training for Every Model | 6 / 0 / 0 | Done as a mechanism, end to end on a tiny model (the integration test extracts a direction from a trained model, ablates it, trains with the ... |
 
-### Phase 3: Consistency Training
-- [ ] Implement boundary consistency loss
-- [ ] Implement self-consistency loss (different noise levels)
-- [ ] Integrate with parallel denoising
-- [ ] Ablation: consistency weight sweep
-
-### Phase 4: Inference Solvers
-- [ ] Euler solver
-- [ ] Heun solver (2nd order)
-- [ ] DDIM solver
-- [ ] DPM-Solver++ (2nd order)
-- [ ] DPM-Solver++ (3rd order, stretch goal)
-- [ ] Solver benchmark: quality vs steps vs time
-
-### Phase 5: Flow Matching
-- [ ] Rectified flow objective
-- [ ] OT flow objective
-- [ ] Linear sigma schedule
-- [ ] Compare with EDM objective across tasks
-
-### Phase 6: MoE Routing
-- [ ] Top-K router
-- [ ] Expert MLP pool
-- [ ] Load balancing loss
-- [ ] Noise-aware router (conditions on sigma)
-- [ ] Benchmark: 1 vs 2 vs 4 vs 8 experts
-
-### Phase 7: Block Distillation
-- [ ] Teacher-student training loop
-- [ ] KL divergence on denoising trajectory
-- [ ] MSE on denoising trajectory
-- [ ] Distill N blocks → M blocks
-- [ ] Combine with QLoRA
-
-### Phase 8: Adaptive Depth
-- [ ] Halting probability module
-- [ ] Adaptive depth controller
-- [ ] Depth regularization
-- [ ] Block skipping policy
-- [ ] Benchmark: quality vs expected depth
-
-### Phase 9: QLoRA / Quantization
-- [ ] 4-bit NormalFloat block weights
-- [ ] LoRA adapters for each block
-- [ ] Integration with block-wise training
-- [ ] Memory benchmark
-
-### Phase 10: Architecture Ports
-- [ ] DiT (image generation, ImageNet 256)
-- [ ] Masked Diffusion (text, text8)
-- [ ] Autoregressive Transformer (OWT)
-- [ ] Recurrent-depth Transformer (single-pass training)
-
-### Phase 11: Production
-- [ ] Mixed precision (bf16) training
-- [ ] Gradient checkpointing
-- [ ] Distributed training (DDP, DeepSpeed, FSDP)
-- [ ] W&B logging integration
-- [ ] Model checkpointing
-- [ ] Inference API / serving
-
-### Phase 12: Applications & Demos
-- [ ] Gradio demo for interactive exploration
-- [ ] Colab notebook for quick start
-- [ ] Blog post explaining parallel denoising
-- [ ] Video tutorial
-
----
+The original phase-by-phase design checklist that used to live here is
+superseded by that file.
 
 ## Contributing
 
