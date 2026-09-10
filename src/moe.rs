@@ -46,6 +46,9 @@ pub struct MoEConfig {
     /// Attach a loss-free selection bias to the router (roadmap 23.5). Off
     /// by default: a router without one routes exactly as it always has.
     pub balance_bias: bool,
+    /// Width of the per-token routing state appended to the router input
+    /// (roadmap 25.4); `0` appends nothing.
+    pub state_size: usize,
 }
 
 impl MoEConfig {
@@ -60,12 +63,20 @@ impl MoEConfig {
             route_on_tokens: true,
             z_level: 1e-3,
             balance_bias: false,
+            state_size: 0,
         }
     }
 
     /// Give the router a loss-free selection bias (roadmap 23.5).
     pub fn with_balance_bias(mut self, enabled: bool) -> Self {
         self.balance_bias = enabled;
+        self
+    }
+
+    /// Append a routing state of this width to the router input (roadmap
+    /// 25.4).
+    pub fn with_state_size(mut self, size: usize) -> Self {
+        self.state_size = size;
         self
     }
 
@@ -85,13 +96,16 @@ impl MoEConfig {
         self
     }
 
-    /// Width of the router's input vector.
+    /// Width of the router's input vector: the condition, the token's own
+    /// features when routing on tokens, and the routing state when one is
+    /// carried.
     pub fn router_input_size(&self) -> usize {
-        if self.route_on_tokens {
+        let base = if self.route_on_tokens {
             self.cond_size + self.hidden_size
         } else {
             self.cond_size
-        }
+        };
+        base + self.state_size
     }
 
     /// Parameters the expert pool holds, versus one dense MLP of the same
@@ -324,6 +338,9 @@ pub struct MoELayer<B: Backend> {
     /// an `EmptyRecord` and a checkpoint written before this existed still
     /// loads — the value comes from the config, not from the weights.
     z_level: f64,
+    /// Width of the routing state the router input ends with (roadmap 25.4);
+    /// `0` for a router that takes none.
+    state_size: usize,
 }
 
 /// Scatter sparse top-k gate values back into a dense `[T, width]` row.
@@ -432,8 +449,16 @@ pub struct LayerRouting<B: Backend> {
     pub prob_mass: Tensor<B, 1>,
     /// Mean per-token routing entropy in nats, detached.
     pub entropy: Tensor<B, 1>,
+    /// `[T, 1]`: each token's top-1 expert, detached (roadmap 25.6).
+    pub top1: Tensor<B, 2, Int>,
     pub experts: usize,
     pub tokens: usize,
+    /// How the `T` tokens are laid out, `batch x seq_len`, for the token
+    /// stability diagnostic. `seq_len = 1` when the layer does not know.
+    pub batch: usize,
+    pub seq_len: usize,
+    /// Which axis this router decides.
+    pub kind: crate::routing::RouterKind,
 }
 
 /// `(load, prob_mass, entropy)` for one layer's routing decision.
@@ -449,17 +474,39 @@ pub fn layer_routing<B: Backend>(
         load: f.reshape([num_experts]).detach(),
         prob_mass: p.reshape([num_experts]),
         entropy: entropy_of_rows(probs).detach(),
+        top1: top1.clone(),
         experts: num_experts,
         tokens,
+        batch: tokens,
+        seq_len: 1,
+        kind: crate::routing::RouterKind::Ffn,
     }
 }
 
 impl<B: Backend> LayerRouting<B> {
+    /// Record the `batch x seq_len` layout of the routed tokens, so adjacent
+    /// positions can be compared within a sequence (roadmap 25.6).
+    pub fn with_sequence(mut self, batch: usize, seq_len: usize) -> Self {
+        assert_eq!(batch * seq_len, self.tokens, "layout must cover every routed token");
+        self.batch = batch;
+        self.seq_len = seq_len;
+        self
+    }
+
+    /// Tag the axis this router decides.
+    pub fn with_kind(mut self, kind: crate::routing::RouterKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
     /// Sync to the host and normalize.
     pub fn to_host(&self) -> RoutingStats {
         let load: Vec<f32> = self.load.clone().into_data().convert::<f32>().iter::<f32>().collect();
         let entropy: f32 = self.entropy.clone().into_scalar().elem::<f32>();
-        RoutingStats::from_load(load, entropy, self.tokens)
+        let mut stats = RoutingStats::from_load(load, entropy, self.tokens);
+        stats.stability = crate::routing::token_stability(&self.top1, self.batch, self.seq_len);
+        stats.kind = self.kind;
+        stats
     }
 }
 
@@ -473,6 +520,10 @@ impl<B: Backend> LayerRouting<B> {
 /// | low | -- | **collapse**: a few experts take everything |
 /// | high | high | balanced but *undecided*: every token hedges over every expert -- the failure mode a per-micro-batch balance loss produces, invisible in the loss itself |
 /// | high | low | balanced **and** specialized: what routing is for |
+///
+/// Phase 25 adds the two locality numbers a multi-axis router needs:
+/// `stability` (adjacent tokens choosing the same expert) and `agreement`
+/// (this layer's top-1 matching the routed layer before it).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RoutingStats {
     /// Top-1 load fraction per expert; sums to 1.
@@ -484,6 +535,22 @@ pub struct RoutingStats {
     pub token_entropy: f32,
     /// Tokens the fractions were measured over.
     pub tokens: usize,
+    /// Which axis this router decides (roadmap 25.5).
+    #[serde(default)]
+    pub kind: crate::routing::RouterKind,
+    /// Fraction of adjacent positions, within a sequence, that chose the
+    /// same top-1 expert (roadmap 25.6); `1` when nothing is adjacent.
+    #[serde(default = "one")]
+    pub stability: f32,
+    /// Fraction of tokens whose top-1 expert matches the previous routed
+    /// layer's, when the two have the same width; `None` for the first
+    /// routed layer or incomparable widths.
+    #[serde(default)]
+    pub agreement: Option<f32>,
+}
+
+fn one() -> f32 {
+    1.0
 }
 
 impl RoutingStats {
@@ -492,7 +559,30 @@ impl RoutingStats {
         let norm = if e > 1 { (e as f32).ln() } else { 1.0 };
         let load_entropy = if e > 1 { normalized_entropy(&load) } else { 1.0 };
         let token_entropy = if e > 1 { (token_entropy_nats / norm).clamp(0.0, 1.0) } else { 1.0 };
-        Self { load, load_entropy, token_entropy, tokens }
+        Self {
+            load,
+            load_entropy,
+            token_entropy,
+            tokens,
+            kind: crate::routing::RouterKind::Ffn,
+            stability: 1.0,
+            agreement: None,
+        }
+    }
+
+    /// Mean token stability over a set of layers; 1 for an empty set.
+    pub fn mean_stability(layers: &[RoutingStats]) -> f32 {
+        if layers.is_empty() {
+            return 1.0;
+        }
+        layers.iter().map(|l| l.stability).sum::<f32>() / layers.len() as f32
+    }
+
+    /// Mean layer agreement over the layers that report one; `None` when
+    /// none does.
+    pub fn mean_agreement(layers: &[RoutingStats]) -> Option<f32> {
+        let values: Vec<f32> = layers.iter().filter_map(|l| l.agreement).collect();
+        (!values.is_empty()).then(|| values.iter().sum::<f32>() / values.len() as f32)
     }
 
     pub fn experts(&self) -> usize {
@@ -516,6 +606,12 @@ impl RoutingStats {
             *x = a * *x + b * *y;
         }
         self.token_entropy = a * self.token_entropy + b * other.token_entropy;
+        self.stability = a * self.stability + b * other.stability;
+        self.agreement = match (self.agreement, other.agreement) {
+            (Some(x), Some(y)) => Some(a * x + b * y),
+            (x, None) => x,
+            (None, y) => y,
+        };
         self.load_entropy = normalized_entropy(&self.load);
         self.tokens += other.tokens;
     }
@@ -664,6 +760,7 @@ impl<B: Backend> MoELayer<B> {
             top_k,
             route_on_tokens: config.route_on_tokens,
             z_level: config.z_level,
+            state_size: config.state_size,
         }
     }
 
@@ -678,6 +775,17 @@ impl<B: Backend> MoELayer<B> {
     /// Configured router z-loss weight.
     pub fn z_level(&self) -> f64 {
         self.z_level
+    }
+
+    /// Width of the routing state this layer's router expects (roadmap 25.4).
+    pub fn state_size(&self) -> usize {
+        self.state_size
+    }
+
+    /// Declare the routing-state width of a layer assembled from parts.
+    pub fn with_state_size(mut self, size: usize) -> Self {
+        self.state_size = size;
+        self
     }
 
     /// Assemble from already-built parts. Used by [`crate::mosme`] to produce
@@ -701,6 +809,7 @@ impl<B: Backend> MoELayer<B> {
             top_k: top_k.clamp(1, num_experts),
             route_on_tokens,
             z_level,
+            state_size: 0,
         }
     }
 
@@ -731,6 +840,19 @@ impl<B: Backend> MoELayer<B> {
     /// Exposed so callers (and tests) can reproduce the routing decision
     /// without re-deriving how the condition and token features are combined.
     pub fn router_logits(&self, x: &Tensor<B, 3>, routing_cond: &Tensor<B, 2>) -> Tensor<B, 2> {
+        self.router_logits_with(x, routing_cond, None)
+    }
+
+    /// [`Self::router_logits`] with the per-token routing state `[b, n, s]`
+    /// appended (roadmap 25.4). A layer built with `state_size = 0` takes
+    /// `None` and computes exactly what it always did; one built with a state
+    /// refuses to route without it.
+    pub fn router_logits_with(
+        &self,
+        x: &Tensor<B, 3>,
+        routing_cond: &Tensor<B, 2>,
+        state: Option<&Tensor<B, 3>>,
+    ) -> Tensor<B, 2> {
         let [b, n, h] = x.dims();
         let t = b * n;
         let cond_size = routing_cond.dims()[1];
@@ -739,11 +861,17 @@ impl<B: Backend> MoELayer<B> {
             .unsqueeze_dim::<3>(1)
             .repeat_dim(1, n)
             .reshape([t, cond_size]);
-        let input = if self.route_on_tokens {
-            Tensor::cat(vec![cond_tok, x.clone().reshape([t, h])], 1)
-        } else {
-            cond_tok
-        };
+        let mut parts = vec![cond_tok];
+        if self.route_on_tokens {
+            parts.push(x.clone().reshape([t, h]));
+        }
+        if self.state_size > 0 {
+            let state = state.expect("this router was built with a routing state and needs one to route");
+            let s = state.dims()[2];
+            assert_eq!(s, self.state_size, "routing state width {s} does not match the router's {}", self.state_size);
+            parts.push(state.clone().reshape([t, s]));
+        }
+        let input = if parts.len() == 1 { parts.pop().expect("one part") } else { Tensor::cat(parts, 1) };
         self.router.linear.forward(input)
     }
 
@@ -757,11 +885,21 @@ impl<B: Backend> MoELayer<B> {
         x: Tensor<B, 3>,
         routing_cond: Tensor<B, 2>,
     ) -> MoEOutput<B> {
+        self.forward_with_state(x, routing_cond, None)
+    }
+
+    /// [`Self::forward`] with the routing state of roadmap 25.4.
+    pub fn forward_with_state(
+        &self,
+        x: Tensor<B, 3>,
+        routing_cond: Tensor<B, 2>,
+        state: Option<&Tensor<B, 3>>,
+    ) -> MoEOutput<B> {
         let device = x.device();
         let [b, n, _h] = x.dims();
         let t = b * n;
 
-        let logits = self.router_logits(&x, &routing_cond); // [T, E]
+        let logits = self.router_logits_with(&x, &routing_cond, state); // [T, E]
         let probs = softmax(logits.clone(), 1);
 
         // Top-k selection with renormalized gates. The router decides who is
@@ -789,7 +927,7 @@ impl<B: Backend> MoELayer<B> {
         let balance = weighted_switch_loss(&probs, &top1, &ones, self.num_experts);
         let z_loss = router_z_loss(&logits);
         let balance_loss = balance.clone() + z_loss.clone().mul_scalar(self.z_level as f32);
-        let routing = layer_routing(&probs, &top1, self.num_experts);
+        let routing = layer_routing(&probs, &top1, self.num_experts).with_sequence(b, n);
 
         MoEOutput { output: out.reshape([b, n, h_size]), balance_loss, balance, z_loss, routing }
     }
@@ -866,6 +1004,7 @@ mod tests {
             route_on_tokens: false,
             z_level: 1e-3,
             balance_bias: false,
+            state_size: 0,
         }
     }
 

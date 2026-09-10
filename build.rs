@@ -76,11 +76,16 @@ fn main() {
     println!("cargo:rustc-env=DBLOCKS_BURN_VERSION={burn}");
 
     println!("cargo:rerun-if-changed=Cargo.lock");
-    println!("cargo:rerun-if-changed=.git/HEAD");
-    match std::fs::read_to_string(".git/HEAD") {
+    // In a linked worktree `.git` is a file pointing at the real git dir.
+    let git_dir = match std::fs::read_to_string(".git") {
+        Ok(pointer) => pointer.trim().strip_prefix("gitdir: ").map(str::to_string).unwrap_or_else(|| ".git".into()),
+        Err(_) => ".git".into(),
+    };
+    println!("cargo:rerun-if-changed={git_dir}/HEAD");
+    match std::fs::read_to_string(format!("{git_dir}/HEAD")) {
         Ok(head) => {
             if let Some(reference) = head.trim().strip_prefix("ref: ") {
-                println!("cargo:rerun-if-changed=.git/{reference}");
+                println!("cargo:rerun-if-changed={git_dir}/{reference}");
             }
         }
         Err(err) => println!("cargo:warning=build provenance: .git/HEAD unreadable, rebuilds will not track commits: {err}"),

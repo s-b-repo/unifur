@@ -759,6 +759,78 @@ that unlearning 24 idioms makes a model write good code. The rules are a
 reviewable, extensible floor; a learned detector would be the next step and
 needs labeled data this repository does not have.
 
+## Phase 25: Hybrid Attention, Positions and Routing State
+
+The first of the multi-axis LM phases issues #2-#4 ask for: a language
+trunk whose attention is a **schedule** rather than a switch, positions that
+do not bound the sequence, the decode state each mode needs, one routing
+state every router can read, and the locality diagnostics that decide
+whether expert residency is worth building. Every mechanism is additive: the
+defaults are the Phase 19 trunk bit for bit.
+
+- [x] **25.1** Attention modes (`hybrid.rs`): `Dense` (the control),
+      `Sliding{window}` (the last `w` positions), `Retrieval{top_k}` (every
+      score computed, only the `k` best values read), `Linear` (causal linear
+      attention with the `elu + 1` feature map and a `(S, z)` recurrent
+      state), `Learned` (a per-layer softmax mixture of dense and linear, the
+      one mode that adds a parameter: a zero-initialized `[2]` logit). An
+      `AttentionSchedule` assigns one per layer and parses every form the
+      comparison needs -- `3:1`, `2:1@sliding64`, `LLLD`, one mode per layer
+      -- so 1:1, 2:1, 3:1, 4:1 and learned schedules are one flag apart.
+      Non-dense modes are causal only; the image trunk refuses them
+- [x] **25.2** Positions (`PositionKind`): the learned table, **rotary**
+      (queries and keys rotated by absolute position, so a score depends only
+      on distance and any offset is valid), or none. Under rotary or none the
+      LM has no position table and no context bound: cached decoding runs
+      past `context`, and with sliding or linear layers the state stays
+      bounded however far it goes (issue #5, item 4)
+- [x] **25.3** Per-layer decode state (`LayerState`, replacing the Phase 19
+      key/value cache): keys and values, a window's tail with the absolute
+      position of its oldest key, the linear `(S, z)`, or both;
+      `KvCache::resident_floats` reports the footprint
+- [x] **25.4** Routing state (`routing.rs`): `r_l = tanh(W_h LN(h_l) + W_r
+      r_{l-1} + b)` per token, updated from each layer's input and appended to
+      every router's input -- flat MoE, MoSME box and expert routers, and the
+      value-expert router of Phase 26 -- through `--routing-state s`. Bounded,
+      per pass, and absent at width 0
+- [x] **25.5** Common router report: `RoutingStats` gains a `RouterKind`
+      (FFN, value, attention mode, depth, branch) so every axis reports
+      through one interface (issue #4, D1)
+- [x] **25.6** Routing-locality diagnostics: **token stability** (adjacent
+      positions, within a sequence, choosing the same top-1 expert) and
+      **layer agreement** (this layer's top-1 matching the previous routed
+      layer's), in the JSONL log and the end-of-run table. The numbers that
+      decide issue #4's B7 -- residency/paging only if locality is high --
+      and that the routing state is meant to raise
+- [x] **25.7** Cost model (`cost.rs`): active parameters, FLOPs, keys read
+      and decode-state floats per token, per layer and per trunk, counted
+      from the shapes; `lm train` prints it, `lm bench` records it. On a CPU
+      backend every mode is executed densely, so wall-clock measures the
+      backend; the quality-per-active-FLOP axis is read from these counts
+- [x] **25.8** CLI: `lm train | generate | merge --attention --positions
+      --routing-state --window --retrieval-k`; a checkpoint's recorded
+      architecture is reloaded from its training state, so a model is decoded
+      as the trunk it was trained as; `lm bench --axis attention | positions
+      | routing` (28.6 extended per axis, as promised)
+- [x] **25.9** Certificates (`hybrid` group, 9): an all-dense schedule is
+      the Phase 19 trunk bit for bit; a window or a retrieval set covering
+      the sequence is dense bit for bit; the linear recurrence equals the
+      masked form; rotary scores depend only on distance; every mode decodes
+      from its state exactly as it recomputes, under every position kind and
+      several chunkings; rotary decoding continues past the table and matches
+      a full recompute there; the routing state is bounded, carries history
+      and costs nothing when off; the locality diagnostics read as specified.
+      Plus `integration_hybrid_schedules_and_routing_state_train_end_to_end`
+
+**Status**: Done as mechanisms. `dblocks lm bench --axis attention` on the
+tiny model, 2 CPU steps, one seed: the six schedules land within 0.005 of
+each other in loss (all ~5.48, i.e. untrained) at counted costs of 6.96e4
+(sliding8, linear) to 7.78e4 (learned) FLOPs per token against dense's
+7.37e4 -- which says only that the plumbing runs and what each mode costs.
+Whether any schedule, position kind or routing state buys quality per FLOP
+is UNKNOWN and listed as such in `docs/Claims.md`; the harness is the bench
+axis on a GPU.
+
 ## Phase 28: Reproducibility and Audit
 
 Issue #1 asked for a research-grade audit: every claim classified, every
@@ -1030,6 +1102,7 @@ from current behaviour. The command exits non-zero on any failure, and
 | `moe` | Gates are a distribution; the balance loss lies in `[1, E]` on the diagonal; `max_e x_e <= logsumexp <= max_e x_e + ln E`; the z-loss is the squared distance of the log-sum-exp from zero; a per-row shift moves the z-loss but no routing probability; routing entropies read as specified, including the balanced-but-hedging case; reported statistics match a host recomputation; a load window of one is the fused loss bit for bit and a two-batch window allows cross-batch specialization; a zero or uniform selection bias is a bitwise identity, a bias steers selection not gates, and one nudge moves each bias by exactly the rate |
 | `mosme` | Two-level gates compose into a distribution; one box reduces *exactly* to flat MoE; adding a disabled expert is bit-identical; a `-inf` mask gives an exactly zero gate |
 | `lm` | Tokenization is lossless; causal attention leaks *exactly* nothing backwards; an untrained tied head starts at `ln(vocab)`; top-1 sampling is greedy decoding; the KV cache matches full recompute under every chunking, and cached decoding emits identical tokens |
+| `hybrid` | An all-dense schedule is the Phase 19 trunk bit for bit; a window or retrieval set covering the sequence is dense attention bit for bit; linear attention's recurrent state equals its masked form; rotary scores depend only on distance; every mode decodes from its state exactly as it recomputes, under every position kind; rotary decoding continues past the table and matches a full recompute; the routing state is bounded, carries history and costs nothing when off; token stability and layer agreement read as specified |
 | `antipattern` | Every rule matches its examples and none of its counterexamples; labels follow tokens through both readers; zero weights or zero alpha reproduce the plain loss bit for bit; the unlikelihood term is 0 at `p = 0` and bounded at `p = 1`; the objective recomputed from the logits with each target in exactly one sum; a penalized optimizer step ends strictly below the plain step, which raises `p(bad)` |
 | `codequality` | A regularizer at strength 0 is an exact zero; the identity filter policies keep every window at weight 1; analyzers are pure functions of the source; the geometric mean collapses on a zero dimension; the external analyzer without its feature is a no-op; down-weights lie in the closed interval |
 | `planner` | The budget is never exceeded, even against an `expand` that ignores its allowance; depth 0 *is* the greedy policy; `beam(1)` reproduces greedy exactly; only a plan's first step is committed; planned sigmas fall monotonically without undershooting; lookahead defeats a myopic trap |

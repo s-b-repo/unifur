@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use diffusionblocks::{
     accuracy::{Ensemble, Guidance, LogitNorm, ScalingCurve, ScalingPoint},
+    hybrid::{AttentionSchedule, PositionKind},
     antipattern::{Labeler, RuleSet},
     checkpoint,
     corpus::{self, TokenCorpus},
@@ -80,6 +81,71 @@ impl ModelArgs {
             None => Ok(model),
         }
     }
+}
+
+/// Architecture flags shared by the `lm` subcommands that build a model
+/// (roadmap Phase 25). A checkpoint's own training state wins over these
+/// when one is beside it, so a model is decoded with the trunk it was
+/// trained as.
+#[derive(clap::Args, Clone)]
+struct LmArchArgs {
+    /// The small configuration, for CPU smoke runs.
+    #[arg(long, default_value_t = false)]
+    tiny: bool,
+    /// Attention schedule (roadmap 25.1): `dense`, `linear`, `learned`,
+    /// `sliding<w>`, `retrieval<k>` for every layer; `3:1` (three linear per
+    /// dense), `2:1@sliding64`; a letter pattern such as `LLLD`; or one mode
+    /// per layer, comma-separated. Empty is dense.
+    #[arg(long, default_value = "")]
+    attention: String,
+    /// Window for `sliding` layers named without one.
+    #[arg(long, default_value_t = 64)]
+    window: usize,
+    /// Top-k for `retrieval` layers named without one.
+    #[arg(long, default_value_t = 32)]
+    retrieval_k: usize,
+    /// learned | rotary | none (roadmap 25.2). Anything but `learned` lets
+    /// cached decoding run past the context length.
+    #[arg(long, default_value = "learned")]
+    positions: String,
+    /// Width of the per-token routing state carried through the layers and
+    /// appended to every router's input (roadmap 25.4); 0 is none.
+    #[arg(long, default_value_t = 0)]
+    routing_state: usize,
+}
+
+impl LmArchArgs {
+    fn config(&self) -> Result<LmConfig> {
+        let mut config = if self.tiny { LmConfig::tiny() } else { LmConfig::default() };
+        if !self.attention.trim().is_empty() {
+            let schedule = AttentionSchedule::parse(&self.attention, config.num_layers, self.window, self.retrieval_k)?;
+            config = config.with_attention(schedule);
+        }
+        config = config.with_positions(PositionKind::parse(&self.positions)?).with_routing_state(self.routing_state);
+        Ok(config)
+    }
+}
+
+/// The architecture a checkpoint was trained with, when its training state
+/// records one; otherwise what the flags say.
+fn lm_config_for(arch: &LmArchArgs, checkpoint: Option<&PathBuf>) -> Result<LmConfig> {
+    if let Some(path) = checkpoint {
+        if let Some(state) = checkpoint::TrainState::for_model(path)? {
+            match state.config.get("model_config").filter(|v| !v.is_null()) {
+                Some(value) => {
+                    let config: LmConfig = serde_json::from_value(value.clone())
+                        .map_err(|err| anyhow::anyhow!("parse the model config recorded beside {}: {err}", path.display()))?;
+                    println!("architecture from {}: {}", checkpoint::TrainState::dir_for(path).display(), config.describe());
+                    return Ok(config);
+                }
+                None => println!(
+                    "{} records no architecture; building the model from the flags",
+                    checkpoint::TrainState::dir_for(path).display()
+                ),
+            }
+        }
+    }
+    arch.config()
 }
 
 // `Train` carries far more flags than the other subcommands, so the enum is
@@ -234,9 +300,8 @@ enum LmAction {
         /// Stream windows from disk instead of loading the corpus.
         #[arg(long, default_value_t = false)]
         streaming: bool,
-        /// The small configuration, for CPU smoke runs.
-        #[arg(long, default_value_t = false)]
-        tiny: bool,
+        #[command(flatten)]
+        arch: LmArchArgs,
         #[arg(long, default_value_t = 42)]
         seed: u64,
         #[arg(long, default_value_t = 10)]
@@ -267,6 +332,12 @@ enum LmAction {
         seeds: String,
         #[arg(long, default_value_t = 4)]
         batch_size: usize,
+        /// Which axis to vary (roadmap 25.8): `trunk` (dense, flat MoE, MoE
+        /// with loss-free bias), `attention` (dense, 3:1 linear, sliding,
+        /// retrieval, linear, learned), `positions` (learned, rotary, none),
+        /// `routing` (MoE with and without a routing state).
+        #[arg(long, default_value = "trunk")]
+        axis: String,
         /// Append one record per variant here.
         #[arg(long)]
         json: Option<PathBuf>,
@@ -379,9 +450,10 @@ enum LmAction {
         weights: String,
         #[arg(long, default_value = "checkpoints")]
         out: PathBuf,
-        /// The small configuration -- must match the inputs'.
-        #[arg(long, default_value_t = false)]
-        tiny: bool,
+        /// The inputs' architecture; read from the first input's training
+        /// state when it has one.
+        #[command(flatten)]
+        arch: LmArchArgs,
     },
     /// Generate a continuation from an untrained model.
     ///
@@ -418,9 +490,10 @@ enum LmAction {
         /// Weights from `dblocks lm train`; random when omitted.
         #[arg(long)]
         checkpoint: Option<PathBuf>,
-        /// The small configuration -- must match the checkpoint's.
-        #[arg(long, default_value_t = false)]
-        tiny: bool,
+        /// The checkpoint's architecture; read from its training state when
+        /// it has one.
+        #[command(flatten)]
+        arch: LmArchArgs,
         /// Gate the request through a policy (roadmap Phase 30): a blocked
         /// prompt is refused before any forward pass. Uses plain or cached
         /// decoding.
@@ -1039,17 +1112,6 @@ fn cmd_lm(action: LmAction) -> Result<()> {
                 // about this dimension configure their own command via the
                 // analyzer API. The CLI exists so the dimension is reachable
                 // without writing Rust code.
-/// The message a panicking thread carried, for reporting a joined thread's
-/// failure as an error instead of re-panicking.
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
-    if let Some(s) = payload.downcast_ref::<&str>() {
-        (*s).to_string()
-    } else if let Some(s) = payload.downcast_ref::<String>() {
-        s.clone()
-    } else {
-        "non-string panic payload".to_string()
-    }
-}
 
                 let args = match tool.as_str() {
                     "clippy" => vec!["clippy".into(), "--message-format=json".into()],
@@ -1146,7 +1208,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
             weight_decay,
             penalty,
             streaming,
-            tiny,
+            arch,
             seed,
             log_every,
             log,
@@ -1191,16 +1253,19 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
             let mix_mode = diffusionblocks::mix::MixMode::parse(&mix)?;
             let mut mix = diffusionblocks::mix::CorpusMix::new(corpora.iter_mut().collect(), weights, mix_mode)?;
 
-            let model_config = if tiny { LmConfig::tiny() } else { LmConfig::default() };
+            let model_config = lm_config_for(&arch, resume.as_ref())?;
             let model = LanguageModel::<Train>::new(&model_config, &device);
+            let cost = model_config.cost(model_config.context).total();
             println!(
-                "training: {} tokens in {} corpus(es) ({}) | context={} layers={} hidden={} | steps={steps} batch={batch_size} lr={lr}",
+                "training: {} tokens in {} corpus(es) ({}) | {} | steps={steps} batch={batch_size} lr={lr}",
                 mix.total_tokens(),
                 mix.len(),
                 mix.mode().name(),
-                model_config.context,
-                model_config.num_layers,
-                model_config.hidden_size
+                model_config.describe(),
+            );
+            println!(
+                "cost per token at context {}: {} active parameters, {:.3e} FLOPs, {} keys read, {} floats of decode state",
+                model_config.context, cost.active_params, cost.flops, cost.keys_read, cost.state_floats
             );
             let teacher_weights = parse_weights(&teacher_weights)?;
             let mut inputs = train::LmTrainInputs::<Train>::default();
@@ -1433,9 +1498,9 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
             );
             Ok(())
         }
-        LmAction::Merge { input, weights, out, tiny } => {
+        LmAction::Merge { input, weights, out, arch } => {
             let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
-            let config = if tiny { LmConfig::tiny() } else { LmConfig::default() };
+            let config = lm_config_for(&arch, input.first())?;
             let template = LanguageModel::<Eval>::new(&config, &device);
             let weights = if weights.trim().is_empty() { vec![1.0; input.len()] } else { parse_weights(&weights)? };
             let (merged, parents) = diffusionblocks::merge::merge_checkpoints::<Eval, _>(template, &input, &weights, &device)?;
@@ -1444,23 +1509,22 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
             println!("merged {} -> {}", diffusionblocks::merge::describe(&parents, &weights), path.display());
             Ok(())
         }
-        LmAction::Bench { corpus: corpus_path, steps, seeds, batch_size, json } => {
+        LmAction::Bench { corpus: corpus_path, steps, seeds, batch_size, axis, json } => {
             use diffusionblocks::experiment::{Record, RunLog};
-            use diffusionblocks::vit::MoeTrunkConfig;
             type Train = train::DefaultTrainBackend;
             let device: <Train as burn::tensor::backend::BackendTypes>::Device = Default::default();
             let seeds = parse_seeds(&seeds)?;
             let mut corpus = TokenCorpus::in_memory(&corpus_path)?;
-            let moe = MoeTrunkConfig { num_experts: 3, top_k: 1, every_n_layers: 2, z_level: 1e-3, balance_bias: false };
-            let variants: Vec<(&str, LmConfig, f32)> = vec![
-                ("dense", LmConfig::tiny(), 0.0),
-                ("moe", LmConfig { moe: Some(moe), ..LmConfig::tiny() }, 0.0),
-                ("moe+bias", LmConfig { moe: Some(MoeTrunkConfig { balance_bias: true, ..moe }), ..LmConfig::tiny() }, 1e-3),
-            ];
-            println!("{:<10} {:>6} {:>12} {:>12} {:>10}", "variant", "seeds", "final loss", "±ci95", "ms/step");
-            println!("{}", "-".repeat(54));
+            let variants = lm_bench_variants(&axis)?;
+            println!("axis: {axis}");
+            println!(
+                "{:<14} {:>6} {:>12} {:>12} {:>10} {:>12} {:>11}",
+                "variant", "seeds", "final loss", "±ci95", "ms/step", "active par.", "FLOPs/tok"
+            );
+            println!("{}", "-".repeat(84));
             let mut records = Vec::new();
             for (name, model_config, rate) in variants {
+                let cost = model_config.cost(model_config.context).total();
                 let train_config = train::LmTrainConfig {
                     steps,
                     batch_size,
@@ -1485,15 +1549,26 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
                     ms_per_step.push(1e3 * report.elapsed_secs / report.steps_taken.max(1) as f64);
                 }
                 let mean_ms = ms_per_step.iter().sum::<f64>() / ms_per_step.len() as f64;
-                record.extra = serde_json::json!({ "ms_per_step": ms_per_step, "forward_passes_per_token": 1 });
+                record.extra = serde_json::json!({
+                    "ms_per_step": ms_per_step,
+                    "forward_passes_per_token": 1,
+                    "axis": axis,
+                    "architecture": model_config.describe(),
+                    "active_params_per_token": cost.active_params,
+                    "flops_per_token": cost.flops,
+                    "keys_read_per_token": cost.keys_read,
+                    "decode_state_floats": cost.state_floats,
+                });
                 let summary = record.summary.context("no seed produced a measurement")?;
                 println!(
-                    "{:<10} {:>6} {:>12.4} {:>12.4} {:>10.1}",
+                    "{:<14} {:>6} {:>12.4} {:>12.4} {:>10.1} {:>12} {:>11.3e}",
                     name,
                     summary.n,
                     summary.mean,
                     if summary.ci95_half_width.is_nan() { 0.0 } else { summary.ci95_half_width },
-                    mean_ms
+                    mean_ms,
+                    cost.active_params,
+                    cost.flops
                 );
                 records.push(record);
             }
@@ -1517,7 +1592,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
             cached,
             seed,
             checkpoint: weights,
-            tiny,
+            arch,
             policy,
             key,
             grant,
@@ -1525,7 +1600,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
             let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
             <Eval as burn::tensor::backend::Backend>::seed(&device, seed);
 
-            let config = if tiny { LmConfig::tiny() } else { LmConfig::default() };
+            let config = lm_config_for(&arch, weights.as_ref())?;
             let mut model = LanguageModel::<Eval>::new(&config, &device);
             if let Some(path) = &weights {
                 model = checkpoint::load::<Eval, _>(model, path, &device)?;
@@ -1582,10 +1657,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 
             let ids = tokenizer.encode(&prompt);
 
-            println!(
-                "context={} layers={} hidden={} vocab={}",
-                config.context, config.num_layers, config.hidden_size, config.vocab_size
-            );
+            println!("{} vocab={}", config.describe(), config.vocab_size);
 
             let started = std::time::Instant::now();
             let out = if lookahead > 0 {
@@ -1641,6 +1713,36 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
             Ok(())
         }
     }
+}
+
+/// The configurations one `lm bench` axis compares, with the loss-free bias
+/// rate each trains under (roadmap 28.6, extended per axis in Phase 25).
+fn lm_bench_variants(axis: &str) -> Result<Vec<(String, LmConfig, f32)>> {
+    use diffusionblocks::vit::MoeTrunkConfig;
+    let tiny = LmConfig::tiny();
+    let layers = tiny.num_layers;
+    let moe = MoeTrunkConfig { num_experts: 3, top_k: 1, every_n_layers: 2, z_level: 1e-3, balance_bias: false };
+    let schedule = |text: &str| AttentionSchedule::parse(text, layers, 8, 4);
+    Ok(match axis {
+        "trunk" => vec![
+            ("dense".into(), tiny.clone(), 0.0),
+            ("moe".into(), LmConfig { moe: Some(moe), ..tiny.clone() }, 0.0),
+            ("moe+bias".into(), LmConfig { moe: Some(MoeTrunkConfig { balance_bias: true, ..moe }), ..tiny.clone() }, 1e-3),
+        ],
+        "attention" => ["dense", "3:1", "sliding8", "retrieval4", "linear", "learned"]
+            .iter()
+            .map(|name| Ok((name.to_string(), tiny.clone().with_attention(schedule(name)?), 0.0)))
+            .collect::<Result<Vec<_>>>()?,
+        "positions" => [PositionKind::Learned, PositionKind::Rotary, PositionKind::None]
+            .iter()
+            .map(|kind| (kind.name().to_string(), tiny.clone().with_positions(*kind), 0.0))
+            .collect(),
+        "routing" => vec![
+            ("moe".into(), LmConfig { moe: Some(moe), ..tiny.clone() }, 0.0),
+            ("moe+state8".into(), LmConfig { moe: Some(moe), ..tiny.clone() }.with_routing_state(8), 0.0),
+        ],
+        other => anyhow::bail!("unknown bench axis '{other}' (expected trunk|attention|positions|routing)"),
+    })
 }
 
 fn cmd_experts(action: ExpertsAction) -> Result<()> {

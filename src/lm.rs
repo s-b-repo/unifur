@@ -40,9 +40,10 @@ use burn::{
 use rand::Rng;
 
 use crate::{
+    hybrid::{AttentionMode, AttentionSchedule, LayerState, PositionKind},
     planner::{Budget, LookaheadDecoder},
     tokenizer::{Special, VOCAB_SIZE},
-    vit::{DbLayer, LayerKvCache, TimestepEmbedder, ViTDiTConfig},
+    vit::{DbLayer, LayerCarry, TimestepEmbedder, ViTDiTConfig},
 };
 
 /// Unlikelihood penalty on labeled targets (roadmap Phase 24).
@@ -150,6 +151,18 @@ pub struct LmConfig {
     pub num_blocks: usize,
     pub moe: Option<crate::vit::MoeTrunkConfig>,
     pub mosme: Option<crate::vit::MosmeTrunkConfig>,
+    /// One attention mode per layer (roadmap Phase 25); `None` is dense
+    /// everywhere, the Phase 19 trunk.
+    #[serde(default)]
+    pub attention: Option<AttentionSchedule>,
+    /// How positions enter the model (roadmap 25.2). With anything but the
+    /// learned table the sequence length is unbounded.
+    #[serde(default)]
+    pub positions: PositionKind,
+    /// Width of the per-token routing state carried through the layers
+    /// (roadmap 25.4); `0` is none.
+    #[serde(default)]
+    pub routing_state: usize,
 }
 
 impl Default for LmConfig {
@@ -169,6 +182,9 @@ impl Default for LmConfig {
             num_blocks: 4,
             moe: None,
             mosme: None,
+            attention: None,
+            positions: PositionKind::Learned,
+            routing_state: 0,
         }
     }
 }
@@ -192,6 +208,92 @@ impl LmConfig {
     pub fn with_mosme(mut self, mosme: crate::vit::MosmeTrunkConfig) -> Self {
         self.mosme = Some(mosme);
         self
+    }
+
+    /// Assign an attention mode to every layer (roadmap Phase 25).
+    pub fn with_attention(mut self, schedule: AttentionSchedule) -> Self {
+        assert_eq!(
+            schedule.num_layers(),
+            self.num_layers,
+            "the schedule covers {} layers, the model has {}",
+            schedule.num_layers(),
+            self.num_layers
+        );
+        self.attention = Some(schedule);
+        self
+    }
+
+    /// Choose how positions enter the model (roadmap 25.2).
+    pub fn with_positions(mut self, positions: PositionKind) -> Self {
+        self.positions = positions;
+        self
+    }
+
+    /// Carry a per-token routing state of this width (roadmap 25.4).
+    pub fn with_routing_state(mut self, size: usize) -> Self {
+        self.routing_state = size;
+        self
+    }
+
+    /// The attention schedule, dense when none was set.
+    pub fn attention_schedule(&self) -> AttentionSchedule {
+        self.attention.clone().unwrap_or_else(|| AttentionSchedule::dense(self.num_layers))
+    }
+
+    /// What one token costs in this trunk when it sees `positions` keys:
+    /// active parameters, FLOPs and decode-time state per layer, counted
+    /// from the shapes (roadmap 25.8, [`crate::cost`]).
+    pub fn cost(&self, positions: usize) -> crate::cost::TrunkCost {
+        let schedule = self.attention_schedule();
+        let state = self.routing_state;
+        let router_in = |route_on_tokens: bool| {
+            (if route_on_tokens { self.cond_hidden_size + self.hidden_size } else { self.cond_hidden_size }) + state
+        };
+        let layers = (0..self.num_layers)
+            .map(|idx| {
+                let attention = crate::cost::attention_cost(schedule.mode(idx), self.hidden_size, self.num_heads, positions);
+                let ffn = match (&self.mosme, self.moe) {
+                    (Some(mosme), _) if mosme.applies_to(idx) => crate::cost::moe_cost(
+                        self.hidden_size,
+                        self.intermediate_size,
+                        mosme.spec.num_experts(),
+                        mosme.spec.top_box.max(1) * mosme.spec.top_expert.max(1),
+                        router_in(mosme.spec.route_on_tokens),
+                        None,
+                    ),
+                    (_, Some(moe)) if moe.applies_to(idx) => crate::cost::moe_cost(
+                        self.hidden_size,
+                        self.intermediate_size,
+                        moe.num_experts,
+                        moe.top_k,
+                        router_in(true),
+                        None,
+                    ),
+                    _ => crate::cost::dense_mlp_cost(self.hidden_size, self.intermediate_size),
+                };
+                let routing = crate::cost::LayerCost {
+                    active_params: if state > 0 { (self.hidden_size + state) * state + state + 2 * self.hidden_size } else { 0 },
+                    flops: if state > 0 { 2.0 * ((self.hidden_size + state) * state) as f64 } else { 0.0 },
+                    keys_read: 0,
+                    state_floats: 0,
+                };
+                attention.plus(ffn).plus(routing)
+            })
+            .collect();
+        crate::cost::TrunkCost { layers }
+    }
+
+    /// One line naming the architecture, for banners and records.
+    pub fn describe(&self) -> String {
+        format!(
+            "layers={} hidden={} context={} attention={} positions={} routing_state={}",
+            self.num_layers,
+            self.hidden_size,
+            self.context,
+            self.attention_schedule().summary(),
+            self.positions.name(),
+            self.routing_state
+        )
     }
 
     /// Layers per block.
@@ -222,6 +324,9 @@ impl LmConfig {
             moe: self.moe,
             mosme: self.mosme.clone(),
             causal: true,
+            attention: self.attention.clone(),
+            rotary: self.positions == PositionKind::Rotary,
+            routing_state: self.routing_state,
         }
     }
 }
@@ -242,8 +347,9 @@ pub struct LmOutput<B: Backend> {
 #[derive(Module, Debug)]
 pub struct LanguageModel<B: Backend> {
     token_embedding: Embedding<B>,
-    /// `[1, context, hidden]`, learned.
-    position_embedding: Param<Tensor<B, 3>>,
+    /// `[1, context, hidden]`, learned; `None` under rotary or no positions
+    /// (roadmap 25.2), where nothing bounds the sequence length.
+    position_embedding: Option<Param<Tensor<B, 3>>>,
     time_embedder: TimestepEmbedder<B>,
     layers: Vec<DbLayer<B>>,
     final_norm: LayerNorm<B>,
@@ -251,6 +357,8 @@ pub struct LanguageModel<B: Backend> {
     vocab_size: usize,
     layers_per_block: usize,
     num_blocks: usize,
+    /// Whether the position table bounds the sequence length.
+    bounded: bool,
 }
 
 impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
@@ -261,14 +369,27 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             config.num_layers,
             config.num_blocks
         );
+        if let Some(schedule) = &config.attention {
+            assert_eq!(
+                schedule.num_layers(),
+                config.num_layers,
+                "the attention schedule covers {} layers, the model has {}",
+                schedule.num_layers(),
+                config.num_layers
+            );
+        }
         let trunk = config.trunk();
 
-        let position = Tensor::<B, 2>::random(
-            [1, config.context * config.hidden_size],
-            Distribution::Normal(0.0, config.initializer_range),
-            device,
-        )
-        .reshape([1, config.context, config.hidden_size]);
+        let position = config.positions.is_bounded().then(|| {
+            Param::from_tensor(
+                Tensor::<B, 2>::random(
+                    [1, config.context * config.hidden_size],
+                    Distribution::Normal(0.0, config.initializer_range),
+                    device,
+                )
+                .reshape([1, config.context, config.hidden_size]),
+            )
+        });
 
         Self {
             // Burn's default embedding initializer is N(0, 1), which with a
@@ -283,7 +404,7 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
                     std: config.initializer_range,
                 })
                 .init(device),
-            position_embedding: Param::from_tensor(position),
+            position_embedding: position,
             time_embedder: TimestepEmbedder::new(
                 config.cond_hidden_size,
                 config.frequency_embedding_size,
@@ -299,11 +420,28 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             vocab_size: config.vocab_size,
             layers_per_block: config.layers_per_block(),
             num_blocks: config.num_blocks.max(1),
+            bounded: config.positions.is_bounded(),
         }
     }
 
     pub fn context(&self) -> usize {
         self.context
+    }
+
+    /// Whether a position table bounds the sequence length (roadmap 25.2).
+    /// When it does not, cached decoding may run past `context`.
+    pub fn positions_bounded(&self) -> bool {
+        self.bounded
+    }
+
+    /// The attention mode of every layer (roadmap 25.1).
+    pub fn attention_modes(&self) -> Vec<AttentionMode> {
+        self.layers.iter().map(DbLayer::attention_mode).collect()
+    }
+
+    /// Whether the trunk carries a routing state (roadmap 25.4).
+    pub fn has_routing_state(&self) -> bool {
+        self.layers.iter().any(DbLayer::has_routing_state)
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -337,16 +475,28 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         self.token_embedding.weight.val()
     }
 
+    /// Token ids `[b, n]` at absolute positions `offset..offset + n` to hidden
+    /// states `[b, n, hidden]`.
+    fn embed_at(&self, tokens: Tensor<B, 2, Int>, offset: usize) -> Tensor<B, 3> {
+        let [_, n] = tokens.dims();
+        if self.bounded {
+            assert!(
+                offset + n <= self.context,
+                "sequence of {} exceeds the {} the position table covers",
+                offset + n,
+                self.context
+            );
+        }
+        let embedded = self.token_embedding.forward(tokens);
+        match &self.position_embedding {
+            Some(table) => embedded + table.val().narrow(1, offset, n),
+            None => embedded,
+        }
+    }
+
     /// Token ids `[b, n]` to hidden states `[b, n, hidden]`.
     fn embed(&self, tokens: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        let [_, n] = tokens.dims();
-        assert!(
-            n <= self.context,
-            "sequence of {n} exceeds the {} the position table covers",
-            self.context
-        );
-        let embedded = self.token_embedding.forward(tokens);
-        embedded + self.position_embedding.val().narrow(1, 0, n)
+        self.embed_at(tokens, 0)
     }
 
     /// Run a contiguous span of layers, mirroring `denoise_span` on the image
@@ -404,8 +554,9 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         }
         let mut states = Vec::with_capacity(self.layers.len());
         let mut balance: Option<crate::vit::RouterAux<B>> = None;
+        let mut carry = LayerCarry::at(0);
         for i in span.start..span.end.min(self.layers.len()) {
-            let (mut next, aux) = self.layers[i].forward(hidden, &cond);
+            let (mut next, aux) = self.layers[i].forward(hidden, &cond, &mut carry);
             if let Some(d) = ablate {
                 next = crate::ablation::project_out(next, d);
             }
@@ -498,12 +649,14 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         let device = tokens.device();
         let [b, m] = tokens.dims();
         let offset = cache.position();
-        assert!(
-            offset + m <= self.context,
-            "cached sequence of {} exceeds the {} the position table covers",
-            offset + m,
-            self.context
-        );
+        if self.bounded {
+            assert!(
+                offset + m <= self.context,
+                "cached sequence of {} exceeds the {} the position table covers",
+                offset + m,
+                self.context
+            );
+        }
         assert_eq!(
             cache.layers.len(),
             self.layers.len(),
@@ -515,13 +668,14 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         );
 
         // Positions are absolute: the new tokens sit *after* the cached ones,
-        // so they must read the position table at `offset`, not at 0.
-        let embedded = self.token_embedding.forward(tokens);
-        let mut hidden = embedded + self.position_embedding.val().narrow(1, offset, m);
+        // so they must read the position table (or the rotary angle) at
+        // `offset`, not at 0.
+        let mut hidden = self.embed_at(tokens, offset);
 
         let mut balance: Option<crate::vit::RouterAux<B>> = None;
+        let mut carry = LayerCarry::at(offset);
         for (layer, layer_cache) in self.layers.iter().zip(cache.layers.iter_mut()) {
-            let (states, aux) = layer.forward_cached(hidden, &cond, layer_cache);
+            let (states, aux) = layer.forward_cached(hidden, &cond, layer_cache, &mut carry);
             hidden = states;
             if let Some(aux) = aux {
                 balance = Some(match balance {
@@ -931,7 +1085,7 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         if ids.is_empty() {
             ids.push(Special::Bos.id());
         }
-        if ids.len() > self.context {
+        if self.bounded && ids.len() > self.context {
             ids.drain(..ids.len() - self.context);
         }
 
@@ -940,7 +1094,10 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
 
         for _ in 0..max_new {
             let n = pending.len();
-            if n == 0 || cache.position() + n > self.context {
+            // The context edge only exists under a position table (roadmap
+            // 25.2): rotary layers keep going, and a sliding or linear layer's
+            // state stays bounded however far they go.
+            if n == 0 || (self.bounded && cache.position() + n > self.context) {
                 break;
             }
             let window: Vec<i64> = pending.iter().map(|t| *t as i64).collect();
@@ -1102,20 +1259,22 @@ impl LookaheadStats {
     }
 }
 
-/// Per-layer key/value caches for incremental decoding.
+/// Per-layer decode state for incremental decoding: keys and values, a
+/// sliding window's tail, or a linear layer's recurrent state, whichever the
+/// layer's mode keeps (roadmap 25.3).
 ///
 /// A cache is bound to one sequence: it records where in that sequence the
-/// next token goes, and every layer's keys and values for everything before it.
+/// next token goes, and every layer's state for everything before it.
 #[derive(Debug, Clone)]
 pub struct KvCache<B: Backend> {
-    layers: Vec<LayerKvCache<B>>,
+    layers: Vec<LayerState<B>>,
     position: usize,
 }
 
 impl<B: Backend> KvCache<B> {
     pub fn new(num_layers: usize) -> Self {
         Self {
-            layers: (0..num_layers).map(|_| LayerKvCache::new()).collect(),
+            layers: (0..num_layers).map(|_| LayerState::new()).collect(),
             position: 0,
         }
     }
@@ -1139,6 +1298,16 @@ impl<B: Backend> KvCache<B> {
             layer.clear();
         }
         self.position = 0;
+    }
+
+    /// The per-layer states, for inspection.
+    pub fn layers(&self) -> &[LayerState<B>] {
+        &self.layers
+    }
+
+    /// Floats of state held across every layer: the decode-time footprint.
+    pub fn resident_floats(&self) -> usize {
+        self.layers.iter().map(LayerState::resident_floats).sum()
     }
 }
 
@@ -1825,5 +1994,124 @@ mod tests {
         let long: Vec<u16> = (0..m.context() as u16 + 4).map(|i| i % 200).collect();
         let mut cache = m.new_cache();
         m.forward_cached(tokens(&device, &long), &mut cache);
+    }
+
+    #[test]
+    fn test_every_attention_schedule_decodes_cached_like_uncached() {
+        // Phase 25: whatever a layer keeps between steps -- keys, a window's
+        // tail, a linear state, or both -- decoding from it must emit the
+        // tokens a full recompute emits.
+        use crate::hybrid::{AttentionMode, AttentionSchedule};
+        let device = Default::default();
+        let layers = LmConfig::tiny().num_layers;
+        let schedules = vec![
+            AttentionSchedule::parse("3:1", layers, 3, 2).unwrap(),
+            AttentionSchedule::parse("sliding3", layers, 3, 2).unwrap(),
+            AttentionSchedule::parse("retrieval2", layers, 3, 2).unwrap(),
+            AttentionSchedule::parse("learned,linear,dense,sliding2", layers, 3, 2).unwrap(),
+        ];
+        let prompt = ByteTokenizer::new().encode("once ");
+        for schedule in schedules {
+            assert!(schedule.modes.iter().any(|m| *m != AttentionMode::Dense));
+            let m = LanguageModel::<B>::new(&LmConfig::tiny().with_attention(schedule.clone()), &device);
+            assert_eq!(m.attention_modes(), schedule.modes);
+            let max_new = m.context() - prompt.len();
+            let plain = m.generate(&prompt, max_new, &Sampling::Greedy, &mut StdRng::seed_from_u64(4), &device);
+            let cached = m.generate_cached(&prompt, max_new, &Sampling::Greedy, &mut StdRng::seed_from_u64(4), &device);
+            assert_eq!(cached, plain, "schedule {} diverged", schedule.pattern());
+        }
+    }
+
+    #[test]
+    fn test_rotary_sliding_trunk_runs_past_the_context() {
+        // Under a position table decoding stops at the table's edge; under
+        // rotary positions with bounded-state layers it keeps going, and the
+        // per-layer state stays bounded however far it goes.
+        use crate::hybrid::{AttentionMode, AttentionSchedule, PositionKind};
+        let device = Default::default();
+        let base = LmConfig::tiny();
+        let schedule = AttentionSchedule::ratio(base.num_layers, 1, AttentionMode::Linear, AttentionMode::Sliding { window: 4 });
+        let unbounded = LanguageModel::<B>::new(
+            &base.clone().with_attention(schedule.clone()).with_positions(PositionKind::Rotary),
+            &device,
+        );
+        assert!(!unbounded.positions_bounded());
+        let prompt = vec![Special::Bos.id(), 65, 66];
+        let want = base.context * 2;
+        let out = unbounded.generate_cached(&prompt, want, &Sampling::Greedy, &mut StdRng::seed_from_u64(1), &device);
+        // Greedy decoding may hit <eos> early; then the run is simply shorter.
+        let stopped_at_eos = out.last() == Some(&Special::Eos.id());
+        assert!(out.len() == prompt.len() + want || stopped_at_eos, "stopped at {} of {}", out.len(), prompt.len() + want);
+
+        // The footprint of the state is what the modes promise: a window of 4
+        // holds at most 3 keys per sliding layer, a linear layer holds d^2 + d.
+        let mut cache = unbounded.new_cache();
+        let ids: Vec<i64> = (0..(base.context as i64 + 9)).map(|i| 40 + i % 50).collect();
+        for chunk in ids.chunks(4) {
+            let t = Tensor::<B, 1, Int>::from_ints(chunk, &device).reshape([1, chunk.len()]);
+            unbounded.forward_cached(t, &mut cache);
+        }
+        assert_eq!(cache.position(), ids.len());
+        for (state, mode) in cache.layers().iter().zip(unbounded.attention_modes()) {
+            match mode {
+                AttentionMode::Sliding { window } => assert!(state.len() < window, "window kept {} keys", state.len()),
+                AttentionMode::Linear => assert!(state.keys.is_none() && state.linear.is_some()),
+                _ => unreachable!(),
+            }
+        }
+
+        // A learned table still stops where it always did.
+        let bounded = LanguageModel::<B>::new(&base.clone().with_attention(schedule), &device);
+        assert!(bounded.positions_bounded());
+        let out = bounded.generate_cached(&prompt, want, &Sampling::Greedy, &mut StdRng::seed_from_u64(1), &device);
+        assert!(out.len() <= base.context + 1);
+    }
+
+    #[test]
+    fn test_routing_state_trunk_reports_locality() {
+        // A MoE trunk carrying a routing state routes, trains a step, and
+        // reports token stability and layer agreement (roadmap 25.4-25.6).
+        use crate::vit::MoeTrunkConfig;
+        let device = Default::default();
+        let moe = MoeTrunkConfig { num_experts: 3, top_k: 1, every_n_layers: 2, z_level: 1e-3, balance_bias: false };
+        let config = LmConfig { moe: Some(moe), ..LmConfig::tiny() }.with_routing_state(6);
+        let m = LanguageModel::<B>::new(&config, &device);
+        assert!(m.has_routing_state());
+        let ids = [65u16, 66, 67, 68, 69, 70, 71, 72];
+        let step = m.next_token_step(tokens(&device, &ids), None, 0..m.num_layers());
+        assert!(step.metrics.loss.is_finite());
+        assert_eq!(step.routing.len(), 2, "two sparse layers");
+        for stats in &step.routing {
+            assert!((0.0..=1.0).contains(&stats.stability), "{}", stats.stability);
+            assert_eq!(stats.kind, crate::routing::RouterKind::Ffn);
+        }
+        assert!(step.routing[0].agreement.is_none(), "the first routed layer has nothing before it");
+        let agreement = step.routing[1].agreement.expect("equal widths are comparable");
+        assert!((0.0..=1.0).contains(&agreement));
+
+        // The state also decodes: cached and uncached generation still agree.
+        let prompt = ByteTokenizer::new().encode("ab");
+        let plain = m.generate(&prompt, 6, &Sampling::Greedy, &mut StdRng::seed_from_u64(2), &device);
+        let cached = m.generate_cached(&prompt, 6, &Sampling::Greedy, &mut StdRng::seed_from_u64(2), &device);
+        assert_eq!(plain, cached);
+    }
+
+    #[test]
+    fn test_config_fields_from_phase_25_survive_json_and_default_to_off() {
+        use crate::hybrid::{AttentionSchedule, PositionKind};
+        let config = LmConfig::tiny()
+            .with_attention(AttentionSchedule::parse("2:1@sliding8", 4, 8, 4).unwrap())
+            .with_positions(PositionKind::Rotary)
+            .with_routing_state(3);
+        let json = serde_json::to_string(&config).unwrap();
+        let back: LmConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.attention_schedule().pattern(), "SSDS");
+        assert_eq!(back.positions, PositionKind::Rotary);
+        assert_eq!(back.routing_state, 3);
+        // A Phase 19 state file, written before these fields existed, still parses.
+        let old = serde_json::to_string(&LmConfig::tiny()).unwrap().replace(",\"attention\":null", "").replace(",\"positions\":\"learned\"", "").replace(",\"routing_state\":0", "");
+        assert!(!old.contains("routing_state"));
+        let parsed: LmConfig = serde_json::from_str(&old).unwrap();
+        assert!(parsed.attention.is_none() && parsed.positions == PositionKind::Learned && parsed.routing_state == 0);
     }
 }

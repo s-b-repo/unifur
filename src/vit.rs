@@ -7,6 +7,8 @@
 //! DiffusionBlocks.
 
 use serde::{Deserialize, Serialize};
+use crate::hybrid::{AttentionMode, AttentionSchedule, LayerState};
+use crate::routing::RoutingState;
 use crate::tensor_ext::{exact_gelu, l2_normalize_rows, silu};
 use burn::{
     module::{Module, Param},
@@ -58,6 +60,17 @@ pub struct ViTDiTConfig {
     /// `true` for language modeling, where seeing the future would let the
     /// model copy the answer.
     pub causal: bool,
+    /// One attention mode per layer (roadmap Phase 25); `None` is dense
+    /// everywhere, which is the pre-Phase-25 trunk bit for bit. Anything but
+    /// dense needs `causal`.
+    pub attention: Option<AttentionSchedule>,
+    /// Rotate queries and keys by their absolute position (roadmap 25.2).
+    /// Off for the image path, whose positions are a learned table.
+    pub rotary: bool,
+    /// Width of the per-token routing state carried through the layers
+    /// (roadmap 25.4); `0` builds none and leaves every router input as it
+    /// was.
+    pub routing_state: usize,
 }
 
 /// Where and how mixture-of-experts layers enter the trunk.
@@ -177,6 +190,9 @@ impl ViTDiTConfig {
             moe: None,
             mosme: None,
             causal: false,
+            attention: None,
+            rotary: false,
+            routing_state: 0,
         }
     }
 
@@ -184,6 +200,30 @@ impl ViTDiTConfig {
     pub fn with_moe(mut self, moe: MoeTrunkConfig) -> Self {
         self.moe = Some(moe);
         self
+    }
+
+    /// Assign an attention mode to every layer (roadmap Phase 25).
+    pub fn with_attention(mut self, schedule: AttentionSchedule) -> Self {
+        self.attention = Some(schedule);
+        self
+    }
+
+    /// Rotate queries and keys by absolute position (roadmap 25.2).
+    pub fn with_rotary(mut self, rotary: bool) -> Self {
+        self.rotary = rotary;
+        self
+    }
+
+    /// Carry a per-token routing state of this width through the layers
+    /// (roadmap 25.4).
+    pub fn with_routing_state(mut self, size: usize) -> Self {
+        self.routing_state = size;
+        self
+    }
+
+    /// The attention mode of layer `idx`.
+    pub fn attention_mode(&self, idx: usize) -> AttentionMode {
+        self.attention.as_ref().map_or(AttentionMode::Dense, |s| s.mode(idx))
     }
 
     /// Enable hierarchical expert boxes in the trunk.
@@ -222,6 +262,9 @@ impl ViTDiTConfig {
             moe: None,
             mosme: None,
             causal: false,
+            attention: None,
+            rotary: false,
+            routing_state: 0,
         }
     }
 
@@ -371,7 +414,16 @@ impl<B: Backend> ViTDiTEmbeddings<B> {
     }
 }
 
-/// Multi-head self-attention (`ViTAttention`, biased qkv/out projections).
+/// Floor on the linear-attention normalizer.
+const LINEAR_EPS: f32 = 1e-6;
+
+/// Multi-head self-attention (`ViTAttention`, biased qkv/out projections),
+/// attending in one of the modes of [`crate::hybrid`] (roadmap Phase 25).
+///
+/// The mode is a plain value from the config, like `causal`, not a parameter;
+/// the only parameter a mode adds is the `[2]` dense/linear mixing logit of
+/// [`AttentionMode::Learned`], zero-initialized so an untrained mixture is
+/// even.
 #[derive(Module, Debug)]
 struct Attention<B: Backend> {
     query: Linear<B>,
@@ -382,6 +434,10 @@ struct Attention<B: Backend> {
     head_dim: usize,
     attn_dropout: Dropout,
     output_dropout: Dropout,
+    #[module(skip)]
+    mode: AttentionMode,
+    rotary: bool,
+    mix: Option<Param<Tensor<B, 1>>>,
 }
 
 impl<B: Backend> Attention<B> {
@@ -390,6 +446,8 @@ impl<B: Backend> Attention<B> {
         num_heads: usize,
         attn_dropout: f64,
         output_dropout: f64,
+        mode: AttentionMode,
+        rotary: bool,
         device: &B::Device,
     ) -> Self {
         let mut query = LinearConfig::new(hidden_size, hidden_size)
@@ -410,6 +468,16 @@ impl<B: Backend> Attention<B> {
             query.bias = Some(Param::from_tensor(bias));
         }
 
+        let mix = matches!(mode, AttentionMode::Learned)
+            .then(|| Param::from_tensor(Tensor::<B, 1>::zeros([2], device)));
+        if rotary {
+            assert!(
+                (hidden_size / num_heads) % 2 == 0,
+                "rotary positions need an even head dimension, got {}",
+                hidden_size / num_heads
+            );
+        }
+
         Self {
             query,
             key: LinearConfig::new(hidden_size, hidden_size).with_bias(true).init(device),
@@ -419,6 +487,9 @@ impl<B: Backend> Attention<B> {
             head_dim: hidden_size / num_heads,
             attn_dropout: DropoutConfig::new(attn_dropout).init(),
             output_dropout: DropoutConfig::new(output_dropout).init(),
+            mode,
+            rotary,
+            mix,
         }
     }
 
@@ -428,152 +499,201 @@ impl<B: Backend> Attention<B> {
             .swap_dims(1, 2) // [b, heads, n, head_dim]
     }
 
-    fn forward(&self, x: Tensor<B, 3>, causal: bool) -> Tensor<B, 3> {
+    fn merge_heads(&self, ctx: Tensor<B, 4>) -> Tensor<B, 3> {
+        let ctx = ctx.swap_dims(1, 2); // [b, n, heads, head_dim]
+        let [b, n, _, _] = ctx.dims();
+        let ctx = ctx.reshape([b, n, self.num_heads * self.head_dim]);
+        self.output_dropout.forward(self.dense.forward(ctx))
+    }
+
+    /// The mode this layer attends in.
+    pub(crate) fn mode(&self) -> AttentionMode {
+        self.mode
+    }
+
+    /// Rotate queries and keys by their absolute positions, when configured.
+    fn rotate(&self, q: Tensor<B, 4>, k: Tensor<B, 4>, offset: usize) -> (Tensor<B, 4>, Tensor<B, 4>) {
+        if !self.rotary {
+            return (q, k);
+        }
+        (
+            crate::hybrid::apply_rotary(q, offset, crate::hybrid::ROTARY_BASE),
+            crate::hybrid::apply_rotary(k, offset, crate::hybrid::ROTARY_BASE),
+        )
+    }
+
+    /// Softmax attention of `q` `[b, heads, m, d]` over `k`/`v`
+    /// `[b, heads, total, d]`, with an additive mask and, for retrieval, a
+    /// per-row top-k restriction.
+    fn softmax_attend(
+        &self,
+        q: Tensor<B, 4>,
+        k: Tensor<B, 4>,
+        v: Tensor<B, 4>,
+        mask: Option<Tensor<B, 4>>,
+        top_k: Option<usize>,
+    ) -> Tensor<B, 4> {
         // The 1/sqrt(head_dim) scale is folded into the Q projection weights.
+        let mut scores = q.matmul(k.swap_dims(2, 3)); // [b, heads, m, total]
+        if let Some(mask) = mask {
+            // Additive -inf, so exp() gives exactly 0 there and a masked key
+            // gets no weight whatsoever. Masking the *scores* rather than the
+            // probabilities is what makes that exact: zeroing after the
+            // softmax would leave the denominator polluted by the future.
+            scores = scores + mask;
+        }
+        if let Some(k) = top_k {
+            scores = crate::hybrid::keep_top_k(scores, k);
+        }
+        let probs = self.attn_dropout.forward(softmax(scores, 3));
+        probs.matmul(v)
+    }
+
+    /// Softmax weights of the learned dense/linear mixture, `[2]`.
+    fn mix_weights(&self) -> Tensor<B, 1> {
+        let logits = self.mix.as_ref().expect("a learned layer carries its mixing logits").val();
+        softmax(logits, 0)
+    }
+
+    fn mix_pair(&self, dense: Tensor<B, 4>, linear: Tensor<B, 4>) -> Tensor<B, 4> {
+        let w = self.mix_weights();
+        let w_dense = w.clone().narrow(0, 0, 1).reshape([1, 1, 1, 1]);
+        let w_linear = w.narrow(0, 1, 1).reshape([1, 1, 1, 1]);
+        dense * w_dense + linear * w_linear
+    }
+
+    /// Attention over a whole sequence whose first position is `offset`.
+    fn forward(&self, x: Tensor<B, 3>, causal: bool, offset: usize) -> Tensor<B, 3> {
+        use crate::hybrid::{attention_mask, feature_map, linear_attention};
+
+        let n = x.dims()[1];
         let q = self.split_heads(self.query.forward(x.clone()));
         let k = self.split_heads(self.key.forward(x.clone()));
         let v = self.split_heads(self.value.forward(x));
+        let (q, k) = self.rotate(q, k, offset);
+        let device = q.device();
+        let mode = self.mode;
+        assert!(
+            causal || mode == AttentionMode::Dense,
+            "only dense attention is defined bidirectionally; this layer is {:?}",
+            mode
+        );
 
-        // Scaled dot-product attention over all heads.
-        let mut scores = q.matmul(k.swap_dims(2, 3)); // [b, heads, n, n]
-        if causal {
-            // Additive -inf above the diagonal, so exp() gives exactly 0 there
-            // and position i can place no weight whatsoever on i+1. Masking the
-            // *scores* rather than the probabilities is what makes that exact:
-            // zeroing after the softmax would leave the denominator polluted by
-            // the future.
-            let [_, _, n, _] = scores.dims();
-            let device = scores.device();
-            scores = scores + causal_mask::<B>(n, &device);
-        }
-        let probs = self.attn_dropout.forward(softmax(scores, 3));
-        let ctx = probs.matmul(v).swap_dims(1, 2); // [b, n, heads, head_dim]
-
-        let [b, n, _, _] = ctx.dims();
-        let ctx = ctx.reshape([b, n, self.num_heads * self.head_dim]);
-        self.output_dropout.forward(self.dense.forward(ctx))
+        let ctx = match mode {
+            AttentionMode::Dense => {
+                let mask = causal.then(|| causal_mask::<B>(n, &device));
+                self.softmax_attend(q, k, v, mask, None)
+            }
+            AttentionMode::Sliding { window } => {
+                let mask = attention_mask::<B>(n, n, 0, 0, Some(window), &device);
+                self.softmax_attend(q, k, v, Some(mask), None)
+            }
+            AttentionMode::Retrieval { top_k } => {
+                let mask = attention_mask::<B>(n, n, 0, 0, None, &device);
+                self.softmax_attend(q, k, v, Some(mask), Some(top_k))
+            }
+            AttentionMode::Linear => {
+                let (ctx, _) = linear_attention(feature_map(q), feature_map(k), v, None, LINEAR_EPS);
+                ctx
+            }
+            AttentionMode::Learned => {
+                let mask = attention_mask::<B>(n, n, 0, 0, None, &device);
+                let dense = self.softmax_attend(q.clone(), k.clone(), v.clone(), Some(mask), None);
+                let (linear, _) = linear_attention(feature_map(q), feature_map(k), v, None, LINEAR_EPS);
+                self.mix_pair(dense, linear)
+            }
+        };
+        self.merge_heads(ctx)
     }
 
     /// Causal attention over `x` (the *new* positions only), reusing and
-    /// extending `cache`.
+    /// extending the layer's `state`.
     ///
-    /// Generation without a cache recomputes every previous position's keys and
-    /// values on every step: `O(n^2)` work per token instead of `O(n)`. Nothing
-    /// about the result changes — those tensors are a pure function of tokens
-    /// that have already been committed — which is why
+    /// Generation without a state recomputes every previous position's keys
+    /// and values on every step: `O(n^2)` work per token instead of `O(n)`.
+    /// Nothing about the result changes — those tensors are a pure function
+    /// of tokens that have already been committed — which is why
     /// `lm/kv_cache_matches_full_recompute` can demand exact agreement rather
-    /// than a tolerance.
+    /// than a tolerance. A sliding layer keeps only the last `window - 1`
+    /// positions and a linear layer only its `(S, z)` state, so their
+    /// footprint is bounded whatever the sequence length.
     ///
     /// Only meaningful causally: with bidirectional attention an earlier
     /// position's output depends on later ones, so nothing is reusable.
-    fn forward_cached(&self, x: Tensor<B, 3>, cache: &mut LayerKvCache<B>) -> Tensor<B, 3> {
+    fn forward_state(&self, x: Tensor<B, 3>, state: &mut LayerState<B>) -> Tensor<B, 3> {
+        use crate::hybrid::{attention_mask, feature_map, linear_attention};
+
         let m = x.dims()[1];
+        let offset = state.positions;
         let q = self.split_heads(self.query.forward(x.clone()));
         let k_new = self.split_heads(self.key.forward(x.clone()));
         let v_new = self.split_heads(self.value.forward(x));
+        let (q, k_new) = self.rotate(q, k_new, offset);
+        let device = q.device();
 
-        let (k, v) = match (cache.keys.take(), cache.values.take()) {
-            (Some(pk), Some(pv)) => (
-                Tensor::cat(vec![pk, k_new], 2),
-                Tensor::cat(vec![pv, v_new], 2),
-            ),
-            _ => (k_new, v_new),
+        let ctx = match self.mode {
+            AttentionMode::Dense | AttentionMode::Retrieval { .. } => {
+                let top_k = match self.mode {
+                    AttentionMode::Retrieval { top_k } => Some(top_k),
+                    _ => None,
+                };
+                state.push_kv(k_new, v_new, None);
+                let (k, v) = state.kv();
+                let total = k.dims()[2];
+                // Query j sits at absolute position `offset + j`, so it may
+                // attend to any key up to that index. The mask is rectangular,
+                // not triangular: the cached prefix is entirely in the past.
+                let mask = attention_mask::<B>(m, total, offset, state.first_key_position, None, &device);
+                self.softmax_attend(q, k, v, Some(mask), top_k)
+            }
+            AttentionMode::Sliding { window } => {
+                state.push_kv(k_new, v_new, None);
+                let (k, v) = state.kv();
+                let total = k.dims()[2];
+                let mask = attention_mask::<B>(m, total, offset, state.first_key_position, Some(window), &device);
+                let ctx = self.softmax_attend(q, k, v, Some(mask), None);
+                // Only the last `window - 1` positions can be read by any
+                // future query; the rest is forgotten, position included.
+                state.trim(window.saturating_sub(1));
+                ctx
+            }
+            AttentionMode::Linear => {
+                let (ctx, next) = linear_attention(feature_map(q), feature_map(k_new), v_new, state.linear.take(), LINEAR_EPS);
+                state.linear = Some(next);
+                ctx
+            }
+            AttentionMode::Learned => {
+                state.push_kv(k_new.clone(), v_new.clone(), None);
+                let (k, v) = state.kv();
+                let total = k.dims()[2];
+                let mask = attention_mask::<B>(m, total, offset, state.first_key_position, None, &device);
+                let dense = self.softmax_attend(q.clone(), k, v, Some(mask), None);
+                let (linear, next) = linear_attention(feature_map(q), feature_map(k_new), v_new, state.linear.take(), LINEAR_EPS);
+                state.linear = Some(next);
+                self.mix_pair(dense, linear)
+            }
         };
-        cache.keys = Some(k.clone());
-        cache.values = Some(v.clone());
-
-        let total = k.dims()[2];
-        let past = total - m;
-
-        // Query j sits at absolute position `past + j`, so it may attend to any
-        // key up to that index. The mask is rectangular, not triangular: the
-        // cached prefix is entirely in the past and never masked.
-        let mut scores = q.matmul(k.swap_dims(2, 3)); // [b, heads, m, total]
-        let device = scores.device();
-        scores = scores + causal_mask_offset::<B>(m, total, past, &device);
-
-        let probs = self.attn_dropout.forward(softmax(scores, 3));
-        let ctx = probs.matmul(v).swap_dims(1, 2);
-
-        let [b, n, _, _] = ctx.dims();
-        let ctx = ctx.reshape([b, n, self.num_heads * self.head_dim]);
-        self.output_dropout.forward(self.dense.forward(ctx))
+        state.positions += m;
+        self.merge_heads(ctx)
     }
 }
 
-/// Cached keys and values for one attention layer, `[b, heads, positions, dim]`.
-///
-/// Empty until the first cached forward pass; a cache is bound to the sequence
-/// that filled it, so decoding a new prompt needs a fresh one (or
-/// [`Self::clear`]).
-#[derive(Debug, Clone)]
-pub struct LayerKvCache<B: Backend> {
-    keys: Option<Tensor<B, 4>>,
-    values: Option<Tensor<B, 4>>,
-}
-
-impl<B: Backend> Default for LayerKvCache<B> {
-    fn default() -> Self {
-        Self { keys: None, values: None }
-    }
-}
-
-impl<B: Backend> LayerKvCache<B> {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Positions currently cached.
-    pub fn len(&self) -> usize {
-        self.keys.as_ref().map_or(0, |k| k.dims()[2])
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Forget everything, so the cache can be reused for another sequence.
-    pub fn clear(&mut self) {
-        self.keys = None;
-        self.values = None;
-    }
-}
-
-/// Additive causal mask `[1, 1, m, total]` for `m` new queries appended after
-/// `offset` cached positions.
-///
-/// Query `j` is at absolute position `offset + j` and may attend to key `i`
-/// exactly when `i <= offset + j`. With `offset == 0` and `total == m` this is
-/// [`causal_mask`].
-pub(crate) fn causal_mask_offset<B: Backend>(
-    m: usize,
-    total: usize,
-    offset: usize,
-    device: &B::Device,
-) -> Tensor<B, 4> {
-    let mut values = Vec::with_capacity(m * total);
-    for query in 0..m {
-        for key in 0..total {
-            values.push(if key <= offset + query { 0.0f32 } else { f32::NEG_INFINITY });
-        }
-    }
-    Tensor::<B, 1>::from_floats(values.as_slice(), device).reshape([1, 1, m, total])
-}
+/// Per-layer decode-time state (roadmap 25.3). Keys and values for a dense,
+/// retrieval or sliding layer; the recurrent `(S, z)` for a linear one; both
+/// for a learned mixture. Kept under the Phase 19 name so callers read the
+/// same.
+pub type LayerKvCache<B> = LayerState<B>;
 
 /// Additive causal mask `[1, 1, n, n]`: `0` on and below the diagonal,
 /// `-inf` above it.
 ///
 /// Built on the host and broadcast over batch and heads. `n` is the sequence
 /// length, which for the image path is fixed by the patch geometry and for the
-/// language path is the context window.
+/// language path is the context window. The general form -- an offset, a
+/// window, cached keys -- is [`crate::hybrid::attention_mask`]; this is its
+/// `m = total = n` case.
 pub(crate) fn causal_mask<B: Backend>(n: usize, device: &B::Device) -> Tensor<B, 4> {
-    let mut values = Vec::with_capacity(n * n);
-    for query in 0..n {
-        for key in 0..n {
-            values.push(if key <= query { 0.0f32 } else { f32::NEG_INFINITY });
-        }
-    }
-    Tensor::<B, 1>::from_floats(values.as_slice(), device).reshape([1, 1, n, n])
+    crate::hybrid::attention_mask::<B>(n, n, 0, 0, None, device)
 }
 
 /// MLP block: `Linear -> exact GELU -> Linear` (`ViTIntermediate` +
@@ -654,9 +774,21 @@ impl<B: Backend> RouterAux<B> {
         Self { balance: self.balance + other.balance, z: self.z + other.z, layers: self.layers }
     }
 
-    /// Per-layer routing statistics, synced to the host.
+    /// Per-layer routing statistics, synced to the host, with each layer's
+    /// top-1 agreement with the routed layer before it (roadmap 25.6).
     pub fn to_host(&self) -> Vec<crate::moe::RoutingStats> {
-        self.layers.iter().map(crate::moe::LayerRouting::to_host).collect()
+        let mut stats: Vec<crate::moe::RoutingStats> =
+            self.layers.iter().map(crate::moe::LayerRouting::to_host).collect();
+        let top1: Vec<Vec<i64>> = self.layers.iter().map(|l| crate::routing::top1_to_host(&l.top1)).collect();
+        for i in 1..stats.len() {
+            stats[i].agreement = crate::routing::layer_agreement(
+                &top1[i - 1],
+                &top1[i],
+                self.layers[i - 1].experts,
+                self.layers[i].experts,
+            );
+        }
+        stats
     }
 }
 
@@ -687,29 +819,57 @@ impl<B: Backend> SparseLayerMut<'_, B> {
 
 impl<B: Backend> FeedForward<B> {
     /// Returns the transformed states and, for sparse layers, the auxiliary
-    /// losses that must be added to the training objective.
+    /// losses that must be added to the training objective. `state` is the
+    /// per-token routing state of roadmap 25.4, appended to the router input
+    /// when the layer was built with one.
     fn forward(
         &self,
         x: Tensor<B, 3>,
         conditioning: &Tensor<B, 2>,
+        state: Option<&Tensor<B, 3>>,
     ) -> (Tensor<B, 3>, Option<RouterAux<B>>) {
+        let [b, n, _] = x.dims();
         match self {
             Self::Dense(mlp) => (mlp.forward(x), None),
             Self::Sparse(moe) => {
-                let out = moe.forward(x, conditioning.clone());
+                let out = moe.forward_with_state(x, conditioning.clone(), state);
                 let z = out.z_loss.mul_scalar(moe.z_level() as f32);
                 (out.output, Some(RouterAux { balance: out.balance, z, layers: vec![out.routing] }))
             }
             Self::Hierarchical(mosme) => {
-                let out = mosme.forward(x, conditioning.clone());
+                let out = mosme.forward_with_state(x, conditioning.clone(), state);
                 let z = out.balance.z_loss.clone().mul_scalar(mosme.z_level() as f32);
-                let routing = out.gates.layer_routing();
+                let routing = out.gates.layer_routing().with_sequence(b, n);
                 (
                     out.output,
                     Some(RouterAux { balance: out.balance.total.clone(), z, layers: vec![routing] }),
                 )
             }
         }
+    }
+}
+
+/// What flows *between* the layers of one pass besides the hidden states
+/// (roadmap Phase 25): the per-token routing state, and the absolute position
+/// of the pass's first token for rotary layers.
+#[derive(Debug, Clone)]
+pub(crate) struct LayerCarry<B: Backend> {
+    /// `[b, n, size]` after the last layer that updated it; `None` before the
+    /// first, and always `None` in a trunk built without a routing state.
+    pub routing_state: Option<Tensor<B, 3>>,
+    /// Absolute position of the first token of this pass.
+    pub offset: usize,
+}
+
+impl<B: Backend> Default for LayerCarry<B> {
+    fn default() -> Self {
+        Self { routing_state: None, offset: 0 }
+    }
+}
+
+impl<B: Backend> LayerCarry<B> {
+    pub(crate) fn at(offset: usize) -> Self {
+        Self { routing_state: None, offset }
     }
 }
 
@@ -730,6 +890,9 @@ pub(crate) struct DbLayer<B: Backend> {
     /// [`ViTDiTConfig::causal`]; `false` for the image path, whose tokens are
     /// patches with no ordering to respect.
     causal: bool,
+    /// Updates the per-token routing state on the way through (roadmap
+    /// 25.4); `None` in a trunk built without one.
+    routing: Option<RoutingState<B>>,
 }
 
 impl<B: Backend> DbLayer<B> {
@@ -747,7 +910,8 @@ impl<B: Backend> DbLayer<B> {
                     mosme.spec.clone(),
                 )
                 .with_intermediate_size(config.intermediate_size)
-                .with_balance_bias(mosme.balance_bias);
+                .with_balance_bias(mosme.balance_bias)
+                .with_state_size(config.routing_state);
                 FeedForward::Hierarchical(crate::mosme::MosmeFeedForward::new(&cfg, device))
             }
             (_, Some(moe)) if moe.applies_to(layer_idx) => {
@@ -755,7 +919,8 @@ impl<B: Backend> DbLayer<B> {
                     .with_z_level(moe.z_level)
                     .with_top_k(moe.top_k)
                     .with_intermediate_size(config.intermediate_size)
-                    .with_balance_bias(moe.balance_bias);
+                    .with_balance_bias(moe.balance_bias)
+                    .with_state_size(config.routing_state);
                 FeedForward::Sparse(crate::moe::MoELayer::new(&cfg, device))
             }
             _ => FeedForward::Dense(Mlp::new(
@@ -765,12 +930,20 @@ impl<B: Backend> DbLayer<B> {
                 device,
             )),
         };
+        let mode = config.attention_mode(layer_idx);
+        assert!(
+            config.causal || mode == AttentionMode::Dense,
+            "layer {layer_idx} asks for {} attention, which is only defined causally",
+            mode.name()
+        );
         Self {
             attention: Attention::new(
                 h,
                 config.num_attention_heads,
                 config.attention_probs_dropout_prob,
                 config.hidden_dropout_prob,
+                mode,
+                config.rotary,
                 device,
             ),
             mlp,
@@ -782,7 +955,18 @@ impl<B: Backend> DbLayer<B> {
                 .init(device),
             ada_ln: AdaLN::new(config.cond_hidden_size, 6 * h, device),
             causal: config.causal,
+            routing: (config.routing_state > 0).then(|| RoutingState::new(h, config.routing_state, device)),
         }
+    }
+
+    /// The attention mode this layer runs in.
+    pub(crate) fn attention_mode(&self) -> AttentionMode {
+        self.attention.mode()
+    }
+
+    /// Whether this layer carries a routing-state updater.
+    pub(crate) fn has_routing_state(&self) -> bool {
+        self.routing.is_some()
     }
 
     /// This layer's selection biases over its global expert index, if it is
@@ -824,10 +1008,12 @@ impl<B: Backend> DbLayer<B> {
         &self,
         hidden_states: Tensor<B, 3>,
         conditioning: &Tensor<B, 2>,
+        carry: &mut LayerCarry<B>,
     ) -> (Tensor<B, 3>, Option<RouterAux<B>>) {
         let causal = self.causal;
-        self.forward_with(hidden_states, conditioning, |attn, normed| {
-            attn.forward(normed, causal)
+        let offset = carry.offset;
+        self.forward_with(hidden_states, conditioning, carry, |attn, normed| {
+            attn.forward(normed, causal, offset)
         })
     }
 
@@ -849,14 +1035,15 @@ impl<B: Backend> DbLayer<B> {
         hidden_states: Tensor<B, 3>,
         conditioning: &Tensor<B, 2>,
         cache: &mut LayerKvCache<B>,
+        carry: &mut LayerCarry<B>,
     ) -> (Tensor<B, 3>, Option<RouterAux<B>>) {
         assert!(
             self.causal,
             "a KV cache is only sound for causal attention: with bidirectional \
              attention an earlier position's output depends on later ones"
         );
-        self.forward_with(hidden_states, conditioning, |attn, normed| {
-            attn.forward_cached(normed, cache)
+        self.forward_with(hidden_states, conditioning, carry, |attn, normed| {
+            attn.forward_state(normed, cache)
         })
     }
 
@@ -864,11 +1051,17 @@ impl<B: Backend> DbLayer<B> {
         &self,
         hidden_states: Tensor<B, 3>,
         conditioning: &Tensor<B, 2>,
+        carry: &mut LayerCarry<B>,
         attend: F,
     ) -> (Tensor<B, 3>, Option<RouterAux<B>>)
     where
         F: FnOnce(&Attention<B>, Tensor<B, 3>) -> Tensor<B, 3>,
     {
+        // The routing state is updated from this layer's *input*, so the
+        // routers inside the layer can already read it (roadmap 25.4).
+        if let Some(routing) = &self.routing {
+            carry.routing_state = Some(routing.step(&hidden_states, carry.routing_state.as_ref()));
+        }
         let residual = hidden_states.clone();
 
         // Chunk the modulation vector [b, 6h] into six [b, h] slices.
@@ -892,7 +1085,8 @@ impl<B: Backend> DbLayer<B> {
             shift_mlp,
             scale_mlp,
         );
-        let (layer_output, balance_loss) = self.mlp.forward(layer_output, conditioning);
+        let (layer_output, balance_loss) =
+            self.mlp.forward(layer_output, conditioning, carry.routing_state.as_ref());
         (layer_output * gate_mlp + hidden_states, balance_loss)
     }
 }
@@ -1001,8 +1195,9 @@ impl<B: Backend> ViTDiTModel<B> {
         conditioning: &Tensor<B, 2>,
     ) -> (Tensor<B, 3>, Option<RouterAux<B>>) {
         let mut aux_total: Option<RouterAux<B>> = None;
+        let mut carry = LayerCarry::default();
         for i in range.start..range.end.min(self.layers.len()) {
-            let (states, aux) = self.layers[i].forward(hidden_states, conditioning);
+            let (states, aux) = self.layers[i].forward(hidden_states, conditioning, &mut carry);
             hidden_states = states;
             if let Some(aux) = aux {
                 aux_total = Some(match aux_total {
@@ -1406,18 +1601,18 @@ mod tests {
     fn prefix_drift_from_future_perturbation(causal: bool) -> (f32, f32) {
         let device = Default::default();
         let (hidden, heads, seq) = (16usize, 4usize, 6usize);
-        let attention = Attention::<B>::new(hidden, heads, 0.0, 0.0, &device);
+        let attention = Attention::<B>::new(hidden, heads, 0.0, 0.0, AttentionMode::Dense, false, &device);
 
         let base = Tensor::<B, 3>::random(
             [1, seq, hidden],
             burn::tensor::Distribution::Uniform(-1.0, 1.0),
             &device,
         );
-        let reference = attention.forward(base.clone(), causal);
+        let reference = attention.forward(base.clone(), causal, 0);
 
         let tail = base.clone().narrow(1, seq - 1, 1) + 10.0;
         let perturbed = Tensor::cat(vec![base.narrow(1, 0, seq - 1), tail], 1);
-        let changed = attention.forward(perturbed, causal);
+        let changed = attention.forward(perturbed, causal, 0);
 
         let prefix = (reference.clone().narrow(1, 0, seq - 1)
             - changed.clone().narrow(1, 0, seq - 1))

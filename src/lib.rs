@@ -27,6 +27,12 @@
 //! - [`antipattern`]: anti-pattern rules and per-token labels for negative supervision
 //! - [`corpus`]: pre-tokenized text corpora, in memory or streamed
 //! - [`lm`]: causal language model over the shared trunk
+//! - [`hybrid`]: per-layer attention modes (dense, sliding, retrieval,
+//!   linear, learned), rotary positions and per-mode decode state
+//! - [`routing`]: the per-token routing state carried through the layers,
+//!   router kinds and routing-locality diagnostics
+//! - [`cost`]: active parameters, FLOPs and resident state per token, counted
+//!   from the configuration
 //! - [`schedule`]: LR schedules, EMA, gradient accumulation and clipping
 //! - [`reweight`]: per-sigma uncertainty weighting and importance sampling
 //! - [`train`]: block-wise training loop
@@ -72,6 +78,7 @@ pub mod cifar;
 pub mod codequality;
 pub mod consistency;
 pub mod corpus;
+pub mod cost;
 pub mod data;
 pub mod dblock;
 pub mod distill;
@@ -79,6 +86,7 @@ pub mod experiment;
 pub mod expert_index;
 pub mod flow;
 pub mod heretic;
+pub mod hybrid;
 pub mod infer;
 pub mod lm;
 pub mod merge;
@@ -97,6 +105,7 @@ pub mod quality_coder;
 pub mod quantize;
 pub mod rawdata;
 pub mod reweight;
+pub mod routing;
 pub mod schedule;
 pub mod sigma;
 pub mod solver;

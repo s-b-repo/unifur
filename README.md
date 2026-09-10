@@ -116,6 +116,14 @@ cargo build --release
 # and keep the best (github.com/p-e-w/heretic).
 ./target/release/dblocks lm heretic --checkpoint lm.mpk --target refuse.txt --baseline keep.txt --trials 12 --out checkpoints
 
+# Hybrid attention (Phase 25): three linear layers per dense one, rotary
+# positions so decoding runs past the context, a routing state every router
+# reads; the architecture is recorded beside the checkpoint and reloaded from
+# it. `lm bench --axis` compares the variants with their counted cost.
+./target/release/dblocks lm train --corpus repo.bin --attention 3:1 --positions rotary --routing-state 16
+./target/release/dblocks lm generate --checkpoint checkpoints/lm-<hash>.mpk --cached --max-new 512
+./target/release/dblocks lm bench --corpus repo.bin --axis attention --json bench.jsonl
+
 # Batched inference with top-k output and per-batch profiling.
 ./target/release/dblocks infer --top-k 3 --solver heun
 
@@ -154,6 +162,9 @@ cargo test --all && cargo clippy --all-targets && ./target/release/dblocks verif
 | Post-training accuracy: guidance, normalization, ensembling, scaling | `accuracy.rs` |
 | LR schedules, EMA, accumulation, clipping; per-sigma reweighting | `schedule.rs`, `reweight.rs` |
 | Causal language model, byte tokenizer, corpora | `lm.rs`, `tokenizer.rs`, `corpus.rs` |
+| Attention modes, rotary positions, per-mode decode state | `hybrid.rs` |
+| Routing state, router kinds, routing-locality diagnostics | `routing.rs` |
+| Active parameters, FLOPs and decode state, counted from shapes | `cost.rs` |
 | Anti-pattern rules and labels for negative supervision | `antipattern.rs` |
 | Code-quality signals, window filter, quality regularizer | `codequality/` |
 | Quality-coder scaffolding (design only) | `quality_coder/` |

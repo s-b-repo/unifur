@@ -71,6 +71,9 @@ pub struct MosmeConfig {
     pub spec: MosmeSpec,
     /// Attach loss-free selection biases to every router (roadmap 23.5).
     pub balance_bias: bool,
+    /// Width of the per-token routing state appended to every router's
+    /// input (roadmap 25.4); `0` appends nothing.
+    pub state_size: usize,
 }
 
 impl MosmeConfig {
@@ -82,6 +85,7 @@ impl MosmeConfig {
             route_on_tokens: spec.route_on_tokens,
             spec,
             balance_bias: false,
+            state_size: 0,
         }
     }
 
@@ -96,13 +100,21 @@ impl MosmeConfig {
         self
     }
 
+    /// Append a routing state of this width to every router's input
+    /// (roadmap 25.4).
+    pub fn with_state_size(mut self, size: usize) -> Self {
+        self.state_size = size;
+        self
+    }
+
     /// Width of the router's input vector.
     pub fn router_input_size(&self) -> usize {
-        if self.route_on_tokens {
+        let base = if self.route_on_tokens {
             self.cond_size + self.hidden_size
         } else {
             self.cond_size
-        }
+        };
+        base + self.state_size
     }
 
     pub fn total_experts(&self) -> usize {
@@ -289,6 +301,9 @@ pub struct HierarchicalRouter<B: Backend> {
     top_box: usize,
     top_expert: usize,
     route_on_tokens: bool,
+    /// Width of the routing state every router input ends with (roadmap
+    /// 25.4); `0` for none.
+    state_size: usize,
 }
 
 impl<B: Backend> HierarchicalRouter<B> {
@@ -311,6 +326,7 @@ impl<B: Backend> HierarchicalRouter<B> {
             top_box: config.spec.top_box.max(1),
             top_expert: config.spec.top_expert.max(1),
             route_on_tokens: config.route_on_tokens,
+            state_size: config.state_size,
         };
         if config.balance_bias {
             router.ensure_balance_bias();
@@ -407,8 +423,27 @@ impl<B: Backend> HierarchicalRouter<B> {
     /// Assemble the router input from rank-3 token features, exactly as
     /// [`MoELayer::router_logits`] does.
     pub fn router_input(&self, x: &Tensor<B, 3>, cond: &Tensor<B, 2>) -> Tensor<B, 2> {
+        self.router_input_with(x, cond, None)
+    }
+
+    /// [`Self::router_input`] with the per-token routing state `[b, n, s]`
+    /// appended (roadmap 25.4). A router built without a state takes `None`
+    /// and assembles exactly what it always did.
+    pub fn router_input_with(&self, x: &Tensor<B, 3>, cond: &Tensor<B, 2>, state: Option<&Tensor<B, 3>>) -> Tensor<B, 2> {
         let [b, n, h] = x.dims();
-        self.router_input_2d(&x.clone().reshape([b * n, h]), &broadcast_cond(cond, n))
+        let base = self.router_input_2d(&x.clone().reshape([b * n, h]), &broadcast_cond(cond, n));
+        if self.state_size == 0 {
+            return base;
+        }
+        let state = state.expect("this router was built with a routing state and needs one to route");
+        let s = state.dims()[2];
+        assert_eq!(s, self.state_size, "routing state width {s} does not match the router's {}", self.state_size);
+        Tensor::cat(vec![base, state.clone().reshape([b * n, s])], 1)
+    }
+
+    /// Width of the routing state this router expects.
+    pub fn state_size(&self) -> usize {
+        self.state_size
     }
 
     /// Assemble the router input from already-flat features `[T, h]` and a
@@ -677,11 +712,16 @@ impl<B: Backend> MosmeFeedForward<B> {
     /// The accumulation order deliberately matches [`MoELayer::forward`]'s so
     /// the single-box case reduces to it bit-for-bit.
     pub fn forward(&self, x: Tensor<B, 3>, cond: Tensor<B, 2>) -> MosmeOutput<B> {
+        self.forward_with_state(x, cond, None)
+    }
+
+    /// [`Self::forward`] with the per-token routing state of roadmap 25.4.
+    pub fn forward_with_state(&self, x: Tensor<B, 3>, cond: Tensor<B, 2>, state: Option<&Tensor<B, 3>>) -> MosmeOutput<B> {
         let device = x.device();
         let [b, n, h] = x.dims();
         let t = b * n;
 
-        let input = self.router.router_input(&x, &cond);
+        let input = self.router.router_input_with(&x, &cond, state);
         let gates = self.router.route(input);
         let composed = gates.composed();
 

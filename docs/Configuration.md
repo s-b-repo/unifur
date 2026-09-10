@@ -291,9 +291,14 @@ Language-model paths (Phases 19, 21b and 24).
 | `--penalty` | `0` | Unlikelihood coefficient on labeled targets. `0` trains plainly and only *measures* `p(bad)`; a positive value charges for them and requires labels |
 | `--streaming` | `false` | Sample windows from disk instead of loading the corpus |
 | `--tiny` | `false` | The small configuration, for CPU smoke runs |
+| `--attention` | dense | Attention schedule (Phase 25): `dense`, `linear`, `learned`, `sliding<w>`, `retrieval<k>`, `3:1`, `2:1@sliding64`, a letter pattern (`LLLD`), or one mode per layer, comma-separated |
+| `--window` | `64` | Window for `sliding` layers named without one |
+| `--retrieval-k` | `32` | Top-k for `retrieval` layers named without one |
+| `--positions` | `learned` | `learned` \| `rotary` \| `none` (Phase 25); anything but `learned` removes the context bound |
+| `--routing-state` | `0` | Width of the per-token routing state carried through the layers and appended to every router's input (Phase 25) |
 | `--seed` | `42` | |
 | `--log-every` | `10` | |
-| `--log` | — | Append-mode JSONL metrics (`loss`, `perplexity`, `penalized_tokens`, `penalized_prob`, `penalty`) |
+| `--log` | — | Append-mode JSONL metrics (`loss`, `perplexity`, `penalized_tokens`, `penalized_prob`, `penalty`, and per routed layer the load, entropies, `stability` and `agreement`) |
 | `--out-dir` | `checkpoints` | Content-addressed checkpoint, stem `lm`, with the training state beside it |
 | `--checkpoint-every` | `0` | Also checkpoint every n steps (Phase 28) |
 | `--resume` | — | A model from `lm train`; its training state is restored and verified |
@@ -306,11 +311,15 @@ Language-model paths (Phases 19, 21b and 24).
 | `--steps` | `30` | Steps per variant per seed |
 | `--seeds` | `1,2` | |
 | `--batch-size` | `4` | |
+| `--axis` | `trunk` | Which axis to vary (Phase 25): `trunk` (`dense`, `moe`, `moe+bias`), `attention` (`dense`, `3:1`, `sliding8`, `retrieval4`, `linear`, `learned`), `positions` (`learned`, `rotary`, `none`), `routing` (`moe`, `moe+state8`) |
 | `--json` | — | Append one record per variant |
 
-Trains the tiny model under each trunk variant (`dense`, `moe`, `moe+bias`) and
-reports the final loss per seed with its interval and the milliseconds per
-step. On CPU this measures what the mechanisms cost, not what they buy.
+Trains the tiny model under each variant of the chosen axis and reports the
+final loss per seed with its interval, the milliseconds per step, and the
+**counted** active parameters and FLOPs per token (`cost.rs`); the record's
+`extra` carries the architecture, the keys read and the decode-state floats
+as well. On CPU the timing measures what the mechanisms cost, not what they
+buy; the counts are what the quality-per-active-FLOP axis is read from.
 
 ### `dblocks lm policy` / `dblocks lm approvals` / `dblocks lm refusal-corpus` (Phase 30)
 
@@ -368,7 +377,7 @@ class and charges the model `α · −log(1 − p_label)` for it (`negative_samp
 | `--budget` | `32` | Candidate evaluations per committed token |
 | `--seed` | `1337` | |
 | `--checkpoint` | — | Weights from `dblocks lm train`; random when omitted |
-| `--tiny` | `false` | Must match the checkpoint's configuration |
+| `--tiny`, `--attention`, `--window`, `--retrieval-k`, `--positions`, `--routing-state` | as for `lm train` | The architecture to build. When the checkpoint has a training state beside it, the architecture recorded there is used instead and printed (Phase 25); `lm merge` reads its first input the same way |
 | `--policy` / `--key` / `--grant` | — | Gate the request through a policy (Phase 30); `--grant` is repeatable |
 
 Weights are random unless a checkpoint is loaded, so the text is noise. What the

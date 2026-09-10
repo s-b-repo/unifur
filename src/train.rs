@@ -1516,6 +1516,10 @@ where
                 fields.push(("min_load", jnum(min_load)));
                 fields.push(("max_load", jnum(max_load)));
                 fields.push(("routing_load", crate::moe::RoutingStats::load_json(&m.routing)));
+                fields.push(("routing_stability", jnum(crate::moe::RoutingStats::mean_stability(&m.routing))));
+                if let Some(agreement) = crate::moe::RoutingStats::mean_agreement(&m.routing) {
+                    fields.push(("routing_agreement", jnum(agreement)));
+                }
             }
             return (loss, fields, m.routing);
         }
@@ -2019,8 +2023,12 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
             }
             if !routing.is_empty() {
                 line.push_str(&format!(
-                    " | routing: token H {:.3}, max load {:.3}",
-                    metrics.routing_entropy, metrics.routing_max_load
+                    " | routing: token H {:.3}, max load {:.3}, stability {:.3}{}",
+                    metrics.routing_entropy,
+                    metrics.routing_max_load,
+                    crate::moe::RoutingStats::mean_stability(&routing),
+                    crate::moe::RoutingStats::mean_agreement(&routing)
+                        .map_or(String::new(), |a| format!(", layer agreement {a:.3}"))
                 ));
             }
             if metrics.negative_teacher_tokens > 0 {
@@ -2057,6 +2065,10 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
                     fields.push(("min_load", crate::logging::jnum(min_load)));
                     fields.push(("max_load", crate::logging::jnum(max_load)));
                     fields.push(("routing_load", crate::moe::RoutingStats::load_json(&routing)));
+                    fields.push(("routing_stability", crate::logging::jnum(crate::moe::RoutingStats::mean_stability(&routing))));
+                    if let Some(agreement) = crate::moe::RoutingStats::mean_agreement(&routing) {
+                        fields.push(("routing_agreement", crate::logging::jnum(agreement)));
+                    }
                 }
                 logger.log(step, &fields)?;
             }

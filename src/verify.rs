@@ -37,6 +37,7 @@
 //! | `moe` | Gates are a probability distribution; the balance loss stays in `[1, E]` on the diagonal |
 //! | `mosme` | Composed two-level gates form a distribution; one box reduces exactly to flat MoE; adding a disabled expert is a bit-exact identity |
 //! | `lm` | Tokenization is lossless; causal attention leaks nothing backwards; an untrained tied head starts at `ln(vocab)` |
+//! | `hybrid` | A dense schedule is the Phase 19 trunk bit for bit; a window or a retrieval set covering the context is dense; linear attention's recurrent state equals its masked form; rotary scores depend only on distance; every mode decodes from its state exactly as it recomputes; rotary decoding continues past the table; the routing state is bounded and carries history; routing locality reads as specified |
 //! | `antipattern` | Every shipped rule matches its examples and none of its counterexamples; labels follow tokens through both corpus readers; zero weights reproduce the plain loss bitwise; the unlikelihood term is 0 for an impossible token and finite for a certain one; a penalized target leaves the likelihood; one penalized step lowers p(bad) where one plain step raises it |
 //! | `model` | Softmax partition, unit-norm label embeddings, DiT zero-init, and that every `x0` estimate lies in the convex hull of the label table |
 //! | `autodiff` | Finite-difference gradient check on the distillation objective |
@@ -210,7 +211,7 @@ impl Report {
 }
 
 /// Names of every certificate group, in the order [`run_all`] emits them.
-pub const GROUPS: [&str; 21] = [
+pub const GROUPS: [&str; 22] = [
     "schedule",
     "preconditioning",
     "stats",
@@ -221,6 +222,7 @@ pub const GROUPS: [&str; 21] = [
     "moe",
     "mosme",
     "lm",
+    "hybrid",
     "antipattern",
     "codequality",
     "planner",
@@ -271,6 +273,7 @@ pub fn run_all() -> Report {
     certificates.extend(moe_certificates());
     certificates.extend(mosme_certificates());
     certificates.extend(lm_certificates());
+    certificates.extend(hybrid_certificates());
     certificates.extend(antipattern_certificates());
     certificates.extend(codequality_certificates());
     certificates.extend(planner_certificates());
@@ -1835,6 +1838,266 @@ fn lm_certificates() -> Vec<Certificate> {
             "Cached and uncached generation produce identical sequences from the same seed.",
             decode_err,
             0.0,
+        ),
+    ]
+}
+
+// ----------------------------------------------------------------- hybrid --
+
+fn hybrid_certificates() -> Vec<Certificate> {
+    use crate::hybrid::{
+        apply_rotary, feature_map, linear_attention, AttentionMode, AttentionSchedule, LinearState,
+        PositionKind, ROTARY_BASE,
+    };
+    use crate::lm::{LanguageModel, LmConfig, Sampling};
+    use crate::moe::MoEConfig;
+    use crate::routing::{layer_agreement, token_stability, RoutingState};
+    use burn::module::Module;
+    use rand::{rngs::StdRng, SeedableRng};
+
+    let device: <B as burn::tensor::backend::BackendTypes>::Device = Default::default();
+    let as_tensor = |v: &[i64]| Tensor::<B, 1, Int>::from_ints(v, &device).reshape([1, v.len()]);
+    let logits_of = |m: &LanguageModel<B>, ids: &[i64]| -> Vec<f32> {
+        m.forward(as_tensor(ids)).logits.into_data().convert::<f32>().iter::<f32>().collect()
+    };
+    let max_abs_diff = |a: &[f32], b: &[f32]| -> f64 {
+        if a.len() != b.len() {
+            return f64::INFINITY;
+        }
+        a.iter().zip(b).map(|(x, y)| f64::from((x - y).abs())).fold(0.0, f64::max)
+    };
+    let max_rel_diff = |a: &[f32], b: &[f32]| -> f64 {
+        if a.len() != b.len() {
+            return f64::INFINITY;
+        }
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| f64::from((x - y).abs()) / f64::from(y.abs()).max(1.0))
+            .fold(0.0, f64::max)
+    };
+    let build = |config: &LmConfig| -> LanguageModel<B> {
+        let model = LanguageModel::<B>::new(config, &device);
+        crate::tensor_ext::force_initialization(&model);
+        model
+    };
+    let tiny = LmConfig::tiny();
+    let n_layers = tiny.num_layers;
+    let ids: Vec<i64> = vec![5, 66, 7, 108, 9, 200, 11, 32];
+
+    // A mode that only changes the mask adds no parameter, so the reference
+    // model's record loads into a model of the other mode and the two share
+    // every weight bit for bit -- without depending on the global RNG, which
+    // any concurrently running test may draw from.
+    let plain = build(&tiny);
+    let same_weights = |config: &LmConfig| -> LanguageModel<B> {
+        LanguageModel::<B>::new(config, &device).load_record(plain.clone().into_record())
+    };
+
+    // 1. An explicit all-dense schedule is the Phase 19 trunk.
+    let dense = same_weights(&LmConfig { attention: Some(AttentionSchedule::dense(n_layers)), ..tiny.clone() });
+    let reference = logits_of(&plain, &ids);
+    let dense_gap = max_abs_diff(&reference, &logits_of(&dense, &ids));
+
+    // 2. A window covering the whole sequence is dense; so is reading every key.
+    let wide = same_weights(&LmConfig {
+        attention: Some(AttentionSchedule { modes: vec![AttentionMode::Sliding { window: 64 }; n_layers] }),
+        ..tiny.clone()
+    });
+    let window_gap = max_abs_diff(&reference, &logits_of(&wide, &ids));
+    let all_keys = same_weights(&LmConfig {
+        attention: Some(AttentionSchedule { modes: vec![AttentionMode::Retrieval { top_k: 64 }; n_layers] }),
+        ..tiny.clone()
+    });
+    let retrieval_gap = max_abs_diff(&reference, &logits_of(&all_keys, &ids));
+
+    // 3. Linear attention: the chunked recurrence equals the masked matrix form.
+    let (b, h, n, d) = (2usize, 2usize, 7usize, 4usize);
+    let q = feature_map(Tensor::<B, 4>::random([b, h, n, d], Distribution::Uniform(-1.0, 1.0), &device));
+    let k = feature_map(Tensor::<B, 4>::random([b, h, n, d], Distribution::Uniform(-1.0, 1.0), &device));
+    let v = Tensor::<B, 4>::random([b, h, n, d], Distribution::Uniform(-1.0, 1.0), &device);
+    let (full, _) = linear_attention(q.clone(), k.clone(), v.clone(), None, 1e-6);
+    let full: Vec<f32> = full.into_data().convert::<f32>().iter::<f32>().collect();
+    let mut linear_gap: f64 = 0.0;
+    for chunks in [vec![1; n], vec![3, 1, 3], vec![2, 5]] {
+        let mut state: Option<LinearState<B>> = None;
+        let mut outputs = Vec::new();
+        let mut at = 0;
+        for size in chunks {
+            let (out, next) = linear_attention(
+                q.clone().narrow(2, at, size),
+                k.clone().narrow(2, at, size),
+                v.clone().narrow(2, at, size),
+                state.take(),
+                1e-6,
+            );
+            outputs.push(out);
+            state = Some(next);
+            at += size;
+        }
+        let produced: Vec<f32> = Tensor::cat(outputs, 2).into_data().convert::<f32>().iter::<f32>().collect();
+        linear_gap = linear_gap.max(max_rel_diff(&produced, &full));
+    }
+
+    // 4. Rotary: a score depends only on the distance between the positions.
+    let rq = Tensor::<B, 4>::random([1, 1, 1, 8], Distribution::Uniform(-1.0, 1.0), &device);
+    let rk = Tensor::<B, 4>::random([1, 1, 1, 8], Distribution::Uniform(-1.0, 1.0), &device);
+    let score = |qo: usize, ko: usize| -> f64 {
+        let s: f32 = (apply_rotary(rq.clone(), qo, ROTARY_BASE) * apply_rotary(rk.clone(), ko, ROTARY_BASE)).sum().into_scalar();
+        f64::from(s)
+    };
+    let base_score = score(9, 4);
+    let rotary_gap = [1usize, 7, 30, 250].iter().map(|s| (score(9 + s, 4 + s) - base_score).abs()).fold(0.0, f64::max);
+
+    // 5. Every mode decodes from its state exactly as it recomputes, under
+    //    several chunkings.
+    let schedules: Vec<(&str, AttentionSchedule)> = vec![
+        ("dense", AttentionSchedule::dense(n_layers)),
+        ("sliding3", AttentionSchedule { modes: vec![AttentionMode::Sliding { window: 3 }; n_layers] }),
+        ("retrieval2", AttentionSchedule { modes: vec![AttentionMode::Retrieval { top_k: 2 }; n_layers] }),
+        ("linear", AttentionSchedule { modes: vec![AttentionMode::Linear; n_layers] }),
+        ("learned", AttentionSchedule { modes: vec![AttentionMode::Learned; n_layers] }),
+        ("3:1", AttentionSchedule::ratio(n_layers, 3, AttentionMode::Linear, AttentionMode::Dense)),
+    ];
+    let mut cache_gap: f64 = 0.0;
+    for (_, schedule) in &schedules {
+        for positions in [PositionKind::Learned, PositionKind::Rotary, PositionKind::None] {
+            let model = build(&LmConfig { attention: Some(schedule.clone()), positions, ..tiny.clone() });
+            let reference = logits_of(&model, &ids);
+            for chunks in [vec![ids.len()], vec![1; ids.len()], vec![3, 1, ids.len() - 4]] {
+                let mut cache = model.new_cache();
+                let mut produced: Vec<f32> = Vec::new();
+                let mut at = 0usize;
+                for size in chunks {
+                    let out = model.forward_cached(as_tensor(&ids[at..at + size]), &mut cache);
+                    produced.extend(out.logits.into_data().convert::<f32>().iter::<f32>());
+                    at += size;
+                }
+                cache_gap = cache_gap.max(max_rel_diff(&produced, &reference));
+            }
+        }
+    }
+
+    // 6. Under rotary positions a sliding/linear trunk keeps decoding past
+    //    the table, and what it emits there is what a full recompute over the
+    //    whole (longer-than-context) sequence emits.
+    let long_model = build(&LmConfig {
+        attention: Some(AttentionSchedule::ratio(n_layers, 1, AttentionMode::Linear, AttentionMode::Sliding { window: 4 })),
+        positions: PositionKind::Rotary,
+        ..tiny.clone()
+    });
+    let prompt: Vec<u16> = vec![crate::tokenizer::Special::Bos.id(), 65, 66];
+    let want = tiny.context + 6;
+    let emitted = long_model.generate_cached(&prompt, want, &Sampling::Greedy, &mut StdRng::seed_from_u64(0), &device);
+    // Greedy decoding from random weights may legitimately emit <eos> early;
+    // what must not happen is stopping at the table's edge for no reason.
+    let stopped_at_eos = emitted.last() == Some(&crate::tokenizer::Special::Eos.id());
+    let past_table = if emitted.len() == prompt.len() + want || stopped_at_eos { 0.0 } else { 1.0 };
+    let long_ids: Vec<i64> = (0..tiny.context as i64 + 5).map(|i| 40 + (i * 7) % 60).collect();
+    let long_reference = logits_of(&long_model, &long_ids);
+    let mut long_cache = long_model.new_cache();
+    let mut long_produced: Vec<f32> = Vec::new();
+    for chunk in long_ids.chunks(5) {
+        let out = long_model.forward_cached(as_tensor(chunk), &mut long_cache);
+        long_produced.extend(out.logits.into_data().convert::<f32>().iter::<f32>());
+    }
+    let ran_past = if long_cache.position() > tiny.context { 0.0 } else { 1.0 };
+    let long_gap = max_rel_diff(&long_produced, &long_reference) + past_table + ran_past;
+
+    // 7. The routing state is bounded by its tanh and carries history.
+    let state = RoutingState::<B>::new(8, 4, &device);
+    let hidden = Tensor::<B, 3>::random([2, 3, 8], Distribution::Normal(0.0, 5.0), &device);
+    let r0 = state.step(&hidden, None);
+    let bound: f32 = r0.clone().abs().max().into_scalar();
+    let history = Tensor::<B, 3>::full([2, 3, 4], 0.9, &device);
+    let moved: f32 = (state.step(&hidden, Some(&history)) - r0).abs().max().into_scalar();
+    let state_residual = f64::from((bound - 1.0).max(0.0)) + if moved > 1e-4 { 0.0 } else { 1.0 };
+    // ...and a trunk built without one has exactly the parameters it had.
+    let count = |m: &LanguageModel<B>| m.num_params();
+    let without = count(&build(&tiny));
+    let zero = count(&build(&LmConfig { routing_state: 0, ..tiny.clone() }));
+    let with = count(&build(&LmConfig { routing_state: 4, ..tiny.clone() }));
+    let params_residual = if without == zero && with > without { 0.0 } else { 1.0 };
+    let width_residual = if MoEConfig::new(8, 4, 3).with_state_size(0).router_input_size() == MoEConfig::new(8, 4, 3).router_input_size()
+        && MoEConfig::new(8, 4, 3).with_state_size(5).router_input_size() == MoEConfig::new(8, 4, 3).router_input_size() + 5
+    {
+        0.0
+    } else {
+        1.0
+    };
+
+    // 8. Routing locality reads as specified.
+    let ids_of = |v: &[i64]| Tensor::<B, 1, Int>::from_ints(v, &device).reshape([v.len(), 1]);
+    let alternating = token_stability(&ids_of(&[0, 1, 0, 1]), 1, 4);
+    let constant = token_stability(&ids_of(&[2, 2, 2, 2]), 1, 4);
+    let across = token_stability(&ids_of(&[0, 0, 1, 1]), 2, 2);
+    let agreement = layer_agreement(&[0, 1, 2], &[0, 1, 0], 3, 3).unwrap_or(f32::NAN);
+    let incomparable = layer_agreement(&[0, 1], &[0, 1], 2, 3).is_none();
+    let locality_residual = f64::from(alternating.abs() + (constant - 1.0).abs() + (across - 1.0).abs() + (agreement - 2.0 / 3.0).abs())
+        + if incomparable { 0.0 } else { 1.0 };
+
+    vec![
+        cert(
+            "hybrid",
+            "dense_schedule_is_the_phase19_trunk",
+            "An explicit all-dense schedule produces the logits of the trunk without a schedule, bit for bit.",
+            dense_gap,
+            0.0,
+        ),
+        cert(
+            "hybrid",
+            "window_covering_the_context_is_dense",
+            "A sliding window at least as long as the sequence attends exactly as dense attention does.",
+            window_gap,
+            0.0,
+        ),
+        cert(
+            "hybrid",
+            "reading_every_key_is_dense",
+            "Retrieval attention whose top-k covers every key attends exactly as dense attention does.",
+            retrieval_gap,
+            0.0,
+        ),
+        cert(
+            "hybrid",
+            "linear_state_matches_masked_form",
+            "Feeding a sequence through the linear-attention recurrence in chunks reproduces the masked matrix form, to within summation order.",
+            linear_gap,
+            1e-5,
+        ),
+        cert(
+            "hybrid",
+            "rotary_scores_depend_on_distance",
+            "Shifting a query and a key by the same offset leaves their rotary score unchanged.",
+            rotary_gap,
+            1e-4,
+        ),
+        cert(
+            "hybrid",
+            "every_mode_decodes_from_its_state_exactly",
+            "For dense, sliding, retrieval, linear, learned and 3:1 schedules under every position kind, cached decoding reproduces the full-recompute logits under every chunking.",
+            cache_gap,
+            1e-4,
+        ),
+        cert(
+            "hybrid",
+            "rotary_decoding_continues_past_the_table",
+            "A rotary sliding/linear trunk emits tokens past the context length, and its cached logits there equal a full recompute over the whole sequence.",
+            long_gap,
+            1e-4,
+        ),
+        cert(
+            "hybrid",
+            "routing_state_is_bounded_and_carries_history",
+            "The routing state stays inside (-1, 1) and depends on the state of the layer before; a trunk without one adds no parameter and a router without one keeps its input width.",
+            state_residual + params_residual + width_residual,
+            0.0,
+        ),
+        cert(
+            "hybrid",
+            "routing_locality_reads_as_specified",
+            "Token stability is 0 for alternating experts, 1 for a constant expert and never counts a sequence boundary; layer agreement is the matching fraction and is undefined across widths.",
+            locality_residual,
+            1e-6,
         ),
     ]
 }
@@ -4233,6 +4496,7 @@ mod tests {
                 "autodiff",
                 "codequality",
                 "experiment",
+                "hybrid",
                 "lm",
                 "loopgraph",
                 "model",

@@ -71,6 +71,12 @@ without a measurement.
 | Direction ablation removes every residual writer's component along the (gate-scaled) direction, is idempotent on an axis, and inference-time projection leaves no component at any layer; the direction penalty at weight 0 is the plain loss and a penalized step lowers the projection relative to a plain step; image negatives at charge 0 cost nothing, are bounded by `−ln ε`, and a charged step lowers the label probability relative to a rewarded one | VERIFIED | `ablation` group (Phase 31) |
 | Heretic's kernel is a trapezoid, its identity parameters change no bit, an integer direction index is that layer's direction, the reported best is the lowest-scoring trial, the detector matches its phrases | VERIFIED | `ablation` group (Phase 31.6) |
 | A trained refusal holds under adversarial prompting | UNKNOWN | needs a real model and an evaluation set; `dblocks lm refusal-corpus` + `lm train` build it, the gate holds regardless |
+| An all-dense attention schedule is the Phase 19 trunk bit for bit; a window or retrieval set covering the sequence is dense attention bit for bit | VERIFIED | `hybrid` group (Phase 25) |
+| Linear attention's recurrent state equals its masked matrix form; every attention mode decodes from its state exactly as it recomputes, under every position kind | VERIFIED | `hybrid` group |
+| Rotary scores depend only on the distance between positions; a rotary sliding/linear trunk decodes past the context and matches a full recompute there | VERIFIED | `hybrid` group |
+| The routing state is bounded and carries history; with width 0 it adds no parameter and changes no router input | VERIFIED | `hybrid` group |
+| Token stability and layer agreement read as specified | VERIFIED | `hybrid` group |
+| The counted cost model (active parameters, FLOPs, keys read, decode state) matches a hand count | VERIFIED | `cost` unit tests (Phase 25) |
 | The certificate suite catches plausible defects | VERIFIED, with limits | Mutation sweep: 5 of 9 mutants survived until the certificates were rewritten to call the code; see `TODO.md` |
 
 ## Measurements made here (CPU, ≤ 400 steps)
@@ -108,7 +114,10 @@ raw trials.
 | Block distillation compensates for fewer blocks | `dblocks train --objective distill --teacher` on a trained teacher, then `dblocks bench` |
 | Solver choice changes accuracy (not just agreement with Euler) | `dblocks bench --json` on a trained checkpoint |
 | A locally good block cannot damage end-to-end quality | `dblocks audit propagation --checkpoint` — the sensitivity and amplification columns |
-| Every Phase 25–27 mechanism (routing state, attention modes, MoVA, adaptive MTP, token-level exits) improves quality per active FLOP | `dblocks lm bench --json` per axis, on a real corpus and a GPU |
+| Every Phase 25–27 mechanism (routing state, attention modes, MoVA, adaptive MTP, token-level exits) improves quality per active FLOP | `dblocks lm bench --json --axis attention \| positions \| routing \| ...` per axis, on a real corpus and a GPU; each record carries the counted active parameters and FLOPs per token |
+| A 3:1 (or any) linear/dense schedule, a sliding window, or retrieval attention at `k` keys matches dense attention's quality at lower cost | `dblocks lm bench --axis attention`, then a GPU run long enough to converge |
+| Rotary positions generalize a model trained at one length to longer sequences | a GPU run; the mechanism decodes past the context, nothing here says how well |
+| A routing state raises layer agreement or expert specialization; routing locality justifies expert residency (issue #4, B7) | `dblocks lm bench --axis routing`; the `stability` and `agreement` columns of the routing log |
 
 ## Out of scope, and why
 

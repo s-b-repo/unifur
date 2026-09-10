@@ -1261,3 +1261,54 @@ fn integration_synthetic_negatives_train_the_image_trunk() {
     .unwrap();
     assert!(report.mean_loss.is_finite());
 }
+
+#[test]
+fn integration_hybrid_schedules_and_routing_state_train_end_to_end() {
+    // Phase 25: a 3:1 linear/dense trunk, a rotary sliding trunk and a MoE
+    // trunk with a routing state each take real optimizer steps and leave a
+    // finite, falling-or-flat loss on a tiny corpus.
+    use diffusionblocks::hybrid::{AttentionSchedule, PositionKind};
+    use diffusionblocks::lm::{LanguageModel, LmConfig};
+    use diffusionblocks::train::{train_lm, LmTrainConfig};
+    use diffusionblocks::vit::MoeTrunkConfig;
+
+    let dir = std::env::temp_dir().join("dblocks-hybrid-integration");
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("text.txt");
+    std::fs::write(&source, "the quick brown fox jumps over the lazy dog. ".repeat(20)).unwrap();
+    let path = dir.join("text.bin");
+    diffusionblocks::corpus::TokenCorpus::tokenize_file(&source, &path).unwrap();
+    let mut corpus = diffusionblocks::corpus::TokenCorpus::in_memory(&path).unwrap();
+
+    let device: Device = Default::default();
+    let layers = LmConfig::tiny().num_layers;
+    let variants: Vec<(&str, LmConfig)> = vec![
+        ("3:1", LmConfig::tiny().with_attention(AttentionSchedule::parse("3:1", layers, 4, 2).unwrap())),
+        (
+            "rotary sliding",
+            LmConfig::tiny()
+                .with_attention(AttentionSchedule::parse("sliding4", layers, 4, 2).unwrap())
+                .with_positions(PositionKind::Rotary),
+        ),
+        (
+            "learned + retrieval",
+            LmConfig::tiny().with_attention(AttentionSchedule::parse("learned,retrieval2,learned,dense", layers, 4, 2).unwrap()),
+        ),
+        (
+            "moe + routing state",
+            LmConfig {
+                moe: Some(MoeTrunkConfig { num_experts: 3, top_k: 1, every_n_layers: 2, z_level: 1e-3, balance_bias: false }),
+                ..LmConfig::tiny()
+            }
+            .with_routing_state(4),
+        ),
+    ];
+    for (name, config) in variants {
+        let model = LanguageModel::<B>::new(&config, &device);
+        let train = LmTrainConfig { steps: 4, batch_size: 2, log_every: 0, lr: 1e-3, ..Default::default() };
+        let (_, report) = train_lm(model, &mut corpus, &train, &device).unwrap();
+        assert_eq!(report.steps_taken, 4, "{name}");
+        assert!(report.first_loss.is_finite() && report.last_loss.is_finite(), "{name}");
+        assert!(report.steps_skipped == 0, "{name}: {} steps skipped", report.steps_skipped);
+    }
+}

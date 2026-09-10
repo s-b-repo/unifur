@@ -9,9 +9,17 @@ key/value cache, and pre-tokenized corpora that stream from disk.
 > (`LmConfig`, `LanguageModel`, `KvCache`, `Sampling`, `LookaheadStats`,
 > `Unlikelihood`), `train.rs` (`train_lm`, `LmTrainConfig`, `LmTrainReport`),
 > `antipattern.rs` (rules and labels for negative supervision). The causal mask
-> lives in `vit.rs` (`causal_mask`, `causal_mask_offset`, `ViTDiTConfig::causal`).
+> lives in `vit.rs` (`causal_mask`, `ViTDiTConfig::causal`) and its general
+> form -- offsets, windows, cached keys -- in `hybrid.rs` (`attention_mask`).
 > CLI: `dblocks lm tokenize | corpus | label | scan | rules | train | generate`.
 > Certificates: the `lm` and `antipattern` groups.
+>
+> Since Phase 25 the trunk's attention is configurable per layer (dense,
+> sliding, retrieval, linear, learned), positions can be a learned table,
+> rotary or none, and a routing state can be carried through the layers:
+> see [Hybrid Attention](Hybrid-Attention.md). Everything on this page
+> describes the default -- dense attention, a learned table -- which is
+> certified to be the pre-Phase-25 model bit for bit.
 
 ---
 

@@ -56,6 +56,7 @@ cargo build --release
 - [Flow Matching](Flow-Matching.md) — rectified flow as an alternative objective
 - [Loss Reduction](Loss-Reduction.md) — schedules, EMA, uncertainty weighting, importance sampling
 - [Language Modeling](Language-Modeling.md) — byte tokenizer, causal trunk, KV cache, corpora
+- [Hybrid Attention](Hybrid-Attention.md) — per-layer attention modes, rotary positions, decode state, routing state, router diagnostics, the cost model
 - [Negative Supervision](Negative-Supervision.md) — anti-pattern rules, labeled corpora, the unlikelihood charge
 - [Multi-Source Training](Multi-Source-Training.md) — dataset mixtures and composites, several teachers, a negative teacher, merged checkpoints
 - [Cyber Policy](Cyber-Policy.md) — blockers, refusals and signed approvals gating a model's capabilities
@@ -93,6 +94,9 @@ cargo build --release
 | Next-step and path prediction | `planner.rs` |
 | Post-training accuracy techniques | `accuracy.rs` |
 | Causal language model, tokenizer, corpora | `lm.rs`, `tokenizer.rs`, `corpus.rs` |
+| Attention modes, rotary positions, per-mode decode state | `hybrid.rs` |
+| Routing state, router kinds, routing-locality diagnostics | `routing.rs` |
+| Active parameters, FLOPs and decode state, counted from shapes | `cost.rs` |
 | Anti-pattern rules and labels for negative supervision | `antipattern.rs` |
 | Code-quality signals, window filter, quality regularizer | `codequality/` |
 | Quality-coder scaffolding: data adapters, eval harness | `quality_coder/` |
