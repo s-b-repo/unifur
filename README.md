@@ -44,7 +44,7 @@ with an accurate "In this repository" block naming the module, types and flags
 that implement it.
 
 ```bash
-# Build and run the quality gate: 95 numerical certificates, non-zero exit on
+# Build and run the quality gate: 111 numerical certificates, non-zero exit on
 # any failure.
 cargo build --release
 ./target/release/dblocks verify
@@ -94,6 +94,19 @@ cargo build --release
 # beside every model file and is verified before use.
 ./target/release/dblocks train --steps 2000 --checkpoint-every 500 --resume
 
+# Several sources, several teachers, a negative teacher, merged checkpoints.
+./target/release/dblocks train --dataset cifar100 --data-dir cifar --dataset synthetic --dataset-weights 0.9,0.1
+./target/release/dblocks lm train --corpus code.bin --corpus prose.bin --mix composite \
+    --teacher a.mpk --teacher b.mpk --distill-weight 0.5 --negative-teacher bad.mpk
+./target/release/dblocks merge --input a.mpk --input b.mpk --out checkpoints
+
+# Capability gating like an approval program: blockers refuse before any
+# forward pass, signed grants lift named scopes, and the refusal can be trained.
+./target/release/dblocks lm policy init --out policy.json --key key.hex
+./target/release/dblocks lm approvals issue --key key.hex --policy policy.json --id team-1 \
+    --scopes cyber:exploit-development --expires 1800000000 --out grant.json
+./target/release/dblocks lm generate --policy policy.json --key key.hex --grant grant.json --prompt "..."
+
 # Batched inference with top-k output and per-batch profiling.
 ./target/release/dblocks infer --top-k 3 --solver heun
 
@@ -140,6 +153,8 @@ cargo test --all && cargo clippy --all-targets && ./target/release/dblocks verif
 | Datasets and streaming I/O | `data.rs`, `rawdata.rs`, `cifar.rs`, `tinyimagenet.rs` |
 | Training loop, checkpoints and training state, logging | `train.rs`, `checkpoint.rs`, `logging.rs` |
 | Experiment records, sweeps, propagation audit | `experiment.rs`, `sweep.rs`, `audit.rs` |
+| Dataset and corpus mixing, checkpoint merging | `mix.rs`, `merge.rs` |
+| Blockers, refusals, signed approvals | `policy.rs` |
 | Inference API, profiler | `infer.rs`, `profile.rs` |
 | **Numerical certificate suite** | `verify.rs` |
 

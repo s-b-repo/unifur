@@ -33,6 +33,9 @@
 //! - [`checkpoint`]: content-addressed checkpoints and training-state sidecars
 //! - [`experiment`]: experiment records with environment, seeds, raw trials and t-intervals
 //! - [`sweep`]: hyperparameter grids trained per seed into experiment records
+//! - [`mix`]: several datasets or corpora in one run, as a mixture or composite
+//! - [`merge`]: weighted averaging of same-architecture checkpoints
+//! - [`policy`]: blockers, refusals and signed approvals gating a model's capabilities
 //! - [`audit`]: error-propagation audit of a block-wise model
 //! - [`solver`]: ODE solvers (Euler / Heun / DDIM / DPM-Solver++ 2M & 3M)
 //! - [`multi_block`]: sequential / parallel / hybrid / adaptive strategies
@@ -76,12 +79,15 @@ pub mod expert_index;
 pub mod flow;
 pub mod infer;
 pub mod lm;
+pub mod merge;
+pub mod mix;
 pub mod logging;
 pub mod loopgraph;
 pub mod moe;
 pub mod mosme;
 pub mod multi_block;
 pub mod planner;
+pub mod policy;
 pub mod precision;
 pub mod profile;
 pub mod quality;

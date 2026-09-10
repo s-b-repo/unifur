@@ -33,7 +33,7 @@ use burn::tensor::{
     backend::Backend,
     Distribution, Int, Tensor,
 };
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 /// Distillation hyperparameters.
@@ -235,12 +235,157 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         (loss, metrics)
     }
 
+    /// [`Self::distill_step`] against several weighted teachers (roadmap
+    /// 29.2): the trajectory target is the weighted mean of the teachers'
+    /// substep latents and the soft target is the weighted mixture of their
+    /// distributions. One teacher at any weight takes the single-teacher path
+    /// unchanged, so this is bit-identical to [`Self::distill_step`] there.
+    pub fn distill_step_multi<R: Rng>(
+        &self,
+        teachers: &[(&DblockClassifier<B>, f64)],
+        pixel_values: &Tensor<B, 4>,
+        labels: Tensor<B, 1, Int>,
+        config: &DistillConfig,
+        rng: &mut R,
+    ) -> (Tensor<B, 1>, DistillMetrics) {
+        assert!(!teachers.is_empty(), "distillation needs at least one teacher");
+        if teachers.len() == 1 {
+            return self.distill_step(teachers[0].0, pixel_values, labels, config, rng);
+        }
+        let total: f64 = teachers.iter().map(|(_, w)| w).sum();
+        assert!(total > 0.0 && teachers.iter().all(|(_, w)| *w >= 0.0), "teacher weights must be non-negative");
+        for (teacher, _) in teachers {
+            assert_eq!(
+                self.model().label_embedding_weight().dims(),
+                teacher.model().label_embedding_weight().dims(),
+                "every teacher must share the student's label embedding space"
+            );
+        }
+
+        let device = pixel_values.device();
+        let b = pixel_values.dims()[0];
+        let substeps = config.teacher_substeps.max(1);
+        let z = self.model().normalized_label_embeds(labels.clone());
+        let block_idx = rng.random_range(0..self.num_blocks());
+        let (sigma_lo, sigma_hi) = self.sampler(config.gamma).extended_window(block_idx);
+        let eps = Tensor::<B, 2>::random(z.dims(), Distribution::Normal(0.0, 1.0), &device);
+        let zt = z + eps * sigma_hi;
+        let student_span = self.layer_range(block_idx);
+        let mut loss: Option<Tensor<B, 1>> = None;
+        let (mut m_kl, mut m_latent, mut m_ce) = (0.0f32, 0.0f32, 0.0f32);
+
+        if config.latent_weight > 0.0 {
+            // Every teacher rolls its own trajectory from the same noise and
+            // the same solver draws; the targets are then averaged.
+            let ratio = (sigma_lo / sigma_hi).powf(1.0 / substeps as f64);
+            let mut target: Option<Tensor<B, 2>> = None;
+            for (teacher, w) in teachers {
+                let mut z_teacher = zt.clone().detach();
+                let mut sigma = sigma_hi;
+                let mut solver = crate::solver::SolverState::new(config.solver);
+                let mut local_rng = rand::rngs::StdRng::seed_from_u64(rng.random::<u64>());
+                for _ in 0..substeps {
+                    let next = sigma * ratio;
+                    let x0 = teacher
+                        .x0_estimate(pixel_values, &z_teacher, sigma, Some(teacher.span_for(sigma)))
+                        .detach();
+                    let mut predictor = |sig: f64, zz: &Tensor<B, 2>| {
+                        teacher
+                            .x0_estimate(pixel_values, zz, sig, Some(teacher.span_for(sig)))
+                            .detach()
+                    };
+                    z_teacher = solver.step(sigma, next, z_teacher, &x0, &mut predictor, &mut local_rng).detach();
+                    sigma = next;
+                }
+                let term = z_teacher.mul_scalar((w / total) as f32);
+                target = Some(match target {
+                    None => term,
+                    Some(acc) => acc + term,
+                });
+            }
+            let z_teacher = target.expect("at least one teacher");
+            let x0_student = self.x0_estimate(pixel_values, &zt, sigma_hi, Some(student_span.clone()));
+            let z_student = euler_step(sigma_hi, sigma_lo, &zt, &x0_student);
+            let l = (z_student - z_teacher).powf_scalar(2.0).mean();
+            m_latent = l.clone().into_scalar();
+            loss = Some(accumulate(loss, l.mul_scalar(config.latent_weight as f32)));
+        }
+
+        if config.kl_weight > 0.0 || config.hard_label_weight > 0.0 {
+            let sigmas = vec![sigma_hi; b];
+            let student_logits = self.denoise(pixel_values.clone(), zt.clone(), &sigmas, Some(block_idx));
+            if config.kl_weight > 0.0 {
+                let teacher_logits: Vec<(Tensor<B, 2>, f64)> = teachers
+                    .iter()
+                    .map(|(teacher, w)| {
+                        (teacher.denoise(pixel_values.clone(), zt.clone(), &sigmas, None).detach(), *w)
+                    })
+                    .collect();
+                let mixture = teacher_mixture(&teacher_logits, config.temperature);
+                let kl = soft_target_kl_probs(mixture, student_logits.clone(), config.temperature);
+                m_kl = kl.clone().into_scalar();
+                loss = Some(accumulate(loss, kl.mul_scalar(config.kl_weight as f32)));
+            }
+            if config.hard_label_weight > 0.0 {
+                let log_probs = log_softmax(student_logits, 1);
+                let ce = -log_probs.gather(1, labels.unsqueeze_dim::<2>(1)).squeeze_dim::<1>(1).mean();
+                m_ce = ce.clone().into_scalar();
+                loss = Some(accumulate(loss, ce.mul_scalar(config.hard_label_weight as f32)));
+            }
+        }
+
+        let loss = loss.unwrap_or_else(|| Tensor::zeros([1], &device));
+        let metrics = DistillMetrics {
+            loss: loss.clone().into_scalar(),
+            kl: m_kl,
+            latent_mse: m_latent,
+            ce: m_ce,
+            block_idx,
+            steps_saved: substeps - 1,
+        };
+        (loss, metrics)
+    }
+
     /// Layer span the model itself would pick for `sigma` (the teacher's own
     /// routing, so distillation never second-guesses it).
     pub fn span_for(&self, sigma: f64) -> std::ops::Range<usize> {
         let block = crate::sigma::estimate_target_layer(&self.block_bounds(), &[sigma]);
         self.layer_range(block)
     }
+}
+
+/// `KL(p || student)` at temperature `T` from a **probability** target -- a
+/// mixture of several teachers' distributions -- with the same `T^2` factor
+/// as [`soft_target_kl`]. Averaged over the batch.
+pub fn soft_target_kl_probs<B: Backend<FloatElem = f32>>(
+    p: Tensor<B, 2>,
+    student_logits: Tensor<B, 2>,
+    temperature: f64,
+) -> Tensor<B, 1> {
+    let t = temperature.max(1e-6) as f32;
+    let log_p = p.clone().clamp_min(1e-30).log();
+    let log_q = log_softmax(student_logits.div_scalar(t), 1);
+    (p * (log_p - log_q)).sum_dim(1).mean().mul_scalar(t * t)
+}
+
+/// The mixture `sum_i w_i softmax(logits_i / T)` of several teachers'
+/// distributions, weights normalized to sum to 1. A distribution by
+/// construction: a convex combination of distributions.
+pub fn teacher_mixture<B: Backend<FloatElem = f32>>(
+    teacher_logits: &[(Tensor<B, 2>, f64)],
+    temperature: f64,
+) -> Tensor<B, 2> {
+    let t = temperature.max(1e-6) as f32;
+    let total: f64 = teacher_logits.iter().map(|(_, w)| w).sum();
+    let mut acc: Option<Tensor<B, 2>> = None;
+    for (logits, w) in teacher_logits {
+        let term = softmax(logits.clone().div_scalar(t), 1).mul_scalar((w / total) as f32);
+        acc = Some(match acc {
+            None => term,
+            Some(a) => a + term,
+        });
+    }
+    acc.expect("at least one teacher")
 }
 
 fn accumulate<B: Backend>(acc: Option<Tensor<B, 1>>, term: Tensor<B, 1>) -> Tensor<B, 1> {

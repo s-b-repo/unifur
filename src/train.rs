@@ -29,7 +29,7 @@ use crate::{
 };
 use crate::{
     corpus::TokenCorpus,
-    lm::{label_weights, LanguageModel, Unlikelihood},
+    lm::{LanguageModel, Unlikelihood},
 };
 use burn::{
     backend::{
@@ -44,6 +44,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 
 use crate::checkpoint::{self, DatasetIdentity, TrainState};
+use crate::mix::{BatchOrigin, CorpusMix, MixMode, MixWeights, SourceStats};
 
 /// The device RNG seed for one step: a function of `(seed, step)` only.
 ///
@@ -65,6 +66,8 @@ pub fn step_seed(seed: u64, step: usize) -> u64 {
 type TrainBackend<C> = Autodiff<NdArray<f32>, C>;
 type ModelOptim<C> =
     burn::optim::adaptor::OptimizerAdaptor<burn::optim::AdamW, DblockClassifier<TrainBackend<C>>, TrainBackend<C>>;
+type Teachers<C> = Vec<(DblockClassifier<TrainBackend<C>>, f64)>;
+type TeacherRefs<'a, C> = Vec<(&'a DblockClassifier<TrainBackend<C>>, f64)>;
 type HeadOptim<C> =
     burn::optim::adaptor::OptimizerAdaptor<burn::optim::AdamW, LogVarianceHead<TrainBackend<C>>, TrainBackend<C>>;
 
@@ -199,6 +202,13 @@ pub struct TrainConfig {
     /// Optional JSONL metrics sink (roadmap 1.5 / 15.6).
     pub log_file: Option<PathBuf>,
     pub dataset: DatasetChoice,
+    /// Further sources trained alongside `dataset` (roadmap 29.1). Every
+    /// source must share the image size and label count.
+    pub extra_datasets: Vec<DatasetChoice>,
+    /// Weights over `dataset` and `extra_datasets`, in order; empty is uniform.
+    pub dataset_weights: Vec<f64>,
+    /// How the sources share a run.
+    pub mix_mode: MixMode,
     pub objective: Objective,
     /// Quality verification applied at each phase of a training step.
     pub checks: TrainingChecks,
@@ -206,6 +216,11 @@ pub struct TrainConfig {
     pub resume: Option<PathBuf>,
     /// Frozen teacher for [`Objective::Distill`].
     pub teacher: Option<PathBuf>,
+    /// Further teachers distilled from at once (roadmap 29.2); weighted with
+    /// `teacher_weights` over `teacher` (or the initial snapshot) and these.
+    pub extra_teachers: Vec<PathBuf>,
+    /// Empty is uniform.
+    pub teacher_weights: Vec<f64>,
     /// Flat mixture-of-experts placement in the trunk (roadmap 6.5).
     pub moe: Option<crate::vit::MoeTrunkConfig>,
     /// Boxes of specialized micro experts in the trunk (roadmap 18.7).
@@ -263,10 +278,15 @@ impl Default for TrainConfig {
             seed: 42,
             log_file: None,
             dataset: DatasetChoice::Synthetic,
+            extra_datasets: Vec::new(),
+            dataset_weights: Vec::new(),
+            mix_mode: MixMode::Mixture,
             objective: Objective::Dblock,
             checks: TrainingChecks::default(),
             resume: None,
             teacher: None,
+            extra_teachers: Vec::new(),
+            teacher_weights: Vec::new(),
             moe: None,
             mosme: None,
             lr_schedule: LrSchedule::default(),
@@ -286,6 +306,22 @@ impl Default for TrainConfig {
 }
 
 impl TrainConfig {
+    /// Every source, primary first.
+    pub fn all_datasets(&self) -> Vec<&DatasetChoice> {
+        std::iter::once(&self.dataset).chain(self.extra_datasets.iter()).collect()
+    }
+
+    /// Normalized weights over [`Self::all_datasets`].
+    pub fn mix_weights(&self) -> anyhow::Result<MixWeights> {
+        let n = 1 + self.extra_datasets.len();
+        if self.dataset_weights.is_empty() {
+            Ok(MixWeights::uniform(n))
+        } else {
+            anyhow::ensure!(self.dataset_weights.len() == n, "{} dataset weight(s) for {n} source(s)", self.dataset_weights.len());
+            MixWeights::new(&self.dataset_weights)
+        }
+    }
+
     /// Model configuration implied by this training configuration.
     ///
     /// A real dataset dictates the image size and class count, so those are
@@ -338,6 +374,8 @@ pub struct TrainSummary {
     pub resumed_from_step: usize,
     /// Every periodic checkpoint written, as `(steps completed, model path)`.
     pub periodic_checkpoints: Vec<(usize, PathBuf)>,
+    /// Per-source batches, samples and mean loss (roadmap 29.1).
+    pub sources: SourceStats,
 }
 
 impl TrainSummary {
@@ -402,7 +440,7 @@ where
         DblockClassifier::<Autodiff<NdArray<f32>, C>>::new(&vit_config, &dblock_config, &device);
     // Hashed once, before anything else happens: it is both what the state
     // file records and what a resume is checked against.
-    let dataset_identity = dataset_identity(config)?;
+    let dataset_identity = dataset_identities(config)?;
     let config_json = serde_json::to_value(config).context("serialize training config")?;
     let mut restored: Option<TrainState> = None;
     if let Some(path) = &config.resume {
@@ -420,15 +458,10 @@ where
                 );
                 state.verify_files(&dir)?;
                 anyhow::ensure!(
-                    state.dataset.matches(&dataset_identity),
-                    "refusing to resume: the checkpoint was trained on {} ({} bytes, sha256 {}), this run \
-                     opened {} ({} bytes, sha256 {})",
-                    state.dataset.description,
-                    state.dataset.bytes,
-                    state.dataset.sha256.as_deref().unwrap_or("-"),
-                    dataset_identity.description,
-                    dataset_identity.bytes,
-                    dataset_identity.sha256.as_deref().unwrap_or("-")
+                    checkpoint::same_datasets(&state.datasets, &dataset_identity),
+                    "refusing to resume: the checkpoint was trained on [{}], this run opened [{}]",
+                    checkpoint::describe_datasets(&state.datasets),
+                    checkpoint::describe_datasets(&dataset_identity)
                 );
                 let differences = state.config_differences(&config_json);
                 if !differences.is_empty() {
@@ -479,24 +512,41 @@ where
     let mut global_load =
         (config.balance_scope == BalanceScope::Global).then(|| GlobalLoad::new(config.accumulate));
 
-    // The teacher is frozen: either a separate checkpoint or a snapshot of the
-    // starting model.
-    let teacher = match &config.objective {
+    // The teachers are frozen: separate checkpoints, or a snapshot of the
+    // starting model when none is given. Several distil at once (29.2).
+    let teachers: Teachers<C> = match &config.objective {
         Objective::Distill(_) => {
-            let base = DblockClassifier::<Autodiff<NdArray<f32>, C>>::new(
-                &vit_config,
-                &dblock_config,
-                &device,
-            );
-            Some(match &config.teacher {
-                Some(path) => base
+            let load = |path: &PathBuf| -> anyhow::Result<DblockClassifier<Autodiff<NdArray<f32>, C>>> {
+                DblockClassifier::<Autodiff<NdArray<f32>, C>>::new(&vit_config, &dblock_config, &device)
                     .load_file(path, &Recorder::new(), &device)
-                    .map_err(|err| anyhow::anyhow!("load teacher {}: {err}", path.display()))?,
+                    .map_err(|err| anyhow::anyhow!("load teacher {}: {err}", path.display()))
+            };
+            let mut list = vec![match &config.teacher {
+                Some(path) => load(path)?,
                 None => model.clone(),
-            })
+            }];
+            for path in &config.extra_teachers {
+                list.push(load(path)?);
+            }
+            let weights = if config.teacher_weights.is_empty() {
+                vec![1.0; list.len()]
+            } else {
+                anyhow::ensure!(
+                    config.teacher_weights.len() == list.len(),
+                    "{} teacher weight(s) for {} teacher(s)",
+                    config.teacher_weights.len(),
+                    list.len()
+                );
+                config.teacher_weights.clone()
+            };
+            if list.len() > 1 {
+                println!("distilling from {} teachers, weights {:?}", list.len(), weights);
+            }
+            list.into_iter().zip(weights).collect()
         }
-        _ => None,
+        _ => Vec::new(),
     };
+    let teacher_refs: TeacherRefs<'_, C> = teachers.iter().map(|(t, w)| (t, *w)).collect();
 
     // --- Phase: preflight -------------------------------------------------
     //
@@ -516,7 +566,22 @@ where
         }
     }
 
-    let mut dataset = open_dataset(config)?;
+    let mut dataset = open_sources(config)?;
+    let mut source_stats = SourceStats::new(dataset.names.clone());
+    if dataset.sources.len() > 1 {
+        println!(
+            "data: {} sources as a {} ({})",
+            dataset.sources.len(),
+            dataset.mode.name(),
+            dataset
+                .names
+                .iter()
+                .zip(dataset.weights.as_slice())
+                .map(|(n, w)| format!("{n} x{w:.3}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     let mut rng = ChaCha12Rng::seed_from_u64(config.seed);
 
     // Burn optimizers are functional: step() consumes the model record and
@@ -603,6 +668,9 @@ where
         }
         health = extras.health;
         running = extras.running;
+        if extras.sources.names.len() == source_stats.names.len() {
+            source_stats = extras.sources;
+        }
         summary.steps_taken = extras.steps_taken;
         summary.steps_skipped = extras.steps_skipped;
         summary.steps_clipped = extras.steps_clipped;
@@ -652,7 +720,7 @@ where
             host_rng: serde_json::to_value(rng).context("serialize host RNG")?,
             config: config_json.clone(),
             build: checkpoint::BuildInfo::current(),
-            dataset: dataset_identity.clone(),
+            datasets: dataset_identity.clone(),
             model: checkpoint::model_entry(&model_path)?,
             optimizer,
             ema: ema_file,
@@ -671,7 +739,8 @@ where
                       summary: &TrainSummary,
                       loss_sum: f64,
                       elapsed: f64,
-                      ema: &Option<Ema<DblockClassifier<TrainBackend<C>>>>| DblockExtras {
+                      ema: &Option<Ema<DblockClassifier<TrainBackend<C>>>>,
+                      sources: &SourceStats| DblockExtras {
         scales: scales.clone(),
         importance: importance.clone(),
         health: health.clone(),
@@ -684,6 +753,7 @@ where
         loss_sum,
         elapsed_secs: elapsed,
         ema_updates: ema.as_ref().map(Ema::updates),
+        sources: sources.clone(),
     };
     if config.accumulate > 1 {
         println!(
@@ -695,10 +765,10 @@ where
     for step in start_step..config.steps {
         // The device stream is a pure function of (seed, step): see `step_seed`.
         <TrainBackend<C> as burn::tensor::backend::Backend>::seed(&device, step_seed(config.seed, step));
-        let batch = dataset.next(&mut rng, &device);
+        let (batch, origin) = dataset.next(&mut rng, &device);
         let (loss, mut fields, routing) = compute_loss(
             &model,
-            teacher.as_ref(),
+            &teacher_refs,
             &batch,
             config,
             step,
@@ -713,9 +783,13 @@ where
             },
         );
         let block_idx = block_of(&fields);
+        if dataset.sources.len() > 1 {
+            fields.push(("source", origin.sole_source().map_or("-1".to_string(), |s| s.to_string())));
+        }
 
         let mut verdict = StepVerdict::accepted();
         let scalar_loss: f32 = loss.clone().into_scalar();
+        source_stats.record(&origin, scalar_loss);
 
         // Per-block loss normalization. Blocks see wildly different EDM
         // weights, so without this the run is effectively tuned for whichever
@@ -930,6 +1004,7 @@ where
                 loss_sum,
                 elapsed_before + start.elapsed().as_secs_f64(),
                 &ema,
+                &source_stats,
             );
             if let Some(path) = save_state(
                 step + 1,
@@ -966,6 +1041,7 @@ where
         loss_sum,
         summary.elapsed_secs,
         &ema,
+        &source_stats,
     );
     summary.checkpoint = save_state(
         config.steps,
@@ -986,6 +1062,10 @@ where
         );
     }
     summary.health = health;
+    if source_stats.is_multi() {
+        print!("\nper-source:\n{}", source_stats.render());
+    }
+    summary.sources = source_stats;
 
     // The averaged weights are usually the better evaluation model, and are
     // what gets returned when EMA is enabled. The checkpoint holds the *live*
@@ -1012,18 +1092,97 @@ struct DblockExtras {
     loss_sum: f64,
     elapsed_secs: f64,
     ema_updates: Option<usize>,
+    #[serde(default)]
+    sources: SourceStats,
 }
 
-/// What a run's data is, for the training state (roadmap Phase 28).
-fn dataset_identity(config: &TrainConfig) -> anyhow::Result<DatasetIdentity> {
-    Ok(match &config.dataset {
-        DatasetChoice::Synthetic => DatasetIdentity::synthetic(format!(
-            "synthetic {}x{} images, {} labels",
-            config.image_size, config.image_size, config.num_labels
-        )),
-        DatasetChoice::Cifar100 { dir, .. } => DatasetIdentity::of_path(dir, "cifar100")?,
-        DatasetChoice::TinyImagenet { dir, .. } => DatasetIdentity::of_path(dir, "tiny-imagenet")?,
-    })
+/// What a run's data is, for the training state (roadmap Phase 28), one
+/// entry per source.
+fn dataset_identities(config: &TrainConfig) -> anyhow::Result<Vec<DatasetIdentity>> {
+    config
+        .all_datasets()
+        .into_iter()
+        .map(|choice| {
+            Ok(match choice {
+                DatasetChoice::Synthetic => DatasetIdentity::synthetic(format!(
+                    "synthetic {}x{} images, {} labels",
+                    config.image_size, config.image_size, config.num_labels
+                )),
+                DatasetChoice::Cifar100 { dir, .. } => DatasetIdentity::of_path(dir, "cifar100")?,
+                DatasetChoice::TinyImagenet { dir, .. } => DatasetIdentity::of_path(dir, "tiny-imagenet")?,
+            })
+        })
+        .collect()
+}
+
+/// The sources of a run, opened with the batch size each contributes.
+struct MixedDataset {
+    sources: Vec<AnyDataset>,
+    names: Vec<String>,
+    weights: MixWeights,
+    mode: MixMode,
+    /// Per source, the batch it yields (the full batch for a mixture, its
+    /// slice for a composite; a slice of zero means the source is skipped).
+    slices: Vec<usize>,
+}
+
+impl MixedDataset {
+    fn next<B: burn::tensor::backend::Backend, R: Rng>(&mut self, rng: &mut R, device: &B::Device) -> (Batch<B>, BatchOrigin) {
+        let n = self.sources.len();
+        match self.mode {
+            MixMode::Mixture => {
+                let source = self.weights.draw(rng);
+                let batch = self.sources[source].next(rng, device);
+                let size = batch.batch_size();
+                (batch, BatchOrigin::single(source, n, size))
+            }
+            MixMode::Composite => {
+                let mut parts = Vec::with_capacity(n);
+                for (i, source) in self.sources.iter_mut().enumerate() {
+                    if self.slices[i] > 0 {
+                        parts.push(source.next(rng, device));
+                    }
+                }
+                (crate::mix::concat_batches(parts), BatchOrigin { counts: self.slices.clone() })
+            }
+        }
+    }
+}
+
+fn open_sources(config: &TrainConfig) -> anyhow::Result<MixedDataset> {
+    let choices = config.all_datasets();
+    let weights = config.mix_weights()?;
+    let shape = config.dataset.shape().unwrap_or((config.image_size, config.num_labels));
+    for (i, choice) in choices.iter().enumerate().skip(1) {
+        let other = choice.shape().unwrap_or((config.image_size, config.num_labels));
+        anyhow::ensure!(
+            other == shape,
+            "source {i} is {}x{} with {} labels but the primary source is {}x{} with {} labels; \
+             one model cannot train on both",
+            other.0,
+            other.0,
+            other.1,
+            shape.0,
+            shape.0,
+            shape.1
+        );
+    }
+    let slices = match config.mix_mode {
+        MixMode::Mixture => vec![config.batch_size; choices.len()],
+        MixMode::Composite => weights.split(config.batch_size),
+    };
+    let mut sources = Vec::with_capacity(choices.len());
+    let mut names = Vec::with_capacity(choices.len());
+    for (i, choice) in choices.iter().enumerate() {
+        let batch_size = slices[i].max(1);
+        sources.push(open_one(config, choice, batch_size, i as u64)?);
+        names.push(match choice {
+            DatasetChoice::Synthetic => format!("synthetic#{i}"),
+            DatasetChoice::Cifar100 { dir, .. } => format!("cifar100:{}", dir.display()),
+            DatasetChoice::TinyImagenet { dir, .. } => format!("tiny-imagenet:{}", dir.display()),
+        });
+    }
+    Ok(MixedDataset { sources, names, weights, mode: config.mix_mode, slices })
 }
 
 /// Block index recorded in a step's metric fields, or 0 when the objective
@@ -1036,28 +1195,23 @@ fn block_of(fields: &[(&'static str, String)]) -> usize {
         .unwrap_or(0)
 }
 
-fn open_dataset(config: &TrainConfig) -> anyhow::Result<AnyDataset> {
+fn open_one(config: &TrainConfig, choice: &DatasetChoice, batch_size: usize, index: u64) -> anyhow::Result<AnyDataset> {
     let (image_size, num_labels) = config
         .dataset
         .shape()
         .unwrap_or((config.image_size, config.num_labels));
-    Ok(match &config.dataset {
+    Ok(match choice {
         DatasetChoice::Synthetic => AnyDataset::Synthetic(SyntheticDataset::new(
             image_size,
             num_labels,
-            config.batch_size,
-            config.seed,
+            batch_size,
+            config.seed.wrapping_add(index),
         )),
         DatasetChoice::Cifar100 { dir, streaming } => {
-            AnyDataset::Raw(Box::new(crate::cifar::open(dir, true, config.batch_size, *streaming)?))
+            AnyDataset::Raw(Box::new(crate::cifar::open(dir, true, batch_size, *streaming)?))
         }
         DatasetChoice::TinyImagenet { dir, streaming } => {
-            AnyDataset::Raw(Box::new(crate::tinyimagenet::open(
-                dir,
-                true,
-                config.batch_size,
-                *streaming,
-            )?))
+            AnyDataset::Raw(Box::new(crate::tinyimagenet::open(dir, true, batch_size, *streaming)?))
         }
     })
 }
@@ -1268,7 +1422,7 @@ impl<B: AutodiffBackend<FloatElem = f32>> Reweighting<'_, B> {
 
 fn compute_loss<B, R>(
     model: &DblockClassifier<B>,
-    teacher: Option<&DblockClassifier<B>>,
+    teachers: &[(&DblockClassifier<B>, f64)],
     batch: &Batch<B>,
     config: &TrainConfig,
     step: usize,
@@ -1328,9 +1482,9 @@ where
             (loss, vec![("loss", jnum(value)), ("flow_mse", jnum(value))])
         }
         Objective::Distill(cfg) => {
-            let teacher = teacher.expect("distillation requires a teacher");
-            let (loss, m) = model.distill_step(
-                teacher,
+            assert!(!teachers.is_empty(), "distillation requires a teacher");
+            let (loss, m) = model.distill_step_multi(
+                teachers,
                 &batch.pixel_values,
                 batch.labels.clone(),
                 cfg,
@@ -1424,6 +1578,15 @@ pub struct LmTrainConfig {
     pub resume: Option<PathBuf>,
     /// The model's shape, recorded in the state so a resume can be checked.
     pub model_config: Option<crate::lm::LmConfig>,
+    /// Weight on distillation toward the teacher mixture (roadmap 29.2);
+    /// `0.0` is off.
+    pub distill_weight: f64,
+    pub distill_temperature: f64,
+    /// A negative teacher's proposal is charged only where it is at least
+    /// this sure (roadmap 29.3).
+    pub negative_confidence: f32,
+    /// Coefficient on the negative teacher's charge; `0.0` is off.
+    pub negative_penalty: f32,
 }
 
 impl Default for LmTrainConfig {
@@ -1442,7 +1605,25 @@ impl Default for LmTrainConfig {
             checkpoint_every: 0,
             resume: None,
             model_config: None,
+            distill_weight: 0.0,
+            distill_temperature: 2.0,
+            negative_confidence: 0.5,
+            negative_penalty: 0.0,
         }
+    }
+}
+
+/// Frozen models a language-model run trains *with* (roadmap Phase 29):
+/// teachers to distil from, and a negative teacher whose confident choices
+/// are charged.
+pub struct LmTrainInputs<B: AutodiffBackend<FloatElem = f32>> {
+    pub teachers: Vec<(LanguageModel<B>, f64)>,
+    pub negative_teacher: Option<LanguageModel<B>>,
+}
+
+impl<B: AutodiffBackend<FloatElem = f32>> Default for LmTrainInputs<B> {
+    fn default() -> Self {
+        Self { teachers: Vec::new(), negative_teacher: None }
     }
 }
 
@@ -1469,6 +1650,15 @@ pub struct LmTrainReport {
     pub resumed_from_step: usize,
     /// Every periodic checkpoint written, as `(steps completed, model path)`.
     pub periodic_checkpoints: Vec<(usize, PathBuf)>,
+    /// Per-corpus batches, samples and mean loss (roadmap 29.1).
+    pub sources: SourceStats,
+    /// Mean probability the model gave the negative teacher's proposals, at
+    /// the first and the last step (roadmap 29.3); 0 without one.
+    pub first_negative_teacher_prob: f32,
+    pub last_negative_teacher_prob: f32,
+    pub negative_teacher_tokens: usize,
+    /// The distillation term at the last step (roadmap 29.2); 0 without teachers.
+    pub last_distill_loss: f32,
 }
 
 /// Train a causal language model on `corpus`, charging labeled anti-patterns
@@ -1479,8 +1669,21 @@ pub struct LmTrainReport {
 /// the plain objective is shown to *learn* the anti-patterns rather than merely
 /// tolerate them. With the penalty on, those targets are charged for instead.
 pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
-    mut model: LanguageModel<B>,
+    model: LanguageModel<B>,
     corpus: &mut TokenCorpus,
+    config: &LmTrainConfig,
+    device: &B::Device,
+) -> anyhow::Result<(LanguageModel<B>, LmTrainReport)> {
+    let mut mix = CorpusMix::single(corpus)?;
+    train_lm_mixed(model, &mut mix, &LmTrainInputs::default(), config, device)
+}
+
+/// [`train_lm`] over several corpora, with teachers and a negative teacher
+/// (roadmap Phase 29).
+pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
+    mut model: LanguageModel<B>,
+    mix: &mut CorpusMix<'_>,
+    inputs: &LmTrainInputs<B>,
     config: &LmTrainConfig,
     device: &B::Device,
 ) -> anyhow::Result<(LanguageModel<B>, LmTrainReport)> {
@@ -1489,13 +1692,23 @@ pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
     let context = model.context();
     anyhow::ensure!(context >= 2, "a context of {context} has no target position");
 
-    let labeled = corpus.has_labels();
+    let labeled = mix.any_labels();
     anyhow::ensure!(
         labeled || config.penalty.is_off(),
-        "a penalty of {} needs labels: label the corpus and open them first",
+        "a penalty of {} needs labels: label a corpus and open them first",
         config.penalty.alpha
     );
-    let table = if labeled { Some(corpus.manifest()?.weight_table()) } else { None };
+    let teacher_refs: Vec<(&LanguageModel<B>, f64)> = inputs.teachers.iter().map(|(t, w)| (t, *w)).collect();
+    for (teacher, _) in &teacher_refs {
+        anyhow::ensure!(
+            teacher.vocab_size() == model.vocab_size() && teacher.context() >= context,
+            "a teacher must share the vocabulary and cover the student's context"
+        );
+    }
+    if let Some(negative) = &inputs.negative_teacher {
+        anyhow::ensure!(negative.vocab_size() == model.vocab_size(), "the negative teacher must share the vocabulary");
+    }
+    let mut source_stats = SourceStats::new(mix.names().to_vec());
 
     let mut optim = AdamWConfig::new()
         .with_weight_decay(config.weight_decay as f32)
@@ -1510,11 +1723,7 @@ pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
 
     // Training state (roadmap Phase 28): identity of the data, the config as
     // JSON, and whatever an earlier run left beside the model being resumed.
-    let mut sources = vec![corpus.path().to_path_buf()];
-    if corpus.has_labels() {
-        sources.push(crate::corpus::labels_path(corpus.path()));
-    }
-    let dataset_identity = DatasetIdentity::of_paths(&sources, "corpus")?;
+    let dataset_identity = mix.identities()?;
     let config_json = serde_json::to_value(config).context("serialize LM training config")?;
     let mut restored: Option<TrainState> = None;
     if let Some(path) = &config.resume {
@@ -1525,14 +1734,10 @@ pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
                 anyhow::ensure!(state.kind == "lm", "{} holds `{}` training state, not an lm run", dir.display(), state.kind);
                 state.verify_files(&dir)?;
                 anyhow::ensure!(
-                    state.dataset.matches(&dataset_identity),
-                    "refusing to resume: the checkpoint was trained on a different corpus ({} bytes, sha256 {}) \
-                     than {} ({} bytes, sha256 {})",
-                    state.dataset.bytes,
-                    state.dataset.sha256.as_deref().unwrap_or("-"),
-                    corpus.path().display(),
-                    dataset_identity.bytes,
-                    dataset_identity.sha256.as_deref().unwrap_or("-")
+                    checkpoint::same_datasets(&state.datasets, &dataset_identity),
+                    "refusing to resume: the checkpoint was trained on [{}], this run opened [{}]",
+                    checkpoint::describe_datasets(&state.datasets),
+                    checkpoint::describe_datasets(&dataset_identity)
                 );
                 let differences = state.config_differences(&config_json);
                 if !differences.is_empty() {
@@ -1566,6 +1771,11 @@ pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
         checkpoint: None,
         resumed_from_step: 0,
         periodic_checkpoints: Vec::new(),
+        sources: SourceStats::default(),
+        first_negative_teacher_prob: 0.0,
+        last_negative_teacher_prob: 0.0,
+        negative_teacher_tokens: 0,
+        last_distill_loss: 0.0,
     };
     let mut loss_sum = 0.0f64;
     let mut elapsed_before = 0.0f64;
@@ -1623,7 +1833,7 @@ pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
             host_rng: serde_json::to_value(rng).context("serialize host RNG")?,
             config: config_json.clone(),
             build: checkpoint::BuildInfo::current(),
-            dataset: dataset_identity.clone(),
+            datasets: dataset_identity.clone(),
             model: checkpoint::model_entry(&model_path)?,
             optimizer,
             ema: None,
@@ -1638,11 +1848,7 @@ pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
 
     for step in start_step..config.steps {
         <B as burn::tensor::backend::Backend>::seed(device, step_seed(config.seed, step));
-        let (windows, labels) = if labeled {
-            corpus.sample_batch_labeled(config.batch_size, context - 1, &mut rng)?
-        } else {
-            (corpus.sample_batch(config.batch_size, context - 1, &mut rng)?, Vec::new())
-        };
+        let (windows, weight_rows, origin) = mix.sample(config.batch_size, context - 1, &mut rng)?;
         let flat: Vec<i64> = windows
             .iter()
             .flat_map(|w| w.iter().map(|t| i64::from(*t)))
@@ -1650,11 +1856,28 @@ pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
         let tokens = Tensor::<B, 1, burn::tensor::Int>::from_ints(flat.as_slice(), device)
             .reshape([config.batch_size, context]);
 
-        let negatives = table
+        let negatives = weight_rows
             .as_ref()
-            .map(|table| (label_weights::<B>(&labels, table, device), config.penalty));
+            .map(|rows| (crate::mix::weight_rows::<B>(rows, device), config.penalty));
+        let extra = match (&inputs.negative_teacher, config.negative_penalty > 0.0) {
+            (Some(negative), true) => {
+                let (proposed, weights) = negative.negative_proposals(tokens.clone(), config.negative_confidence);
+                Some(crate::lm::ExtraNegatives {
+                    tokens: proposed,
+                    weights,
+                    alpha: config.negative_penalty,
+                    epsilon: config.penalty.epsilon,
+                })
+            }
+            _ => None,
+        };
+        let distill = (config.distill_weight > 0.0 && !teacher_refs.is_empty()).then_some(crate::lm::Distillation {
+            teachers: teacher_refs.as_slice(),
+            temperature: config.distill_temperature,
+            weight: config.distill_weight,
+        });
         let crate::lm::LmStep { loss, metrics, routing } =
-            model.next_token_step(tokens, negatives, span.clone());
+            model.next_token_step_full(tokens, negatives, extra, distill, span.clone());
 
         if !metrics.loss.is_finite() {
             // The same policy as the image loop: a pathological step is
@@ -1673,9 +1896,14 @@ pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
         if report.steps_taken == 0 {
             report.first_loss = metrics.loss;
             report.first_penalized_prob = metrics.penalized_prob;
+            report.first_negative_teacher_prob = metrics.negative_teacher_prob;
         }
         report.last_loss = metrics.loss;
         report.last_penalized_prob = metrics.penalized_prob;
+        report.last_negative_teacher_prob = metrics.negative_teacher_prob;
+        report.negative_teacher_tokens += metrics.negative_teacher_tokens;
+        report.last_distill_loss = metrics.distill_loss;
+        source_stats.record(&origin, metrics.loss);
         report.steps_taken += 1;
         report.penalized_tokens += metrics.penalized_tokens;
         report.tokens_seen += metrics.tokens_counted;
@@ -1698,6 +1926,15 @@ pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
                     metrics.routing_entropy, metrics.routing_max_load
                 ));
             }
+            if metrics.negative_teacher_tokens > 0 {
+                line.push_str(&format!(
+                    " | negative teacher: {} proposals, p {:.4}",
+                    metrics.negative_teacher_tokens, metrics.negative_teacher_prob
+                ));
+            }
+            if metrics.distill_loss > 0.0 {
+                line.push_str(&format!(" | distill {:.4}", metrics.distill_loss));
+            }
             println!("{line}");
             if let Some(logger) = logger.as_mut() {
                 let mut fields = vec![
@@ -1706,6 +1943,10 @@ pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
                     ("penalized_tokens", metrics.penalized_tokens.to_string()),
                     ("penalized_prob", crate::logging::jnum(metrics.penalized_prob)),
                     ("penalty", crate::logging::jnum(metrics.penalty)),
+                    ("negative_teacher_tokens", metrics.negative_teacher_tokens.to_string()),
+                    ("negative_teacher_prob", crate::logging::jnum(metrics.negative_teacher_prob)),
+                    ("distill_loss", crate::logging::jnum(metrics.distill_loss)),
+                    ("source", origin.sole_source().map_or("-1".to_string(), |s| s.to_string())),
                 ];
                 if !routing.is_empty() {
                     let (load_h, token_h, min_load, max_load) =
@@ -1732,6 +1973,10 @@ pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
     anyhow::ensure!(report.steps_taken > 0, "every step produced a non-finite loss");
     report.mean_loss = (loss_sum / report.steps_taken as f64) as f32;
     report.elapsed_secs = elapsed_before + started.elapsed().as_secs_f64();
+    if source_stats.is_multi() {
+        print!("per-corpus:\n{}", source_stats.render());
+    }
+    report.sources = source_stats;
     report.checkpoint = save_state(config.steps, &model, &optim, &rng, &report, loss_sum, report.elapsed_secs)?;
     Ok((model, report))
 }

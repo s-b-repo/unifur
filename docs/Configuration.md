@@ -39,11 +39,12 @@ dblocks train --help
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--dataset` | `synthetic` | `synthetic` \| `cifar100` \| `tiny-imagenet` |
-| `--data-dir` | — | Directory holding the `.bin` splits; required by the real datasets |
-| `--streaming` | `false` | Fetch records per batch instead of loading the split |
-| `--image-size` | `32` | Ignored when the dataset dictates it |
-| `--num-labels` | `100` | Ignored when the dataset dictates it |
+| `--dataset` | `synthetic` | `synthetic` \| `cifar100` \| `tiny-imagenet`. Repeatable (Phase 29): several sources in one run |
+| `--data-dir` | — | Directory of a dataset's `.bin` splits; repeat once per `--dataset` that needs one, in order |
+| `--dataset-weights` | uniform | Weights over the datasets, e.g. `0.7,0.3` |
+| `--mix` | `mixture` | `mixture` (each batch from one source, drawn by weight) \| `composite` (every batch sliced from every source) |
+| `--streaming` | `false` | Stream records from disk instead of loading a split into memory |
+| `--image-size` / `--num-labels` | `32` / `100` | For synthetic data; real datasets dictate their own |
 | `--batch-size` | `128` | |
 
 ### Objective
@@ -54,6 +55,7 @@ dblocks train --help
 | `--teacher` | — | Frozen teacher checkpoint for `distill` |
 | `--num-blocks` | `3` | Must divide `num_hidden_layers` |
 | `--gamma` | `0.05` | Sigma-window extension, in log space |
+| `--teacher` | — | Repeatable (Phase 29): several teachers distil at once, weighted by `--teacher-weights` |
 
 ### Optimization
 
@@ -191,6 +193,14 @@ Train a grid of configurations, one run per seed, into experiment records.
 | `--batch-size` | `16` | |
 | `--json` | — | Append each cell's record as soon as it finishes |
 
+## `dblocks merge` (Phase 29)
+
+Average same-architecture checkpoints into a new one: `--input` (repeatable),
+`--weights` (uniform when empty), `--out` (default `checkpoints`), plus the
+model flags that describe the architecture. The state directory beside the
+result records the parents' hashes and weights. `dblocks lm merge` does the
+same for `lm train` checkpoints (`--tiny` must match the inputs).
+
 ## `dblocks audit propagation` (Phase 28)
 
 Per block, on one batch: local loss at the window midpoint, boundary mismatch
@@ -264,7 +274,16 @@ Language-model paths (Phases 19, 21b and 24).
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--corpus` | — | Corpus from `lm tokenize`; a `.labels` sidecar next to it is opened automatically |
+| `--corpus` | — | Corpus from `lm tokenize`; a `.labels` sidecar next to it is opened automatically. Repeatable (Phase 29) |
+| `--corpus-weights` | uniform | Weights over the corpora |
+| `--mix` | `mixture` | `mixture` \| `composite` |
+| `--teacher` | — | `lm train` checkpoints to distil from, repeatable (Phase 29) |
+| `--teacher-weights` | uniform | |
+| `--distill-weight` | `0` | Weight on `KL(teacher mixture \|\| student)`; `0` is off |
+| `--distill-temperature` | `2.0` | |
+| `--negative-teacher` | — | A checkpoint whose confident next-token choices are charged (Phase 29): an open-weight source of bad patterns |
+| `--negative-confidence` | `0.5` | Charge a proposal only where the negative teacher is at least this sure |
+| `--negative-penalty` | `1.0` | Coefficient on that charge |
 | `--steps` | `200` | |
 | `--batch-size` | `8` | |
 | `--lr` | `3e-4` | AdamW |
@@ -293,6 +312,25 @@ Trains the tiny model under each trunk variant (`dense`, `moe`, `moe+bias`) and
 reports the final loss per seed with its interval and the milliseconds per
 step. On CPU this measures what the mechanisms cost, not what they buy.
 
+### `dblocks lm policy` / `dblocks lm approvals` / `dblocks lm refusal-corpus` (Phase 30)
+
+| Command | Flags | Meaning |
+|---|---|---|
+| `lm policy init` | `--out policy.json --key key.hex` | Write the starter policy (three cyber scopes) and a fresh signing key |
+| `lm policy list` | `--policy` | Blockers, scopes, patterns and revocations |
+| `lm policy add-blocker` | `--policy --id --scope --pattern (repeatable) --applies-to prompt\|output\|both --refusal [--description]` | Add a blocker; every pattern must parse and consume something |
+| `lm policy remove-blocker` | `--policy --id` | Remove a blocker |
+| `lm policy check` | `--policy --prompt [--key --grant ...]` | Show which blockers fire and the decision |
+| `lm policy revoke` | `--policy --grant-id` | Refuse a grant from now on |
+| `lm approvals issue` | `--key --policy --id --scopes a,b --expires <unix> [--note] --out grant.json` | Sign a grant |
+| `lm approvals verify` | `--key --policy --grant` | Check signature, key, expiry and revocation, in that order |
+| `lm refusal-corpus` | `--policy --prompts file [--answers file] --out corpus.bin` | Build the refusal/approval training documents and tokenize them |
+
+`dblocks lm generate` takes `--policy policy.json` (with `--key key.hex` and any
+number of `--grant grant.json`): a blocked prompt is refused before any
+forward pass, a lifted one is sent with the approval marker, and the output
+is checked against the output blockers. See [Cyber Policy](Cyber-Policy.md).
+
 ### `dblocks lm generate`
 
 | Flag | Default | Meaning |
@@ -309,6 +347,7 @@ step. On CPU this measures what the mechanisms cost, not what they buy.
 | `--seed` | `1337` | |
 | `--checkpoint` | — | Weights from `dblocks lm train`; random when omitted |
 | `--tiny` | `false` | Must match the checkpoint's configuration |
+| `--policy` / `--key` / `--grant` | — | Gate the request through a policy (Phase 30); `--grant` is repeatable |
 
 Weights are random unless a checkpoint is loaded, so the text is noise. What the
 command demonstrates is that the decoding paths agree and what each one costs.

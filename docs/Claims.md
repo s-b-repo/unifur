@@ -17,7 +17,7 @@ the one the issue states: an optimization hypothesis does not become a fact
 without a measurement.
 
 > **In this repository.** Certificates: `src/verify.rs` (`dblocks verify`,
-> 18 groups). Measurements: the `Status` paragraphs of `TODO.md`. Harnesses:
+> 19 groups). Measurements: the `Status` paragraphs of `TODO.md`. Harnesses:
 > `dblocks sweep`, `dblocks bench --json`, `dblocks audit propagation`,
 > `dblocks lm bench`, `dblocks experiment compare`.
 
@@ -63,6 +63,10 @@ without a measurement.
 | A resumed run is bit-identical to an uninterrupted one (weights, EMA shadow, logged losses) | VERIFIED | `integration_resume_is_bit_identical_for_the_*_trainer` (Phase 28) |
 | A corrupted checkpoint file is refused by name | VERIFIED | same test |
 | Experiment intervals are the t interval on the mean; more trials narrow it | VERIFIED | `experiment` group |
+| Dataset/corpus mixtures follow their weights and composites slice exactly; a one-source mix is the plain source | VERIFIED | `multisource` group (Phase 29) |
+| Multi-teacher distillation reduces to single-teacher distillation for one teacher; the mixture target is a distribution | VERIFIED | `multisource` group |
+| A negative teacher below its confidence is the plain loss bit for bit and never contradicts the corpus; its step lowers its proposals relative to a plain step | VERIFIED | `multisource` group |
+| Checkpoint merging is the identity on equal inputs and linear in its weights | VERIFIED | `multisource` group |
 | The certificate suite catches plausible defects | VERIFIED, with limits | Mutation sweep: 5 of 9 mutants survived until the certificates were rewritten to call the code; see `TODO.md` |
 
 ## Measurements made here (CPU, ≤ 400 steps)

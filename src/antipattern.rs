@@ -386,6 +386,15 @@ impl Pattern {
     }
 
     /// Whether some atom must consume at least one token.
+    /// The first match anywhere in `text`, as `(start, end)` token offsets,
+    /// skipping empty matches.
+    pub fn find(&self, text: &[u16]) -> Option<(usize, usize)> {
+        (0..=text.len()).find_map(|at| {
+            let (end, _) = self.match_at(text, at)?;
+            (end > at).then_some((at, end))
+        })
+    }
+
     pub fn consumes(&self) -> bool {
         self.atoms.iter().any(|(a, q)| !a.is_zero_width() && q.min >= 1)
     }

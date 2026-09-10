@@ -187,7 +187,7 @@ impl Report {
 }
 
 /// Names of every certificate group, in the order [`run_all`] emits them.
-pub const GROUPS: [&str; 17] = [
+pub const GROUPS: [&str; 19] = [
     "schedule",
     "preconditioning",
     "stats",
@@ -203,6 +203,8 @@ pub const GROUPS: [&str; 17] = [
     "planner",
     "accuracy",
     "optim",
+    "experiment",
+    "multisource",
     "model",
     "autodiff",
 ];
@@ -249,6 +251,8 @@ pub fn run_all() -> Report {
     certificates.extend(planner_certificates());
     certificates.extend(accuracy_certificates());
     certificates.extend(optim_certificates());
+    certificates.extend(experiment_certificates());
+    certificates.extend(multisource_certificates());
     certificates.extend(model_certificates());
     certificates.extend(autodiff_certificates());
     Report { certificates }
@@ -3104,6 +3108,369 @@ fn planner_certificates() -> Vec<Certificate> {
 
 // ------------------------------------------------------------------ model --
 
+// ------------------------------------------------------------- experiment --
+
+fn experiment_certificates() -> Vec<Certificate> {
+    use crate::experiment::{median, t_quantile_975, Summary};
+
+    // ------------------------------------------------------------------
+    // The interval a record reports is the t interval on the mean: it
+    // contains the mean, and its half-width is exactly t_{0.975, n-1} s/sqrt(n)
+    // for the sample standard deviation s. Measured through `Summary::of`.
+    let sample = [3.1, 2.7, 3.9, 3.3, 2.5, 3.6, 3.0];
+    let summary = Summary::of(&sample).expect("non-empty");
+    let mean = sample.iter().sum::<f64>() / sample.len() as f64;
+    let var = sample.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (sample.len() - 1) as f64;
+    let half = t_quantile_975(sample.len() - 1) * var.sqrt() / (sample.len() as f64).sqrt();
+    let (lo, hi) = summary.ci95();
+    let mut interval_err = (summary.ci95_half_width - half).abs().max((summary.mean - mean).abs());
+    if !(lo <= summary.mean && summary.mean <= hi) {
+        interval_err = 1.0;
+    }
+
+    // ------------------------------------------------------------------
+    // More trials narrow the interval. For a sample of +-1 pairs the
+    // standard deviation is sqrt(n/(n-1)), so the half-width is
+    // t_{0.975, n-1}/sqrt(n-1): both factors fall with n, and the summary must
+    // agree -- a table with a typo, or a std with the wrong denominator, would
+    // break the monotonicity somewhere.
+    let mut shrink_err: f64 = 0.0;
+    let mut previous = f64::INFINITY;
+    for pairs in 1..=20 {
+        let values: Vec<f64> = (0..pairs).flat_map(|_| [-1.0, 1.0]).collect();
+        let hw = Summary::of(&values).expect("non-empty").ci95_half_width;
+        shrink_err = shrink_err.max((hw - previous).max(0.0));
+        previous = hw;
+    }
+
+    // ------------------------------------------------------------------
+    // The median of an odd sample is its middle element, whatever order the
+    // sample arrived in; of an even one, the mean of the two middle elements.
+    let scrambled = [9.0, 1.0, 7.0, 3.0, 5.0];
+    let median_err = (median(&scrambled) - 5.0).abs() + (median(&[4.0, 1.0, 2.0, 3.0]) - 2.5).abs();
+
+    // ------------------------------------------------------------------
+    // The t table is what the interval rests on: non-increasing in the degrees
+    // of freedom, always at least the normal quantile, and equal to it far out.
+    let mut table_err: f64 = 0.0;
+    let mut last = f64::INFINITY;
+    for df in 1..=200 {
+        let t = t_quantile_975(df);
+        table_err = table_err.max((t - last).max(0.0)).max((1.96 - t).max(0.0));
+        last = t;
+    }
+    table_err = table_err.max((t_quantile_975(1000) - 1.96).abs());
+
+    vec![
+        cert(
+            "experiment",
+            "ci_is_the_t_interval_on_the_mean",
+            "A record's 95% interval contains its mean and has half-width exactly t(0.975, n-1) * s / sqrt(n).",
+            interval_err,
+            1e-12,
+        ),
+        cert(
+            "experiment",
+            "more_trials_narrow_the_interval",
+            "For +-1 pairs the half-width is t(0.975, n-1)/sqrt(n-1); it must fall as pairs are added.",
+            shrink_err,
+            0.0,
+        ),
+        cert(
+            "experiment",
+            "median_is_the_middle_element",
+            "The median of an odd sample is its middle element regardless of arrival order; of an even one, the mean of the two middle elements.",
+            median_err,
+            0.0,
+        ),
+        cert(
+            "experiment",
+            "t_table_is_monotone_and_bounded_by_the_normal_quantile",
+            "t(0.975, df) is non-increasing in df, never below 1.96, and equals 1.96 far out.",
+            table_err,
+            0.0,
+        ),
+    ]
+}
+
+// ------------------------------------------------------------ multisource --
+
+fn multisource_certificates() -> Vec<Certificate> {
+    use crate::corpus::TokenCorpus;
+    use crate::train::DefaultTrainBackend as A;
+    use burn::optim::{GradientsParams, Optimizer, SgdConfig};
+    use crate::distill::{soft_target_kl, soft_target_kl_probs, teacher_mixture};
+    use crate::lm::{Distillation, ExtraNegatives, LanguageModel, LmConfig};
+    use crate::merge::{flatten, merge_into, ParamSnapshot};
+    use crate::mix::{CorpusMix, MixMode, MixWeights};
+    use burn::nn::LinearConfig;
+    use rand::SeedableRng;
+
+    let device = Default::default();
+
+    // ------------------------------------------------------------------
+    // Mixture: the source of each batch is drawn by weight. 4000 draws of a
+    // 0.75 / 0.25 split have a binomial standard deviation of 0.0068 on the
+    // share; the tolerance is 3.6 of those.
+    let weights = MixWeights::new(&[3.0, 1.0]).expect("valid");
+    let mut rng = rand_chacha::ChaCha12Rng::seed_from_u64(29);
+    let draws = 4000;
+    let first = (0..draws).filter(|_| weights.draw(&mut rng) == 0).count();
+    let mixture_err = (first as f64 / draws as f64 - 0.75).abs();
+
+    // Composite: every batch is sliced exactly, and no slice is more than one
+    // item from its ideal share (largest-remainder apportionment).
+    let mut composite_err = 0.0f64;
+    for batch in 1..=64usize {
+        let slices = weights.split(batch);
+        if slices.iter().sum::<usize>() != batch {
+            composite_err = 1.0;
+        }
+        for (i, slice) in slices.iter().enumerate() {
+            let ideal = weights.get(i) * batch as f64;
+            composite_err = composite_err.max(((*slice as f64) - ideal).abs() - 1.0).max(0.0);
+        }
+    }
+
+    // A single-source mix draws exactly the windows the corpus alone would,
+    // from the same random stream; a 3:1 composite of eight slices 6 + 2.
+    let scratch = std::env::temp_dir().join(format!("dblocks-verify-mix-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&scratch);
+    let corpus_path = scratch.join("mix.bin");
+    let single_err = (|| -> anyhow::Result<f64> {
+        TokenCorpus::write(&corpus_path, &(0..300).map(|i| (i % 250) as u16).collect::<Vec<_>>())?;
+        let mut plain = TokenCorpus::in_memory(&corpus_path)?;
+        let mut a = rand_chacha::ChaCha12Rng::seed_from_u64(5);
+        let expected = plain.sample_batch(3, 8, &mut a)?;
+        let mut mixed = TokenCorpus::in_memory(&corpus_path)?;
+        let mut mix = CorpusMix::single(&mut mixed)?;
+        let mut b = rand_chacha::ChaCha12Rng::seed_from_u64(5);
+        let (got, rows, origin) = mix.sample(3, 8, &mut b)?;
+        Ok(f64::from(u8::from(got != expected || rows.is_some() || origin.counts != vec![3])))
+    })()
+    .unwrap_or(f64::INFINITY);
+    let composite_mix_err = (|| -> anyhow::Result<f64> {
+        let mut x = TokenCorpus::in_memory(&corpus_path)?;
+        let mut y = TokenCorpus::in_memory(&corpus_path)?;
+        let mut mix = CorpusMix::new(vec![&mut x, &mut y], MixWeights::new(&[3.0, 1.0])?, MixMode::Composite)?;
+        let mut r = rand_chacha::ChaCha12Rng::seed_from_u64(6);
+        let (got, _, origin) = mix.sample(8, 4, &mut r)?;
+        Ok(f64::from(u8::from(got.len() != 8 || origin.counts != vec![6, 2])))
+    })()
+    .unwrap_or(f64::INFINITY);
+    let _ = std::fs::remove_dir_all(&scratch);
+
+    // ------------------------------------------------------------------
+    // Teacher mixtures. One teacher's mixture is its own softened
+    // distribution bit for bit; two copies of it are the same; and the
+    // probability-target KL agrees with the logit-target KL up to the
+    // rounding of `log(softmax)` against `log_softmax`.
+    let logits = Tensor::<B, 2>::random([5, 7], Distribution::Uniform(-3.0, 3.0), &device);
+    let student = Tensor::<B, 2>::random([5, 7], Distribution::Uniform(-3.0, 3.0), &device);
+    let bits = |t: Tensor<B, 2>| -> Vec<u32> { t.into_data().convert::<f32>().iter::<f32>().map(f32::to_bits).collect() };
+    let softened = bits(softmax(logits.clone().div_scalar(2.0), 1));
+    let one = bits(teacher_mixture(&[(logits.clone(), 0.7)], 2.0));
+    let twins = teacher_mixture(&[(logits.clone(), 1.0), (logits.clone(), 3.0)], 2.0);
+    let mut mixture_identity_err = f64::from(u8::from(one != softened));
+    let twin_rows: Vec<f32> = twins.into_data().convert::<f32>().iter::<f32>().collect();
+    let soft_rows: Vec<f32> = softmax(logits.clone().div_scalar(2.0), 1).into_data().convert::<f32>().iter::<f32>().collect();
+    for (a, b) in twin_rows.iter().zip(&soft_rows) {
+        mixture_identity_err = mixture_identity_err.max(f64::from((a - b).abs()));
+    }
+    let mut distribution_err = 0.0f64;
+    let other = Tensor::<B, 2>::random([5, 7], Distribution::Uniform(-3.0, 3.0), &device);
+    let mixed = teacher_mixture(&[(logits.clone(), 0.3), (other, 0.7)], 1.5);
+    for row in mixed.sum_dim(1).into_data().convert::<f32>().iter::<f32>() {
+        distribution_err = distribution_err.max(f64::from((row - 1.0).abs()));
+    }
+    let kl_logits = f64::from(soft_target_kl(logits.clone(), student.clone(), 2.0).into_scalar());
+    let kl_probs = f64::from(soft_target_kl_probs(softmax(logits.div_scalar(2.0), 1), student, 2.0).into_scalar());
+    let kl_agreement_err = (kl_logits - kl_probs).abs() / kl_logits.abs().max(1.0);
+
+    // ------------------------------------------------------------------
+    // Negative teacher. At a confidence no probability reaches, nothing is
+    // proposed and the objective is the plain loss to the bit; where a
+    // proposal is charged it is never the corpus target; and a step with the
+    // charge ends with the proposals less probable than a plain step does.
+    let model = LanguageModel::<B>::new(&LmConfig { context: 16, ..LmConfig::tiny() }, &device);
+    let negative = LanguageModel::<B>::new(&LmConfig { context: 16, ..LmConfig::tiny() }, &device);
+    let ids: Vec<i64> = (0..16).map(|i| 65 + (i * 7 % 26) as i64).collect();
+    let tokens = Tensor::<B, 1, Int>::from_ints(ids.as_slice(), &device).reshape([1, 16]);
+    let span = 0..model.num_layers();
+    let (plain, _) = model.next_token_loss(tokens.clone(), span.clone());
+    let (proposed, weights_none) = negative.negative_proposals(tokens.clone(), 2.0);
+    let silent = model.next_token_step_full(
+        tokens.clone(),
+        None,
+        Some(ExtraNegatives { tokens: proposed, weights: weights_none, alpha: 1.0, epsilon: 1e-6 }),
+        None,
+        span.clone(),
+    );
+    let mut negative_identity_err =
+        f64::from(u8::from(plain.into_scalar().to_bits() != silent.loss.into_scalar().to_bits()));
+    if silent.metrics.negative_teacher_tokens != 0 {
+        negative_identity_err = 1.0;
+    }
+    let (proposed, weights) = negative.negative_proposals(tokens.clone(), 0.0);
+    let proposed_host: Vec<i64> = proposed.into_data().convert::<i64>().iter::<i64>().collect();
+    let weights_host: Vec<f32> = weights.into_data().convert::<f32>().iter::<f32>().collect();
+    let mut contradiction_err = 0.0f64;
+    for (j, w) in weights_host.iter().enumerate() {
+        if *w > 0.0 && proposed_host[j] == ids[j + 1] {
+            contradiction_err = 1.0;
+        }
+        if *w == 0.0 && proposed_host[j] != ids[j + 1] {
+            contradiction_err = 1.0; // at confidence 0 every differing proposal is charged
+        }
+    }
+
+    // The comparative step, on the autodiff backend.
+    let ad_device = Default::default();
+    let ad_model = LanguageModel::<A>::new(&LmConfig { context: 16, ..LmConfig::tiny() }, &ad_device);
+    let ad_negative = LanguageModel::<A>::new(&LmConfig { context: 16, ..LmConfig::tiny() }, &ad_device);
+    let ad_tokens = || Tensor::<A, 1, Int>::from_ints(ids.as_slice(), &ad_device).reshape([1, 16]);
+    let (ad_proposed, ad_weights) = ad_negative.negative_proposals(ad_tokens(), 0.0);
+    let extra = || ExtraNegatives {
+        tokens: ad_proposed.clone(),
+        weights: ad_weights.clone(),
+        alpha: 1.0,
+        epsilon: 1e-6,
+    };
+    let prob_of_proposals = |m: &LanguageModel<A>| {
+        m.next_token_step_full(ad_tokens(), None, Some(ExtraNegatives { alpha: 0.0, ..extra() }), None, span.clone())
+            .metrics
+            .negative_teacher_prob
+    };
+    let lr = 0.1;
+    let charged_step = ad_model.next_token_step_full(ad_tokens(), None, Some(extra()), None, span.clone());
+    let grads = GradientsParams::from_grads(charged_step.loss.backward(), &ad_model);
+    let charged = SgdConfig::new().init().step(lr, ad_model.clone(), grads);
+    let plain_step = ad_model.next_token_step_full(ad_tokens(), None, None, None, span.clone());
+    let grads = GradientsParams::from_grads(plain_step.loss.backward(), &ad_model);
+    let rewarded = SgdConfig::new().init().step(lr, ad_model, grads);
+    let (after_charged, after_plain) = (prob_of_proposals(&charged), prob_of_proposals(&rewarded));
+    let mut negative_step_err = f64::from((after_charged - after_plain).max(0.0));
+    if after_charged.to_bits() == after_plain.to_bits() {
+        negative_step_err = 1.0;
+    }
+    // Distillation toward a single teacher equal to the student is zero.
+    let self_distill = model
+        .next_token_step_full(
+            tokens,
+            None,
+            None,
+            Some(Distillation { teachers: &[(&model, 1.0)], temperature: 2.0, weight: 1.0 }),
+            span,
+        )
+        .metrics
+        .distill_loss;
+    let self_distill_err = f64::from(self_distill.abs());
+
+    // ------------------------------------------------------------------
+    // Merging: identity on identical inputs, to the bit; linear otherwise.
+    let a = LinearConfig::new(4, 3).init::<B>(&device);
+    let b_lin = LinearConfig::new(4, 3).init::<B>(&device);
+    let fa = flatten::<B, _>(&a);
+    let fb = flatten::<B, _>(&b_lin);
+    let same = merge_into::<B, _>(a.clone(), &[ParamSnapshot::of::<B, _>(&a)], &[1.0, 1.0]).expect("merge");
+    let mut merge_identity_err = f64::from(u8::from(flatten::<B, _>(&same) != fa));
+    let half = merge_into::<B, _>(a, &[ParamSnapshot::of::<B, _>(&b_lin)], &[1.0, 3.0]).expect("merge");
+    let mut merge_linear_err = 0.0f64;
+    for ((m, x), y) in flatten::<B, _>(&half).iter().zip(&fa).zip(&fb) {
+        merge_linear_err = merge_linear_err.max(f64::from((m - (0.25 * x + 0.75 * y)).abs()));
+    }
+    if fa == fb {
+        merge_identity_err = 1.0; // two inits must differ for the test to mean anything
+    }
+
+    vec![
+        cert(
+            "multisource",
+            "mixture_draws_follow_the_weights",
+            "Over 4000 draws the share of batches taken from a 0.75-weight source is 0.75 within 3.6 binomial standard deviations.",
+            mixture_err,
+            0.025,
+        ),
+        cert(
+            "multisource",
+            "composite_slices_are_exact_apportionment",
+            "For every batch size the composite slices sum to the batch and each is within one item of its weight's share.",
+            composite_err,
+            0.0,
+        ),
+        cert(
+            "multisource",
+            "single_source_mix_is_the_plain_corpus",
+            "A one-corpus mix draws exactly the windows the corpus alone draws from the same stream, with no penalty rows and a whole-batch origin; a 3:1 composite of eight windows slices 6 + 2.",
+            single_err.max(composite_mix_err),
+            0.0,
+        ),
+        cert(
+            "multisource",
+            "teacher_mixture_of_one_is_its_own_softened_distribution",
+            "A mixture of one teacher, at any weight, is softmax(logits / T) bit for bit; two copies of a teacher mix to the same distribution.",
+            mixture_identity_err,
+            1e-6,
+        ),
+        cert(
+            "multisource",
+            "teacher_mixture_is_a_distribution",
+            "Every row of a weighted teacher mixture sums to 1.",
+            distribution_err,
+            1e-5,
+        ),
+        cert(
+            "multisource",
+            "probability_target_kl_agrees_with_logit_target_kl",
+            "KL from a probability target equals KL from the logits it came from, up to the rounding of log(softmax) against log_softmax.",
+            kl_agreement_err,
+            1e-5,
+        ),
+        cert(
+            "multisource",
+            "negative_teacher_below_its_confidence_is_the_plain_loss",
+            "A negative teacher whose confidence bar no probability reaches proposes nothing, and the objective equals the plain loss bit for bit.",
+            negative_identity_err,
+            0.0,
+        ),
+        cert(
+            "multisource",
+            "negative_teacher_never_contradicts_the_corpus",
+            "A proposal equal to the corpus target is never charged; at confidence 0 every differing proposal is.",
+            contradiction_err,
+            0.0,
+        ),
+        cert(
+            "multisource",
+            "negative_teacher_step_ends_below_plain_step",
+            "From the same weights, one SGD step with the negative teacher's charge leaves its proposals strictly less probable than one plain step does.",
+            negative_step_err,
+            0.0,
+        ),
+        cert(
+            "multisource",
+            "self_distillation_is_zero",
+            "Distilling a model toward itself as its only teacher costs exactly nothing.",
+            self_distill_err,
+            1e-6,
+        ),
+        cert(
+            "multisource",
+            "merge_of_identical_checkpoints_is_the_identity",
+            "Averaging a checkpoint with itself returns it bit for bit.",
+            merge_identity_err,
+            0.0,
+        ),
+        cert(
+            "multisource",
+            "merge_is_linear_in_its_weights",
+            "A 1:3 merge equals 0.25 a + 0.75 b parameter by parameter.",
+            merge_linear_err,
+            1e-6,
+        ),
+    ]
+}
+
 fn model_certificates() -> Vec<Certificate> {
     let device = Default::default();
     let cfg = ViTDiTConfig::tiny(10);
@@ -3334,11 +3701,13 @@ mod tests {
                 "antipattern",
                 "autodiff",
                 "codequality",
+                "experiment",
                 "lm",
                 "loopgraph",
                 "model",
                 "moe",
                 "mosme",
+                "multisource",
                 "optim",
                 "planner",
                 "precision",

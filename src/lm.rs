@@ -473,7 +473,7 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         tokens: Tensor<B, 2, Int>,
         span: std::ops::Range<usize>,
     ) -> (Tensor<B, 1>, LmMetrics) {
-        let step = self.objective(tokens, span, None);
+        let step = self.objective(tokens, span, None, None, None);
         (step.loss, step.metrics)
     }
 
@@ -486,7 +486,45 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         negatives: Option<(Tensor<B, 2>, Unlikelihood)>,
         span: std::ops::Range<usize>,
     ) -> LmStep<B> {
-        self.objective(tokens, span, negatives)
+        self.objective(tokens, span, negatives, None, None)
+    }
+
+    /// [`Self::next_token_step`] with the two open-weight signals of roadmap
+    /// Phase 29: extra negatives proposed by a negative teacher
+    /// ([`Self::negative_proposals`]) and distillation toward a weighted
+    /// mixture of teachers.
+    pub fn next_token_step_full(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        negatives: Option<(Tensor<B, 2>, Unlikelihood)>,
+        extra: Option<ExtraNegatives<B>>,
+        distill: Option<Distillation<'_, B>>,
+        span: std::ops::Range<usize>,
+    ) -> LmStep<B> {
+        self.objective(tokens, span, negatives, extra, distill)
+    }
+
+    /// What a frozen **negative** model would say next (roadmap 29.3): at
+    /// every position its arg-max token and, as the weight, `1.0` where it is
+    /// at least `confidence` sure **and** that token is not the corpus
+    /// target -- the corpus is never contradicted -- else `0.0`. Both
+    /// `[b, n - 1]`, aligned with the predicting positions.
+    pub fn negative_proposals(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        confidence: f32,
+    ) -> (Tensor<B, 2, Int>, Tensor<B, 2>) {
+        let [b, n] = tokens.dims();
+        assert!(n >= 2, "proposals need at least two positions");
+        let logits = self.forward(tokens.clone()).logits.narrow(1, 0, n - 1).detach();
+        let probs = softmax(logits, 2);
+        let (max_p, argmax) = probs.max_dim_with_indices(2);
+        let argmax = argmax.reshape([b, n - 1]);
+        let max_p = max_p.reshape([b, n - 1]);
+        let targets = tokens.narrow(1, 1, n - 1);
+        let confident = max_p.greater_equal_elem(confidence).float();
+        let differs = argmax.clone().equal(targets).bool_not().float();
+        (argmax, confident * differs)
     }
 
     /// Next-token loss with labeled targets **charged** rather than rewarded
@@ -504,7 +542,7 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         penalty: Unlikelihood,
         span: std::ops::Range<usize>,
     ) -> (Tensor<B, 1>, LmMetrics) {
-        let step = self.objective(tokens, span, Some((weights, penalty)));
+        let step = self.objective(tokens, span, Some((weights, penalty)), None, None);
         (step.loss, step.metrics)
     }
 
@@ -513,6 +551,8 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         tokens: Tensor<B, 2, Int>,
         span: std::ops::Range<usize>,
         negatives: Option<(Tensor<B, 2>, Unlikelihood)>,
+        extra: Option<ExtraNegatives<B>>,
+        distill: Option<Distillation<'_, B>>,
     ) -> LmStep<B> {
         let device = tokens.device();
         let [b, n] = tokens.dims();
@@ -522,13 +562,13 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
 
         // Drop the last position (no target) and the first target (no input).
         let logits = out.logits.narrow(1, 0, n - 1);
-        let targets = tokens.narrow(1, 1, n - 1);
+        let targets = tokens.clone().narrow(1, 1, n - 1);
 
         let flat_logits = logits.reshape([b * (n - 1), self.vocab_size]);
         let flat_targets = targets.clone().reshape([b * (n - 1), 1]);
 
-        let log_probs = log_softmax(flat_logits, 1);
-        let target_log_prob = log_probs.gather(1, flat_targets).squeeze_dim::<1>(1); // [b*(n-1)]
+        let log_probs = log_softmax(flat_logits.clone(), 1);
+        let target_log_prob = log_probs.clone().gather(1, flat_targets).squeeze_dim::<1>(1); // [b*(n-1)]
         let nll = -target_log_prob.clone();
 
         // Mask padding out of both the numerator and the denominator.
@@ -539,6 +579,7 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             .bool_not()
             .float();
         let counted = keep.clone().sum().clamp_min(1.0);
+        let keep_all = keep.clone();
 
         let (loss, penalized_tokens, penalty, penalized_prob) = match negatives {
             None => ((nll * keep).sum() / counted.clone(), 0, 0.0, 0.0),
@@ -583,6 +624,60 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             }
         };
 
+        // --- open-weight negatives (roadmap 29.3) ---------------------------
+        // Tokens a negative teacher would choose are charged with the same
+        // bounded term the labeled negatives use. They are *not* removed from
+        // the likelihood: they were never targets. Padded positions charge
+        // nothing, whatever the teacher proposed there.
+        let (loss, negative_teacher_tokens, negative_teacher_prob) = match extra {
+            None => (loss, 0, 0.0),
+            Some(extra) => {
+                assert_eq!(extra.tokens.dims(), [b, n - 1], "proposals must cover every predicting position");
+                assert_eq!(extra.weights.dims(), [b, n - 1], "one weight per proposal");
+                let idx = extra.tokens.reshape([b * (n - 1), 1]);
+                let lp = log_probs.gather(1, idx).squeeze_dim::<1>(1);
+                let w = extra.weights.reshape([b * (n - 1)]) * keep_all.clone();
+                let flagged = w.clone().greater_elem(0.0).float();
+                let count = flagged.clone().sum();
+                let prob = (lp.clone().exp() * flagged).sum() / count.clone().clamp_min(1.0);
+                let charge = (unlikelihood(lp, extra.epsilon) * w).sum();
+                (
+                    loss + charge.mul_scalar(extra.alpha) / counted.clone(),
+                    count.into_scalar() as usize,
+                    prob.into_scalar(),
+                )
+            }
+        };
+
+        // --- distillation toward a teacher mixture (roadmap 29.2) -----------
+        let (loss, distill_loss) = match distill {
+            None => (loss, 0.0),
+            Some(d) if d.weight > 0.0 && !d.teachers.is_empty() => {
+                let teacher_logits: Vec<(Tensor<B, 2>, f64)> = d
+                    .teachers
+                    .iter()
+                    .map(|(teacher, w)| {
+                        let t = teacher
+                            .forward(tokens.clone())
+                            .logits
+                            .narrow(1, 0, n - 1)
+                            .reshape([b * (n - 1), self.vocab_size])
+                            .detach();
+                        (t, *w)
+                    })
+                    .collect();
+                let mixture = crate::distill::teacher_mixture(&teacher_logits, d.temperature);
+                let t = d.temperature.max(1e-6) as f32;
+                let log_p = mixture.clone().clamp_min(1e-30).log();
+                let log_q = log_softmax(flat_logits.div_scalar(t), 1);
+                let per_row = (mixture * (log_p - log_q)).sum_dim(1).reshape([b * (n - 1)]);
+                let kl = (per_row * keep_all).sum() / counted.clone() * (t * t);
+                let value: f32 = kl.clone().into_scalar();
+                (loss + kl.mul_scalar(d.weight as f32), value)
+            }
+            Some(_) => (loss, 0.0),
+        };
+
         let value: f32 = loss.clone().into_scalar();
         let routing: Vec<crate::moe::RoutingStats> =
             out.balance_loss.as_ref().map_or_else(Vec::new, |aux| aux.to_host());
@@ -601,6 +696,9 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             penalized_prob,
             routing_entropy,
             routing_max_load,
+            negative_teacher_tokens,
+            negative_teacher_prob,
+            distill_loss,
         };
 
         // The balance term is scaled; the z-loss already carries its own
@@ -958,6 +1056,33 @@ pub struct LmMetrics {
     /// Mean, over the span's sparse layers, of the largest expert load
     /// fraction; 0 for a dense trunk. `1/E` is balanced, `1` is collapse.
     pub routing_max_load: f32,
+    /// Positions a negative teacher proposed a charged token at (roadmap 29.3).
+    pub negative_teacher_tokens: usize,
+    /// Mean probability the model gave those tokens.
+    pub negative_teacher_prob: f32,
+    /// The distillation term's value (before its weight); 0 without teachers.
+    pub distill_loss: f32,
+}
+
+/// Tokens proposed by a negative teacher, with their charge (roadmap 29.3).
+#[derive(Debug, Clone)]
+pub struct ExtraNegatives<B: Backend> {
+    /// `[b, n - 1]`: the token the negative model would emit at each position.
+    pub tokens: Tensor<B, 2, Int>,
+    /// `[b, n - 1]`: `1.0` where the proposal is charged, else `0.0`.
+    pub weights: Tensor<B, 2>,
+    /// Coefficient on the charge.
+    pub alpha: f32,
+    /// Floor inside the unlikelihood logarithm.
+    pub epsilon: f32,
+}
+
+/// Distillation toward a weighted mixture of teachers (roadmap 29.2).
+#[derive(Clone, Copy)]
+pub struct Distillation<'a, B: Backend> {
+    pub teachers: &'a [(&'a LanguageModel<B>, f64)],
+    pub temperature: f64,
+    pub weight: f64,
 }
 
 /// How the next token is chosen.

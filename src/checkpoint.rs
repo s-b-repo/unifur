@@ -198,7 +198,7 @@ impl<B: Backend> ModuleVisitor<B> for ContentHasher {
 // sees only model files.
 
 /// Bumped when the sidecar's shape changes incompatibly.
-pub const STATE_FORMAT_VERSION: u32 = 1;
+pub const STATE_FORMAT_VERSION: u32 = 2;
 
 /// sha256 of a file's bytes, hex-encoded, streamed in 1 MiB chunks.
 pub fn file_sha256_hex(path: &Path) -> anyhow::Result<String> {
@@ -315,6 +315,26 @@ impl DatasetIdentity {
     }
 }
 
+/// Same sources in the same order, each matching.
+pub fn same_datasets(a: &[DatasetIdentity], b: &[DatasetIdentity]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.matches(y))
+}
+
+/// `description (bytes, sha256[..12])` per source, comma-separated.
+pub fn describe_datasets(list: &[DatasetIdentity]) -> String {
+    list.iter()
+        .map(|d| {
+            format!(
+                "{} ({} bytes, {})",
+                d.description,
+                d.bytes,
+                d.sha256.as_deref().map_or("no hash".to_string(), |h| h[..12.min(h.len())].to_string())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn collect_files(root: &Path, out: &mut Vec<PathBuf>) -> anyhow::Result<()> {
     let meta = fs::metadata(root).with_context(|| format!("stat {}", root.display()))?;
     if meta.is_file() {
@@ -355,7 +375,8 @@ pub struct TrainState {
     /// The training configuration, so a mismatch can be reported.
     pub config: serde_json::Value,
     pub build: BuildInfo,
-    pub dataset: DatasetIdentity,
+    /// One entry per source, primary first (roadmap 29.1).
+    pub datasets: Vec<DatasetIdentity>,
     pub model: StateFile,
     pub optimizer: Option<StateFile>,
     pub ema: Option<StateFile>,

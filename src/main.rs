@@ -164,8 +164,40 @@ enum LmAction {
     /// present the run reports the probability it assigns to flagged tokens,
     /// and `--penalty` charges for them instead of rewarding them.
     Train {
+        /// Corpus from `lm tokenize`. Repeatable (roadmap 29.1): several
+        /// corpora train in one run, weighted by `--corpus-weights` and
+        /// combined per `--mix`; a `.labels` sidecar next to any of them is
+        /// opened automatically.
+        #[arg(long, action = clap::ArgAction::Append, required = true)]
+        corpus: Vec<PathBuf>,
+        /// Weights over the corpora, e.g. `0.7,0.3`; empty is uniform.
+        #[arg(long, default_value = "")]
+        corpus_weights: String,
+        /// mixture | composite.
+        #[arg(long, default_value = "mixture")]
+        mix: String,
+        /// Teacher checkpoints from `lm train` to distil from, repeatable
+        /// (roadmap 29.2); weighted by `--teacher-weights`.
+        #[arg(long, action = clap::ArgAction::Append)]
+        teacher: Vec<PathBuf>,
+        #[arg(long, default_value = "")]
+        teacher_weights: String,
+        /// Weight on the distillation term; `0` is off.
+        #[arg(long, default_value_t = 0.0)]
+        distill_weight: f64,
+        #[arg(long, default_value_t = 2.0)]
+        distill_temperature: f64,
+        /// A checkpoint whose confident next-token choices are *charged*
+        /// (roadmap 29.3): an open-weight source of bad patterns.
         #[arg(long)]
-        corpus: PathBuf,
+        negative_teacher: Option<PathBuf>,
+        /// Charge a proposal only where the negative teacher is at least this
+        /// sure of it.
+        #[arg(long, default_value_t = 0.5)]
+        negative_confidence: f32,
+        /// Coefficient on the negative teacher's charge.
+        #[arg(long, default_value_t = 1.0)]
+        negative_penalty: f32,
         #[arg(long, default_value_t = 200)]
         steps: usize,
         #[arg(long, default_value_t = 8)]
@@ -218,6 +250,19 @@ enum LmAction {
         #[arg(long)]
         json: Option<PathBuf>,
     },
+    /// Average several `lm train` checkpoints of one configuration into a
+    /// new one (roadmap 29.4).
+    Merge {
+        #[arg(long, action = clap::ArgAction::Append, required = true)]
+        input: Vec<PathBuf>,
+        #[arg(long, default_value = "")]
+        weights: String,
+        #[arg(long, default_value = "checkpoints")]
+        out: PathBuf,
+        /// The small configuration -- must match the inputs'.
+        #[arg(long, default_value_t = false)]
+        tiny: bool,
+    },
     /// Generate a continuation from an untrained model.
     ///
     /// The weights are random unless `--checkpoint` is given, so the output is
@@ -266,21 +311,37 @@ enum LmAction {
 enum Command {
     /// Block-wise training.
     Train {
-        /// Dataset: synthetic | cifar100 | tiny-imagenet.
-        #[arg(long, default_value = "synthetic")]
-        dataset: String,
-        /// Directory holding the dataset's `.bin` splits.
-        #[arg(long)]
-        data_dir: Option<PathBuf>,
+        /// Dataset: synthetic | cifar100 | tiny-imagenet. Repeatable
+        /// (roadmap 29.1): several sources train in one run, weighted by
+        /// `--dataset-weights` and combined per `--mix`. Every source must
+        /// share the image size and label count.
+        #[arg(long, default_value = "synthetic", action = clap::ArgAction::Append)]
+        dataset: Vec<String>,
+        /// Directory holding a dataset's `.bin` splits; repeat once per
+        /// `--dataset` that needs one, in the same order.
+        #[arg(long, action = clap::ArgAction::Append)]
+        data_dir: Vec<PathBuf>,
+        /// Weights over the datasets, e.g. `0.7,0.3`; empty is uniform.
+        #[arg(long, default_value = "")]
+        dataset_weights: String,
+        /// mixture (each batch from one source, drawn by weight) |
+        /// composite (every batch sliced from every source).
+        #[arg(long, default_value = "mixture")]
+        mix: String,
         /// Stream records from disk instead of loading the split into memory.
         #[arg(long, default_value_t = false)]
         streaming: bool,
         /// Objective: dblock | consistency | flow | distill.
         #[arg(long, default_value = "dblock")]
         objective: String,
-        /// Frozen teacher checkpoint for `--objective distill`.
-        #[arg(long)]
-        teacher: Option<PathBuf>,
+        /// Frozen teacher checkpoint for `--objective distill`. Repeatable
+        /// (roadmap 29.2): several teachers distil at once, weighted by
+        /// `--teacher-weights`.
+        #[arg(long, action = clap::ArgAction::Append)]
+        teacher: Vec<PathBuf>,
+        /// Weights over the teachers; empty is uniform.
+        #[arg(long, default_value = "")]
+        teacher_weights: String,
         #[arg(long, default_value_t = 32)]
         image_size: usize,
         #[arg(long, default_value_t = 100)]
@@ -502,6 +563,20 @@ enum Command {
         #[arg(long)]
         json: Option<PathBuf>,
     },
+    /// Average several checkpoints of one architecture into a new one
+    /// (roadmap 29.4): a model soup as a starting point.
+    Merge {
+        #[command(flatten)]
+        model: ModelArgs,
+        /// Checkpoints to merge, repeatable.
+        #[arg(long, action = clap::ArgAction::Append, required = true)]
+        input: Vec<PathBuf>,
+        /// Weights over the inputs; empty is uniform.
+        #[arg(long, default_value = "")]
+        weights: String,
+        #[arg(long, default_value = "checkpoints")]
+        out: PathBuf,
+    },
     /// Audits that measure what the theory assumes (roadmap Phase 28).
     Audit {
         #[command(subcommand)]
@@ -632,6 +707,7 @@ fn main() -> Result<()> {
             cmd_sweep(&grid, &seeds, steps, &dataset, data_dir, batch_size, json)
         }
         Command::Audit { action } => cmd_audit(action),
+        Command::Merge { model, input, weights, out } => cmd_merge(model, input, &weights, out),
         Command::Experiment { action } => cmd_experiment(action),
         Command::Infer { model, batch_size, num_inference_steps, top_k, solver } => {
             cmd_infer(model, batch_size, num_inference_steps, top_k, &solver)
@@ -791,7 +867,16 @@ fn cmd_lm(action: LmAction) -> Result<()> {
             Ok(())
         }
         LmAction::Train {
-            corpus: corpus_path,
+            corpus: corpus_paths,
+            corpus_weights,
+            mix,
+            teacher,
+            teacher_weights,
+            distill_weight,
+            distill_temperature,
+            negative_teacher,
+            negative_confidence,
+            negative_penalty,
             steps,
             batch_size,
             lr,
@@ -810,40 +895,63 @@ fn cmd_lm(action: LmAction) -> Result<()> {
             let device: <Train as burn::tensor::backend::BackendTypes>::Device = Default::default();
             <Train as burn::tensor::backend::Backend>::seed(&device, seed);
 
-            let mut corpus = if streaming {
-                TokenCorpus::streaming(&corpus_path)?
-            } else {
-                TokenCorpus::in_memory(&corpus_path)?
-            };
-            if corpus::labels_path(&corpus_path).exists() {
-                corpus.open_labels()?;
-                let manifest = corpus.manifest()?;
-                println!(
-                    "labels: {} of {} tokens flagged ({:.3}%) across {} categories | penalty {}",
-                    manifest.labeled_tokens,
-                    manifest.tokens,
-                    100.0 * manifest.labeled_fraction(),
-                    manifest.categories.iter().filter(|c| c.tokens > 0).count(),
-                    if penalty > 0.0 { format!("alpha={penalty}") } else { "off (measuring only)".into() }
-                );
-            } else if penalty > 0.0 {
+            let corpus_path = corpus_paths[0].clone();
+            let mut corpora: Vec<TokenCorpus> = Vec::with_capacity(corpus_paths.len());
+            let mut any_labels = false;
+            for path in &corpus_paths {
+                let mut corpus = if streaming { TokenCorpus::streaming(path)? } else { TokenCorpus::in_memory(path)? };
+                if corpus::labels_path(path).exists() {
+                    corpus.open_labels()?;
+                    let manifest = corpus.manifest()?;
+                    println!(
+                        "labels ({}): {} of {} tokens flagged ({:.3}%) across {} categories | penalty {}",
+                        path.display(),
+                        manifest.labeled_tokens,
+                        manifest.tokens,
+                        100.0 * manifest.labeled_fraction(),
+                        manifest.categories.iter().filter(|c| c.tokens > 0).count(),
+                        if penalty > 0.0 { format!("alpha={penalty}") } else { "off (measuring only)".into() }
+                    );
+                    any_labels = true;
+                } else {
+                    println!("labels ({}): none", path.display());
+                }
+                corpora.push(corpus);
+            }
+            if penalty > 0.0 && !any_labels {
                 anyhow::bail!(
                     "--penalty {penalty} needs labels; run `dblocks lm label --corpus {}` first",
                     corpus_path.display()
                 );
-            } else {
-                println!("labels: none");
             }
+            let weights = diffusionblocks::mix::MixWeights::parse(&corpus_weights, corpora.len())?;
+            let mix_mode = diffusionblocks::mix::MixMode::parse(&mix)?;
+            let mut mix = diffusionblocks::mix::CorpusMix::new(corpora.iter_mut().collect(), weights, mix_mode)?;
 
             let model_config = if tiny { LmConfig::tiny() } else { LmConfig::default() };
             let model = LanguageModel::<Train>::new(&model_config, &device);
             println!(
-                "training: {} tokens | context={} layers={} hidden={} | steps={steps} batch={batch_size} lr={lr}",
-                corpus.len(),
+                "training: {} tokens in {} corpus(es) ({}) | context={} layers={} hidden={} | steps={steps} batch={batch_size} lr={lr}",
+                mix.total_tokens(),
+                mix.len(),
+                mix.mode().name(),
                 model_config.context,
                 model_config.num_layers,
                 model_config.hidden_size
             );
+            let teacher_weights = parse_weights(&teacher_weights)?;
+            let mut inputs = train::LmTrainInputs::<Train>::default();
+            for (i, path) in teacher.iter().enumerate() {
+                let loaded = checkpoint::load::<Train, _>(LanguageModel::<Train>::new(&model_config, &device), path, &device)?;
+                let w = teacher_weights.get(i).copied().unwrap_or(1.0);
+                println!("teacher {}: {} (weight {w})", i + 1, path.display());
+                inputs.teachers.push((loaded, w));
+            }
+            if let Some(path) = &negative_teacher {
+                inputs.negative_teacher =
+                    Some(checkpoint::load::<Train, _>(LanguageModel::<Train>::new(&model_config, &device), path, &device)?);
+                println!("negative teacher: {} (confidence >= {negative_confidence}, penalty {negative_penalty})", path.display());
+            }
 
             let config = train::LmTrainConfig {
                 steps,
@@ -859,8 +967,12 @@ fn cmd_lm(action: LmAction) -> Result<()> {
                 checkpoint_every,
                 resume,
                 model_config: Some(model_config.clone()),
+                distill_weight: if teacher.is_empty() { 0.0 } else { distill_weight },
+                distill_temperature,
+                negative_confidence,
+                negative_penalty: if negative_teacher.is_some() { negative_penalty } else { 0.0 },
             };
-            let (model, report) = train::train_lm(model, &mut corpus, &config, &device)?;
+            let (model, report) = train::train_lm_mixed(model, &mut mix, &inputs, &config, &device)?;
             println!(
                 "done: {} steps in {:.1}s | loss {:.4} -> {:.4} (mean {:.4}) | {} skipped",
                 report.steps_taken,
@@ -876,11 +988,31 @@ fn cmd_lm(action: LmAction) -> Result<()> {
                     report.penalized_tokens, report.first_penalized_prob, report.last_penalized_prob
                 );
             }
+            if report.negative_teacher_tokens > 0 {
+                println!(
+                    "negative teacher: {} proposals charged | p {:.4} -> {:.4}",
+                    report.negative_teacher_tokens, report.first_negative_teacher_prob, report.last_negative_teacher_prob
+                );
+            }
+            if report.last_distill_loss > 0.0 {
+                println!("distillation term at the last step: {:.4}", report.last_distill_loss);
+            }
             let path = match report.checkpoint {
                 Some(path) => path,
                 None => checkpoint::save_content_addressed(model, &out_dir, "lm")?,
             };
             println!("checkpoint saved: {} (training state beside it)", path.display());
+            Ok(())
+        }
+        LmAction::Merge { input, weights, out, tiny } => {
+            let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
+            let config = if tiny { LmConfig::tiny() } else { LmConfig::default() };
+            let template = LanguageModel::<Eval>::new(&config, &device);
+            let weights = if weights.trim().is_empty() { vec![1.0; input.len()] } else { parse_weights(&weights)? };
+            let (merged, parents) = diffusionblocks::merge::merge_checkpoints::<Eval, _>(template, &input, &weights, &device)?;
+            let path = checkpoint::save_content_addressed(merged, &out, "lm")?;
+            write_merge_state(&path, &parents, &weights, &input)?;
+            println!("merged {} -> {}", diffusionblocks::merge::describe(&parents, &weights), path.display());
             Ok(())
         }
         LmAction::Bench { corpus: corpus_path, steps, seeds, batch_size, json } => {
@@ -1143,9 +1275,12 @@ fn cmd_train(command: Command) -> Result<()> {
     let Command::Train {
         dataset,
         data_dir,
+        dataset_weights,
+        mix,
         streaming,
         objective,
         teacher,
+        teacher_weights,
         image_size,
         num_labels,
         num_blocks,
@@ -1214,7 +1349,15 @@ fn cmd_train(command: Command) -> Result<()> {
         log_every,
         seed,
         log_file: log_file.map(PathBuf::from),
-        dataset: DatasetChoice::parse(&dataset, data_dir, streaming)?,
+        dataset: DatasetChoice::parse(&dataset[0], data_dir.first().cloned(), streaming)?,
+        extra_datasets: dataset
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(i, name)| DatasetChoice::parse(name, data_dir.get(i).cloned(), streaming))
+            .collect::<Result<Vec<_>>>()?,
+        dataset_weights: parse_weights(&dataset_weights)?,
+        mix_mode: diffusionblocks::mix::MixMode::parse(&mix)?,
         objective: Objective::parse(&objective)?,
         checks: if no_checks {
             TrainingChecks::none()
@@ -1226,7 +1369,9 @@ fn cmd_train(command: Command) -> Result<()> {
             }
         },
         resume,
-        teacher,
+        teacher: teacher.first().cloned(),
+        extra_teachers: teacher.iter().skip(1).cloned().collect(),
+        teacher_weights: parse_weights(&teacher_weights)?,
         moe: moe_every.map(|every| MoeTrunkConfig {
             num_experts: moe_experts,
             top_k: moe_top_k,
@@ -1268,7 +1413,8 @@ fn cmd_train(command: Command) -> Result<()> {
     };
 
     println!(
-        "training: dataset={dataset} objective={} blocks={num_blocks} steps={steps}",
+        "training: dataset={} objective={} blocks={num_blocks} steps={steps}",
+        dataset.join("+"),
         config.objective.name()
     );
 
@@ -1730,6 +1876,13 @@ fn cmd_bench(
     Ok(())
 }
 
+fn parse_weights(text: &str) -> Result<Vec<f64>> {
+    text.split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().parse::<f64>().map_err(|e| anyhow::anyhow!("weight {s:?}: {e}")))
+        .collect()
+}
+
 fn parse_seeds(text: &str) -> Result<Vec<u64>> {
     let seeds: Vec<u64> = text
         .split(',')
@@ -1772,6 +1925,49 @@ fn cmd_sweep(
         "\nEvery cell differs from every other only in what the grid names; the trials are the\n\
          per-seed final losses and the interval is the 95% t-interval over seeds."
     );
+    Ok(())
+}
+
+fn cmd_merge(model_args: ModelArgs, input: Vec<PathBuf>, weights: &str, out: PathBuf) -> Result<()> {
+    let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
+    let template = ModelArgs { checkpoint: None, ..model_args.clone() }.build(None)?;
+    let weights = if weights.trim().is_empty() { vec![1.0; input.len()] } else { parse_weights(weights)? };
+    let (merged, parents) = diffusionblocks::merge::merge_checkpoints::<Eval, _>(template, &input, &weights, &device)?;
+    let path = checkpoint::save_content_addressed(merged, &out, "dblocks")?;
+    write_merge_state(&path, &parents, &weights, &input)?;
+    println!("merged {} -> {}", diffusionblocks::merge::describe(&parents, &weights), path.display());
+    Ok(())
+}
+
+/// A state directory for a merged model recording its parents, so the
+/// provenance chain does not stop at the merge.
+fn write_merge_state(path: &Path, parents: &[String], weights: &[f64], inputs: &[PathBuf]) -> Result<()> {
+    use diffusionblocks::checkpoint::{self as ck, TrainState};
+    let dir = TrainState::dir_for(path);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    let state = TrainState {
+        format_version: ck::STATE_FORMAT_VERSION,
+        kind: "merge".into(),
+        step: 0,
+        seed: 0,
+        host_rng: serde_json::Value::Null,
+        config: serde_json::json!({
+            "inputs": inputs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            "weights": weights,
+        }),
+        build: ck::BuildInfo::current(),
+        datasets: Vec::new(),
+        model: ck::model_entry(path)?,
+        optimizer: None,
+        ema: None,
+        head: None,
+        head_optimizer: None,
+        extras: serde_json::json!({ "parents": parents, "weights": weights }),
+        saved_unix_secs: ck::unix_now(),
+    };
+    state.write(&dir)?;
     Ok(())
 }
 

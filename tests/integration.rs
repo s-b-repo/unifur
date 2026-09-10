@@ -804,6 +804,114 @@ fn integration_lm_trainer_nudges_its_router_biases() {
 }
 
 #[test]
+fn integration_two_synthetic_sources_train_as_mixture_and_composite() {
+    // Roadmap 29.1 on the image trunk: two sources, weighted 3:1. A mixture
+    // takes every batch from one source; a composite slices every batch 3 + 1.
+    use diffusionblocks::mix::MixMode;
+    use diffusionblocks::train::{train, DatasetChoice, TrainConfig};
+    let base = TrainConfig {
+        image_size: 32,
+        num_labels: 10,
+        batch_size: 4,
+        num_blocks: 2,
+        steps: 6,
+        log_every: 1,
+        extra_datasets: vec![DatasetChoice::Synthetic],
+        dataset_weights: vec![3.0, 1.0],
+        checks: diffusionblocks::quality::TrainingChecks::none(),
+        ..TrainConfig::default()
+    };
+    let (_, mixture) = train(&TrainConfig { mix_mode: MixMode::Mixture, ..base.clone() }).unwrap();
+    assert_eq!(mixture.sources.names.len(), 2);
+    assert_eq!(mixture.sources.batches.iter().sum::<usize>(), 6, "one source per step");
+    assert_eq!(mixture.sources.samples.iter().sum::<usize>(), 24);
+    let (_, composite) = train(&TrainConfig { mix_mode: MixMode::Composite, ..base }).unwrap();
+    assert_eq!(composite.sources.batches, vec![6, 6], "both sources in every step");
+    assert_eq!(composite.sources.samples, vec![18, 6], "3 + 1 of every 4");
+}
+
+#[test]
+fn integration_lm_trains_on_two_corpora_with_a_teacher_and_a_negative_teacher() {
+    // Roadmap 29.1-29.3 on the language path: a labeled and an unlabeled
+    // corpus as a composite, a teacher to distil from, and a negative teacher
+    // whose confident choices are charged.
+    use diffusionblocks::antipattern::Labeler;
+    use diffusionblocks::corpus::TokenCorpus;
+    use diffusionblocks::lm::{LanguageModel, LmConfig, Unlikelihood};
+    use diffusionblocks::mix::{CorpusMix, MixMode, MixWeights};
+    use diffusionblocks::train::{train_lm_mixed, LmTrainConfig, LmTrainInputs};
+
+    let device: Device = Default::default();
+    let dir = std::env::temp_dir().join(format!("dblocks-lm-multisource-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bad = dir.join("bad.txt");
+    std::fs::write(&bad, "try:\n    f()\nexcept:\n    pass\n".repeat(20)).unwrap();
+    let bad_bin = dir.join("bad.bin");
+    TokenCorpus::tokenize_file(&bad, &bad_bin).unwrap();
+    TokenCorpus::label_file(&bad_bin, &Labeler::builtin()).unwrap();
+    let good = dir.join("good.txt");
+    std::fs::write(&good, "def f():\n    return 1\n".repeat(30)).unwrap();
+    let good_bin = dir.join("good.bin");
+    TokenCorpus::tokenize_file(&good, &good_bin).unwrap();
+
+    let mut labeled = TokenCorpus::in_memory(&bad_bin).unwrap();
+    labeled.open_labels().unwrap();
+    let mut plain = TokenCorpus::in_memory(&good_bin).unwrap();
+    let mut mix = CorpusMix::new(vec![&mut labeled, &mut plain], MixWeights::new(&[1.0, 1.0]).unwrap(), MixMode::Composite).unwrap();
+    assert!(mix.any_labels());
+
+    let config = LmConfig { context: 24, ..LmConfig::tiny() };
+    let student = LanguageModel::<B>::new(&config, &device);
+    let inputs = LmTrainInputs::<B> {
+        teachers: vec![(LanguageModel::<B>::new(&config, &device), 1.0), (LanguageModel::<B>::new(&config, &device), 2.0)],
+        negative_teacher: Some(LanguageModel::<B>::new(&config, &device)),
+    };
+    let train_config = LmTrainConfig {
+        steps: 4,
+        batch_size: 4,
+        log_every: 0,
+        penalty: Unlikelihood::new(1.0),
+        distill_weight: 0.5,
+        negative_confidence: 0.0,
+        negative_penalty: 1.0,
+        ..Default::default()
+    };
+    let (_, report) = train_lm_mixed(student, &mut mix, &inputs, &train_config, &device).unwrap();
+    assert_eq!(report.steps_taken, 4);
+    assert_eq!(report.sources.names.len(), 2);
+    assert_eq!(report.sources.batches, vec![4, 4]);
+    assert!(report.penalized_tokens > 0, "the labeled corpus contributes negatives");
+    assert!(report.negative_teacher_tokens > 0, "at confidence 0 the negative teacher proposes at every differing position");
+    assert!(report.last_distill_loss > 0.0, "two random teachers differ from the student");
+    assert!(report.last_loss.is_finite());
+}
+
+#[test]
+fn integration_merging_saved_checkpoints_averages_them() {
+    use diffusionblocks::checkpoint::save_content_addressed;
+    use diffusionblocks::lm::{LanguageModel, LmConfig};
+    use diffusionblocks::merge::{flatten, merge_checkpoints};
+
+    let device: Device = Default::default();
+    let dir = std::env::temp_dir().join(format!("dblocks-merge-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let config = LmConfig::tiny();
+    let a = LanguageModel::<B>::new(&config, &device);
+    let b = LanguageModel::<B>::new(&config, &device);
+    let (fa, fb) = (flatten::<B, _>(&a), flatten::<B, _>(&b));
+    let pa = save_content_addressed(a, &dir, "lm").unwrap();
+    let pb = save_content_addressed(b, &dir, "lm").unwrap();
+    let template = LanguageModel::<B>::new(&config, &device);
+    let (merged, parents) = merge_checkpoints::<B, _>(template, &[pa, pb], &[1.0, 1.0], &device).unwrap();
+    assert_eq!(parents.len(), 2);
+    assert_ne!(parents[0], parents[1]);
+    for ((m, x), y) in flatten::<B, _>(&merged).iter().zip(&fa).zip(&fb) {
+        assert!((m - 0.5 * (x + y)).abs() <= 1e-6 * (x.abs() + y.abs() + 1.0));
+    }
+}
+
+#[test]
 fn integration_negative_supervision_unlearns_error_swallowing() {
     // The Phase 24 claim end to end. A corpus in which every handler swallows
     // its error is tokenized, labeled and trained on twice from the same

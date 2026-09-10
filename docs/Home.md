@@ -28,7 +28,7 @@ Two documents are authoritative about what is and is not implemented:
 
 ```bash
 cargo build --release
-./target/release/dblocks verify        # 95 certificates, non-zero exit on failure
+./target/release/dblocks verify        # 111 certificates, non-zero exit on failure
 ./target/release/dblocks train --steps 200
 ./target/release/dblocks sample --planned --plan-depth 2   # plan the trajectory
 ./target/release/dblocks lm generate --lookahead 2         # plan the tokens
@@ -57,6 +57,8 @@ cargo build --release
 - [Loss Reduction](Loss-Reduction.md) — schedules, EMA, uncertainty weighting, importance sampling
 - [Language Modeling](Language-Modeling.md) — byte tokenizer, causal trunk, KV cache, corpora
 - [Negative Supervision](Negative-Supervision.md) — anti-pattern rules, labeled corpora, the unlikelihood charge
+- [Multi-Source Training](Multi-Source-Training.md) — dataset mixtures and composites, several teachers, a negative teacher, merged checkpoints
+- [Cyber Policy](Cyber-Policy.md) — blockers, refusals and signed approvals gating a model's capabilities
 - [Next-Step Planning](Next-Step-Planning.md) — beam search over trajectories and tokens
 - [Accuracy Improvements](Accuracy-Improvements.md) — guidance, normalization, ensembling, compute scaling
 
@@ -107,6 +109,8 @@ cargo build --release
 | Datasets and streaming I/O | `data.rs`, `rawdata.rs`, `cifar.rs`, `tinyimagenet.rs` |
 | Training loop, checkpoints and training state, logging | `train.rs`, `checkpoint.rs`, `logging.rs` |
 | Experiment records, sweeps, propagation audit | `experiment.rs`, `sweep.rs`, `audit.rs` |
+| Dataset and corpus mixing, checkpoint merging | `mix.rs`, `merge.rs` |
+| Blockers, refusals, signed approvals | `policy.rs` |
 | Inference API, profiler | `infer.rs`, `profile.rs` |
 | Numerical certificate suite | `verify.rs` |
 
