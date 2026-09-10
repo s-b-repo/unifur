@@ -12,13 +12,13 @@ specific blocker.
 
 ## Roadmap (2026-09-10)
 
-Phases 1–24 and 28–31 are on `feat/phases-18-23` and pushed. The phases
+Phases 1–25 and 28–31 are on `feat/phases-18-23` and pushed. The phases
 below are being built now, one commit each, and land on the same branch when
 their gate is green:
 
 | Phase | Scope | Source | State |
 |---|---|---|---|
-| 25 Unified routing, per-token routing state, LatentMoE | `router.rs` (flat / latent / hierarchical routers behind one interface), `routing_state.rs` (GRU state per token shared by a layer group, reset at block boundaries), `--moe-latent-dim`, `lm train --routing-state` | issue #3 steps 1, 3, 4; issue #4 B5–B6, D1 | in flight (branch `feat/phases-25-27`) |
+| 25 Hybrid attention, rotary positions, decode state, routing state, router diagnostics, cost model | `routing.rs`, attention modes and rotary positions in the LM trunk, a unified decode state, the `hybrid` certificate group (9) | issue #3 steps 1, 3, 4; issue #4 B2, B5–B6, D1; issue #5 §4–5 | landed: d10d321 (see Phase 25 below) |
 | 26 Attention modes, hierarchical MoVA, Engram, long-term memory | `attention.rs` (full / linear KDA-style / sparse DSA-style cores per layer), MoVA value experts as shared base + low-rank deltas, `memory.rs` (n-gram Engram, Titans-lite associative memory), `lm train --attention kda:3,dsa:1 --mova-spec --engram --long-memory` | issues #2, #3 steps 2, 6, 7; #4 B2–B4, C10 | in flight (same branch) |
 | 27 Adaptive MTP, token-level exits, compute policy | `mtp.rs` (offset heads, speculative decoding with exact rollback), token-level early exits with self-verification, `PolicyPlanner` over the existing beam, `lm generate --speculative --exit-threshold --policy` | issue #3 steps 5, 8, 9; #4 C3, C8, C9, D2 | in flight (same branch) |
 | 32 Latent reasoning and LM substrate gaps | persistent latent state with sequential and parallel refinement, progress objective, calibrated verifier, span semantics, LayerNorm conditioning ablation, rotary positions, unified inference state, experiment verdicts and the negative-result ledger, the falsification harness | issue #5 all sections; #4 C4–C8, D3, D6 | in flight (same branch) |
