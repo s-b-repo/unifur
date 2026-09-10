@@ -331,6 +331,19 @@ number of `--grant grant.json`): a blocked prompt is refused before any
 forward pass, a lifted one is sent with the approval marker, and the output
 is checked against the output blockers. See [Cyber Policy](Cyber-Policy.md).
 
+### `dblocks lm direction` / `ablate` / `direction-score` (Phase 31)
+
+| Command | Flags | Meaning |
+|---|---|---|
+| `lm direction` | `--checkpoint --target a.txt --baseline b.txt [--layer auto\|n] --out dir.json [--tiny]` | Extract the behaviour direction (one prompt per line per file); `auto` keeps the layer with the largest separation |
+| `lm ablate` | `--checkpoint --direction dir.json --out dir [--tiny]` | Orthogonalize every residual-writing weight against the direction; writes a new checkpoint whose state records the parent and the direction |
+| `lm direction-score` | `--checkpoint --direction dir.json --prompts p.txt [--tiny]` | Mean projection of the prompts onto the direction at its layer |
+
+`dblocks lm train` takes `--direction dir.json --direction-weight λ` to
+penalize the squared projection during training; `dblocks train` takes
+`--synthetic-negatives p` to mark a fraction of synthetic samples as negative
+labels charged with `−log(1 − p_k)`. See [Direction Ablation](Direction-Ablation.md).
+
 ### `dblocks lm generate`
 
 | Flag | Default | Meaning |

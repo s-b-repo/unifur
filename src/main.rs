@@ -250,6 +250,31 @@ enum LmAction {
         #[arg(long)]
         json: Option<PathBuf>,
     },
+    /// Capability gating (roadmap Phase 30): blockers, refusals and the
+    /// scopes signed approvals lift.
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
+    /// Signed grants that lift policy scopes for their holder (roadmap Phase 30).
+    Approvals {
+        #[command(subcommand)]
+        action: ApprovalsAction,
+    },
+    /// Build the refusal and approval training documents a policy implies
+    /// and tokenize them into a corpus (roadmap 30.3).
+    RefusalCorpus {
+        #[arg(long)]
+        policy: PathBuf,
+        /// One prompt per line.
+        #[arg(long)]
+        prompts: PathBuf,
+        /// One answer per line, aligned with the prompts; optional.
+        #[arg(long)]
+        answers: Option<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Average several `lm train` checkpoints of one configuration into a
     /// new one (roadmap 29.4).
     Merge {
@@ -301,6 +326,17 @@ enum LmAction {
         /// The small configuration -- must match the checkpoint's.
         #[arg(long, default_value_t = false)]
         tiny: bool,
+        /// Gate the request through a policy (roadmap Phase 30): a blocked
+        /// prompt is refused before any forward pass. Uses plain or cached
+        /// decoding.
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        /// The policy's key, needed to verify `--grant`s.
+        #[arg(long)]
+        key: Option<PathBuf>,
+        /// Grants to present; repeatable.
+        #[arg(long, action = clap::ArgAction::Append)]
+        grant: Vec<PathBuf>,
     },
 }
 
@@ -627,6 +663,99 @@ enum Command {
         num_blocks: usize,
         #[arg(long, default_value_t = 0.05)]
         gamma: f64,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyAction {
+    /// Write the starter policy (three cyber scopes) and a fresh signing key.
+    Init {
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        key: PathBuf,
+    },
+    /// Blockers, scopes, patterns and revocations.
+    List {
+        #[arg(long)]
+        policy: PathBuf,
+    },
+    /// Add a blocker; every pattern must parse and consume something.
+    AddBlocker {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        scope: String,
+        /// Pattern in the `antipattern` syntax; repeatable.
+        #[arg(long, action = clap::ArgAction::Append, required = true)]
+        pattern: Vec<String>,
+        /// prompt | output | both
+        #[arg(long, default_value = "both")]
+        applies_to: String,
+        #[arg(long)]
+        refusal: String,
+        #[arg(long, default_value = "")]
+        description: String,
+    },
+    /// Remove a blocker by id.
+    RemoveBlocker {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        id: String,
+    },
+    /// Show which blockers fire on a prompt and what the gate would decide,
+    /// given any grants presented.
+    Check {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        prompt: String,
+        #[arg(long)]
+        key: Option<PathBuf>,
+        #[arg(long, action = clap::ArgAction::Append)]
+        grant: Vec<PathBuf>,
+    },
+    /// Refuse a grant from now on.
+    Revoke {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        grant_id: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApprovalsAction {
+    /// Sign a grant with the policy's key.
+    Issue {
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        id: String,
+        /// Comma-separated scopes, e.g. `cyber:exploit-development,cyber:malware`.
+        #[arg(long)]
+        scopes: String,
+        /// Expiry as a Unix timestamp.
+        #[arg(long)]
+        expires: u64,
+        #[arg(long, default_value = "")]
+        note: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Check a grant's signature, key, expiry and revocation, in that order.
+    Verify {
+        #[arg(long)]
+        key: PathBuf,
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        grant: PathBuf,
     },
 }
 
@@ -1004,6 +1133,33 @@ fn cmd_lm(action: LmAction) -> Result<()> {
             println!("checkpoint saved: {} (training state beside it)", path.display());
             Ok(())
         }
+        LmAction::Policy { action } => cmd_policy(action),
+        LmAction::Approvals { action } => cmd_approvals(action),
+        LmAction::RefusalCorpus { policy, prompts, answers, out } => {
+            use diffusionblocks::policy::{refusal_documents, Policy};
+            let policy = Policy::read(&policy)?;
+            let read_lines = |path: &Path| -> Result<Vec<String>> {
+                Ok(std::fs::read_to_string(path)
+                    .map_err(|err| anyhow::anyhow!("read {}: {err}", path.display()))?
+                    .lines()
+                    .map(str::to_string)
+                    .collect())
+            };
+            let prompt_lines = read_lines(&prompts)?;
+            let answer_lines = answers.as_deref().map(read_lines).transpose()?;
+            let docs = refusal_documents(&policy, &prompt_lines, answer_lines.as_deref());
+            let tokenizer = ByteTokenizer::new();
+            let tokens: Vec<u16> = docs.iter().flat_map(|d| tokenizer.encode_document(d)).collect();
+            TokenCorpus::write(&out, &tokens)?;
+            println!(
+                "{} prompt(s) -> {} document(s), {} tokens -> {}",
+                prompt_lines.len(),
+                docs.len(),
+                tokens.len(),
+                out.display()
+            );
+            Ok(())
+        }
         LmAction::Merge { input, weights, out, tiny } => {
             let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
             let config = if tiny { LmConfig::tiny() } else { LmConfig::default() };
@@ -1089,6 +1245,9 @@ fn cmd_lm(action: LmAction) -> Result<()> {
             seed,
             checkpoint: weights,
             tiny,
+            policy,
+            key,
+            grant,
         } => {
             let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
             <Eval as burn::tensor::backend::Backend>::seed(&device, seed);
@@ -1100,6 +1259,54 @@ fn cmd_lm(action: LmAction) -> Result<()> {
                 println!("loaded {}", path.display());
             }
             let tokenizer = ByteTokenizer::new();
+
+            if let Some(policy_path) = &policy {
+                use diffusionblocks::policy::{gated_generate, Decision, Grant, Key, Policy};
+                let policy = Policy::read(policy_path)?;
+                let grants: Vec<Grant> = grant.iter().map(|p| Grant::read(p)).collect::<Result<_>>()?;
+                let approved = match (&key, grants.is_empty()) {
+                    (Some(key_path), false) => {
+                        let key = Key::read(key_path)?;
+                        let approved = policy.approved_scopes(&key, &grants, checkpoint::unix_now());
+                        for g in &grants {
+                            match g.verify(&key, &policy, checkpoint::unix_now()) {
+                                Ok(()) => println!("grant {}: valid for {}", g.approval.id, g.approval.scopes.join(",")),
+                                Err(err) => println!("grant {}: rejected: {err}", g.approval.id),
+                            }
+                        }
+                        approved
+                    }
+                    (None, false) => anyhow::bail!("--grant needs --key to verify against"),
+                    _ => Vec::new(),
+                };
+                let sampling = Sampling::parse(&sampling, top_k, temperature)?;
+                let mut rng = StdRng::seed_from_u64(seed);
+                let outcome = gated_generate(&policy, &approved, &prompt, |sent| {
+                    let ids = tokenizer.encode(sent);
+                    let out = if cached {
+                        model.generate_cached(&ids, max_new, &sampling, &mut rng, &device)
+                    } else {
+                        model.generate(&ids, max_new, &sampling, &mut rng, &device)
+                    };
+                    tokenizer.decode_lossy(&out[ids.len().min(out.len())..])
+                });
+                match &outcome.prompt_decision {
+                    Decision::Refuse { blocker, scope, .. } => {
+                        println!("refused before any forward pass: blocker {blocker} (scope {scope})")
+                    }
+                    Decision::Allow { approved } if !approved.is_empty() => {
+                        println!("approved scopes lifted: {}", approved.join(","))
+                    }
+                    Decision::Allow { .. } => println!("no blocker fired on the prompt"),
+                }
+                if let Some(Decision::Refuse { blocker, .. }) = &outcome.output_decision {
+                    println!("output replaced: blocker {blocker} fired on what the model produced");
+                }
+                println!("model called: {}", outcome.model_called);
+                println!("---\n{}\n---", outcome.text);
+                return Ok(());
+            }
+
             let ids = tokenizer.encode(&prompt);
 
             println!(
@@ -1926,6 +2133,116 @@ fn cmd_sweep(
          per-seed final losses and the interval is the 95% t-interval over seeds."
     );
     Ok(())
+}
+
+fn cmd_policy(action: PolicyAction) -> Result<()> {
+    use diffusionblocks::policy::{starter, Applies, Blocker, Grant, Key, Policy};
+    match action {
+        PolicyAction::Init { out, key } => {
+            let k = Key::generate();
+            k.write(&key)?;
+            let policy = starter(&k);
+            policy.write(&out)?;
+            println!(
+                "policy {} ({} blockers, scopes {}) and key {} (id {}) written",
+                out.display(),
+                policy.blockers.len(),
+                policy.scopes().join(","),
+                key.display(),
+                k.id()
+            );
+            Ok(())
+        }
+        PolicyAction::List { policy } => {
+            let p = Policy::read(&policy)?;
+            println!("policy {} | key id {} | {} blocker(s) | {} revoked grant(s)", policy.display(), p.key_id, p.blockers.len(), p.revoked.len());
+            for b in &p.blockers {
+                println!("- {} [{}] {:?}: {} pattern(s); refusal: {:?}", b.id, b.scope, b.applies_to, b.patterns.len(), b.refusal);
+                for pat in &b.patterns {
+                    println!("    {pat}");
+                }
+            }
+            for g in &p.revoked {
+                println!("revoked: {g}");
+            }
+            Ok(())
+        }
+        PolicyAction::AddBlocker { policy, id, scope, pattern, applies_to, refusal, description } => {
+            let mut p = Policy::read(&policy)?;
+            p.add_blocker(Blocker { id: id.clone(), scope, description, patterns: pattern, applies_to: Applies::parse(&applies_to)?, refusal })?;
+            p.write(&policy)?;
+            println!("blocker {id} added to {}", policy.display());
+            Ok(())
+        }
+        PolicyAction::RemoveBlocker { policy, id } => {
+            let mut p = Policy::read(&policy)?;
+            let removed = p.remove_blocker(&id)?;
+            p.write(&policy)?;
+            println!("blocker {} [{}] removed from {}", removed.id, removed.scope, policy.display());
+            Ok(())
+        }
+        PolicyAction::Check { policy, prompt, key, grant } => {
+            let p = Policy::read(&policy)?;
+            let grants: Vec<Grant> = grant.iter().map(|g| Grant::read(g)).collect::<Result<_>>()?;
+            let approved = match (&key, grants.is_empty()) {
+                (Some(key_path), false) => p.approved_scopes(&Key::read(key_path)?, &grants, checkpoint::unix_now()),
+                (None, false) => anyhow::bail!("--grant needs --key to verify against"),
+                _ => Vec::new(),
+            };
+            let hits = p.hits(&prompt, false);
+            if hits.is_empty() {
+                println!("no blocker fires");
+            }
+            for h in &hits {
+                println!("blocker {} [{}] fires at bytes {}..{}", h.blocker, h.scope, h.start, h.end);
+            }
+            println!("decision: {:?}", p.decide_prompt(&prompt, &approved));
+            Ok(())
+        }
+        PolicyAction::Revoke { policy, grant_id } => {
+            let mut p = Policy::read(&policy)?;
+            p.revoke(&grant_id);
+            p.write(&policy)?;
+            println!("grant {grant_id} revoked in {}", policy.display());
+            Ok(())
+        }
+    }
+}
+
+fn cmd_approvals(action: ApprovalsAction) -> Result<()> {
+    use diffusionblocks::policy::{Approval, Grant, Key, Policy};
+    match action {
+        ApprovalsAction::Issue { key, policy, id, scopes, expires, note, out } => {
+            let k = Key::read(&key)?;
+            let p = Policy::read(&policy)?;
+            anyhow::ensure!(p.key_id == k.id(), "key {} is not the policy's key ({})", k.id(), p.key_id);
+            let approval = Approval {
+                id: id.clone(),
+                scopes: scopes.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect(),
+                issued_unix: checkpoint::unix_now(),
+                expires_unix: expires,
+                note,
+            };
+            let unknown: Vec<&String> = approval.scopes.iter().filter(|s| *s != "*" && !p.scopes().contains(s)).collect();
+            if !unknown.is_empty() {
+                println!("note: scope(s) {:?} have no blocker in this policy", unknown);
+            }
+            let grant = Grant::issue(&k, approval)?;
+            grant.write(&out)?;
+            println!("grant {id} for {} written to {} (expires {expires})", scopes, out.display());
+            Ok(())
+        }
+        ApprovalsAction::Verify { key, policy, grant } => {
+            let g = Grant::read(&grant)?;
+            match g.verify(&Key::read(&key)?, &Policy::read(&policy)?, checkpoint::unix_now()) {
+                Ok(()) => {
+                    println!("grant {} is valid for {} until {}", g.approval.id, g.approval.scopes.join(","), g.approval.expires_unix);
+                    Ok(())
+                }
+                Err(err) => anyhow::bail!("{err}"),
+            }
+        }
+    }
 }
 
 fn cmd_merge(model_args: ModelArgs, input: Vec<PathBuf>, weights: &str, out: PathBuf) -> Result<()> {

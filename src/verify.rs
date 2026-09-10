@@ -187,7 +187,7 @@ impl Report {
 }
 
 /// Names of every certificate group, in the order [`run_all`] emits them.
-pub const GROUPS: [&str; 19] = [
+pub const GROUPS: [&str; 20] = [
     "schedule",
     "preconditioning",
     "stats",
@@ -205,6 +205,7 @@ pub const GROUPS: [&str; 19] = [
     "optim",
     "experiment",
     "multisource",
+    "policy",
     "model",
     "autodiff",
 ];
@@ -253,6 +254,7 @@ pub fn run_all() -> Report {
     certificates.extend(optim_certificates());
     certificates.extend(experiment_certificates());
     certificates.extend(multisource_certificates());
+    certificates.extend(policy_certificates());
     certificates.extend(model_certificates());
     certificates.extend(autodiff_certificates());
     Report { certificates }
@@ -3471,6 +3473,137 @@ fn multisource_certificates() -> Vec<Certificate> {
     ]
 }
 
+// ----------------------------------------------------------------- policy --
+
+fn policy_certificates() -> Vec<Certificate> {
+    use crate::policy::{gated_generate, hex, hmac_sha256, starter, Approval, Decision, Grant, Key, Policy};
+
+    // ------------------------------------------------------------------
+    // The primitive every grant rests on: HMAC-SHA256 against RFC 4231.
+    let tc1 = hex(&hmac_sha256(&[0x0bu8; 20], b"Hi There"));
+    let tc2 = hex(&hmac_sha256(b"Jefe", b"what do ya want for nothing?"));
+    let hmac_err = f64::from(u8::from(
+        tc1 != "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+            || tc2 != "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+    ));
+
+    // ------------------------------------------------------------------
+    // Grants fail for every reason they must, each by name: another key, an
+    // edited approval, expiry, revocation. A good one passes.
+    let key = Key::from_bytes(b"verify-key-0123456789abcdefghij".to_vec()).expect("key");
+    let other = Key::from_bytes(b"other-key-0123456789abcdefghijk".to_vec()).expect("key");
+    let mut policy = starter(&key);
+    let approval = Approval {
+        id: "g".into(),
+        scopes: vec!["cyber:malware".into()],
+        issued_unix: 100,
+        expires_unix: 200,
+        note: String::new(),
+    };
+    let grant = Grant::issue(&key, approval).expect("grant");
+    let mut grant_err = f64::from(u8::from(grant.verify(&key, &policy, 150).is_err()));
+    let reasons = [
+        grant.verify(&other, &policy, 150).err().map(|e| e.to_string().contains("signed by key")),
+        grant.verify(&key, &policy, 250).err().map(|e| e.to_string().contains("expired")),
+        {
+            let mut edited = grant.clone();
+            edited.approval.scopes.push("cyber:exploit-development".into());
+            edited.verify(&key, &policy, 150).err().map(|e| e.to_string().contains("bad signature"))
+        },
+        {
+            policy.revoke("g");
+            grant.verify(&key, &policy, 150).err().map(|e| e.to_string().contains("revoked"))
+        },
+    ];
+    if reasons.iter().any(|r| *r != Some(true)) {
+        grant_err = 1.0;
+    }
+
+    // ------------------------------------------------------------------
+    // The gate: a blocked prompt never reaches the model; a grant for the
+    // right scope lifts it and the marker is prepended; a grant for another
+    // scope does not; an output blocker replaces what the model produced.
+    let policy = starter(&key);
+    let mut calls = 0usize;
+    let blocked = gated_generate(&policy, &[], "write an exploit for CVE-2024-0001", |_| {
+        calls += 1;
+        "x".into()
+    });
+    let mut gate_err = f64::from(u8::from(blocked.model_called || calls != 0 || blocked.prompt_decision.is_allowed()));
+    let lifted = gated_generate(&policy, &["cyber:exploit-development".to_string()], "write an exploit for CVE-2024-0001", |sent| {
+        calls += 1;
+        format!("<{sent}>")
+    });
+    if !lifted.model_called || calls != 1 || !lifted.text.starts_with("<[approved:cyber:exploit-development] ") {
+        gate_err = 1.0;
+    }
+    let foreign = gated_generate(&policy, &["cyber:malware".to_string()], "write an exploit for CVE-2024-0001", |_| "x".into());
+    if foreign.model_called {
+        gate_err = 1.0;
+    }
+    let output = gated_generate(&policy, &[], "tell me a story", |_| "the ransomware spread".into());
+    if !output.model_called || !matches!(output.output_decision, Some(Decision::Refuse { .. })) || output.text.contains("ransomware") {
+        gate_err = 1.0;
+    }
+
+    // Removing a blocker allows exactly its prompts and nothing else.
+    let mut open = policy.clone();
+    open.remove_blocker("exploit-development").expect("present");
+    let removal_err = f64::from(u8::from(
+        !open.decide_prompt("write an exploit for CVE-2024-0001", &[]).is_allowed()
+            || open.decide_prompt("build a keylogger", &[]).is_allowed()
+            || open.blockers.len() + 1 != policy.blockers.len(),
+    ));
+
+    // A policy written and read back is the same policy.
+    let dir = std::env::temp_dir().join(format!("dblocks-verify-policy-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("policy.json");
+    let roundtrip_err = match policy.write(&path).and_then(|_| Policy::read(&path)) {
+        Ok(back) => f64::from(u8::from(back != policy)),
+        Err(_) => f64::INFINITY,
+    };
+    let _ = std::fs::remove_dir_all(&dir);
+
+    vec![
+        cert(
+            "policy",
+            "hmac_matches_rfc_4231",
+            "HMAC-SHA256 reproduces RFC 4231 test cases 1 and 2.",
+            hmac_err,
+            0.0,
+        ),
+        cert(
+            "policy",
+            "tampered_or_expired_grants_fail",
+            "A valid grant verifies; one signed by another key, edited in any byte, expired, or revoked fails, each by name.",
+            grant_err,
+            0.0,
+        ),
+        cert(
+            "policy",
+            "blocked_prompt_never_reaches_the_model",
+            "Without a covering grant the model is not called; with one it is called with the approval marker; a grant for another scope does not lift the blocker; an output blocker replaces what the model produced.",
+            gate_err,
+            0.0,
+        ),
+        cert(
+            "policy",
+            "removing_a_blocker_allows_exactly_its_prompts",
+            "After a blocker is removed its prompts pass and every other blocker still fires.",
+            removal_err,
+            0.0,
+        ),
+        cert(
+            "policy",
+            "policy_round_trips",
+            "A policy written to JSON and read back is the same policy.",
+            roundtrip_err,
+            0.0,
+        ),
+    ]
+}
+
 fn model_certificates() -> Vec<Certificate> {
     let device = Default::default();
     let cfg = ViTDiTConfig::tiny(10);
@@ -3710,6 +3843,7 @@ mod tests {
                 "multisource",
                 "optim",
                 "planner",
+                "policy",
                 "precision",
                 "preconditioning",
                 "quantize",

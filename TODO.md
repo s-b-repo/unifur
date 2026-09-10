@@ -212,7 +212,7 @@ invariants, not assumptions.
 
 - [x] **14.1–14.5** Every load-bearing identity is stated as a theorem and
       checked as a residual against a tolerance in `verify.rs`
-- [x] **14.6** Numerical verification — 111 certificates across 19 groups, run by
+- [x] **14.6** Numerical verification — 116 certificates across 20 groups, run by
       `dblocks verify` (non-zero exit on failure) and by the test suite
 
 **Status**: See [Quality gate](#quality-gate) below.
@@ -702,44 +702,6 @@ that unlearning 24 idioms makes a model write good code. The rules are a
 reviewable, extensible floor; a learned detector would be the next step and
 needs labeled data this repository does not have.
 
-## Phase 29: Multi-Source Training
-
-Everything a run learns from, and how much, should be a weight: several
-datasets or corpora, several teachers, a model to learn *against*, and
-averaged checkpoints as a start.
-
-- [x] **29.1** Dataset mixtures and composites (`mix.rs`): repeatable
-      `--dataset` / `--corpus` with weights; a **mixture** draws each batch's
-      source by weight from the host RNG (so it is resumable), a **composite**
-      slices every batch by weight exactly (largest-remainder apportionment).
-      Image sources must share image size and label count; corpora keep their
-      own labels, with zero penalty weight on windows from unlabeled ones.
-      Per-source batches, samples and mean loss in the JSONL, the state and the
-      end-of-run table; every source's hash in the training state
-- [x] **29.2** Multi-teacher distillation: image trunk (`distill_step_multi`:
-      weighted mean of the teachers' substep latents, weighted mixture of their
-      softened distributions, single-teacher path unchanged bit for bit) and
-      language model (`KL(mixture || student)` at temperature, added to the
-      corpus loss), `--teacher` repeatable on both
-- [x] **29.3** Negative teacher (`LanguageModel::negative_proposals`): a frozen
-      checkpoint's arg-max where it is at least `--negative-confidence` sure
-      becomes a charged token unless it equals the corpus target, with the
-      bounded unlikelihood term; composes with labeled negatives
-- [x] **29.4** Checkpoint merging (`merge.rs`, `dblocks merge`, `dblocks lm
-      merge`): parameter-wise weighted average with traversal-order pairing and
-      a shape check, the parents' hashes in the result's state
-- [x] **29.5** Certificates (`multisource` group, 12): mixture shares follow
-      the weights; composite slices are exact; a single-source mix is the
-      plain corpus; the teacher mixture of one is its own softened
-      distribution and every mixture is a distribution; the probability-target
-      KL agrees with the logit-target KL; a negative teacher below its
-      confidence is the plain loss bit for bit, never contradicts the corpus,
-      and its step ends below a plain step; self-distillation is zero; merging
-      is the identity on equal inputs and linear otherwise
-
-**Status**: Done. Whether any of it improves a real model is a GPU question;
-the mechanisms are certified and every run records its sources.
-
 ## Phase 28: Reproducibility and Audit
 
 Issue #1 asked for a research-grade audit: every claim classified, every
@@ -805,6 +767,117 @@ lists stay blocked; the protocol and the state they need do not.
 
 **Status**: Done. What it does *not* do is run the GPU experiments; what it
 does is make each of them a command whose output carries its own provenance.
+
+## Phase 29: Multi-Source Training
+
+Everything a run learns from, and how much, should be a weight: several
+datasets or corpora, several teachers, a model to learn *against*, and
+averaged checkpoints as a start.
+
+- [x] **29.1** Dataset mixtures and composites (`mix.rs`): repeatable
+      `--dataset` / `--corpus` with weights; a **mixture** draws each batch's
+      source by weight from the host RNG (so it is resumable), a **composite**
+      slices every batch by weight exactly (largest-remainder apportionment).
+      Image sources must share image size and label count; corpora keep their
+      own labels, with zero penalty weight on windows from unlabeled ones.
+      Per-source batches, samples and mean loss in the JSONL, the state and the
+      end-of-run table; every source's hash in the training state
+- [x] **29.2** Multi-teacher distillation: image trunk (`distill_step_multi`:
+      weighted mean of the teachers' substep latents, weighted mixture of their
+      softened distributions, single-teacher path unchanged bit for bit) and
+      language model (`KL(mixture || student)` at temperature, added to the
+      corpus loss), `--teacher` repeatable on both
+- [x] **29.3** Negative teacher (`LanguageModel::negative_proposals`): a frozen
+      checkpoint's arg-max where it is at least `--negative-confidence` sure
+      becomes a charged token unless it equals the corpus target, with the
+      bounded unlikelihood term; composes with labeled negatives
+- [x] **29.4** Checkpoint merging (`merge.rs`, `dblocks merge`, `dblocks lm
+      merge`): parameter-wise weighted average with traversal-order pairing and
+      a shape check, the parents' hashes in the result's state
+- [x] **29.5** Certificates (`multisource` group, 12): mixture shares follow
+      the weights; composite slices are exact; a single-source mix is the
+      plain corpus; the teacher mixture of one is its own softened
+      distribution and every mixture is a distribution; the probability-target
+      KL agrees with the logit-target KL; a negative teacher below its
+      confidence is the plain loss bit for bit, never contradicts the corpus,
+      and its step ends below a plain step; self-distillation is zero; merging
+      is the identity on equal inputs and linear otherwise
+
+**Status**: Done. Whether any of it improves a real model is a GPU question;
+the mechanisms are certified and every run records its sources.
+
+## Phase 30: Cyber Policy -- Blockers, Refusals and Approvals
+
+Modelled on an approval program: capabilities in named scopes are blocked by
+default, a blocked request is refused **before any forward pass**, and a
+signed approval lifts the scopes it names for its holder. Blockers are added
+and removed without retraining; the refusal can also be trained into the
+weights. No compliance with any organization's criteria is claimed -- this is
+a mechanism such a program can adopt.
+
+- [x] **30.1** `policy.rs`: `Policy` (blockers with `antipattern`-syntax
+      patterns on the prompt, the output or both, each with a scope and a
+      refusal; a revocation list; the id of the signing key), `Grant`
+      (an `Approval` -- id, scopes, issued, expiry, note -- plus its
+      HMAC-SHA256 under a `Key`), `gated_generate` (refuse before the model,
+      prepend the approval marker when a grant lifts the scope, replace an
+      output that trips an output blocker), `refusal_documents`, and a starter
+      policy with three cyber scopes. HMAC-SHA256 is built on the crate's
+      `sha2` and checked against RFC 4231
+- [x] **30.2** CLI: `dblocks lm policy init | list | add-blocker |
+      remove-blocker | check | revoke`, `dblocks lm approvals issue | verify`,
+      `dblocks lm generate --policy --key --grant`
+- [x] **30.3** Training the refusal: `dblocks lm refusal-corpus` writes
+      `prompt + refusal` for every blocked prompt and `marker + prompt +
+      answer` when an answer is supplied, tokenized for `lm train`, so the
+      weights learn to refuse the bare request and comply with the approved
+      one; mixable with any corpus through Phase 29
+- [x] **30.4** Certificates (`policy` group, 5): the HMAC matches RFC 4231;
+      a grant signed by another key, edited, expired or revoked fails by name;
+      a blocked prompt never reaches the model, a covering grant lifts it with
+      the marker, a foreign scope does not, and an output blocker replaces the
+      output; removing a blocker allows exactly its prompts; the policy JSON
+      round-trips. Plus an end-to-end test against a real model and a trained
+      refusal corpus
+
+**Status**: Done as a mechanism. Whether a trained refusal holds up under
+adversarial prompting is a GPU-scale evaluation this repository cannot run;
+the gate holds regardless of the weights.
+
+## Phase 31: Direction Ablation and Negative Training for Every Model
+
+After mlabonne's abliteration: a behaviour direction is the normalized
+difference of mean residual-stream activations between a target and a
+baseline prompt set at one layer. Remove it from the weights, project it out
+at inference, or penalize it during training -- the last being negative
+supervision for any model whose hidden states can be read.
+
+- [x] **31.1** `ablation.rs`: `Direction` (JSON, per-layer separation
+      recorded), `extract` / `best`, `orthogonalize` (every weight that
+      *writes* the residual stream -- attention `dense`, MLP and expert
+      `fc_out`, token and position embeddings -- has each row projected off
+      the direction; readers are untouched), `project_out`,
+      `projection_penalty`; `LanguageModel::hidden_states` and
+      `forward_ablated`
+- [x] **31.2** Training with the direction: `--direction dir.json
+      --direction-weight` adds `lambda * mean((h_L . d)^2)` at the
+      direction's layer to the LM loss, composable with labeled negatives
+      and the negative teacher
+- [x] **31.3** Negative supervision for the image trunk:
+      `DblockClassifier::training_step_negative` charges per-sample negative
+      labels with `-log(1 - p_k)`; `--synthetic-negatives p` exercises it
+- [x] **31.4** CLI: `dblocks lm direction | ablate | direction-score`;
+      `docs/Direction-Ablation.md`
+- [x] **31.5** Certificates (`ablation` group): orthogonalized weights cannot
+      write the direction (`max |W d| = 0`); orthogonalization is idempotent
+      to the bit; readers are untouched; the projection leaves exactly zero
+      along `d` and is the identity on its complement; an extracted direction
+      separates its sets; weight 0 is the plain loss bit for bit; no negative
+      labels is the plain image step bit for bit
+
+**Status**: Done as a mechanism. Whether removing a direction removes a
+behaviour in a real model is UNKNOWN here (GPU-scale evaluation); the gate of
+Phase 30 is the control that holds regardless.
 
 ## Mutation testing the gate
 
@@ -882,6 +955,7 @@ from current behaviour. The command exits non-zero on any failure, and
 | `planner` | The budget is never exceeded, even against an `expand` that ignores its allowance; depth 0 *is* the greedy policy; `beam(1)` reproduces greedy exactly; only a plan's first step is committed; planned sigmas fall monotonically without undershooting; lookahead defeats a myopic trap |
 | `optim` | Accumulation over `k` steps equals one `k`x batch and fires on that cadence; the EMA is a convex combination that never extrapolates; the LR schedule is bounded, its ramp monotone; the uncertainty optimum is `ln L` and its gradient scale is 1 for every loss magnitude; importance sampling is unbiased with weights bounded by the smoothing floor |
 | `experiment` | A record's 95% interval is the t interval on the mean; more trials narrow it; the median is the middle element; the t table is monotone and bounded by the normal quantile |
+| `policy` | HMAC-SHA256 matches RFC 4231; tampered, foreign-key, expired or revoked grants fail by name; a blocked prompt never reaches the model and a covering grant lifts it with the marker; removing a blocker allows exactly its prompts; the policy JSON round-trips |
 | `multisource` | Mixture shares follow the weights; composite slices are exact; a one-corpus mix is the plain corpus; a teacher mixture of one is its own softened distribution and every mixture is a distribution; the probability-target KL agrees with the logit-target KL; a negative teacher below its confidence is the plain loss bit for bit, never contradicts the corpus, and its step ends below a plain step; self-distillation is zero; merging is the identity on equal inputs and linear in its weights |
 | `accuracy` | Guidance at scale 1 is bitwise identity and affine in the estimates elsewhere; every logit normalization preserves the arg-max; ensembles emit distributions and N copies of one member are that member; the scaling frontier is exactly the undominated set |
 | `model` | Softmax partition; `x0` inside the label-embedding convex hull; unit-norm embeddings; DiT zero-init |
@@ -975,8 +1049,8 @@ See [`docs/Quality-Gate.md`](docs/Quality-Gate.md).
 
 ## Test inventory
 
-414 unit + 30 integration tests, all passing; `cargo clippy --all-targets`
-clean; `cargo doc` warning-free. 111 numerical certificates in 19 groups, plus
+414 unit + 31 integration tests, all passing; `cargo clippy --all-targets`
+clean; `cargo doc` warning-free. 116 numerical certificates in 20 groups, plus
 five-phase verification inside every training run and a bit-identity test
 for resumed training.
 

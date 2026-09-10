@@ -17,7 +17,7 @@ the one the issue states: an optimization hypothesis does not become a fact
 without a measurement.
 
 > **In this repository.** Certificates: `src/verify.rs` (`dblocks verify`,
-> 19 groups). Measurements: the `Status` paragraphs of `TODO.md`. Harnesses:
+> 20 groups). Measurements: the `Status` paragraphs of `TODO.md`. Harnesses:
 > `dblocks sweep`, `dblocks bench --json`, `dblocks audit propagation`,
 > `dblocks lm bench`, `dblocks experiment compare`.
 
@@ -67,6 +67,8 @@ without a measurement.
 | Multi-teacher distillation reduces to single-teacher distillation for one teacher; the mixture target is a distribution | VERIFIED | `multisource` group |
 | A negative teacher below its confidence is the plain loss bit for bit and never contradicts the corpus; its step lowers its proposals relative to a plain step | VERIFIED | `multisource` group |
 | Checkpoint merging is the identity on equal inputs and linear in its weights | VERIFIED | `multisource` group |
+| The policy gate refuses a blocked prompt before any forward pass; grants are unforgeable without the key (HMAC-SHA256 per RFC 4231), expire and can be revoked; removing a blocker allows exactly its prompts | VERIFIED | `policy` group (Phase 30) |
+| A trained refusal holds under adversarial prompting | UNKNOWN | needs a real model and an evaluation set; `dblocks lm refusal-corpus` + `lm train` build it, the gate holds regardless |
 | The certificate suite catches plausible defects | VERIFIED, with limits | Mutation sweep: 5 of 9 mutants survived until the certificates were rewritten to call the code; see `TODO.md` |
 
 ## Measurements made here (CPU, ≤ 400 steps)

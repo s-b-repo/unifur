@@ -729,7 +729,10 @@ mod tests {
         let raw = 20.0f32;
         let sigmas = Tensor::<AB, 1>::from_floats([1.0f32].as_slice(), &device);
 
-        for _ in 0..400 {
+        // 800 steps rather than 400: from an unlucky initialization -- and
+        // the initialization is whatever the process-wide device RNG hands
+        // out while other tests run -- 400 once left the head 0.2 short.
+        for _ in 0..800 {
             let per_sample = Tensor::<AB, 1>::from_floats([raw].as_slice(), &device);
             let loss = UncertaintyWeighting::full()
                 .apply(per_sample, head.forward(sigmas.clone()))

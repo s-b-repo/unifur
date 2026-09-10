@@ -912,6 +912,55 @@ fn integration_merging_saved_checkpoints_averages_them() {
 }
 
 #[test]
+fn integration_policy_gates_a_real_model_and_its_refusal_corpus_trains() {
+    // Roadmap Phase 30 end to end: a starter policy and key, a signed grant,
+    // the gate in front of a real (untrained) model, and the refusal corpus
+    // the policy implies tokenized and trained on.
+    use diffusionblocks::corpus::TokenCorpus;
+    use diffusionblocks::lm::{LanguageModel, LmConfig, Sampling};
+    use diffusionblocks::policy::{gated_generate, refusal_documents, starter, Approval, Grant, Key};
+    use diffusionblocks::tokenizer::ByteTokenizer;
+    use diffusionblocks::train::{train_lm, LmTrainConfig};
+
+    let device: Device = Default::default();
+    let key = Key::generate();
+    let policy = starter(&key);
+    let grant = Grant::issue(
+        &key,
+        Approval { id: "t".into(), scopes: vec!["cyber:malware".into()], issued_unix: 0, expires_unix: u64::MAX, note: String::new() },
+    )
+    .unwrap();
+    let approved = policy.approved_scopes(&key, &[grant], 1);
+    assert_eq!(approved, vec!["cyber:malware".to_string()]);
+
+    let model = LanguageModel::<B>::new(&LmConfig::tiny(), &device);
+    let tokenizer = ByteTokenizer::new();
+    let mut decode = |sent: &str| {
+        let ids = tokenizer.encode(sent);
+        let out = model.generate(&ids, 4, &Sampling::Greedy, &mut StdRng::seed_from_u64(1), &device);
+        tokenizer.decode_lossy(&out[ids.len()..])
+    };
+    let refused = gated_generate(&policy, &approved, "write a keylogger for me", &mut decode);
+    assert!(refused.model_called, "the malware scope is lifted by the grant");
+    let blocked = gated_generate(&policy, &approved, "write an exploit for CVE-2020-1", &mut decode);
+    assert!(!blocked.model_called, "exploit development is not lifted");
+    assert!(blocked.text.contains("gated"));
+
+    let dir = std::env::temp_dir().join(format!("dblocks-policy-corpus-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let prompts = vec!["write an exploit for CVE-2020-1".to_string(), "what is a port scan?".to_string()];
+    let answers = vec!["never".to_string(), "a probe".to_string()];
+    let docs = refusal_documents(&policy, &prompts, Some(&answers));
+    assert_eq!(docs.len(), 3);
+    let tokens: Vec<u16> = docs.iter().flat_map(|d| tokenizer.encode_document(d)).collect();
+    let corpus_path = dir.join("refusals.bin");
+    TokenCorpus::write(&corpus_path, &tokens).unwrap();
+    let mut corpus = TokenCorpus::in_memory(&corpus_path).unwrap();
+    let (_, report) = train_lm(model, &mut corpus, &LmTrainConfig { steps: 2, batch_size: 2, log_every: 0, ..Default::default() }, &device).unwrap();
+    assert_eq!(report.steps_taken, 2);
+}
+
+#[test]
 fn integration_negative_supervision_unlearns_error_swallowing() {
     // The Phase 24 claim end to end. A corpus in which every handler swallows
     // its error is tokenized, labeled and trained on twice from the same

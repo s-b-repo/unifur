@@ -44,7 +44,7 @@ with an accurate "In this repository" block naming the module, types and flags
 that implement it.
 
 ```bash
-# Build and run the quality gate: 111 numerical certificates, non-zero exit on
+# Build and run the quality gate: 116 numerical certificates, non-zero exit on
 # any failure.
 cargo build --release
 ./target/release/dblocks verify
@@ -107,6 +107,12 @@ cargo build --release
     --scopes cyber:exploit-development --expires 1800000000 --out grant.json
 ./target/release/dblocks lm generate --policy policy.json --key key.hex --grant grant.json --prompt "..."
 
+# Direction ablation: find the direction that separates two prompt sets,
+# remove it from the weights, or penalize it while training.
+./target/release/dblocks lm direction --checkpoint lm.mpk --target bad.txt --baseline ok.txt --out dir.json
+./target/release/dblocks lm ablate --checkpoint lm.mpk --direction dir.json --out checkpoints
+./target/release/dblocks lm train --corpus code.bin --direction dir.json --direction-weight 0.1
+
 # Batched inference with top-k output and per-batch profiling.
 ./target/release/dblocks infer --top-k 3 --solver heun
 
@@ -155,6 +161,7 @@ cargo test --all && cargo clippy --all-targets && ./target/release/dblocks verif
 | Experiment records, sweeps, propagation audit | `experiment.rs`, `sweep.rs`, `audit.rs` |
 | Dataset and corpus mixing, checkpoint merging | `mix.rs`, `merge.rs` |
 | Blockers, refusals, signed approvals | `policy.rs` |
+| Behaviour directions: extraction, orthogonalization, penalty | `ablation.rs` |
 | Inference API, profiler | `infer.rs`, `profile.rs` |
 | **Numerical certificate suite** | `verify.rs` |
 
