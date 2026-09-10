@@ -4059,7 +4059,11 @@ fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
     let projection_of = |m: &LanguageModel<A>| -> f32 {
         projection_penalty(&m.hidden_states(ad_tokens())[last], &ad_direction).into_scalar()
     };
-    let lr = 0.1;
+    // First order, the penalized step moves the projection by
+    // `-lr * weight * |grad P|^2` relative to the plain step; the second-order
+    // remainder scales with `lr^2`, so a small step keeps the sign for any
+    // initialization the process-wide RNG hands out (it flipped once at 0.1).
+    let lr = 0.01;
     let penalized_step = ad_model.next_token_step_directed(
         ad_tokens(),
         None,
@@ -4134,8 +4138,8 @@ fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
 
     let (untouched, touched_by_identity) =
         apply::<B, _>(model.clone(), &directions, &HereticParams::identity(), Some(&gates)).context("identity")?;
-    let probs = softmax(model.forward(tokens()).logits.reshape([16, model.vocab_size()]), 1);
-    let self_kl = f64::from(mean_kl(probs.clone(), probs));
+    let logits = model.forward(tokens()).logits.reshape([16, model.vocab_size()]);
+    let self_kl = f64::from(mean_kl(logits.clone(), logits));
     let mut identity_err = self_kl + touched_by_identity as f64;
     if canonical_hash_hex::<B, _>(&untouched) != canonical_hash_hex::<B, _>(&model) {
         identity_err += 1.0;

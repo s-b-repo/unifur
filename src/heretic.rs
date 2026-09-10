@@ -249,11 +249,13 @@ impl RefusalDetector {
     }
 }
 
-/// `KL(p || q)` per row, averaged, from two `[n, v]` probability matrices.
-pub fn mean_kl<B: Backend<FloatElem = f32>>(p: Tensor<B, 2>, q: Tensor<B, 2>) -> f32 {
-    let log_p = p.clone().clamp_min(1e-30).log();
-    let log_q = q.clamp_min(1e-30).log();
-    (p * (log_p - log_q)).sum_dim(1).mean().into_scalar()
+/// `KL(p || q)` per row, averaged, from two `[n, v]` **logit** matrices:
+/// both distributions are formed with `log_softmax`, so nothing is clamped
+/// and a model's KL from itself is exactly zero (roadmap 33.1).
+pub fn mean_kl<B: Backend<FloatElem = f32>>(p_logits: Tensor<B, 2>, q_logits: Tensor<B, 2>) -> f32 {
+    let log_p = burn::tensor::activation::log_softmax(p_logits, 1);
+    let log_q = burn::tensor::activation::log_softmax(q_logits, 1);
+    (log_p.clone().exp() * (log_p - log_q)).sum_dim(1).mean().into_scalar()
 }
 
 /// One evaluated parameter set.
@@ -457,7 +459,7 @@ pub fn decensor<B: Backend<FloatElem = f32>>(
     let gates = model.layer_gates(device);
     let detector = config.detector.clone().unwrap_or_default();
 
-    let baseline_probs: Vec<Tensor<B, 1>> = config.baseline.iter().map(|p| model.next_token_probs(&encode(p), device)).collect();
+    let baseline_logits: Vec<Tensor<B, 1>> = config.baseline.iter().map(|p| model.next_token_logits(&encode(p), device)).collect();
     let refusal_rate = |m: &crate::lm::LanguageModel<B>| -> f64 {
         let texts: Vec<String> = config
             .target
@@ -477,8 +479,8 @@ pub fn decensor<B: Backend<FloatElem = f32>>(
         let (ablated, touched) = apply::<B, _>(model.clone(), &directions, params, Some(&gates))?;
         let refusals = refusal_rate(&ablated);
         let mut kl = 0.0f64;
-        for (prompt, p) in config.baseline.iter().zip(&baseline_probs) {
-            let q = ablated.next_token_probs(&encode(prompt), device);
+        for (prompt, p) in config.baseline.iter().zip(&baseline_logits) {
+            let q = ablated.next_token_logits(&encode(prompt), device);
             let v = p.dims()[0];
             kl += f64::from(mean_kl(p.clone().reshape([1, v]), q.reshape([1, v])));
         }

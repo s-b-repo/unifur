@@ -321,8 +321,8 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
                         (teacher.denoise(pixel_values.clone(), zt.clone(), &sigmas, None).detach(), *w)
                     })
                     .collect();
-                let mixture = teacher_mixture(&teacher_logits, config.temperature);
-                let kl = soft_target_kl_probs(mixture, student_logits.clone(), config.temperature);
+                let log_mixture = log_teacher_mixture(&teacher_logits, config.temperature);
+                let kl = soft_target_kl_log(log_mixture, student_logits.clone(), config.temperature);
                 m_kl = kl.clone().into_scalar();
                 loss = Some(accumulate(loss, kl.mul_scalar(config.kl_weight as f32)));
             }
@@ -386,6 +386,48 @@ pub fn teacher_mixture<B: Backend<FloatElem = f32>>(
         });
     }
     acc.expect("at least one teacher")
+}
+
+/// `log(sum_i w_i softmax(l_i / T))` computed in the log domain (roadmap
+/// 33.1): the log-sum-exp over teachers of `log w_i + log_softmax(l_i / T)`.
+/// The probability-space mixture underflows to zero for a token no teacher
+/// favours and has to be clamped before its logarithm; this form keeps the
+/// true log-mass, and with one teacher it is that teacher's `log_softmax`
+/// bit for bit (`x - max(x) = 0`, `exp(0) = 1`, `log(1) = 0`, `0 + x = x`).
+pub fn log_teacher_mixture<B: Backend<FloatElem = f32>>(
+    teacher_logits: &[(Tensor<B, 2>, f64)],
+    temperature: f64,
+) -> Tensor<B, 2> {
+    let t = temperature.max(1e-6) as f32;
+    let total: f64 = teacher_logits.iter().map(|(_, w)| w).sum();
+    let terms: Vec<Tensor<B, 3>> = teacher_logits
+        .iter()
+        .map(|(logits, w)| {
+            let [n, v] = logits.dims();
+            let log_w = ((w / total).max(0.0)).ln() as f32; // -inf for a zero weight: exp(-inf) = 0 below
+            log_softmax(logits.clone().div_scalar(t), 1).add_scalar(log_w).reshape([1, n, v])
+        })
+        .collect();
+    let stacked = Tensor::cat(terms, 0); // [k, n, v]
+    let [_, n, v] = stacked.dims();
+    let max = stacked.clone().max_dim(0); // [1, n, v]
+    let lse = (stacked - max.clone()).exp().sum_dim(0).log() + max;
+    lse.reshape([n, v])
+}
+
+/// `KL(p || student)` at temperature `T` from a **log-probability** target
+/// (roadmap 33.1), with the same `T^2` factor as [`soft_target_kl`].
+/// Averaged over the batch. `p = exp(log_p)` is formed from the log target,
+/// so a token with a very small target mass contributes `p * (log_p - log_q)`
+/// with its true logarithm rather than a clamped one.
+pub fn soft_target_kl_log<B: Backend<FloatElem = f32>>(
+    log_p: Tensor<B, 2>,
+    student_logits: Tensor<B, 2>,
+    temperature: f64,
+) -> Tensor<B, 1> {
+    let t = temperature.max(1e-6) as f32;
+    let log_q = log_softmax(student_logits.div_scalar(t), 1);
+    (log_p.clone().exp() * (log_p - log_q)).sum_dim(1).mean().mul_scalar(t * t)
 }
 
 fn accumulate<B: Backend>(acc: Option<Tensor<B, 1>>, term: Tensor<B, 1>) -> Tensor<B, 1> {

@@ -106,9 +106,28 @@ impl Unlikelihood {
 
 /// The per-token unlikelihood term `-log(1 - p)` from log-probabilities,
 /// floored at `-log(epsilon)`.
+///
+/// `1 - p` is `-expm1(log p)` (roadmap 33.1): forming it as `1 - exp(log p)`
+/// loses the leading digits when `p` is near one -- at `p = 1 - 1e-4` the
+/// f32 rounding of `p` alone is a 0.06% error in `1 - p` -- which is exactly
+/// where a charge is large and its gradient matters.
 pub fn unlikelihood<B: Backend>(log_probs: Tensor<B, 1>, epsilon: f32) -> Tensor<B, 1> {
-    let p = log_probs.exp();
-    p.neg().add_scalar(1.0).clamp_min(epsilon).log().neg()
+    expm1(log_probs).neg().clamp_min(epsilon).log().neg()
+}
+
+/// `exp(x) - 1` without cancellation for `x` near zero: a degree-10 Taylor
+/// polynomial (truncation below `2^-30` on `|x| <= ln 2`) where the direct
+/// form would cancel, the direct form elsewhere.
+pub fn expm1<B: Backend, const D: usize>(x: Tensor<B, D>) -> Tensor<B, D> {
+    let near = x.clone().abs().lower_elem(std::f32::consts::LN_2);
+    // Horner: x (1 + x/2 (1 + x/3 (... (1 + x/10))))
+    let mut poly = x.clone().div_scalar(10.0).add_scalar(1.0);
+    for k in (2..10).rev() {
+        poly = x.clone().div_scalar(k as f32) * poly + 1.0;
+    }
+    let series = x.clone() * poly;
+    let direct = x.exp().sub_scalar(1.0);
+    direct.mask_where(near, series)
 }
 
 /// Per-token penalty weights from label bytes, via a label -> weight table
@@ -614,6 +633,16 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             .collect()
     }
 
+    /// Next-token logits after `ids`, `[vocab]` on the device.
+    pub fn next_token_logits(&self, ids: &[u16], device: &B::Device) -> Tensor<B, 1> {
+        let ids: Vec<i64> = if ids.is_empty() { vec![i64::from(Special::Bos.id())] } else { ids.iter().map(|t| i64::from(*t)).collect() };
+        let start = ids.len().saturating_sub(self.context);
+        let window = &ids[start..];
+        let n = window.len();
+        let tokens = Tensor::<B, 1, Int>::from_ints(window, device).reshape([1, n]);
+        self.forward(tokens).logits.narrow(1, n - 1, 1).reshape([self.vocab_size])
+    }
+
     /// Next-token probabilities after `ids`, `[vocab]` on the device.
     pub fn next_token_probs(&self, ids: &[u16], device: &B::Device) -> Tensor<B, 1> {
         let ids: Vec<i64> = if ids.is_empty() { vec![i64::from(Special::Bos.id())] } else { ids.iter().map(|t| i64::from(*t)).collect() };
@@ -927,11 +956,11 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
                         (t, *w)
                     })
                     .collect();
-                let mixture = crate::distill::teacher_mixture(&teacher_logits, d.temperature);
+                // Log-domain mixture (roadmap 33.1): no clamp, no underflow.
+                let log_p = crate::distill::log_teacher_mixture(&teacher_logits, d.temperature);
                 let t = d.temperature.max(1e-6) as f32;
-                let log_p = mixture.clone().clamp_min(1e-30).log();
                 let log_q = log_softmax(flat_logits.div_scalar(t), 1);
-                let per_row = (mixture * (log_p - log_q)).sum_dim(1).reshape([b * (n - 1)]);
+                let per_row = (log_p.clone().exp() * (log_p - log_q)).sum_dim(1).reshape([b * (n - 1)]);
                 let kl = (per_row * keep_all).sum() / counted.clone() * (t * t);
                 let value: f32 = kl.clone().into_scalar();
                 (loss + kl.mul_scalar(d.weight as f32), value)
