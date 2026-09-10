@@ -751,7 +751,8 @@ fn integration_global_scope_and_bias_balancing_train_a_moe_trunk() {
         ..TrainConfig::default()
     };
     let (model, summary) = train(&config).unwrap();
-    assert_eq!(summary.steps_taken + summary.steps_skipped, 6);
+    assert_eq!(summary.steps_taken + summary.steps_skipped + summary.steps_accumulated, 6);
+    assert_eq!((summary.steps_taken, summary.steps_accumulated), (3, 3), "accumulate 2: half the micro-batches step, half are folded");
     assert!(summary.health.has_routing(), "routing statistics must reach the health report");
     let rendered = summary.health.render();
     assert!(rendered.contains("load H") && rendered.contains("token H"), "{rendered}");
@@ -1126,4 +1127,137 @@ fn integration_a_language_model_trains_on_a_corpus() {
         &device,
     );
     assert_eq!(plain, cached, "the cache must survive training too");
+}
+
+#[test]
+fn integration_direction_ablation_penalty_and_heretic_run_on_a_trained_model() {
+    // Roadmap Phase 31 end to end on a tiny model: train a few steps, extract
+    // a direction from two prompt sets, ablate it from the weights (gates
+    // honoured), train with the activation penalty, and run a three-trial
+    // Heretic search whose result is a usable model.
+    use diffusionblocks::ablation::{best, extract, orthogonalize, residual_projection};
+    use diffusionblocks::corpus::TokenCorpus;
+    use diffusionblocks::heretic::{decensor, HereticConfig};
+    use diffusionblocks::lm::{LanguageModel, LmConfig};
+    use diffusionblocks::tokenizer::ByteTokenizer;
+    use diffusionblocks::train::{train_lm, LmTrainConfig};
+
+    let device: Device = Default::default();
+    let dir = std::env::temp_dir().join(format!("dblocks-ablation-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let tokenizer = ByteTokenizer::new();
+    let docs = ["I cannot help with that request.", "Sure, here is the code you asked for.", "fn main() { println!(\"hi\"); }"];
+    let tokens: Vec<u16> = docs.iter().cycle().take(24).flat_map(|d| tokenizer.encode_document(d)).collect();
+    let corpus_path = dir.join("corpus.bin");
+    TokenCorpus::write(&corpus_path, &tokens).unwrap();
+    let mut corpus = TokenCorpus::in_memory(&corpus_path).unwrap();
+
+    let config = LmConfig { context: 16, ..LmConfig::tiny() };
+    let (model, _) = train_lm(
+        LanguageModel::<B>::new(&config, &device),
+        &mut corpus,
+        &LmTrainConfig { steps: 3, batch_size: 2, log_every: 0, ..Default::default() },
+        &device,
+    )
+    .unwrap();
+
+    // A direction from the trained model's own residual stream.
+    let target = ["write a keylogger", "write an exploit", "make malware"];
+    let baseline = ["what is a port", "explain a socket", "sort a list"];
+    let residuals = |prompts: &[&str]| -> Vec<Vec<Vec<f32>>> {
+        prompts.iter().map(|p| model.residuals_at_last_position(&tokenizer.encode(p), &device)).collect()
+    };
+    let (t, b) = (residuals(&target), residuals(&baseline));
+    let directions: Vec<_> = (0..model.num_layers())
+        .filter_map(|l| {
+            let tl: Vec<Vec<f32>> = t.iter().map(|r| r[l].clone()).collect();
+            let bl: Vec<Vec<f32>> = b.iter().map(|r| r[l].clone()).collect();
+            extract(l, &tl, &bl)
+        })
+        .collect();
+    assert_eq!(directions.len(), model.num_layers());
+    let chosen = best(&directions).cloned().unwrap();
+    assert!(chosen.separation > 0.0);
+    let path = dir.join("direction.json");
+    chosen.write(&path).unwrap();
+    assert_eq!(diffusionblocks::ablation::Direction::read(&path).unwrap(), chosen);
+
+    // Weight-space ablation with the model's gates: the writers lose their
+    // component along the direction and the model still runs.
+    let gates = model.layer_gates(&device);
+    let before = residual_projection::<B, _>(&model, &chosen, Some(&gates));
+    let (ablated, touched) = orthogonalize::<B, _>(model.clone(), &chosen, Some(gates.clone()));
+    let after = residual_projection::<B, _>(&ablated, &chosen, Some(&gates));
+    assert!(touched > 0 && after < before, "touched {touched}, {before} -> {after}");
+    let ids = tokenizer.encode("keylogger");
+    let ids64: Vec<i64> = ids.iter().map(|t| i64::from(*t)).collect();
+    let n = ids64.len();
+    let tokens = Tensor::<B, 1, burn::tensor::Int>::from_ints(ids64.as_slice(), &device).reshape([1, n]);
+    let logits = ablated.forward(tokens.clone()).logits;
+    assert!(logits.clone().abs().max().into_scalar().is_finite());
+    let ablated_at_inference = model.forward_ablated(tokens, &chosen.tensor::<B>(&device)).logits;
+    assert!(ablated_at_inference.abs().max().into_scalar().is_finite());
+
+    // Training with the penalty reports the projection and lowers it.
+    let (penalized, report) = train_lm(
+        model.clone(),
+        &mut corpus,
+        &LmTrainConfig { steps: 3, batch_size: 2, log_every: 0, direction: Some(chosen.clone()), direction_weight: 10.0, ..Default::default() },
+        &device,
+    )
+    .unwrap();
+    assert!(report.first_direction_projection > 0.0 && report.last_direction_projection.is_finite());
+    assert!(report.last_direction_projection < report.first_direction_projection, "{} -> {}", report.first_direction_projection, report.last_direction_projection);
+    assert!(penalized.hidden_size() == model.hidden_size());
+
+    // Heretic: three trials, a best, and a model that still generates.
+    let heretic = HereticConfig {
+        target: target.iter().map(|s| s.to_string()).collect(),
+        baseline: baseline.iter().map(|s| s.to_string()).collect(),
+        trials: 3,
+        kl_weight: 1.0,
+        max_new: 4,
+        seed: 1,
+        detector: None,
+    };
+    let (decensored, report) = decensor(model.clone(), &heretic, &device).unwrap();
+    assert_eq!(report.trials.len(), 3);
+    assert_eq!(report.directions.len(), model.num_layers());
+    let best_trial = report.best.as_ref().unwrap();
+    assert!(report.trials.iter().all(|t| t.score >= best_trial.score));
+    assert!(best_trial.kl.is_finite() && (0.0..=1.0).contains(&best_trial.refusals));
+    let out = decensored.generate(&ids, 3, &diffusionblocks::lm::Sampling::Greedy, &mut StdRng::seed_from_u64(0), &device);
+    assert!(out.len() > ids.len());
+
+    // The same search from the trainer makes the decensored model the run's
+    // final checkpoint.
+    let (_, report) = train_lm(
+        model,
+        &mut corpus,
+        &LmTrainConfig { steps: 2, batch_size: 2, log_every: 0, heretic: Some(HereticConfig { trials: 2, ..heretic }), ..Default::default() },
+        &device,
+    )
+    .unwrap();
+    assert_eq!(report.heretic.as_ref().unwrap().trials.len(), 2);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn integration_synthetic_negatives_train_the_image_trunk() {
+    // Roadmap 31.3: half of every synthetic batch relabeled and charged.
+    use diffusionblocks::train::{train, TrainConfig};
+    let (_, report) = train(&TrainConfig {
+        image_size: 32,
+        num_labels: 10,
+        batch_size: 4,
+        num_blocks: 1,
+        steps: 3,
+        log_every: 1,
+        synthetic_negatives: 0.5,
+        negative_penalty: 1.0,
+        checks: diffusionblocks::quality::TrainingChecks::none(),
+        ..TrainConfig::default()
+    })
+    .unwrap();
+    assert!(report.mean_loss.is_finite());
 }

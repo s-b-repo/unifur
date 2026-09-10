@@ -212,7 +212,7 @@ invariants, not assumptions.
 
 - [x] **14.1–14.5** Every load-bearing identity is stated as a theorem and
       checked as a residual against a tolerance in `verify.rs`
-- [x] **14.6** Numerical verification — 116 certificates across 20 groups, run by
+- [x] **14.6** Numerical verification — 130 certificates across 21 groups, run by
       `dblocks verify` (non-zero exit on failure) and by the test suite
 
 **Status**: See [Quality gate](#quality-gate) below.
@@ -528,7 +528,36 @@ CPU steps from random initialization is nowhere near enough for it to bite; the
 certificates show the term behaves as specified. It is insurance, correctly
 priced at `1e-3`, against something that has not happened yet.
 
-<!-- 23.4-23.6 MEASUREMENT -->
+**23.4-23.6 measured** (400 steps, 3 blocks, seed 42, `--uncertainty 1.0`;
+the MoSME runs use 2 boxes / 5 experts on every second trunk layer with
+`--z-level 1e-3`, the flat-MoE runs 5 experts top-1 on every second layer
+with `--accumulate 2`; "end" is the mean of the last five logged steps, the
+entropies are the 23.6 diagnostics normalized by `ln E`):
+
+| Configuration | CE at end | load H (end) | token H (end) | min / max expert load (end) |
+|---|---|---|---|---|
+| A: MoSME baseline | **1.809** | 0.898 | 0.967 | 0.106 / 0.363 |
+| B: A + `--bias-balance-rate 1e-3` (23.5) | 1.843 | **0.931** | 0.964 | 0.115 / **0.317** |
+| C: flat MoE, `--balance-scope micro` | 1.914 | 0.894 | 0.983 | 0.106 / 0.340 |
+| D: C with `--balance-scope global` (23.4) | 1.917 | 0.666 | 0.967 | 0.021 / 0.546 |
+
+Read plainly, one seed each: the loss-free bias does what DeepSeek says it
+does — the busiest expert's share drops from 36% to 32% and the load entropy
+rises from 0.90 to 0.93 — at a cross-entropy within noise of the baseline
+(1.84 vs 1.81; a single-seed difference of that size is not a result either
+way). Global-batch balancing behaves exactly as its certificate says and as
+Zhu et al. intend: with the window over two micro-batches the per-micro-batch
+load entropy *falls* (0.89 to 0.67, one expert down to 2% of a micro-batch)
+because the constraint no longer forbids micro-batches from specializing, and
+the cross-entropy is unchanged (1.917 vs 1.914). Whether that freedom buys
+quality is a GPU question (`Remaining`); at this scale it buys nothing and
+costs nothing. Token entropy stays above 0.96 in every run — the routers are
+not collapsing, which is the only thing 400 CPU steps can show. The
+balance-loss column is not comparable across A/B and C/D (different trunks),
+and the earlier "rejected" column of runs C and D read 50% only because the
+summary counted every pending accumulation micro-batch as a rejection; that
+accounting is fixed in the same commit as this paragraph, and no step in any
+of the four runs was actually rejected by a gate.
 
 ## Phase 21: Next-Step and Path Prediction
 
@@ -857,27 +886,50 @@ supervision for any model whose hidden states can be read.
       *writes* the residual stream -- attention `dense`, MLP and expert
       `fc_out`, token and position embeddings -- has each row projected off
       the direction; readers are untouched), `project_out`,
-      `projection_penalty`; `LanguageModel::hidden_states` and
-      `forward_ablated`
+      `projection_penalty`; `LanguageModel::hidden_states`,
+      `residuals_at_last_position`, `forward_ablated`, `layer_gates`. The
+      trunk's residual adds are adaLN-gated, so a writer inside layer `l` is
+      projected off `normalize(g_l ⊙ d)` -- the direction it can actually
+      write -- not off `d`
 - [x] **31.2** Training with the direction: `--direction dir.json
       --direction-weight` adds `lambda * mean((h_L . d)^2)` at the
       direction's layer to the LM loss, composable with labeled negatives
-      and the negative teacher
+      and the negative teacher; `direction_projection` in the logs
 - [x] **31.3** Negative supervision for the image trunk:
       `DblockClassifier::training_step_negative` charges per-sample negative
-      labels with `-log(1 - p_k)`; `--synthetic-negatives p` exercises it
-- [x] **31.4** CLI: `dblocks lm direction | ablate | direction-score`;
-      `docs/Direction-Ablation.md`
-- [x] **31.5** Certificates (`ablation` group): orthogonalized weights cannot
-      write the direction (`max |W d| = 0`); orthogonalization is idempotent
-      to the bit; readers are untouched; the projection leaves exactly zero
-      along `d` and is the identity on its complement; an extracted direction
-      separates its sets; weight 0 is the plain loss bit for bit; no negative
-      labels is the plain image step bit for bit
+      labels with `-log(1 - p_k)`; `--synthetic-negatives p
+      --negative-penalty` relabel a fraction of every batch and charge it;
+      sweep key `negatives`
+- [x] **31.4** CLI: `dblocks lm direction | ablate | direction-score
+      [--ablated]`; `docs/Direction-Ablation.md`
+- [x] **31.5** Certificates (`ablation` group, 14): the extracted direction
+      separates its sets; after ablating the real model no residual writer
+      has a component along the gate-scaled direction (tolerance from the
+      arithmetic); ablating twice on an axis changes no bit; inference
+      ablation removes the direction from every layer; weight 0 is the plain
+      loss bit for bit; a penalized step ends below a plain step; a zero
+      negative charge costs nothing; the charge is bounded by `-ln eps`; a
+      charged image step ends below a rewarded one; plus the five Heretic
+      claims of 31.6
+- [x] **31.6** Heretic mode (github.com/p-e-w/heretic): `heretic.rs` --
+      per-component trapezoid kernels over layers and fractional direction
+      indices, weighted gate-aware orthogonalization, a phrase-list
+      `RefusalDetector`, first-token KL against the original, a seeded
+      TPE-like sampler with the Pareto front kept, every trial recorded;
+      `dblocks lm heretic` decensors a checkpoint, `dblocks lm train
+      --heretic-target --heretic-baseline` makes the decensored model the
+      run's final checkpoint. Certified: the kernel is a trapezoid, identity
+      parameters touch nothing and self-KL is 0, an integer index is that
+      layer's direction, the best is never worse than any trial, the
+      detector matches its phrases
 
-**Status**: Done as a mechanism. Whether removing a direction removes a
-behaviour in a real model is UNKNOWN here (GPU-scale evaluation); the gate of
-Phase 30 is the control that holds regardless.
+**Status**: Done as a mechanism, end to end on a tiny model (the
+integration test extracts a direction from a trained model, ablates it,
+trains with the penalty, and runs a three-trial Heretic search). Whether
+removing a direction removes a behaviour in a real model, and whether
+Heretic's search finds the refusal/KL trade-off it finds on large models,
+are UNKNOWN here (GPU-scale evaluation); the gate of Phase 30 is the
+control that holds regardless.
 
 ## Mutation testing the gate
 
@@ -1002,6 +1054,8 @@ See [`docs/Quality-Gate.md`](docs/Quality-Gate.md).
 | `solver.rs` | DPM++2M used `r = (t_prev - t)/h`, which is negative in λ-space, so the multistep extrapolated backwards and was *worse than Euler*. |
 | `solver.rs` | DDIM added ancestral noise *before* the drift step and computed the drift from the noised latent; the k-diffusion order is step-then-noise. `eta > 1` could also request more noise than the target level holds. |
 | `solver.rs` | `integrate` ignored the caller's RNG, so seeded stochastic trajectories were not reproducible. |
+| `reweight.rs` (test) | The head-convergence test trained with Adam at `beta_2 = 0.999` from whatever initialization the process-wide device RNG handed out. From an unlucky one the objective's gradient `1 - L exp(-l)` starts in the thousands and settles near one, and the second-moment memory of the early magnitude left the later steps too small to close the gap: a flake that reproduced under `cargo test --all` about one run in five. `beta_2 = 0.9` forgets it in ten steps and the test now trains to tolerance under a cap instead of for a fixed count. |
+| `train.rs` | With `--accumulate k > 1`, every accepted micro-batch that did not complete a cycle was counted as a *rejected* step: the summary of a 400-step run reported "200 rejected by a quality check, 50% reject rate" when no gate had fired. The counter now separates `steps_accumulated` (persisted in the training state) from rejections; the reject rate and the mean-loss denominator use all three. |
 | `consistency.rs` | Each residual was scaled by *its own value*, silently optimizing `L²` — a gradient that vanishes exactly where the residual is already small. |
 | `consistency.rs` | The trajectory rollout multiplied sigma by a factor > 1, so the "chain" ran *up* the noise schedule. |
 | `multi_block.rs` | `config.solver` was stored and never used: `sample --solver` was silently ignored and everything ran Euler. |
@@ -1046,11 +1100,17 @@ See [`docs/Quality-Gate.md`](docs/Quality-Gate.md).
 | 20.x convergence *results* | GPU compute. The mechanisms ship and are certified; whether they improve final accuracy needs runs long enough for convergence to mean something |
 | 22.2 self-conditioning | Needs a new module parameter, which breaks existing checkpoint records — see the phase note |
 | 22.7 learned step-value head | Trained models, to generate the value targets |
+| 23.4–23.6 quality effect of balancing | GPU compute: at 400 CPU steps the mechanisms move the load entropies as specified and CE not at all (measured, Phase 23); whether specialization buys quality needs convergence-length runs |
+| 24.x / 29.3 / 31.2 effect of negative supervision on generated code | GPU compute and a real corpus: the terms are certified to move the flagged probabilities per step; their effect on a trained model's output is unmeasured |
+| 28 GPU reproduction matrix (issue #1 §3–6, #4 A1) | GPU compute; `dblocks sweep` / `dblocks bench --json` / `dblocks experiment compare` are the harness |
+| 29.2 / 29.4 quality of multi-teacher distillation and merged checkpoints | GPU compute; certified as mechanisms |
+| 30.3 whether the refusal corpus teaches a real model to refuse and to comply under an approval marker | GPU compute and an instruction-tuned checkpoint; the gate holds regardless (`policy` certificates) |
+| 31 whether ablating a direction removes a behaviour; whether Heretic's search finds a better refusal/KL trade-off than uniform ablation | GPU compute and an instruction-tuned checkpoint with real prompt sets; `lm direction-score --ablated` and `lm heretic --json` are the harness |
 
 ## Test inventory
 
-414 unit + 31 integration tests, all passing; `cargo clippy --all-targets`
-clean; `cargo doc` warning-free. 116 numerical certificates in 20 groups, plus
+420 unit + 33 integration tests, all passing; `cargo clippy --all-targets`
+clean; `cargo doc` warning-free. 130 numerical certificates in 21 groups, plus
 five-phase verification inside every training run and a bit-identity test
 for resumed training.
 

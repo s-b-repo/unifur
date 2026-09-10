@@ -261,6 +261,11 @@ pub struct TrainConfig {
     /// Also checkpoint every this many steps (`0` = only at the end). A step
     /// inside an accumulation cycle defers to the next cycle boundary.
     pub checkpoint_every: usize,
+    /// Fraction of each batch relabeled with a wrong class and charged as a
+    /// negative (roadmap 31.3); `0` is off and takes the plain path.
+    pub synthetic_negatives: f64,
+    /// Coefficient on the negative charge.
+    pub negative_penalty: f32,
 }
 
 impl Default for TrainConfig {
@@ -301,6 +306,8 @@ impl Default for TrainConfig {
             bias_balance_rate: 0.0,
             out_dir: None,
             checkpoint_every: 0,
+            synthetic_negatives: 0.0,
+            negative_penalty: 1.0,
         }
     }
 }
@@ -354,6 +361,10 @@ pub struct TrainSummary {
     pub steps_taken: usize,
     /// Steps rejected by a quality check at any phase.
     pub steps_skipped: usize,
+    /// Accepted micro-batches folded into an accumulation cycle that had not
+    /// completed yet (`--accumulate` > 1): neither steps nor rejections.
+    #[serde(default)]
+    pub steps_accumulated: usize,
     pub final_loss: f32,
     pub mean_loss: f32,
     pub elapsed_secs: f64,
@@ -379,9 +390,9 @@ pub struct TrainSummary {
 }
 
 impl TrainSummary {
-    /// Fraction of steps the gradient gate rejected.
+    /// Fraction of micro-batches a quality gate rejected.
     pub fn skip_rate(&self) -> f32 {
-        let total = self.steps_taken + self.steps_skipped;
+        let total = self.steps_taken + self.steps_skipped + self.steps_accumulated;
         if total == 0 {
             0.0
         } else {
@@ -674,6 +685,7 @@ where
         }
         summary.steps_taken = extras.steps_taken;
         summary.steps_skipped = extras.steps_skipped;
+        summary.steps_accumulated = extras.steps_accumulated;
         summary.steps_clipped = extras.steps_clipped;
         summary.periodic_verifications = extras.periodic_verifications;
         summary.final_lr = extras.final_lr;
@@ -748,6 +760,7 @@ where
         running: running.clone(),
         steps_taken: summary.steps_taken,
         steps_skipped: summary.steps_skipped,
+        steps_accumulated: summary.steps_accumulated,
         steps_clipped: summary.steps_clipped,
         periodic_verifications: summary.periodic_verifications,
         final_lr: summary.final_lr,
@@ -781,6 +794,8 @@ where
                 balance: config.balance_schedule,
                 step,
                 global_load: global_load.as_mut(),
+                synthetic_negatives: config.synthetic_negatives,
+                negative_penalty: config.negative_penalty,
             },
         );
         let block_idx = block_of(&fields);
@@ -909,6 +924,8 @@ where
                 }
             }
             summary.steps_taken += 1;
+        } else if verdict.accepted {
+            summary.steps_accumulated += 1;
         } else {
             summary.steps_skipped += 1;
         }
@@ -1023,7 +1040,9 @@ where
         }
     }
 
-    let completed = summary.steps_taken + summary.steps_skipped;
+    // Every micro-batch the loop ran, whether it stepped, was folded into a
+    // pending accumulation cycle, or was rejected.
+    let completed = summary.steps_taken + summary.steps_skipped + summary.steps_accumulated;
     summary.mean_loss = if completed == 0 {
         0.0
     } else {
@@ -1087,6 +1106,8 @@ struct DblockExtras {
     running: RunningAvg,
     steps_taken: usize,
     steps_skipped: usize,
+    #[serde(default)]
+    steps_accumulated: usize,
     steps_clipped: usize,
     periodic_verifications: usize,
     final_lr: f64,
@@ -1240,6 +1261,9 @@ pub struct Reweighting<'a, B: AutodiffBackend<FloatElem = f32>> {
     /// Global-batch load windows, when the balance scope is global
     /// (roadmap 23.4).
     pub global_load: Option<&'a mut GlobalLoad>,
+    /// Fraction of samples relabeled as negatives, and the charge (roadmap 31.3).
+    pub synthetic_negatives: f64,
+    pub negative_penalty: f32,
 }
 
 impl<B: AutodiffBackend<FloatElem = f32>> Reweighting<'_, B> {
@@ -1286,13 +1310,46 @@ impl<B: AutodiffBackend<FloatElem = f32>> Reweighting<'_, B> {
             None => (sampler_cfg.sample(rng, block_idx, b), None),
         };
 
-        let parts = model.training_step_on(
-            batch.pixel_values.clone(),
-            batch.labels.clone(),
-            &sigmas,
-            block_idx,
-            weights.as_deref(),
-        );
+        // Synthetic negatives (roadmap 31.3): a fraction of the batch keeps a
+        // deliberately wrong label and is charged for it instead of rewarded.
+        let parts = if self.synthetic_negatives > 0.0 {
+            let device = batch.pixel_values.device();
+            let labels: Vec<i64> = batch.labels.clone().into_data().convert::<i64>().iter::<i64>().collect();
+            let num_labels = model.model().label_embedding_weight().dims()[0] as i64;
+            let mut mask = vec![0.0f32; b];
+            let mut relabeled = labels.clone();
+            for i in 0..b {
+                if rng.random::<f64>() < self.synthetic_negatives && num_labels > 1 {
+                    mask[i] = 1.0;
+                    let offset = rng.random_range(1..num_labels);
+                    relabeled[i] = (labels[i] + offset) % num_labels;
+                }
+            }
+            extra.push(("negative_samples", format!("{}", mask.iter().filter(|m| **m > 0.0).count())));
+            model.training_step_negative(
+                batch.pixel_values.clone(),
+                Tensor::<B, 1, burn::tensor::Int>::from_ints(relabeled.as_slice(), &device),
+                &sigmas,
+                block_idx,
+                weights.as_deref(),
+                crate::dblock::NegativeLabels {
+                    mask: Tensor::<B, 1>::from_floats(mask.as_slice(), &device),
+                    alpha: self.negative_penalty,
+                    epsilon: 1e-6,
+                },
+            )
+        } else {
+            model.training_step_on(
+                batch.pixel_values.clone(),
+                batch.labels.clone(),
+                &sigmas,
+                block_idx,
+                weights.as_deref(),
+            )
+        };
+        if parts.metrics.negative_samples > 0 {
+            extra.push(("negative_prob", jnum(parts.metrics.negative_prob)));
+        }
 
         // --- feed the proposal what it just learned -----------------------
         if let Some(sampler) = self.sampler.as_deref_mut() {
@@ -1594,6 +1651,13 @@ pub struct LmTrainConfig {
     pub negative_confidence: f32,
     /// Coefficient on the negative teacher's charge; `0.0` is off.
     pub negative_penalty: f32,
+    /// A behaviour direction penalized during training (roadmap 31.2).
+    pub direction: Option<crate::ablation::Direction>,
+    /// Weight on `mean((h_L . d)^2)`; `0.0` adds nothing.
+    pub direction_weight: f64,
+    /// Decensor the trained model afterwards (roadmap 31.6): the final
+    /// checkpoint is the best Heretic trial rather than the raw weights.
+    pub heretic: Option<crate::heretic::HereticConfig>,
 }
 
 impl Default for LmTrainConfig {
@@ -1616,6 +1680,9 @@ impl Default for LmTrainConfig {
             distill_temperature: 2.0,
             negative_confidence: 0.5,
             negative_penalty: 0.0,
+            direction: None,
+            direction_weight: 0.0,
+            heretic: None,
         }
     }
 }
@@ -1666,6 +1733,12 @@ pub struct LmTrainReport {
     pub negative_teacher_tokens: usize,
     /// The distillation term at the last step (roadmap 29.2); 0 without teachers.
     pub last_distill_loss: f32,
+    /// Mean squared projection onto the penalized direction at the first and
+    /// last step (roadmap 31.2); 0 without one.
+    pub first_direction_projection: f32,
+    pub last_direction_projection: f32,
+    /// What decensoring found, when it ran (roadmap 31.6).
+    pub heretic: Option<crate::heretic::HereticReport>,
 }
 
 /// Train a causal language model on `corpus`, charging labeled anti-patterns
@@ -1716,6 +1789,10 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
         anyhow::ensure!(negative.vocab_size() == model.vocab_size(), "the negative teacher must share the vocabulary");
     }
     let mut source_stats = SourceStats::new(mix.names().to_vec());
+    let direction_tensor = config.direction.as_ref().map(|d| {
+        anyhow::ensure!(d.hidden_size() == model.hidden_size(), "direction has {} dims, the model {}", d.hidden_size(), model.hidden_size());
+        Ok::<_, anyhow::Error>((d.tensor::<B>(device), d.layer.min(model.num_layers() - 1)))
+    }).transpose()?;
 
     let mut optim = AdamWConfig::new()
         .with_weight_decay(config.weight_decay as f32)
@@ -1783,6 +1860,9 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
         last_negative_teacher_prob: 0.0,
         negative_teacher_tokens: 0,
         last_distill_loss: 0.0,
+        first_direction_projection: 0.0,
+        last_direction_projection: 0.0,
+        heretic: None,
     };
     let mut loss_sum = 0.0f64;
     let mut elapsed_before = 0.0f64;
@@ -1884,8 +1964,13 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
             temperature: config.distill_temperature,
             weight: config.distill_weight,
         });
+        let penalty = direction_tensor.as_ref().map(|(d, layer)| crate::lm::DirectionPenalty {
+            direction: d,
+            layer: *layer,
+            weight: config.direction_weight,
+        });
         let crate::lm::LmStep { loss, metrics, routing } =
-            model.next_token_step_full(tokens, negatives, extra, distill, span.clone());
+            model.next_token_step_directed(tokens, negatives, extra, distill, penalty, span.clone());
 
         if !metrics.loss.is_finite() {
             // The same policy as the image loop: a pathological step is
@@ -1911,6 +1996,10 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
         report.last_negative_teacher_prob = metrics.negative_teacher_prob;
         report.negative_teacher_tokens += metrics.negative_teacher_tokens;
         report.last_distill_loss = metrics.distill_loss;
+        if report.steps_taken == 0 {
+            report.first_direction_projection = metrics.direction_projection;
+        }
+        report.last_direction_projection = metrics.direction_projection;
         source_stats.record(&origin, metrics.loss);
         report.steps_taken += 1;
         report.penalized_tokens += metrics.penalized_tokens;
@@ -1943,6 +2032,9 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
             if metrics.distill_loss > 0.0 {
                 line.push_str(&format!(" | distill {:.4}", metrics.distill_loss));
             }
+            if direction_tensor.is_some() {
+                line.push_str(&format!(" | direction {:.4}", metrics.direction_projection));
+            }
             println!("{line}");
             if let Some(logger) = logger.as_mut() {
                 let mut fields = vec![
@@ -1954,6 +2046,7 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
                     ("negative_teacher_tokens", metrics.negative_teacher_tokens.to_string()),
                     ("negative_teacher_prob", crate::logging::jnum(metrics.negative_teacher_prob)),
                     ("distill_loss", crate::logging::jnum(metrics.distill_loss)),
+                    ("direction_projection", crate::logging::jnum(metrics.direction_projection)),
                     ("source", origin.sole_source().map_or("-1".to_string(), |s| s.to_string())),
                 ];
                 if !routing.is_empty() {
@@ -1985,6 +2078,19 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
         print!("per-corpus:\n{}", source_stats.render());
     }
     report.sources = source_stats;
+    if let Some(heretic) = &config.heretic {
+        println!(
+            "heretic: {} target / {} baseline prompt(s), {} trial(s), kl weight {}",
+            heretic.target.len(),
+            heretic.baseline.len(),
+            heretic.trials,
+            heretic.kl_weight
+        );
+        let (decensored, report_h) = crate::heretic::decensor(model, heretic, device)?;
+        print!("{}", crate::heretic::render(&report_h.trials));
+        model = decensored;
+        report.heretic = Some(report_h);
+    }
     report.checkpoint = save_state(config.steps, &model, &optim, &rng, &report, loss_sum, report.elapsed_secs)?;
     Ok((model, report))
 }

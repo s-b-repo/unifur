@@ -198,6 +198,27 @@ enum LmAction {
         /// Coefficient on the negative teacher's charge.
         #[arg(long, default_value_t = 1.0)]
         negative_penalty: f32,
+        /// A behaviour direction from `lm direction` penalized in activation
+        /// space while training (roadmap 31.2).
+        #[arg(long)]
+        direction: Option<PathBuf>,
+        /// Weight on the direction penalty `mean((h . d)^2)`.
+        #[arg(long, default_value_t = 1.0)]
+        direction_weight: f64,
+        /// Decensor the trained model afterwards (roadmap 31.6, Heretic):
+        /// prompts the model should stop refusing, one per line.
+        #[arg(long, requires = "heretic_baseline")]
+        heretic_target: Option<PathBuf>,
+        /// Prompts whose behaviour Heretic must preserve, one per line.
+        #[arg(long)]
+        heretic_baseline: Option<PathBuf>,
+        #[arg(long, default_value_t = 12)]
+        heretic_trials: usize,
+        #[arg(long, default_value_t = 1.0)]
+        heretic_kl_weight: f64,
+        /// Tokens generated per target prompt when counting refusals.
+        #[arg(long, default_value_t = 24)]
+        heretic_max_new: usize,
         #[arg(long, default_value_t = 200)]
         steps: usize,
         #[arg(long, default_value_t = 8)]
@@ -249,6 +270,80 @@ enum LmAction {
         /// Append one record per variant here.
         #[arg(long)]
         json: Option<PathBuf>,
+    },
+    /// Extract a behaviour direction (roadmap 31.1): the normalized
+    /// difference of the mean residual stream between target and baseline
+    /// prompts, one candidate per layer, the best-separated one written out.
+    Direction {
+        #[arg(long)]
+        checkpoint: PathBuf,
+        /// Prompts exhibiting the behaviour, one per line.
+        #[arg(long)]
+        target: PathBuf,
+        /// Prompts without it, one per line.
+        #[arg(long)]
+        baseline: PathBuf,
+        /// Fix the layer instead of picking the best-separated one.
+        #[arg(long)]
+        layer: Option<usize>,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = false)]
+        tiny: bool,
+    },
+    /// Orthogonalize every residual-writing weight against a direction and
+    /// save the result as a new checkpoint (roadmap 31.1, abliteration).
+    Ablate {
+        #[arg(long)]
+        checkpoint: PathBuf,
+        #[arg(long)]
+        direction: PathBuf,
+        #[arg(long, default_value = "checkpoints")]
+        out: PathBuf,
+        #[arg(long, default_value_t = false)]
+        tiny: bool,
+    },
+    /// Mean projection of the residual stream onto a direction over prompt
+    /// files (roadmap 31.4): the before/after measurement of an ablation.
+    DirectionScore {
+        #[arg(long)]
+        checkpoint: PathBuf,
+        #[arg(long)]
+        direction: PathBuf,
+        /// Prompt files, one prompt per line; repeatable.
+        #[arg(long, action = clap::ArgAction::Append, required = true)]
+        prompts: Vec<PathBuf>,
+        /// Also project the direction out at inference and report the result.
+        #[arg(long, default_value_t = false)]
+        ablated: bool,
+        #[arg(long, default_value_t = false)]
+        tiny: bool,
+    },
+    /// Decensor a checkpoint the Heretic way (roadmap 31.6): search
+    /// per-component weighted ablations against refusals and first-token KL
+    /// and save the best.
+    Heretic {
+        #[arg(long)]
+        checkpoint: PathBuf,
+        #[arg(long)]
+        target: PathBuf,
+        #[arg(long)]
+        baseline: PathBuf,
+        #[arg(long, default_value_t = 12)]
+        trials: usize,
+        #[arg(long, default_value_t = 1.0)]
+        kl_weight: f64,
+        #[arg(long, default_value_t = 24)]
+        max_new: usize,
+        #[arg(long, default_value_t = 0)]
+        seed: u64,
+        #[arg(long, default_value = "checkpoints")]
+        out: PathBuf,
+        /// Write the full report (directions, every trial, the best) here.
+        #[arg(long)]
+        json: Option<PathBuf>,
+        #[arg(long, default_value_t = false)]
+        tiny: bool,
     },
     /// Capability gating (roadmap Phase 30): blockers, refusals and the
     /// scopes signed approvals lift.
@@ -420,6 +515,14 @@ enum Command {
         /// Also write a checkpoint (model + training state) every n steps.
         #[arg(long, default_value_t = 0)]
         checkpoint_every: usize,
+        /// Relabel this fraction of every batch with a wrong class and charge
+        /// the model for believing it (roadmap 31.3): negative supervision
+        /// for the image trunk. 0 is off.
+        #[arg(long, default_value_t = 0.0)]
+        synthetic_negatives: f64,
+        /// Coefficient on the negative charge.
+        #[arg(long, default_value_t = 1.0)]
+        negative_penalty: f32,
         /// Disable every training-time quality check.
         #[arg(long, default_value_t = false)]
         no_checks: bool,
@@ -1030,6 +1133,13 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
             negative_teacher,
             negative_confidence,
             negative_penalty,
+            direction,
+            direction_weight,
+            heretic_target,
+            heretic_baseline,
+            heretic_trials,
+            heretic_kl_weight,
+            heretic_max_new,
             steps,
             batch_size,
             lr,
@@ -1124,7 +1234,24 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
                 distill_temperature,
                 negative_confidence,
                 negative_penalty: if negative_teacher.is_some() { negative_penalty } else { 0.0 },
+                direction: direction.as_deref().map(diffusionblocks::ablation::Direction::read).transpose()?,
+                direction_weight: if direction.is_some() { direction_weight } else { 0.0 },
+                heretic: match (&heretic_target, &heretic_baseline) {
+                    (Some(t), Some(b)) => Some(diffusionblocks::heretic::HereticConfig {
+                        target: diffusionblocks::heretic::HereticConfig::read_prompts(t)?,
+                        baseline: diffusionblocks::heretic::HereticConfig::read_prompts(b)?,
+                        trials: heretic_trials,
+                        kl_weight: heretic_kl_weight,
+                        max_new: heretic_max_new,
+                        seed,
+                        detector: None,
+                    }),
+                    _ => None,
+                },
             };
+            if let Some(d) = &config.direction {
+                println!("direction: layer {} of {} dims, separation {:.3}, weight {}", d.layer, d.hidden_size(), d.separation, config.direction_weight);
+            }
             let (model, report) = train::train_lm_mixed(model, &mut mix, &inputs, &config, &device)?;
             println!(
                 "done: {} steps in {:.1}s | loss {:.4} -> {:.4} (mean {:.4}) | {} skipped",
@@ -1147,6 +1274,21 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
                     report.negative_teacher_tokens, report.first_negative_teacher_prob, report.last_negative_teacher_prob
                 );
             }
+            if config.direction.is_some() {
+                println!(
+                    "direction penalty: mean squared projection {:.6} -> {:.6}",
+                    report.first_direction_projection, report.last_direction_projection
+                );
+            }
+            if let Some(h) = &report.heretic {
+                match &h.best {
+                    Some(t) => println!(
+                        "heretic: refusals {:.3} -> {:.3} | kl {:.4} | {} parameter(s) ablated (saved as the final checkpoint)",
+                        h.baseline_refusals, t.refusals, t.kl, t.touched
+                    ),
+                    None => println!("heretic: no trial ran"),
+                }
+            }
             if report.last_distill_loss > 0.0 {
                 println!("distillation term at the last step: {:.4}", report.last_distill_loss);
             }
@@ -1155,6 +1297,113 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
                 None => checkpoint::save_content_addressed(model, &out_dir, "lm")?,
             };
             println!("checkpoint saved: {} (training state beside it)", path.display());
+            Ok(())
+        }
+        LmAction::Direction { checkpoint, target, baseline, layer, out, tiny } => {
+            use diffusionblocks::ablation;
+            use diffusionblocks::heretic::HereticConfig;
+            let (model, device) = load_lm_eval(&checkpoint, tiny)?;
+            let tokenizer = ByteTokenizer::new();
+            let (target, baseline) = (HereticConfig::read_prompts(&target)?, HereticConfig::read_prompts(&baseline)?);
+            let residuals = |prompts: &[String]| -> Vec<Vec<Vec<f32>>> {
+                prompts.iter().map(|p| model.residuals_at_last_position(&tokenizer.encode(p), &device)).collect()
+            };
+            let (t, b) = (residuals(&target), residuals(&baseline));
+            let layers = model.num_layers();
+            let mut candidates = Vec::new();
+            for l in 0..layers {
+                let tl: Vec<Vec<f32>> = t.iter().map(|r| r[l].clone()).collect();
+                let bl: Vec<Vec<f32>> = b.iter().map(|r| r[l].clone()).collect();
+                if let Some(d) = ablation::extract(l, &tl, &bl) {
+                    println!("layer {l}: separation {:.4} | target {:.4} baseline {:.4}", d.separation, d.target_mean_projection, d.baseline_mean_projection);
+                    candidates.push(d);
+                }
+            }
+            let chosen = match layer {
+                Some(l) => candidates.into_iter().find(|d| d.layer == l).ok_or_else(|| anyhow::anyhow!("layer {l} gave no direction"))?,
+                None => ablation::best(&candidates).cloned().ok_or_else(|| anyhow::anyhow!("no layer separates the prompt sets"))?,
+            };
+            chosen.write(&out)?;
+            println!("direction: layer {} ({} target, {} baseline prompts) -> {}", chosen.layer, target.len(), baseline.len(), out.display());
+            Ok(())
+        }
+        LmAction::Ablate { checkpoint, direction, out, tiny } => {
+            use diffusionblocks::ablation;
+            let (model, device) = load_lm_eval(&checkpoint, tiny)?;
+            let d = ablation::Direction::read(&direction)?;
+            anyhow::ensure!(d.hidden_size() == model.hidden_size(), "direction has {} dims, the model {}", d.hidden_size(), model.hidden_size());
+            let gates = model.layer_gates(&device);
+            let before = ablation::residual_projection::<Eval, _>(&model, &d, Some(&gates));
+            let (ablated, touched) = ablation::orthogonalize::<Eval, _>(model, &d, Some(gates.clone()));
+            let after = ablation::residual_projection::<Eval, _>(&ablated, &d, Some(&gates));
+            let parent = checkpoint::file_sha256_hex(&checkpoint)?;
+            let path = checkpoint::save_content_addressed(ablated, &out, "lm")?;
+            write_derived_state(&path, "ablate", serde_json::json!({ "parent": parent, "direction": &d, "touched": touched }))?;
+            println!("ablated {touched} parameter(s) | max |W d| {before:.3e} -> {after:.3e} | {}", path.display());
+            Ok(())
+        }
+        LmAction::DirectionScore { checkpoint, direction, prompts, ablated, tiny } => {
+            use diffusionblocks::ablation;
+            use diffusionblocks::heretic::HereticConfig;
+            let (model, device) = load_lm_eval(&checkpoint, tiny)?;
+            let d = ablation::Direction::read(&direction)?;
+            anyhow::ensure!(d.hidden_size() == model.hidden_size(), "direction has {} dims, the model {}", d.hidden_size(), model.hidden_size());
+            let tokenizer = ByteTokenizer::new();
+            let tensor = d.tensor::<Eval>(&device);
+            let layer = d.layer.min(model.num_layers() - 1);
+            println!("{:<40} {:>8} {:>12}{}", "prompts", "count", "projection", if ablated { "     ablated" } else { "" });
+            for file in &prompts {
+                let lines = HereticConfig::read_prompts(file)?;
+                let mut sum = 0.0f64;
+                let mut sum_ablated = 0.0f64;
+                for p in &lines {
+                    let ids = tokenizer.encode(p);
+                    let r = model.residuals_at_last_position(&ids, &device);
+                    sum += r[layer].iter().zip(&d.vector).map(|(a, b)| f64::from(a * b)).sum::<f64>();
+                    if ablated {
+                        let ids64: Vec<i64> = if ids.is_empty() { vec![i64::from(diffusionblocks::tokenizer::Special::Bos.id())] } else { ids.iter().map(|t| i64::from(*t)).collect() };
+                        let start = ids64.len().saturating_sub(model.context());
+                        let n = ids64.len() - start;
+                        let tokens = burn::tensor::Tensor::<Eval, 1, burn::tensor::Int>::from_ints(&ids64[start..], &device).reshape([1, n]);
+                        let (_, states) = model.forward_span_states(tokens, 0..model.num_layers(), Some(&tensor));
+                        let h: Vec<f32> = states[layer].clone().narrow(1, n - 1, 1).reshape([d.hidden_size()]).into_data().convert::<f32>().iter::<f32>().collect();
+                        sum_ablated += h.iter().zip(&d.vector).map(|(a, b)| f64::from(a * b)).sum::<f64>();
+                    }
+                }
+                let count = lines.len().max(1) as f64;
+                let mut line = format!("{:<40} {:>8} {:>12.5}", file.display(), lines.len(), sum / count);
+                if ablated {
+                    line.push_str(&format!(" {:>11.3e}", sum_ablated / count));
+                }
+                println!("{line}");
+            }
+            Ok(())
+        }
+        LmAction::Heretic { checkpoint, target, baseline, trials, kl_weight, max_new, seed, out, json, tiny } => {
+            use diffusionblocks::heretic::{self, HereticConfig};
+            let (model, device) = load_lm_eval(&checkpoint, tiny)?;
+            let config = HereticConfig {
+                target: HereticConfig::read_prompts(&target)?,
+                baseline: HereticConfig::read_prompts(&baseline)?,
+                trials,
+                kl_weight,
+                max_new,
+                seed,
+                detector: None,
+            };
+            let (decensored, report) = heretic::decensor(model, &config, &device)?;
+            print!("{}", heretic::render(&report.trials));
+            let parent = checkpoint::file_sha256_hex(&checkpoint)?;
+            let path = checkpoint::save_content_addressed(decensored, &out, "lm")?;
+            write_derived_state(&path, "heretic", serde_json::json!({ "parent": parent, "best": &report.best, "baseline_refusals": report.baseline_refusals }))?;
+            match &report.best {
+                Some(t) => println!("best: refusals {:.3} -> {:.3} | kl {:.4} | {} parameter(s) ablated -> {}", report.baseline_refusals, t.refusals, t.kl, t.touched, path.display()),
+                None => println!("no trial ran; saved the untouched weights -> {}", path.display()),
+            }
+            if let Some(json) = json {
+                std::fs::write(&json, serde_json::to_string_pretty(&report)?)?;
+                println!("report: {}", json.display());
+            }
             Ok(())
         }
         LmAction::Policy { action } => cmd_policy(action),
@@ -1533,6 +1782,8 @@ fn cmd_train(command: Command) -> Result<()> {
         no_checks,
         no_preflight,
         verify_every,
+        synthetic_negatives,
+        negative_penalty,
         mosme_spec,
         mosme_every,
         index_out,
@@ -1643,6 +1894,8 @@ fn cmd_train(command: Command) -> Result<()> {
         // beside it. `--async-save` keeps the old weights-only background save.
         out_dir: (!async_save).then(|| out_path.clone()),
         checkpoint_every,
+        synthetic_negatives,
+        negative_penalty,
     };
 
     println!(
@@ -1664,12 +1917,17 @@ fn cmd_train(command: Command) -> Result<()> {
     } else {
         let (model, summary) = train::train(&config)?;
         println!(
-            "done: {} steps in {:.1}s (mean loss {:.4}, {} rejected by a quality check, {:.1}% reject rate)",
+            "done: {} steps in {:.1}s (mean loss {:.4}, {} rejected by a quality check, {:.1}% reject rate{})",
             summary.steps_taken,
             summary.elapsed_secs,
             summary.mean_loss,
             summary.steps_skipped,
-            100.0 * summary.skip_rate()
+            100.0 * summary.skip_rate(),
+            if summary.steps_accumulated > 0 {
+                format!(", {} micro-batches accumulated", summary.steps_accumulated)
+            } else {
+                String::new()
+            }
         );
         if let Some(reason) = &summary.aborted {
             println!("run stopped early: {reason}");
@@ -2284,6 +2542,43 @@ fn cmd_merge(model_args: ModelArgs, input: Vec<PathBuf>, weights: &str, out: Pat
 
 /// A state directory for a merged model recording its parents, so the
 /// provenance chain does not stop at the merge.
+/// A checkpoint plus its device, loaded for evaluation-side tooling.
+fn load_lm_eval(checkpoint: &Path, tiny: bool) -> Result<(LanguageModel<Eval>, <Eval as burn::tensor::backend::BackendTypes>::Device)> {
+    let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
+    let config = if tiny { LmConfig::tiny() } else { LmConfig::default() };
+    let model = checkpoint::load::<Eval, _>(LanguageModel::<Eval>::new(&config, &device), checkpoint, &device)?;
+    Ok((model, device))
+}
+
+/// Training-state sidecar for a checkpoint derived from another by a
+/// weight-space operation (ablation, decensoring): no optimizer, a parent.
+fn write_derived_state(path: &Path, kind: &str, extras: serde_json::Value) -> Result<()> {
+    use diffusionblocks::checkpoint::{self as ck, TrainState};
+    let dir = TrainState::dir_for(path);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)?;
+    }
+    let state = TrainState {
+        format_version: ck::STATE_FORMAT_VERSION,
+        kind: kind.into(),
+        step: 0,
+        seed: 0,
+        host_rng: serde_json::Value::Null,
+        config: serde_json::Value::Null,
+        build: ck::BuildInfo::current(),
+        datasets: Vec::new(),
+        model: ck::model_entry(path)?,
+        optimizer: None,
+        ema: None,
+        head: None,
+        head_optimizer: None,
+        extras,
+        saved_unix_secs: ck::unix_now(),
+    };
+    state.write(&dir)?;
+    Ok(())
+}
+
 fn write_merge_state(path: &Path, parents: &[String], weights: &[f64], inputs: &[PathBuf]) -> Result<()> {
     use diffusionblocks::checkpoint::{self as ck, TrainState};
     let dir = TrainState::dir_for(path);

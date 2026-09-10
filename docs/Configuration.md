@@ -337,12 +337,21 @@ is checked against the output blockers. See [Cyber Policy](Cyber-Policy.md).
 |---|---|---|
 | `lm direction` | `--checkpoint --target a.txt --baseline b.txt [--layer auto\|n] --out dir.json [--tiny]` | Extract the behaviour direction (one prompt per line per file); `auto` keeps the layer with the largest separation |
 | `lm ablate` | `--checkpoint --direction dir.json --out dir [--tiny]` | Orthogonalize every residual-writing weight against the direction; writes a new checkpoint whose state records the parent and the direction |
-| `lm direction-score` | `--checkpoint --direction dir.json --prompts p.txt [--tiny]` | Mean projection of the prompts onto the direction at its layer |
+| `lm direction-score` | `--checkpoint --direction dir.json --prompts p.txt [--prompts q.txt] [--ablated] [--tiny]` | Mean projection of each prompt file onto the direction at its layer; `--ablated` also reports it with the direction projected out at inference |
+| `lm heretic` | `--checkpoint --target a.txt --baseline b.txt [--trials 12] [--kl-weight 1] [--max-new 24] [--seed 0] --out dir [--json report.json] [--tiny]` | Heretic search over per-component weighted ablations against refusals and first-token KL; saves the best trial as a new checkpoint (Phase 31.6) |
 
 `dblocks lm train` takes `--direction dir.json --direction-weight λ` to
 penalize the squared projection during training; `dblocks train` takes
 `--synthetic-negatives p` to mark a fraction of synthetic samples as negative
 labels charged with `−log(1 − p_k)`. See [Direction Ablation](Direction-Ablation.md).
+
+`dblocks lm train --heretic-target a.txt --heretic-baseline b.txt
+[--heretic-trials 12] [--heretic-kl-weight 1] [--heretic-max-new 24]` runs the
+Heretic search after training and saves the decensored model as the run's
+final checkpoint (`heretic` in the report). `dblocks train --synthetic-negatives p
+[--negative-penalty α]` relabels a fraction `p` of every batch with a wrong
+class and charges the model `α · −log(1 − p_label)` for it (`negative_samples`,
+`negative_prob` in the JSONL); the sweep key is `negatives`.
 
 ### `dblocks lm generate`
 

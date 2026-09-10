@@ -210,7 +210,7 @@ impl Report {
 }
 
 /// Names of every certificate group, in the order [`run_all`] emits them.
-pub const GROUPS: [&str; 20] = [
+pub const GROUPS: [&str; 21] = [
     "schedule",
     "preconditioning",
     "stats",
@@ -229,6 +229,7 @@ pub const GROUPS: [&str; 20] = [
     "experiment",
     "multisource",
     "policy",
+    "ablation",
     "model",
     "autodiff",
 ];
@@ -278,6 +279,7 @@ pub fn run_all() -> Report {
     certificates.extend(experiment_certificates());
     certificates.extend(multisource_certificates());
     certificates.extend(policy_certificates());
+    certificates.extend(ablation_certificates());
     certificates.extend(model_certificates());
     certificates.extend(autodiff_certificates());
     Report { certificates }
@@ -3656,6 +3658,345 @@ fn policy_checks() -> anyhow::Result<Vec<Certificate>> {
     ])
 }
 
+fn ablation_certificates() -> Vec<Certificate> {
+    checks_or_failed("ablation", ablation_checks)
+}
+
+fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
+    use crate::ablation::{best as best_direction, extract, orthogonalize, projection_penalty, residual_projection, Direction};
+    use crate::checkpoint::canonical_hash_hex;
+    use crate::dblock::NegativeLabels;
+    use crate::heretic::{apply, best, interpolate, mean_kl, search, HereticParams, Kernel, RefusalDetector, SearchConfig};
+    use crate::lm::{DirectionPenalty, LanguageModel, LmConfig};
+    use crate::train::DefaultTrainBackend as A;
+    use burn::optim::{GradientsParams, Optimizer, SgdConfig};
+    use burn::tensor::activation::softmax;
+
+    let device = Default::default();
+    let model = LanguageModel::<B>::new(&LmConfig { context: 16, ..LmConfig::tiny() }, &device);
+    let h = model.hidden_size();
+    let layers = model.num_layers();
+    let eps = f64::from(f32::EPSILON);
+
+    // ------------------------------------------------------------------
+    // A direction from the model's own residual stream (roadmap 31.1): the
+    // two prompt sets differ in their last byte, one candidate per layer,
+    // the best-separated one kept. Its target set must project above its
+    // baseline set along it -- that is what "separates" means.
+    let prompt = |last: u8| -> Vec<u16> {
+        let mut ids: Vec<u16> = (0..15u16).map(|i| 65 + (i * 5 % 26)).collect();
+        ids.push(u16::from(last));
+        ids
+    };
+    let residuals = |lasts: &[u8]| -> Vec<Vec<Vec<f32>>> {
+        lasts.iter().map(|l| model.residuals_at_last_position(&prompt(*l), &device)).collect()
+    };
+    let (target, baseline) = (residuals(b"abcde"), residuals(b"vwxyz"));
+    let directions: Vec<Direction> = (0..layers)
+        .filter_map(|l| {
+            let t: Vec<Vec<f32>> = target.iter().map(|r| r[l].clone()).collect();
+            let b: Vec<Vec<f32>> = baseline.iter().map(|r| r[l].clone()).collect();
+            extract(l, &t, &b)
+        })
+        .collect();
+    let chosen = best_direction(&directions).cloned().context("a direction")?;
+    let separation_err = f64::from(u8::from(
+        chosen.separation.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
+            || chosen.target_mean_projection.partial_cmp(&chosen.baseline_mean_projection) != Some(std::cmp::Ordering::Greater),
+    ));
+    let norm_err = (chosen.vector.iter().map(|x| f64::from(*x) * f64::from(*x)).sum::<f64>().sqrt() - 1.0).abs();
+
+    // ------------------------------------------------------------------
+    // Weight-space ablation on the real model, adaLN gates included: after
+    // it, no residual writer has a component along the (gate-scaled)
+    // direction. The tolerance is the arithmetic's: `(w - (w.d) d).d =
+    // (w.d)(1 - d.d)` plus the rounding of two h-term dot products.
+    let gates = model.layer_gates(&device);
+    let before = f64::from(residual_projection::<B, _>(&model, &chosen, Some(&gates)));
+    let (ablated, touched) = orthogonalize::<B, _>(model.clone(), &chosen, Some(gates.clone()));
+    let after = f64::from(residual_projection::<B, _>(&ablated, &chosen, Some(&gates)));
+    let projection_tolerance = 4.0 * h as f64 * eps * before.max(1.0);
+    let mut writer_err = after;
+    if touched == 0 || before.partial_cmp(&after) != Some(std::cmp::Ordering::Greater) {
+        writer_err = 1.0;
+    }
+
+    // On a coordinate axis the projection is exact arithmetic, so a second
+    // pass has nothing left to remove: bit-identical weights.
+    let axis = Direction {
+        layer: chosen.layer,
+        vector: (0..h).map(|i| if i == 3 { 1.0 } else { 0.0 }).collect(),
+        separation: 0.0,
+        target_mean_projection: 0.0,
+        baseline_mean_projection: 0.0,
+        target_count: 0,
+        baseline_count: 0,
+    };
+    let (once, _) = orthogonalize::<B, _>(model.clone(), &axis, Some(gates.clone()));
+    let (twice, _) = orthogonalize::<B, _>(once.clone(), &axis, Some(gates.clone()));
+    let idempotent_err = f64::from(u8::from(canonical_hash_hex::<B, _>(&once) != canonical_hash_hex::<B, _>(&twice)));
+
+    // ------------------------------------------------------------------
+    // Inference-time ablation: with the direction projected out after the
+    // embedding and after every layer, every layer's output has no
+    // component along it.
+    let ids: Vec<i64> = prompt(b'a').iter().map(|t| i64::from(*t)).collect();
+    let tokens = || Tensor::<B, 1, Int>::from_ints(ids.as_slice(), &device).reshape([1, 16]);
+    let d_tensor = chosen.tensor::<B>(&device);
+    let (_, states) = model.forward_span_states(tokens(), 0..layers, Some(&d_tensor));
+    let (_, plain_states) = model.forward_span_states(tokens(), 0..layers, None);
+    let largest_state = plain_states
+        .iter()
+        .map(|s| f64::from(s.clone().abs().max().into_scalar()))
+        .fold(1.0f64, f64::max);
+    let inference_err = states
+        .iter()
+        .map(|s| f64::from(s.clone().matmul(d_tensor.clone().reshape([1, h, 1])).abs().max().into_scalar()))
+        .fold(0.0f64, f64::max);
+    let inference_tolerance = 4.0 * h as f64 * eps * largest_state;
+
+    // ------------------------------------------------------------------
+    // The training penalty (roadmap 31.2). At weight zero the objective is
+    // the plain loss to the bit; with a weight, a step ends with the
+    // penalized layer's states projecting less onto the direction than a
+    // plain step does.
+    let span = 0..layers;
+    let plain = model.next_token_step_full(tokens(), None, None, None, span.clone());
+    let silent = model.next_token_step_directed(
+        tokens(),
+        None,
+        None,
+        None,
+        Some(DirectionPenalty { direction: &d_tensor, layer: chosen.layer, weight: 0.0 }),
+        span.clone(),
+    );
+    let mut zero_weight_err =
+        f64::from(u8::from(plain.loss.into_scalar().to_bits() != silent.loss.into_scalar().to_bits()));
+    if silent.metrics.direction_projection != 0.0 {
+        zero_weight_err = 1.0;
+    }
+
+    let ad_device = Default::default();
+    let ad_model = LanguageModel::<A>::new(&LmConfig { context: 16, ..LmConfig::tiny() }, &ad_device);
+    let ad_tokens = || Tensor::<A, 1, Int>::from_ints(ids.as_slice(), &ad_device).reshape([1, 16]);
+    // The penalized direction: the mean state of the last layer, so the
+    // projection starts large.
+    let last = layers - 1;
+    let mean_state: Vec<f32> = ad_model.hidden_states(ad_tokens())[last]
+        .clone()
+        .mean_dim(1)
+        .reshape([h])
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect();
+    let norm = mean_state.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+    let unit: Vec<f32> = mean_state.iter().map(|x| x / norm).collect();
+    let ad_direction = Tensor::<A, 1>::from_floats(unit.as_slice(), &ad_device);
+    let projection_of = |m: &LanguageModel<A>| -> f32 {
+        projection_penalty(&m.hidden_states(ad_tokens())[last], &ad_direction).into_scalar()
+    };
+    let lr = 0.1;
+    let penalized_step = ad_model.next_token_step_directed(
+        ad_tokens(),
+        None,
+        None,
+        None,
+        Some(DirectionPenalty { direction: &ad_direction, layer: last, weight: 1.0 }),
+        span.clone(),
+    );
+    let grads = GradientsParams::from_grads(penalized_step.loss.backward(), &ad_model);
+    let penalized = SgdConfig::new().init().step(lr, ad_model.clone(), grads);
+    let plain_step = ad_model.next_token_step_full(ad_tokens(), None, None, None, span.clone());
+    let grads = GradientsParams::from_grads(plain_step.loss.backward(), &ad_model);
+    let unpenalized = SgdConfig::new().init().step(lr, ad_model, grads);
+    let (after_penalized, after_plain) = (projection_of(&penalized), projection_of(&unpenalized));
+    let mut penalty_step_err = f64::from((after_penalized - after_plain).max(0.0));
+    if after_penalized.to_bits() == after_plain.to_bits() {
+        penalty_step_err = 1.0;
+    }
+
+    // ------------------------------------------------------------------
+    // Negative labels for the image trunk (roadmap 31.3). A charge of zero
+    // costs nothing; a charge of one is bounded by `-ln eps`; and a charged
+    // step ends with the labels less probable than a rewarded step does --
+    // measured on the clean latent, where no noise is drawn.
+    let cfg = ViTDiTConfig::tiny(10);
+    let block_cfg = DblockConfig { num_blocks: 1, ..DblockConfig::default() };
+    let classifier = DblockClassifier::<A>::new(&cfg, &block_cfg, &ad_device);
+    let pixels = Tensor::<A, 4>::random([4, 3, 32, 32], Distribution::Uniform(-1.0, 1.0), &ad_device);
+    let labels = Tensor::<A, 1, Int>::from_ints([0i64, 1, 2, 3], &ad_device);
+    let sigmas = [0.05f64; 4];
+    let negatives = |alpha: f32| NegativeLabels::<A> {
+        mask: Tensor::<A, 1>::ones([4], &ad_device),
+        alpha,
+        epsilon: 1e-6,
+    };
+    let free = classifier.training_step_negative(pixels.clone(), labels.clone(), &sigmas, 0, None, negatives(0.0));
+    let mut free_err = f64::from(free.metrics.ce_loss.abs());
+    if free.metrics.negative_samples != 4 {
+        free_err = 1.0;
+    }
+    let charged = classifier.training_step_negative(pixels.clone(), labels.clone(), &sigmas, 0, None, negatives(1.0));
+    let bound_err = (f64::from(charged.metrics.ce_loss) + (1e-6f64).ln()).max(0.0);
+
+    let label_prob = |m: &DblockClassifier<A>| -> f32 {
+        let clean = m.model().normalized_label_embeds(labels.clone());
+        let probs = softmax(m.denoise(pixels.clone(), clean, &sigmas, Some(0)), 1);
+        probs.gather(1, labels.clone().unsqueeze_dim::<2>(1)).mean().into_scalar()
+    };
+    let grads = GradientsParams::from_grads(charged.loss.backward(), &classifier);
+    let charged_model = SgdConfig::new().init().step(lr, classifier.clone(), grads);
+    let rewarded_step = classifier.training_step_on(pixels.clone(), labels.clone(), &sigmas, 0, None);
+    let grads = GradientsParams::from_grads(rewarded_step.loss.backward(), &classifier);
+    let rewarded_model = SgdConfig::new().init().step(lr, classifier, grads);
+    let (p_charged, p_rewarded) = (label_prob(&charged_model), label_prob(&rewarded_model));
+    let mut negative_step_err = f64::from((p_charged - p_rewarded).max(0.0));
+    if p_charged.to_bits() == p_rewarded.to_bits() {
+        negative_step_err = 1.0;
+    }
+
+    // ------------------------------------------------------------------
+    // Heretic (roadmap 31.6): the trapezoid kernel, identity parameters,
+    // direction interpolation, the search's best, the refusal detector.
+    let kernel = Kernel { max_weight: 1.0, max_weight_position: 3.0, min_weight: 0.2, min_weight_distance: 2.0 };
+    let mut kernel_err = f64::from((kernel.weight(3) - 1.0).abs() + (kernel.weight(0) - 0.2).abs() + (kernel.weight(6) - 0.2).abs());
+    kernel_err += f64::from((kernel.weight(4) - 0.6).abs());
+    for layer in 0..8 {
+        let w = kernel.weight(layer);
+        if !(0.2..=1.0).contains(&w) {
+            kernel_err += 1.0;
+        }
+    }
+
+    let (untouched, touched_by_identity) =
+        apply::<B, _>(model.clone(), &directions, &HereticParams::identity(), Some(&gates)).context("identity")?;
+    let probs = softmax(model.forward(tokens()).logits.reshape([16, model.vocab_size()]), 1);
+    let self_kl = f64::from(mean_kl(probs.clone(), probs));
+    let mut identity_err = self_kl + touched_by_identity as f64;
+    if canonical_hash_hex::<B, _>(&untouched) != canonical_hash_hex::<B, _>(&model) {
+        identity_err += 1.0;
+    }
+
+    let at_one = interpolate(&directions, 1.0).context("interpolated")?;
+    let interpolation_err = f64::from(u8::from(at_one != directions[1].vector));
+
+    let trials = search(&SearchConfig::new(9, layers), |params| {
+        let refusals = f64::from(params.attention.kernel.max_weight - params.mlp.kernel.min_weight).abs();
+        let kl = f64::from(params.attention.direction_index).abs() * 0.01;
+        Ok((refusals, kl, 1))
+    })
+    .context("search")?;
+    let lowest = trials.iter().map(|t| t.score).fold(f64::INFINITY, f64::min);
+    let best_err = best(&trials).map_or(1.0, |t| (t.score - lowest).max(0.0));
+
+    let detector = RefusalDetector::default();
+    let detector_err = f64::from(u8::from(
+        !detector.is_refusal("I cannot help with that request.") || detector.is_refusal("Sure, here is the code you asked for."),
+    ));
+
+    Ok(vec![
+        cert(
+            "ablation",
+            "extracted_direction_separates_its_sets",
+            "The best-separated direction is a unit vector along which the target prompts' mean residual lies above the baseline prompts' (roadmap 31.1).",
+            separation_err + norm_err,
+            8.0 * h as f64 * eps,
+        ),
+        cert(
+            "ablation",
+            "orthogonalized_writers_have_no_component_along_the_direction",
+            "After weight-space ablation no residual writer of the model has a component along the gate-scaled direction, up to the arithmetic of two h-term dot products.",
+            writer_err,
+            projection_tolerance,
+        ),
+        cert(
+            "ablation",
+            "orthogonalizing_twice_is_the_identity",
+            "On a coordinate axis the projection is exact, so ablating an ablated model changes no bit.",
+            idempotent_err,
+            0.0,
+        ),
+        cert(
+            "ablation",
+            "inference_ablation_removes_the_direction_from_every_layer",
+            "With the direction projected out after every layer, no layer's output has a component along it.",
+            inference_err,
+            inference_tolerance,
+        ),
+        cert(
+            "ablation",
+            "zero_direction_weight_is_the_plain_loss",
+            "A direction penalty of weight zero reproduces the plain next-token loss bit for bit and reports no projection (roadmap 31.2).",
+            zero_weight_err,
+            0.0,
+        ),
+        cert(
+            "ablation",
+            "penalized_step_ends_below_plain_step",
+            "From one initialization and batch, a step with the direction penalty leaves the penalized layer projecting less onto the direction than a plain step does.",
+            penalty_step_err,
+            0.0,
+        ),
+        cert(
+            "ablation",
+            "zero_negative_charge_costs_nothing",
+            "Negative labels charged at zero contribute exactly zero cross-entropy while still being counted (roadmap 31.3).",
+            free_err,
+            0.0,
+        ),
+        cert(
+            "ablation",
+            "negative_charge_is_bounded",
+            "The negative charge -log(1 - p) is clamped at -ln(eps) per sample, so a batch of negatives cannot cost more than that.",
+            bound_err,
+            0.0,
+        ),
+        cert(
+            "ablation",
+            "negative_step_ends_below_rewarded_step",
+            "From one initialization and batch, a step that charges the labels leaves them less probable on the clean latent than a step that rewards them.",
+            negative_step_err,
+            0.0,
+        ),
+        cert(
+            "ablation",
+            "heretic_kernel_is_a_trapezoid",
+            "The Heretic kernel is max_weight at its position, min_weight beyond its distance, linear between, and within [min, max] everywhere (roadmap 31.6).",
+            kernel_err,
+            1e-6,
+        ),
+        cert(
+            "ablation",
+            "heretic_identity_parameters_touch_nothing",
+            "Heretic's identity parameters ablate no parameter, leave every bit of the model in place, and a model's KL from itself is zero.",
+            identity_err,
+            0.0,
+        ),
+        cert(
+            "ablation",
+            "integer_direction_index_is_that_layers_direction",
+            "An integer direction index interpolates to exactly that layer's direction.",
+            interpolation_err,
+            0.0,
+        ),
+        cert(
+            "ablation",
+            "heretic_best_is_never_worse_than_any_trial",
+            "The trial the search reports as best has the lowest score of every trial it ran.",
+            best_err,
+            0.0,
+        ),
+        cert(
+            "ablation",
+            "refusal_detector_matches_its_phrases",
+            "The refusal detector flags a refusal phrase and passes a compliant answer.",
+            detector_err,
+            0.0,
+        ),
+    ])
+}
+
 fn model_certificates() -> Vec<Certificate> {
     let device = Default::default();
     let cfg = ViTDiTConfig::tiny(10);
@@ -3886,6 +4227,7 @@ mod tests {
         assert_eq!(
             groups,
             vec![
+                "ablation",
                 "accuracy",
                 "antipattern",
                 "autodiff",

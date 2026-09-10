@@ -722,27 +722,39 @@ mod tests {
         type AB = Autodiff<NdArray<f32>>;
         let device = Default::default();
         let mut head = LogVarianceHead::<AB>::new(32, 32, &device);
-        let mut optimizer = AdamWConfig::new().init();
+        // A short second-moment memory. The objective's gradient is
+        // `1 - L exp(-l)`: from an initialization with `l` well below `ln L`
+        // it starts in the thousands and settles near one, and Adam's
+        // default `beta_2 = 0.999` remembers the early magnitude for a
+        // thousand steps, leaving the later steps too small to close the
+        // gap. `beta_2 = 0.9` forgets it in ten.
+        let mut optimizer = AdamWConfig::new().with_beta_2(0.9).init();
 
         // One noise level, one loss magnitude: the simplest case where the
         // answer is known exactly.
         let raw = 20.0f32;
         let sigmas = Tensor::<AB, 1>::from_floats([1.0f32].as_slice(), &device);
 
-        // 800 steps rather than 400: from an unlucky initialization -- and
-        // the initialization is whatever the process-wide device RNG hands
-        // out while other tests run -- 400 once left the head 0.2 short.
-        for _ in 0..800 {
+        // The initialization is whatever the process-wide device RNG hands
+        // out while other tests run, so the number of steps is not fixed:
+        // train until the head is within tolerance, and fail only if it never
+        // gets there within a generous cap.
+        let expected = UncertaintyWeighting::optimal_log_variance(f64::from(raw)) as f32;
+        let mut learned = f32::NAN;
+        for step in 0..4000 {
             let per_sample = Tensor::<AB, 1>::from_floats([raw].as_slice(), &device);
             let loss = UncertaintyWeighting::full()
                 .apply(per_sample, head.forward(sigmas.clone()))
                 .mean();
             let grads = GradientsParams::from_grads(loss.backward(), &head);
             head = optimizer.step(0.05, head, grads);
+            if step % 50 == 49 {
+                learned = head.forward(sigmas.clone()).into_scalar();
+                if (learned - expected).abs() < 0.1 {
+                    break;
+                }
+            }
         }
-
-        let learned: f32 = head.forward(sigmas).into_scalar();
-        let expected = UncertaintyWeighting::optimal_log_variance(f64::from(raw)) as f32;
         assert!(
             (learned - expected).abs() < 0.15,
             "head converged to {learned}, expected ln({raw}) = {expected}"

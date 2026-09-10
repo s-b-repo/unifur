@@ -802,6 +802,15 @@ impl<B: Backend> DbLayer<B> {
         }
     }
 
+    /// The adaLN gates `(gate_msa, gate_mlp)` this layer applies under
+    /// `conditioning`, each `[b, h]` -- what its two residual writers are
+    /// scaled by (roadmap 31.1).
+    pub(crate) fn gates(&self, conditioning: &Tensor<B, 2>) -> (Tensor<B, 2>, Tensor<B, 2>) {
+        let mods = self.ada_ln.forward(conditioning.clone());
+        let h = mods.dims()[1] / 6;
+        (mods.clone().narrow(1, 2 * h, h), mods.narrow(1, 5 * h, h))
+    }
+
     /// The sparse feed-forward, if this layer has one.
     pub(crate) fn sparse_mut(&mut self) -> Option<SparseLayerMut<'_, B>> {
         match &mut self.mlp {

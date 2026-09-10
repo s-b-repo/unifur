@@ -62,6 +62,7 @@
 //! - [`logging`]: JSONL metrics logger
 //! - [`verify`]: numerical certificate suite (the quality gate)
 
+pub mod ablation;
 pub mod accuracy;
 pub mod adaptive;
 pub mod audit;
@@ -77,6 +78,7 @@ pub mod distill;
 pub mod experiment;
 pub mod expert_index;
 pub mod flow;
+pub mod heretic;
 pub mod infer;
 pub mod lm;
 pub mod merge;

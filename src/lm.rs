@@ -318,6 +318,11 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         self.layers.len()
     }
 
+    /// Width of the residual stream.
+    pub fn hidden_size(&self) -> usize {
+        self.embedding_weight().dims()[1]
+    }
+
     /// Contiguous layer window owned by `block_idx`.
     pub fn layer_range(&self, block_idx: usize) -> std::ops::Range<usize> {
         assert!(block_idx < self.num_blocks, "block {block_idx} out of range");
@@ -351,20 +356,61 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         tokens: Tensor<B, 2, Int>,
         span: std::ops::Range<usize>,
     ) -> LmOutput<B> {
+        self.forward_span_states(tokens, span, None).0
+    }
+
+    /// The conditioning vector every layer sees on the language path: the
+    /// timestep-zero embedding, `[b, cond]`.
+    fn conditioning(&self, b: usize, device: &B::Device) -> Tensor<B, 2> {
+        crate::vit::silu_public(self.time_embedder.forward(Tensor::<B, 1>::zeros([b], device)))
+    }
+
+    /// The adaLN gates of every layer under the language conditioning
+    /// (roadmap 31.1): what a residual writer's output is scaled by before
+    /// it reaches the stream. Needed to ablate a direction correctly.
+    pub fn layer_gates(&self, device: &B::Device) -> Vec<crate::ablation::LayerGates> {
+        let cond = self.conditioning(1, device);
+        self.layers
+            .iter()
+            .map(|layer| {
+                let (msa, mlp) = layer.gates(&cond);
+                crate::ablation::LayerGates {
+                    attention: msa.into_data().convert::<f32>().iter::<f32>().collect(),
+                    mlp: mlp.into_data().convert::<f32>().iter::<f32>().collect(),
+                }
+            })
+            .collect()
+    }
+
+    /// [`Self::forward_span`] that also returns every layer's output (the
+    /// residual stream before the final norm), and optionally projects a
+    /// direction out of the stream after every layer (roadmap 31.1).
+    pub fn forward_span_states(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        span: std::ops::Range<usize>,
+        ablate: Option<&Tensor<B, 1>>,
+    ) -> (LmOutput<B>, Vec<Tensor<B, 3>>) {
         let device = tokens.device();
         let b = tokens.dims()[0];
 
         // A plain LM has no noise level; timestep zero keeps the conditioning
         // path identical to the image trunk's rather than special-casing it.
-        let cond = crate::vit::silu_public(
-            self.time_embedder.forward(Tensor::<B, 1>::zeros([b], &device)),
-        );
+        let cond = self.conditioning(b, &device);
 
         let mut hidden = self.embed(tokens);
+        if let Some(d) = ablate {
+            hidden = crate::ablation::project_out(hidden, d);
+        }
+        let mut states = Vec::with_capacity(self.layers.len());
         let mut balance: Option<crate::vit::RouterAux<B>> = None;
         for i in span.start..span.end.min(self.layers.len()) {
-            let (states, aux) = self.layers[i].forward(hidden, &cond);
-            hidden = states;
+            let (mut next, aux) = self.layers[i].forward(hidden, &cond);
+            if let Some(d) = ablate {
+                next = crate::ablation::project_out(next, d);
+            }
+            hidden = next;
+            states.push(hidden.clone());
             if let Some(aux) = aux {
                 balance = Some(match balance {
                     None => aux,
@@ -381,12 +427,51 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             .matmul(self.embedding_weight().transpose())
             .reshape([bb, n, self.vocab_size]);
 
-        LmOutput { logits, balance_loss: balance }
+        (LmOutput { logits, balance_loss: balance }, states)
     }
 
     /// Every layer.
     pub fn forward(&self, tokens: Tensor<B, 2, Int>) -> LmOutput<B> {
         self.forward_span(tokens, 0..self.layers.len())
+    }
+
+    /// Every layer's output for `tokens`, before the final norm.
+    pub fn hidden_states(&self, tokens: Tensor<B, 2, Int>) -> Vec<Tensor<B, 3>> {
+        self.forward_span_states(tokens, 0..self.layers.len(), None).1
+    }
+
+    /// Forward with `direction` projected out of the residual stream after
+    /// the embedding and after every layer: inference-time ablation.
+    pub fn forward_ablated(&self, tokens: Tensor<B, 2, Int>, direction: &Tensor<B, 1>) -> LmOutput<B> {
+        self.forward_span_states(tokens, 0..self.layers.len(), Some(direction)).0
+    }
+
+    /// The residual stream at the last position of `ids`, one `[h]` vector
+    /// per layer, on the host: the raw material of a behaviour direction.
+    pub fn residuals_at_last_position(&self, ids: &[u16], device: &B::Device) -> Vec<Vec<f32>> {
+        let ids: Vec<i64> = if ids.is_empty() { vec![i64::from(Special::Bos.id())] } else { ids.iter().map(|t| i64::from(*t)).collect() };
+        let start = ids.len().saturating_sub(self.context);
+        let window = &ids[start..];
+        let n = window.len();
+        let tokens = Tensor::<B, 1, Int>::from_ints(window, device).reshape([1, n]);
+        self.hidden_states(tokens)
+            .into_iter()
+            .map(|h| {
+                let width = h.dims()[2];
+                h.narrow(1, n - 1, 1).reshape([width]).into_data().convert::<f32>().iter::<f32>().collect()
+            })
+            .collect()
+    }
+
+    /// Next-token probabilities after `ids`, `[vocab]` on the device.
+    pub fn next_token_probs(&self, ids: &[u16], device: &B::Device) -> Tensor<B, 1> {
+        let ids: Vec<i64> = if ids.is_empty() { vec![i64::from(Special::Bos.id())] } else { ids.iter().map(|t| i64::from(*t)).collect() };
+        let start = ids.len().saturating_sub(self.context);
+        let window = &ids[start..];
+        let n = window.len();
+        let tokens = Tensor::<B, 1, Int>::from_ints(window, device).reshape([1, n]);
+        let logits = self.forward(tokens).logits.narrow(1, n - 1, 1).reshape([self.vocab_size]);
+        softmax(logits, 0)
     }
 
     /// Forward over `tokens`, treating them as a continuation of whatever
@@ -473,7 +558,7 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         tokens: Tensor<B, 2, Int>,
         span: std::ops::Range<usize>,
     ) -> (Tensor<B, 1>, LmMetrics) {
-        let step = self.objective(tokens, span, None, None, None);
+        let step = self.objective(tokens, span, None, None, None, None);
         (step.loss, step.metrics)
     }
 
@@ -486,7 +571,7 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         negatives: Option<(Tensor<B, 2>, Unlikelihood)>,
         span: std::ops::Range<usize>,
     ) -> LmStep<B> {
-        self.objective(tokens, span, negatives, None, None)
+        self.objective(tokens, span, negatives, None, None, None)
     }
 
     /// [`Self::next_token_step`] with the two open-weight signals of roadmap
@@ -501,7 +586,22 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         distill: Option<Distillation<'_, B>>,
         span: std::ops::Range<usize>,
     ) -> LmStep<B> {
-        self.objective(tokens, span, negatives, extra, distill)
+        self.objective(tokens, span, negatives, extra, distill, None)
+    }
+
+    /// [`Self::next_token_step_full`] with a direction penalty (roadmap 31.2):
+    /// `weight * mean((h_L . d)^2)` at the direction's layer joins the loss.
+    /// A weight of zero adds nothing and the loss is the plain one bit for bit.
+    pub fn next_token_step_directed(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        negatives: Option<(Tensor<B, 2>, Unlikelihood)>,
+        extra: Option<ExtraNegatives<B>>,
+        distill: Option<Distillation<'_, B>>,
+        direction: Option<DirectionPenalty<'_, B>>,
+        span: std::ops::Range<usize>,
+    ) -> LmStep<B> {
+        self.objective(tokens, span, negatives, extra, distill, direction)
     }
 
     /// What a frozen **negative** model would say next (roadmap 29.3): at
@@ -542,7 +642,7 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         penalty: Unlikelihood,
         span: std::ops::Range<usize>,
     ) -> (Tensor<B, 1>, LmMetrics) {
-        let step = self.objective(tokens, span, Some((weights, penalty)), None, None);
+        let step = self.objective(tokens, span, Some((weights, penalty)), None, None, None);
         (step.loss, step.metrics)
     }
 
@@ -553,12 +653,19 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         negatives: Option<(Tensor<B, 2>, Unlikelihood)>,
         extra: Option<ExtraNegatives<B>>,
         distill: Option<Distillation<'_, B>>,
+        direction: Option<DirectionPenalty<'_, B>>,
     ) -> LmStep<B> {
         let device = tokens.device();
         let [b, n] = tokens.dims();
         assert!(n >= 2, "next-token loss needs at least two positions");
 
-        let out = self.forward_span(tokens.clone(), span);
+        // States are only collected when a direction penalty will read them;
+        // the plain path is untouched.
+        let active_direction = direction.filter(|d| d.weight > 0.0);
+        let (out, states) = match active_direction {
+            Some(_) => self.forward_span_states(tokens.clone(), span.clone(), None),
+            None => (self.forward_span(tokens.clone(), span.clone()), Vec::new()),
+        };
 
         // Drop the last position (no target) and the first target (no input).
         let logits = out.logits.narrow(1, 0, n - 1);
@@ -678,6 +785,18 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             Some(_) => (loss, 0.0),
         };
 
+        // --- direction penalty (roadmap 31.2) ---------------------------------
+        let (loss, direction_projection) = match active_direction {
+            None => (loss, 0.0),
+            Some(d) => {
+                let local = d.layer.saturating_sub(span.start).min(states.len().saturating_sub(1));
+                let h = &states[local];
+                let penalty = crate::ablation::projection_penalty(h, d.direction);
+                let value: f32 = penalty.clone().into_scalar();
+                (loss + penalty.mul_scalar(d.weight as f32), value)
+            }
+        };
+
         let value: f32 = loss.clone().into_scalar();
         let routing: Vec<crate::moe::RoutingStats> =
             out.balance_loss.as_ref().map_or_else(Vec::new, |aux| aux.to_host());
@@ -699,6 +818,7 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             negative_teacher_tokens,
             negative_teacher_prob,
             distill_loss,
+            direction_projection,
         };
 
         // The balance term is scaled; the z-loss already carries its own
@@ -1062,6 +1182,19 @@ pub struct LmMetrics {
     pub negative_teacher_prob: f32,
     /// The distillation term's value (before its weight); 0 without teachers.
     pub distill_loss: f32,
+    /// Mean squared projection of the penalized layer's states onto the
+    /// direction (before its weight); 0 without one (roadmap 31.2).
+    pub direction_projection: f32,
+}
+
+/// A behaviour direction penalized during training (roadmap 31.2).
+#[derive(Clone, Copy)]
+pub struct DirectionPenalty<'a, B: Backend> {
+    /// Unit vector `[h]` on the device.
+    pub direction: &'a Tensor<B, 1>,
+    /// Layer whose output is penalized (0-based, absolute).
+    pub layer: usize,
+    pub weight: f64,
 }
 
 /// Tokens proposed by a negative teacher, with their charge (roadmap 29.3).

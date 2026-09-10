@@ -17,7 +17,7 @@ the one the issue states: an optimization hypothesis does not become a fact
 without a measurement.
 
 > **In this repository.** Certificates: `src/verify.rs` (`dblocks verify`,
-> 20 groups). Measurements: the `Status` paragraphs of `TODO.md`. Harnesses:
+> 21 groups). Measurements: the `Status` paragraphs of `TODO.md`. Harnesses:
 > `dblocks sweep`, `dblocks bench --json`, `dblocks audit propagation`,
 > `dblocks lm bench`, `dblocks experiment compare`.
 
@@ -68,6 +68,8 @@ without a measurement.
 | A negative teacher below its confidence is the plain loss bit for bit and never contradicts the corpus; its step lowers its proposals relative to a plain step | VERIFIED | `multisource` group |
 | Checkpoint merging is the identity on equal inputs and linear in its weights | VERIFIED | `multisource` group |
 | The policy gate refuses a blocked prompt before any forward pass; grants are unforgeable without the key (HMAC-SHA256 per RFC 4231), expire and can be revoked; removing a blocker allows exactly its prompts | VERIFIED | `policy` group (Phase 30) |
+| Direction ablation removes every residual writer's component along the (gate-scaled) direction, is idempotent on an axis, and inference-time projection leaves no component at any layer; the direction penalty at weight 0 is the plain loss and a penalized step lowers the projection relative to a plain step; image negatives at charge 0 cost nothing, are bounded by `−ln ε`, and a charged step lowers the label probability relative to a rewarded one | VERIFIED | `ablation` group (Phase 31) |
+| Heretic's kernel is a trapezoid, its identity parameters change no bit, an integer direction index is that layer's direction, the reported best is the lowest-scoring trial, the detector matches its phrases | VERIFIED | `ablation` group (Phase 31.6) |
 | A trained refusal holds under adversarial prompting | UNKNOWN | needs a real model and an evaluation set; `dblocks lm refusal-corpus` + `lm train` build it, the gate holds regardless |
 | The certificate suite catches plausible defects | VERIFIED, with limits | Mutation sweep: 5 of 9 mutants survived until the certificates were rewritten to call the code; see `TODO.md` |
 
@@ -100,6 +102,9 @@ raw trials.
 | MoE expert counts improve quality per FLOP; global-batch load / loss-free bias improve specialization | `dblocks sweep --grid moe_experts=2,4,8 balance_scope=micro,global bias_balance_rate=0,1e-3`; routing entropies are in every record's log |
 | Adaptive depth / early exit is a Pareto improvement | `dblocks bench --json` (scaling curve with the Pareto frontier marked) on a trained checkpoint |
 | Precision policy (bf16 high-σ, f32 low-σ) preserves accuracy | `dblocks sample --precision` on a trained checkpoint; emulation only, no speed claim |
+| Ablating a refusal direction removes refusals without harming other behaviour (abliteration) | `dblocks lm direction` / `lm ablate` / `lm direction-score --ablated` on an instruction-tuned checkpoint with real refusal and benign prompt sets; refusal rate and held-out loss before/after |
+| Heretic's search finds a lower refusal rate at a bounded first-token KL than uniform ablation | `dblocks lm heretic --json` on the same checkpoint; the Pareto front versus `lm ablate` at full strength |
+| The direction penalty during training suppresses a behaviour as ablation does | `dblocks lm train --direction --direction-weight` versus the ablated checkpoint on the refusal set |
 | Block distillation compensates for fewer blocks | `dblocks train --objective distill --teacher` on a trained teacher, then `dblocks bench` |
 | Solver choice changes accuracy (not just agreement with Euler) | `dblocks bench --json` on a trained checkpoint |
 | A locally good block cannot damage end-to-end quality | `dblocks audit propagation --checkpoint` — the sensitivity and amplification columns |

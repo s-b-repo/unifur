@@ -64,6 +64,21 @@ pub struct StepMetrics {
     /// Per-sparse-layer routing statistics of the executed span, in execution
     /// order; empty for a dense trunk (roadmap 23.6).
     pub routing: Vec<crate::moe::RoutingStats>,
+    /// Samples charged as negatives this step (roadmap 31.3); 0 without any.
+    pub negative_samples: usize,
+    /// Mean probability the model gave the negative samples' labels.
+    pub negative_prob: f32,
+}
+
+/// Per-sample negative labels for the image trunk (roadmap 31.3): a sample
+/// marked `1` is charged `alpha * -log(1 - p_label)` -- the bounded term of
+/// Phase 24 on its class probability -- instead of rewarded.
+#[derive(Debug, Clone)]
+pub struct NegativeLabels<B: Backend> {
+    /// `[b]`, `1` where the sample's label is a negative, else `0`.
+    pub mask: Tensor<B, 1>,
+    pub alpha: f32,
+    pub epsilon: f32,
 }
 
 /// The pieces of one training step, kept separate so a caller can reweight
@@ -431,6 +446,36 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         block_idx: usize,
         importance: Option<&[f64]>,
     ) -> StepParts<B> {
+        self.step_core(pixel_values, labels, sigmas, block_idx, importance, None)
+    }
+
+    /// [`Self::training_step_on`] with per-sample negative labels
+    /// (roadmap 31.3). A mask of all zeros takes the plain path unchanged.
+    pub fn training_step_negative(
+        &self,
+        pixel_values: Tensor<B, 4>,
+        labels: Tensor<B, 1, Int>,
+        sigmas: &[f64],
+        block_idx: usize,
+        importance: Option<&[f64]>,
+        negatives: NegativeLabels<B>,
+    ) -> StepParts<B> {
+        let any: f32 = negatives.mask.clone().sum().into_scalar();
+        if any <= 0.0 {
+            return self.step_core(pixel_values, labels, sigmas, block_idx, importance, None);
+        }
+        self.step_core(pixel_values, labels, sigmas, block_idx, importance, Some(negatives))
+    }
+
+    fn step_core(
+        &self,
+        pixel_values: Tensor<B, 4>,
+        labels: Tensor<B, 1, Int>,
+        sigmas: &[f64],
+        block_idx: usize,
+        importance: Option<&[f64]>,
+        negatives: Option<NegativeLabels<B>>,
+    ) -> StepParts<B> {
         let device = pixel_values.device();
         let b = pixel_values.dims()[0];
         assert_eq!(sigmas.len(), b, "one sigma per sample required");
@@ -454,11 +499,25 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             None => (None, None, Vec::new()),
         };
 
-        // Per-sample cross entropy.
+        // Per-sample cross entropy -- or, for a negative label, the bounded
+        // charge on its probability (roadmap 31.3).
         let log_probs = log_softmax(logits, 1);
-        let nll = -log_probs
-            .gather(1, labels.unsqueeze_dim::<2>(1))
-            .squeeze_dim::<1>(1); // [b]
+        let label_log_prob = log_probs.gather(1, labels.unsqueeze_dim::<2>(1)).squeeze_dim::<1>(1); // [b]
+        let (nll, negative_samples, negative_prob) = match &negatives {
+            None => (-label_log_prob, 0, 0.0),
+            Some(neg) => {
+                assert_eq!(neg.mask.dims(), [b], "one negative flag per sample required");
+                let positive = neg.mask.clone().neg().add_scalar(1.0);
+                let charge = crate::lm::unlikelihood(label_log_prob.clone(), neg.epsilon).mul_scalar(neg.alpha);
+                let count = neg.mask.clone().sum();
+                let prob = (label_log_prob.clone().exp() * neg.mask.clone()).sum() / count.clone().clamp_min(1.0);
+                (
+                    -label_log_prob * positive + charge * neg.mask.clone(),
+                    count.into_scalar() as usize,
+                    prob.into_scalar(),
+                )
+            }
+        };
 
         let ce_loss = nll.clone().mean();
 
@@ -520,6 +579,8 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             block_idx,
             balance_loss: m_balance,
             routing: routing.iter().map(crate::moe::LayerRouting::to_host).collect(),
+            negative_samples,
+            negative_prob,
         };
         StepParts { loss, metrics, per_sample, balance, z, importance, routing }
     }

@@ -65,10 +65,10 @@ impl Grid {
 }
 
 /// Keys [`apply`] understands.
-pub const SUPPORTED: [&str; 19] = [
+pub const SUPPORTED: [&str; 20] = [
     "lr", "steps", "batch_size", "num_blocks", "gamma", "weight_decay", "accumulate", "clip_norm",
     "ema_decay", "uncertainty", "importance_bins", "normalize_block_loss", "objective", "consistency",
-    "lr_schedule", "moe_experts", "moe_top_k", "balance_scope", "bias_balance_rate",
+    "lr_schedule", "moe_experts", "moe_top_k", "balance_scope", "bias_balance_rate", "negatives",
 ];
 
 /// Set one flag on a configuration.
@@ -119,6 +119,7 @@ pub fn apply(config: &mut TrainConfig, key: &str, value: &str) -> anyhow::Result
             config.moe = Some(moe);
         }
         "balance_scope" => config.balance_scope = crate::schedule::BalanceScope::parse(value)?,
+        "negatives" => config.synthetic_negatives = num(value)?,
         "bias_balance_rate" => {
             config.bias_balance_rate = num(value)? as f32;
             if let Some(moe) = config.moe.as_mut() {

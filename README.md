@@ -44,7 +44,7 @@ with an accurate "In this repository" block naming the module, types and flags
 that implement it.
 
 ```bash
-# Build and run the quality gate: 116 numerical certificates, non-zero exit on
+# Build and run the quality gate: 130 numerical certificates, non-zero exit on
 # any failure.
 cargo build --release
 ./target/release/dblocks verify
@@ -112,6 +112,9 @@ cargo build --release
 ./target/release/dblocks lm direction --checkpoint lm.mpk --target bad.txt --baseline ok.txt --out dir.json
 ./target/release/dblocks lm ablate --checkpoint lm.mpk --direction dir.json --out checkpoints
 ./target/release/dblocks lm train --corpus code.bin --direction dir.json --direction-weight 0.1
+# Heretic: search kernel-weighted ablations against refusals and first-token KL
+# and keep the best (github.com/p-e-w/heretic).
+./target/release/dblocks lm heretic --checkpoint lm.mpk --target refuse.txt --baseline keep.txt --trials 12 --out checkpoints
 
 # Batched inference with top-k output and per-batch profiling.
 ./target/release/dblocks infer --top-k 3 --solver heun
@@ -162,6 +165,7 @@ cargo test --all && cargo clippy --all-targets && ./target/release/dblocks verif
 | Dataset and corpus mixing, checkpoint merging | `mix.rs`, `merge.rs` |
 | Blockers, refusals, signed approvals | `policy.rs` |
 | Behaviour directions: extraction, orthogonalization, penalty | `ablation.rs` |
+| Heretic: kernel-weighted ablation searched against refusals and KL | `heretic.rs` |
 | Inference API, profiler | `infer.rs`, `profile.rs` |
 | **Numerical certificate suite** | `verify.rs` |
 

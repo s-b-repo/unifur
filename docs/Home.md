@@ -28,7 +28,7 @@ Two documents are authoritative about what is and is not implemented:
 
 ```bash
 cargo build --release
-./target/release/dblocks verify        # 116 certificates, non-zero exit on failure
+./target/release/dblocks verify        # 130 certificates, non-zero exit on failure
 ./target/release/dblocks train --steps 200
 ./target/release/dblocks sample --planned --plan-depth 2   # plan the trajectory
 ./target/release/dblocks lm generate --lookahead 2         # plan the tokens
@@ -113,6 +113,7 @@ cargo build --release
 | Dataset and corpus mixing, checkpoint merging | `mix.rs`, `merge.rs` |
 | Blockers, refusals, signed approvals | `policy.rs` |
 | Behaviour directions: extraction, orthogonalization, penalty | `ablation.rs` |
+| Heretic: kernel-weighted ablation searched against refusals and KL | `heretic.rs` |
 | Inference API, profiler | `infer.rs`, `profile.rs` |
 | Numerical certificate suite | `verify.rs` |
 
