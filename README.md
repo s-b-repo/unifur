@@ -1145,6 +1145,15 @@ table below is generated from it; "blocked" items are all in that table.
 | 30. Cyber Policy -- Blockers, Refusals and Approvals | 4 / 0 / 0 | Done as a mechanism. |
 | 31. Direction Ablation and Negative Training for Every Model | 6 / 0 / 0 | Done as a mechanism, end to end on a tiny model (the integration test extracts a direction from a trained model, ablates it, trains with the ... |
 
+In flight on the branch `feat/phases-25-27`, landing on the same branch
+when green: Phase 25 (unified routing, per-token routing state, LatentMoE),
+Phase 26 (linear and sparse attention cores, hierarchical MoVA, Engram,
+long-term memory), Phase 27 (adaptive multi-token prediction, token-level
+exits with verification, a compute-policy planner) and Phase 32 (persistent
+latent reasoning, calibrated verification, rotary positions, unified
+inference state, the falsification harness of issue #5). The `Roadmap`
+section at the top of `TODO.md` maps each to the GitHub issues it answers.
+
 The original phase-by-phase design checklist that used to live here is
 superseded by that file.
 

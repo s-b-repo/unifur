@@ -6,8 +6,36 @@ Status legend: `[x]` implemented & tested · `[#]` partial (notes inline) ·
 `[ ]` not started / blocked on external resources (noted inline).
 
 **Everything implementable without a GPU, a cluster, or a new dependency is
-done.** What remains is listed under
-[Remaining](#remaining-requires-external-resources) with the specific blocker.
+done or in flight** (see the roadmap below). What cannot be done here is
+listed under [Remaining](#remaining-requires-external-resources) with the
+specific blocker.
+
+## Roadmap (2026-09-10)
+
+Phases 1–24 and 28–31 are on `feat/phases-18-23` and pushed. The phases
+below are being built now, one commit each, and land on the same branch when
+their gate is green:
+
+| Phase | Scope | Source | State |
+|---|---|---|---|
+| 25 Unified routing, per-token routing state, LatentMoE | `router.rs` (flat / latent / hierarchical routers behind one interface), `routing_state.rs` (GRU state per token shared by a layer group, reset at block boundaries), `--moe-latent-dim`, `lm train --routing-state` | issue #3 steps 1, 3, 4; issue #4 B5–B6, D1 | in flight (branch `feat/phases-25-27`) |
+| 26 Attention modes, hierarchical MoVA, Engram, long-term memory | `attention.rs` (full / linear KDA-style / sparse DSA-style cores per layer), MoVA value experts as shared base + low-rank deltas, `memory.rs` (n-gram Engram, Titans-lite associative memory), `lm train --attention kda:3,dsa:1 --mova-spec --engram --long-memory` | issues #2, #3 steps 2, 6, 7; #4 B2–B4, C10 | in flight (same branch) |
+| 27 Adaptive MTP, token-level exits, compute policy | `mtp.rs` (offset heads, speculative decoding with exact rollback), token-level early exits with self-verification, `PolicyPlanner` over the existing beam, `lm generate --speculative --exit-threshold --policy` | issue #3 steps 5, 8, 9; #4 C3, C8, C9, D2 | in flight (same branch) |
+| 32 Latent reasoning and LM substrate gaps | persistent latent state with sequential and parallel refinement, progress objective, calibrated verifier, span semantics, LayerNorm conditioning ablation, rotary positions, unified inference state, experiment verdicts and the negative-result ledger, the falsification harness | issue #5 all sections; #4 C4–C8, D3, D6 | in flight (same branch) |
+
+Each of those adds its certificate group (identity at tolerance 0 when the
+mechanism is off, the mechanism's own invariants on the real code path), its
+docs page, and its `Status` paragraph here. After they land: this file and
+`README.md` consolidated, `docs/Claims.md` rows, then one status comment per
+GitHub issue (#1–#5) mapping every requested item to shipped / GPU-blocked /
+out of scope; #2 and #3 close (every remaining item is a GPU experiment with
+its harness in place), #1, #4 and #5 stay open because their definition of
+done is GPU evidence.
+
+What no phase can deliver on this hardware is in
+[Remaining](#remaining-requires-external-resources): every quality number
+behind the mechanisms, distributed training, native bf16, pretrained-weight
+loading, long-context evaluation.
 
 ## Phase 1: Core DiffusionBlocks (Original Paper Port)
 
