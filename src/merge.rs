@@ -50,6 +50,11 @@ struct Averager<B: Backend> {
     others: Vec<ParamSnapshot>,
     weights: Vec<f32>,
     cursor: usize,
+    /// The first mismatch met during traversal. `ModuleMapper` cannot
+    /// return an error, so it is recorded here and raised by `merge_into`
+    /// once the traversal is over; the parameters after it are left as the
+    /// template's.
+    error: Option<anyhow::Error>,
     _backend: std::marker::PhantomData<B>,
 }
 
@@ -57,20 +62,26 @@ impl<B: Backend<FloatElem = f32>> ModuleMapper<B> for Averager<B> {
     fn map_float<const D: usize>(&mut self, param: Param<Tensor<B, D>>) -> Param<Tensor<B, D>> {
         let idx = self.cursor;
         self.cursor += 1;
+        if self.error.is_some() {
+            return param;
+        }
         let base = param.val();
         let device = base.device();
         let mut acc = base.clone().mul_scalar(self.weights[0]);
         for (k, other) in self.others.iter().enumerate() {
-            let data = other
-                .values
-                .get(idx)
-                .unwrap_or_else(|| panic!("checkpoint {} has fewer parameters than the template", k + 1));
-            assert_eq!(
-                base.shape(),
-                data.shape.clone(),
-                "checkpoint {} differs in shape at parameter {idx}",
-                k + 1
-            );
+            let Some(data) = other.values.get(idx) else {
+                self.error = Some(anyhow::anyhow!("checkpoint {} has fewer parameters than the template", k + 1));
+                return param;
+            };
+            if base.shape() != data.shape.clone() {
+                self.error = Some(anyhow::anyhow!(
+                    "checkpoint {} differs in shape at parameter {idx}: template {:?}, checkpoint {:?}",
+                    k + 1,
+                    base.shape(),
+                    data.shape
+                ));
+                return param;
+            }
             acc = acc + Tensor::<B, D>::from_data(data.clone(), &device).mul_scalar(self.weights[k + 1]);
         }
         // `map` keeps the parameter id; the merged module can then load into
@@ -103,9 +114,13 @@ pub fn merge_into<B: Backend<FloatElem = f32>, M: Module<B>>(
         others: others.to_vec(),
         weights: weights.iter().map(|w| (w / total) as f32).collect(),
         cursor: 0,
+        error: None,
         _backend: std::marker::PhantomData,
     };
     let merged = base.map(&mut mapper);
+    if let Some(err) = mapper.error {
+        return Err(err);
+    }
     anyhow::ensure!(mapper.cursor == expected, "visited {} of {expected} parameters", mapper.cursor);
     Ok(merged)
 }

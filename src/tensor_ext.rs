@@ -22,16 +22,18 @@ pub fn force_initialization<B: Backend, M: Module<B>>(module: &M) {
 struct Materializer;
 
 impl<B: Backend> ModuleVisitor<B> for Materializer {
+    // `val()` materializes a lazily initialized parameter; the returned
+    // tensor itself is not needed.
     fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
-        let _ = param.val();
+        drop(param.val());
     }
 
     fn visit_int<const D: usize>(&mut self, param: &Param<Tensor<B, D, Int>>) {
-        let _ = param.val();
+        drop(param.val());
     }
 
     fn visit_bool<const D: usize>(&mut self, param: &Param<Tensor<B, D, Bool>>) {
-        let _ = param.val();
+        drop(param.val());
     }
 }
 

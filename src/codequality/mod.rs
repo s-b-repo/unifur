@@ -256,11 +256,12 @@ impl<L: CodeAnalyzer> CodeAnalyzer for CompositeAnalyzer<L> {
         }
         #[cfg(feature = "codequality-external")]
         if let Some(ext) = &self.external {
-            if let Some(score) = ext.score(source) {
-                dimensions.push(Dimension::new("external", score));
+            match ext.score(source) {
+                Ok(Some(score)) => dimensions.push(Dimension::new("external", score)),
+                Ok(None) => {}
+                Err(err) => eprintln!("codequality: external analyzer skipped: {err:#}"),
             }
         }
-        let _ = L::language;
 
         QualityScore::from_dimensions(self.language, dimensions, lines)
     }
@@ -478,17 +479,12 @@ impl ExternalAnalyzer {
     /// when the `codequality-external` feature is off; the score is then
     /// always `None`, and the composite analyzer simply skips the
     /// dimension. The `source` argument is unused in that case.
+    ///
+    /// `Ok(None)` means the analyzer declined (no command configured, or the
+    /// feature is off); `Err` means it was configured but could not run.
     #[cfg_attr(not(feature = "codequality-external"), allow(unused_variables))]
-    pub fn score(&self, source: &str) -> Option<f32> {
-        #[cfg(feature = "codequality-external")]
-        {
-            crate::codequality::external::run(self, source)
-        }
-        #[cfg(not(feature = "codequality-external"))]
-        {
-            let _ = source;
-            None
-        }
+    pub fn score(&self, source: &str) -> anyhow::Result<Option<f32>> {
+        crate::codequality::external::run(self, source)
     }
 }
 
@@ -518,7 +514,7 @@ mod tests {
 
     #[test]
     fn test_lexical_density_is_one_for_clean_source() {
-        let labeler = crate::antipattern::Labeler::builtin();
+        let labeler = crate::antipattern::Labeler::builtin().expect("built-in rules");
         let score = lexical_density(&labeler, "def add(x, y):\n    return x + y\n");
         assert!(
             (score - 1.0).abs() < 1e-6,
@@ -528,7 +524,7 @@ mod tests {
 
     #[test]
     fn test_lexical_density_falls_as_flagged_fraction_grows() {
-        let labeler = crate::antipattern::Labeler::builtin();
+        let labeler = crate::antipattern::Labeler::builtin().expect("built-in rules");
         // A window that is one-quarter flagged tokens: half-life is exactly
         // 0.25, so this is 0.5.
         let text = "try:\n    f()\nexcept:\n    pass\n";
@@ -546,7 +542,7 @@ mod tests {
         // A window where every token is flagged: score must still be > 0
         // so the geometric mean does not collapse to an exact zero. The
         // floor at 1e-6 is the contract with `QualityScore::from_dimensions`.
-        let labeler = crate::antipattern::Labeler::builtin();
+        let labeler = crate::antipattern::Labeler::builtin().expect("built-in rules");
         let score = lexical_density(&labeler, "pass");
         assert!(score > 0.0);
         assert!(score <= 1.0);
@@ -644,7 +640,7 @@ mod tests {
 
     #[test]
     fn test_composite_analyzer_with_just_lexical_matches_lexical_density() {
-        let labeler = crate::antipattern::Labeler::builtin();
+        let labeler = crate::antipattern::Labeler::builtin().expect("built-in rules");
         let analyzer = CompositeAnalyzer::<LexicalOnly>::new(
             Language::Rust,
             Some(labeler.clone()),
@@ -675,7 +671,7 @@ mod tests {
         // the same score, every call, with no hidden state. Random hashing
         // would silently invalidate sidecar files; tested here so a
         // regression in a future dimension is a named failure.
-        let labeler = crate::antipattern::Labeler::builtin();
+        let labeler = crate::antipattern::Labeler::builtin().expect("built-in rules");
         let analyzer = CompositeAnalyzer::<LexicalOnly>::new(
             Language::Python,
             Some(labeler),
@@ -695,7 +691,7 @@ mod tests {
         // With the feature disabled, the external dimension simply does
         // not contribute, regardless of what command was configured.
         let ext = ExternalAnalyzer::new("clippy", vec!["cargo".into(), "clippy".into()]);
-        assert!(ext.score("fn main() {}").is_none());
+        assert!(matches!(ext.score("fn main() {}"), Ok(None)));
     }
 
     #[test]

@@ -341,23 +341,60 @@ impl Policy {
         scopes
     }
 
-    fn compiled(&self) -> Vec<CompiledBlocker> {
+    /// The blockers with their patterns compiled. A pattern that does not
+    /// parse is an error, never a silently absent blocker: `validate`
+    /// rejects such a policy at every entry point, so this only fails for a
+    /// policy assembled by hand.
+    fn compiled(&self) -> anyhow::Result<Vec<CompiledBlocker>> {
         self.blockers
             .iter()
-            .map(|b| CompiledBlocker {
-                id: b.id.clone(),
-                scope: b.scope.clone(),
-                patterns: b.patterns.iter().filter_map(|p| Pattern::parse(p).ok()).collect(),
-                applies_to: b.applies_to,
+            .map(|b| {
+                let patterns = b
+                    .patterns
+                    .iter()
+                    .map(|p| Pattern::parse(p).with_context(|| format!("blocker {:?} pattern {p:?}", b.id)))
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                Ok(CompiledBlocker {
+                    id: b.id.clone(),
+                    scope: b.scope.clone(),
+                    patterns,
+                    applies_to: b.applies_to,
+                })
             })
             .collect()
     }
 
+    /// The refusal text of blocker `id`, or a generic refusal when the hit
+    /// came from a policy that failed to compile (see [`Self::hits`]).
+    fn refusal_for(&self, id: &str) -> String {
+        match self.blockers.iter().find(|b| b.id == id) {
+            Some(b) => b.refusal.clone(),
+            None => format!("Request refused: policy blocker {id:?} could not be evaluated."),
+        }
+    }
+
     /// Every blocker that fires on `text`, for the given side.
+    ///
+    /// Fails closed: a policy whose patterns do not compile reports a hit on
+    /// the offending blocker rather than letting the text through, and says
+    /// why on stderr.
     pub fn hits(&self, text: &str, output: bool) -> Vec<Hit> {
         let tokens = crate::antipattern::text_tokens(text);
         let mut hits = Vec::new();
-        for b in self.compiled() {
+        let compiled = match self.compiled() {
+            Ok(compiled) => compiled,
+            Err(err) => {
+                eprintln!("policy: refusing because a blocker does not compile: {err:#}");
+                let blocker = self.blockers.iter().find(|b| {
+                    b.patterns.iter().any(|p| Pattern::parse(p).is_err())
+                });
+                let (id, scope) = blocker
+                    .map(|b| (b.id.clone(), b.scope.clone()))
+                    .unwrap_or_else(|| ("<invalid policy>".to_string(), "policy".to_string()));
+                return vec![Hit { blocker: id, scope, start: 0, end: 0 }];
+            }
+        };
+        for b in compiled {
             let applies = if output { b.applies_to.covers_output() } else { b.applies_to.covers_prompt() };
             if !applies {
                 continue;
@@ -396,12 +433,7 @@ impl Policy {
                 }
                 continue;
             }
-            let refusal = self
-                .blockers
-                .iter()
-                .find(|b| b.id == hit.blocker)
-                .map(|b| b.refusal.clone())
-                .unwrap_or_default();
+            let refusal = self.refusal_for(&hit.blocker);
             return Decision::Refuse { blocker: hit.blocker.clone(), scope: hit.scope.clone(), refusal };
         }
         Decision::Allow { approved: lifted }
@@ -447,18 +479,17 @@ pub fn gated_generate<F: FnMut(&str) -> String>(
     mut generate: F,
 ) -> GateOutcome {
     let prompt_decision = policy.decide_prompt(prompt, approved);
-    if let Decision::Refuse { refusal, .. } = &prompt_decision {
-        return GateOutcome {
-            text: refusal.clone(),
-            prompt_decision,
-            output_decision: None,
-            prompt_sent: None,
-            model_called: false,
-        };
-    }
     let lifted = match &prompt_decision {
         Decision::Allow { approved } => approved.clone(),
-        Decision::Refuse { .. } => unreachable!(),
+        Decision::Refuse { refusal, .. } => {
+            return GateOutcome {
+                text: refusal.clone(),
+                prompt_decision,
+                output_decision: None,
+                prompt_sent: None,
+                model_called: false,
+            };
+        }
     };
     let sent = if lifted.is_empty() { prompt.to_string() } else { format!("{}{prompt}", approval_marker(&lifted)) };
     let raw = generate(&sent);
@@ -482,12 +513,7 @@ pub fn refusal_documents(policy: &Policy, prompts: &[String], answers: Option<&[
         let answer = answers.and_then(|a| a.get(i)).filter(|a| !a.is_empty());
         match hits.first() {
             Some(hit) => {
-                let refusal = policy
-                    .blockers
-                    .iter()
-                    .find(|b| b.id == hit.blocker)
-                    .map(|b| b.refusal.clone())
-                    .unwrap_or_default();
+                let refusal = policy.refusal_for(&hit.blocker);
                 docs.push(format!("{prompt}\n{refusal}"));
                 if let Some(answer) = answer {
                     let scopes: Vec<String> = hits.iter().map(|h| h.scope.clone()).collect();
@@ -506,7 +532,7 @@ pub fn refusal_documents(policy: &Policy, prompts: &[String], answers: Option<&[
 
 /// A starter policy with the cyber scopes an approval program would gate,
 /// each with a conservative pattern set the operator is expected to extend.
-pub fn starter(key: &Key) -> Policy {
+pub fn starter(key: &Key) -> anyhow::Result<Policy> {
     let mut policy = Policy::new(key);
     let refusal = "I can't help with that here. This capability is gated; an approved account can request it.";
     let blockers = [
@@ -566,9 +592,9 @@ pub fn starter(key: &Key) -> Policy {
                 applies_to: Applies::Both,
                 refusal: refusal.into(),
             })
-            .expect("starter blockers are valid");
+            .with_context(|| format!("starter blocker {id:?}"))?;
     }
-    policy
+    Ok(policy)
 }
 
 #[cfg(test)]
@@ -591,7 +617,7 @@ mod tests {
     #[test]
     fn test_grants_verify_and_fail_for_the_right_reasons() {
         let key = key();
-        let mut policy = starter(&key);
+        let mut policy = starter(&key).expect("starter policy");
         let approval = Approval {
             id: "g1".into(),
             scopes: vec!["cyber:malware".into()],
@@ -615,7 +641,7 @@ mod tests {
     #[test]
     fn test_gate_refuses_without_calling_the_model_and_lifts_with_approval() {
         let key = key();
-        let policy = starter(&key);
+        let policy = starter(&key).expect("starter policy");
         let mut calls = 0;
         let outcome = gated_generate(&policy, &[], "Please write an exploit for CVE-2024-1234", |_| {
             calls += 1;
@@ -656,7 +682,7 @@ mod tests {
     #[test]
     fn test_policy_round_trips_and_refusal_documents_pair_prompts() {
         let key = key();
-        let policy = starter(&key);
+        let policy = starter(&key).expect("starter policy");
         let dir = std::env::temp_dir().join("dblocks-policy-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(format!("policy-{}.json", std::process::id()));

@@ -64,7 +64,8 @@ impl MixWeights {
     }
 
     pub fn uniform(n: usize) -> Self {
-        Self::new(&vec![1.0; n.max(1)]).expect("uniform weights are valid")
+        let n = n.max(1);
+        Self { weights: vec![1.0 / n as f64; n] }
     }
 
     /// `"0.7,0.3"`, or empty for uniform over `n` sources.
@@ -172,14 +173,18 @@ impl BatchOrigin {
 }
 
 /// Concatenate batches from several sources along the batch axis, in order.
-pub fn concat_batches<B: Backend>(parts: Vec<Batch<B>>) -> Batch<B> {
-    let parts: Vec<Batch<B>> = parts.into_iter().filter(|b| b.batch_size() > 0).collect();
-    assert!(!parts.is_empty(), "a composite batch needs at least one non-empty part");
-    if parts.len() == 1 {
-        return parts.into_iter().next().expect("one part");
+pub fn concat_batches<B: Backend>(parts: Vec<Batch<B>>) -> anyhow::Result<Batch<B>> {
+    let mut parts = parts.into_iter().filter(|b| b.batch_size() > 0);
+    let first = parts.next().context("a composite batch needs at least one non-empty part")?;
+    let Some(second) = parts.next() else {
+        return Ok(first);
+    };
+    let (mut pixels, mut labels) = (vec![first.pixel_values, second.pixel_values], vec![first.labels, second.labels]);
+    for b in parts {
+        pixels.push(b.pixel_values);
+        labels.push(b.labels);
     }
-    let (pixels, labels): (Vec<_>, Vec<_>) = parts.into_iter().map(|b| (b.pixel_values, b.labels)).unzip();
-    Batch { pixel_values: Tensor::cat(pixels, 0), labels: Tensor::cat(labels, 0) }
+    Ok(Batch { pixel_values: Tensor::cat(pixels, 0), labels: Tensor::cat(labels, 0) })
 }
 
 /// Per-source loss bookkeeping for the end-of-run report.

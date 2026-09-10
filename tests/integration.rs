@@ -848,7 +848,7 @@ fn integration_lm_trains_on_two_corpora_with_a_teacher_and_a_negative_teacher() 
     std::fs::write(&bad, "try:\n    f()\nexcept:\n    pass\n".repeat(20)).unwrap();
     let bad_bin = dir.join("bad.bin");
     TokenCorpus::tokenize_file(&bad, &bad_bin).unwrap();
-    TokenCorpus::label_file(&bad_bin, &Labeler::builtin()).unwrap();
+    TokenCorpus::label_file(&bad_bin, &Labeler::builtin().expect("built-in rules")).unwrap();
     let good = dir.join("good.txt");
     std::fs::write(&good, "def f():\n    return 1\n".repeat(30)).unwrap();
     let good_bin = dir.join("good.bin");
@@ -924,7 +924,7 @@ fn integration_policy_gates_a_real_model_and_its_refusal_corpus_trains() {
 
     let device: Device = Default::default();
     let key = Key::generate();
-    let policy = starter(&key);
+    let policy = starter(&key).expect("starter policy");
     let grant = Grant::issue(
         &key,
         Approval { id: "t".into(), scopes: vec!["cyber:malware".into()], issued_unix: 0, expires_unix: u64::MAX, note: String::new() },
@@ -983,7 +983,7 @@ fn integration_negative_supervision_unlearns_error_swallowing() {
     let unit = "try:\n    f()\nexcept:\n    pass\n";
     std::fs::write(&source, unit.repeat(40)).unwrap();
     TokenCorpus::tokenize_file(&source, &corpus_path).unwrap();
-    let manifest = TokenCorpus::label_file(&corpus_path, &Labeler::builtin()).unwrap();
+    let manifest = TokenCorpus::label_file(&corpus_path, &Labeler::builtin().expect("built-in rules")).unwrap();
     assert_eq!(manifest.labeled_tokens, 40 * ":pass".len(), "{}", manifest.render());
 
     let mut corpus = TokenCorpus::streaming(&corpus_path).unwrap();

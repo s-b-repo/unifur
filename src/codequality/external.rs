@@ -12,22 +12,21 @@ use super::ExternalAnalyzer;
 /// scores `0.0`. The intermediate values are continuous, so a partial
 /// regression in a window is not lost to a binary "drop / keep" decision.
 ///
-/// Returns `None` if the tool is not installed or returns non-JSON
-/// output; the composite analyzer then simply skips the external
-/// dimension, which is the behavior the rest of the pipeline expects when
-/// the feature is off.
+/// Returns `Ok(None)` when no command is configured; an error when the
+/// tool cannot be spawned, fed, or waited for. Non-JSON output is not an
+/// error: it counts as zero warnings (see `count_json_messages`). The
+/// composite analyzer reports the error and skips the external dimension,
+/// so a broken tool never silently changes the score.
 #[cfg(feature = "codequality-external")]
-pub fn run(analyzer: &ExternalAnalyzer, source: &str) -> Option<f32> {
+pub fn run(analyzer: &ExternalAnalyzer, source: &str) -> anyhow::Result<Option<f32>> {
+    use anyhow::Context;
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    if analyzer.command.is_empty() {
-        return None;
-    }
-
-    let mut iter = analyzer.command.iter();
-    let program = iter.next()?;
-    let args: Vec<&str> = iter.map(String::as_str).collect();
+    let Some((program, args)) = analyzer.command.split_first() else {
+        return Ok(None);
+    };
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
 
     let mut child = Command::new(program)
         .args(&args)
@@ -35,13 +34,17 @@ pub fn run(analyzer: &ExternalAnalyzer, source: &str) -> Option<f32> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .ok()?;
+        .with_context(|| format!("spawn external analyzer {program:?}"))?;
     if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(source.as_bytes()).ok()?;
+        stdin
+            .write_all(source.as_bytes())
+            .with_context(|| format!("write source to external analyzer {program:?}"))?;
     }
-    let output = child.wait_with_output().ok()?;
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("wait for external analyzer {program:?}"))?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    parse_warnings(&stdout, source)
+    Ok(parse_warnings(&stdout, source))
 }
 
 #[cfg(feature = "codequality-external")]
@@ -66,6 +69,6 @@ fn count_json_messages(stdout: &str) -> usize {
 }
 
 #[cfg(not(feature = "codequality-external"))]
-pub fn run(_analyzer: &ExternalAnalyzer, _source: &str) -> Option<f32> {
-    None
+pub fn run(_analyzer: &ExternalAnalyzer, _source: &str) -> anyhow::Result<Option<f32>> {
+    Ok(None)
 }

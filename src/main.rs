@@ -1,6 +1,6 @@
 //! `dblocks` CLI: train, sample, benchmark and verify DiffusionBlocks models.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
@@ -821,6 +821,18 @@ enum ExpertsAction {
     },
 }
 
+/// The message a panicking thread carried, for reporting a joined thread's
+/// failure as an error instead of re-panicking.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Sigmas { num_blocks, gamma } => cmd_sigmas(num_blocks, gamma),
@@ -848,7 +860,7 @@ fn main() -> Result<()> {
 fn load_labeler(rules: Option<&Path>) -> Result<Labeler> {
     match rules {
         Some(path) => Labeler::new(RuleSet::read(path)?),
-        None => Ok(Labeler::builtin()),
+        None => Labeler::builtin(),
     }
 }
 
@@ -924,6 +936,18 @@ fn cmd_lm(action: LmAction) -> Result<()> {
                 // about this dimension configure their own command via the
                 // analyzer API. The CLI exists so the dimension is reachable
                 // without writing Rust code.
+/// The message a panicking thread carried, for reporting a joined thread's
+/// failure as an error instead of re-panicking.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
                 let args = match tool.as_str() {
                     "clippy" => vec!["clippy".into(), "--message-format=json".into()],
                     "ruff" => vec!["ruff".into(), "check".into(), "--output-format=json".into()],
@@ -1213,7 +1237,7 @@ fn cmd_lm(action: LmAction) -> Result<()> {
                 }
                 let mean_ms = ms_per_step.iter().sum::<f64>() / ms_per_step.len() as f64;
                 record.extra = serde_json::json!({ "ms_per_step": ms_per_step, "forward_passes_per_token": 1 });
-                let summary = record.summary.expect("at least one seed");
+                let summary = record.summary.context("no seed produced a measurement")?;
                 println!(
                     "{:<10} {:>6} {:>12.4} {:>12.4} {:>10.1}",
                     name,
@@ -1410,8 +1434,10 @@ fn cmd_experts(action: ExpertsAction) -> Result<()> {
             // command is useful before anything has been trained.
             match ExpertIndex::read(&index) {
                 Ok(index) => print!("{}", index.render()),
-                Err(_) => {
-                    let spec = MosmeSpec::read(&index)?;
+                Err(index_err) => {
+                    let spec = MosmeSpec::read(&index).with_context(|| {
+                        format!("{} is neither an expert index ({index_err:#}) nor a spec", index.display())
+                    })?;
                     println!(
                         "spec (untrained): {} boxes, {} experts, top_box={} top_expert={}",
                         spec.boxes.len(),
@@ -1527,7 +1553,7 @@ fn cmd_train(command: Command) -> Result<()> {
         moe_top_k,
     } = command
     else {
-        unreachable!("cmd_train is only called with Command::Train")
+        anyhow::bail!("internal error: cmd_train dispatched with a command other than `train`");
     };
 
     let out_path = Path::new(&out_dir).to_path_buf();
@@ -1633,7 +1659,7 @@ fn cmd_train(command: Command) -> Result<()> {
             Some(path) => path,
             None => checkpoint::save_content_addressed_async(model, out_path, "dblocks")
                 .join()
-                .expect("save thread")?,
+                .map_err(|payload| anyhow::anyhow!("checkpoint save thread panicked: {}", panic_message(&payload)))??,
         }
     } else {
         let (model, summary) = train::train(&config)?;
@@ -1667,7 +1693,7 @@ fn cmd_train(command: Command) -> Result<()> {
                 println!("note: --async-save writes the weights only, without a training state");
                 checkpoint::save_content_addressed_async(model, out_path, "dblocks")
                     .join()
-                    .expect("save thread")?
+                    .map_err(|payload| anyhow::anyhow!("checkpoint save thread panicked: {}", panic_message(&payload)))??
             }
         }
     };
@@ -1755,7 +1781,7 @@ fn cmd_sample(command: Command) -> Result<()> {
         plan_budget,
     } = command
     else {
-        unreachable!("cmd_sample is only called with Command::Sample")
+        anyhow::bail!("internal error: cmd_sample dispatched with a command other than `sample`");
     };
 
     let model = model_args.build(Some(num_inference_steps))?;
@@ -1768,7 +1794,7 @@ fn cmd_sample(command: Command) -> Result<()> {
         batch_size,
         model_args.seed,
     );
-    let batch = dataset.next_batch(&mut rng, &device);
+    let batch = dataset.next_batch(&mut rng, &device)?;
 
     let coarse = Precision::parse(&precision)?;
     let config = MultiBlockConfig {
@@ -1917,7 +1943,7 @@ fn cmd_bench(
         batch_size,
         model_args.seed,
     );
-    let batch = dataset.next_batch(&mut rng, &device);
+    let batch = dataset.next_batch(&mut rng, &device)?;
 
     // A reference run everything else is compared against: sequential Euler is
     // the original DiffusionBlocks inference path.
@@ -1979,7 +2005,7 @@ fn cmd_bench(
                 last = Some(out);
             }
 
-            let (logits, stats) = last.expect("at least one repeat");
+            let (logits, stats) = last.context("no repeat ran: --repeats and --warmup left nothing to measure")?;
             let preds: Vec<i64> = logits
                 .argmax(1)
                 .squeeze_dim::<1>(1)
@@ -1996,7 +2022,7 @@ fn cmd_bench(
             });
             records.push(record);
 
-            let timing = profiler.stats(&scope).unwrap();
+            let timing = profiler.stats(&scope).with_context(|| format!("no timing recorded for scope {scope:?}"))?;
             println!(
                 "{:<10} {:<12} {:>10} {:>12} {:>8} {:>9}/{}  ±{}",
                 kind.name(),
@@ -2141,7 +2167,7 @@ fn cmd_policy(action: PolicyAction) -> Result<()> {
         PolicyAction::Init { out, key } => {
             let k = Key::generate();
             k.write(&key)?;
-            let policy = starter(&k);
+            let policy = starter(&k)?;
             policy.write(&out)?;
             println!(
                 "policy {} ({} blockers, scopes {}) and key {} (id {}) written",
@@ -2295,7 +2321,7 @@ fn cmd_audit(action: AuditAction) -> Result<()> {
             let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
             let mut rng = StdRng::seed_from_u64(model_args.seed);
             let mut dataset = SyntheticDataset::new(model_args.image_size, model_args.num_labels, batch_size, model_args.seed);
-            let batch = dataset.next_batch(&mut rng, &device);
+            let batch = dataset.next_batch(&mut rng, &device)?;
             let report = diffusionblocks::audit::propagation(&model, &batch.pixel_values, &batch.labels, epsilon);
             print!("{}", report.render());
             println!(
@@ -2376,7 +2402,7 @@ fn cmd_infer(
         batch_size,
         model_args.seed,
     );
-    let batch = dataset.next_batch(&mut rng, &device);
+    let batch = dataset.next_batch(&mut rng, &device)?;
 
     let engine = InferenceEngine::new(
         model,

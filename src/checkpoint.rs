@@ -285,7 +285,10 @@ impl DatasetIdentity {
         let mut bytes = 0u64;
         for file in &files {
             let len = fs::metadata(file).with_context(|| format!("stat {}", file.display()))?.len();
-            let name = file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let name = file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .with_context(|| format!("{} has no UTF-8 file name", file.display()))?;
             sha.update(name.as_bytes());
             sha.update([0u8]);
             sha.update(len.to_le_bytes());

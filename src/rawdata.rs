@@ -421,11 +421,11 @@ impl RawImageDataset {
 }
 
 impl<B: Backend> TrainDataset<B> for RawImageDataset {
-    fn next_batch<R: Rng>(&mut self, rng: &mut R, device: &B::Device) -> Batch<B> {
+    fn next_batch<R: Rng>(&mut self, rng: &mut R, device: &B::Device) -> anyhow::Result<Batch<B>> {
         let format = self.format();
         let pixel_bytes = format.pixel_bytes();
         let n = self.len();
-        assert!(n > 0, "cannot sample from an empty split");
+        anyhow::ensure!(n > 0, "cannot sample from an empty split");
 
         self.indices.clear();
         for _ in 0..self.batch_size {
@@ -446,7 +446,7 @@ impl<B: Backend> TrainDataset<B> for RawImageDataset {
             Source::Streaming(split) => {
                 split
                     .fetch_into(&self.indices, &mut self.bytes)
-                    .expect("streaming read failed");
+                    .context("streaming read of a raw image batch")?;
             }
         }
 
@@ -462,7 +462,7 @@ impl<B: Backend> TrainDataset<B> for RawImageDataset {
         let pixels = (pixels - mean) / std;
 
         let labels = Tensor::<B, 1, Int>::from_ints(self.labels.as_slice(), device);
-        Batch { pixel_values: pixels, labels }
+        Ok(Batch { pixel_values: pixels, labels })
     }
 }
 
@@ -547,12 +547,12 @@ mod tests {
                 &mut mem,
                 &mut StdRng::seed_from_u64(seed),
                 &device,
-            );
+            ).expect("batch");
             let b = <RawImageDataset as TrainDataset<B>>::next_batch(
                 &mut stream,
                 &mut StdRng::seed_from_u64(seed),
                 &device,
-            );
+            ).expect("batch");
             let diff = (a.pixel_values - b.pixel_values).abs().max().into_scalar();
             assert_eq!(diff, 0.0, "streaming and in-memory batches must be identical");
             let la: Vec<i64> = a.labels.into_data().convert::<i64>().iter().collect();
@@ -664,11 +664,11 @@ mod tests {
             RawImageDataset::in_memory(&path, format, 4, CIFAR100_MEAN, CIFAR100_STD).unwrap();
         let device = Default::default();
         let mut rng = StdRng::seed_from_u64(0);
-        let _ = <RawImageDataset as TrainDataset<B>>::next_batch(&mut ds, &mut rng, &device);
+        <RawImageDataset as TrainDataset<B>>::next_batch(&mut ds, &mut rng, &device).expect("batch");
         let cap_bytes = ds.bytes.capacity();
         let cap_floats = ds.floats.capacity();
         for _ in 0..5 {
-            let _ = <RawImageDataset as TrainDataset<B>>::next_batch(&mut ds, &mut rng, &device);
+            <RawImageDataset as TrainDataset<B>>::next_batch(&mut ds, &mut rng, &device).expect("batch");
         }
         assert_eq!(ds.bytes.capacity(), cap_bytes, "byte buffer regrew");
         assert_eq!(ds.floats.capacity(), cap_floats, "float buffer regrew");
@@ -725,7 +725,7 @@ mod tests {
             &mut ds,
             &mut StdRng::seed_from_u64(1),
             &Default::default(),
-        );
+        ).expect("batch");
         assert_eq!(batch.pixel_values.dims(), [2, 3, 64, 64]);
 
         std::fs::remove_dir_all(&dir).unwrap();

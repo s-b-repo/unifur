@@ -535,7 +535,7 @@ mod tests {
         let path = corpus_path("labeled");
         TokenCorpus::tokenize_file(&source, &path).unwrap();
 
-        let labeler = Labeler::builtin();
+        let labeler = Labeler::builtin().expect("built-in rules");
         let manifest = TokenCorpus::label_file(&path, &labeler).unwrap();
         assert_eq!(manifest.labeled_tokens, ":pass}".len());
         assert!(labels_path(&path).exists() && manifest_path(&path).exists());

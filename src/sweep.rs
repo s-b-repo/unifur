@@ -83,8 +83,14 @@ pub fn apply(config: &mut TrainConfig, key: &str, value: &str) -> anyhow::Result
         "gamma" => config.gamma = num(value)?,
         "weight_decay" => config.weight_decay = num(value)?,
         "accumulate" => config.accumulate = int(value)?.max(1),
-        "clip_norm" => config.clip_norm = (num(value)? > 0.0).then(|| num(value).unwrap_or(0.0) as f32),
-        "ema_decay" => config.ema_decay = (num(value)? > 0.0).then(|| num(value).unwrap_or(0.0)),
+        "clip_norm" => {
+            let v = num(value)?;
+            config.clip_norm = (v > 0.0).then_some(v as f32);
+        }
+        "ema_decay" => {
+            let v = num(value)?;
+            config.ema_decay = (v > 0.0).then_some(v);
+        }
         "uncertainty" => config.uncertainty = num(value)?,
         "importance_bins" => config.importance_bins = int(value)?,
         "normalize_block_loss" => config.normalize_block_loss = matches!(value, "1" | "true" | "yes"),

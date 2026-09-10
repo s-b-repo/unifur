@@ -121,7 +121,7 @@ mod tests {
             &mut ds,
             &mut StdRng::seed_from_u64(2),
             &Default::default(),
-        );
+        ).expect("batch");
         assert_eq!(batch.pixel_values.dims(), [4, 3, 64, 64]);
 
         std::fs::remove_dir_all(&dir).unwrap();

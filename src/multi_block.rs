@@ -284,7 +284,9 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         }
 
         stats.gated_samples = ever_gated.iter().filter(|&&g| g).count();
-        let min_sigma = *schedule.last().expect("non-empty schedule");
+        // `steps >= 2`, so the schedule has a last element; `SIGMA_MIN` is
+        // what it is by construction.
+        let min_sigma = schedule.last().copied().unwrap_or(SIGMA_MIN);
         let logits = self.denoise(pixel_values.clone(), z, &vec![min_sigma; b], None);
         stats.model_calls += 1;
         (config.logit_norm.apply(logits), stats)
@@ -511,7 +513,7 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             P_STD,
         );
         let sigma_start = schedule[0];
-        let sigma_floor = *schedule.last().expect("non-empty schedule");
+        let sigma_floor = schedule.last().copied().unwrap_or(sigma_start);
 
         let b = pixel_values.dims()[0];
         let h_dim = self.model().label_embedding_weight().dims()[1];

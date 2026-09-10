@@ -102,8 +102,6 @@ pub fn evaluate<B: Backend>(
     x0_new: &Tensor<B, 2>,
     probs_new: Option<&Tensor<B, 2>>,
 ) -> GateReport {
-    let device = x0_new.device();
-
     // Per-sample cosine similarity along the embedding dim.
     let dot = (x0_prev.clone() * x0_new.clone()).sum_dim(1);
     let norm_p = x0_prev.clone().powf_scalar(2.0).sum_dim(1).sqrt();
@@ -145,8 +143,6 @@ pub fn evaluate<B: Backend>(
     if let Some(c) = &conf_v {
         conf_mean = c.iter().sum::<f32>() / n.max(1) as f32;
     }
-    let _ = device;
-
     GateReport {
         passed,
         mean_cosine: sum_cos / n.max(1) as f32,

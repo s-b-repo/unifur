@@ -383,7 +383,9 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             rng,
         );
 
-        let min_sigma = *schedule.last().expect("non-empty schedule");
+        // `discrete_sigmas_dblock` always yields at least two sigmas; the
+        // first was read above as `s0`, so the last is present too.
+        let min_sigma = schedule.last().copied().unwrap_or(s0);
         self.denoise(pixel_values.clone(), z_end, &vec![min_sigma; b], None)
     }
 
@@ -559,7 +561,8 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             z = z + (next_sigma - sigma) * d;
         }
 
-        let min_sigma = *self.inference_sigmas.last().expect("non-empty schedule");
+        // Non-empty by construction (`sigma0` above indexed it).
+        let min_sigma = self.inference_sigmas.last().copied().unwrap_or(sigma0);
         self.denoise(pixel_values, z, &vec![min_sigma; b], None)
     }
 

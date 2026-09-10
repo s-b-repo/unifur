@@ -132,7 +132,7 @@ impl AnyDataset {
         &mut self,
         rng: &mut R,
         device: &B::Device,
-    ) -> Batch<B> {
+    ) -> anyhow::Result<Batch<B>> {
         match self {
             Self::Synthetic(d) => d.next_batch(rng, device),
             Self::Raw(d) => d.next_batch(rng, device),
@@ -637,7 +637,8 @@ where
     let mut elapsed_before = 0.0f64;
     let mut start_step = 0usize;
     if let Some(state) = &restored {
-        let dir = TrainState::dir_for(config.resume.as_ref().expect("resume path"));
+        let resume = config.resume.as_ref().context("a training state was restored without a resume path")?;
+        let dir = TrainState::dir_for(resume);
         if let Some(file) = &state.optimizer {
             optim = optim.load_record(checkpoint::load_record::<TrainBackend<C>, _>(&dir, file, &device)?);
         }
@@ -765,7 +766,7 @@ where
     for step in start_step..config.steps {
         // The device stream is a pure function of (seed, step): see `step_seed`.
         <TrainBackend<C> as burn::tensor::backend::Backend>::seed(&device, step_seed(config.seed, step));
-        let (batch, origin) = dataset.next(&mut rng, &device);
+        let (batch, origin) = dataset.next(&mut rng, &device).with_context(|| format!("step {step}: draw a batch"))?;
         let (loss, mut fields, routing) = compute_loss(
             &model,
             &teacher_refs,
@@ -1127,23 +1128,29 @@ struct MixedDataset {
 }
 
 impl MixedDataset {
-    fn next<B: burn::tensor::backend::Backend, R: Rng>(&mut self, rng: &mut R, device: &B::Device) -> (Batch<B>, BatchOrigin) {
+    fn next<B: burn::tensor::backend::Backend, R: Rng>(
+        &mut self,
+        rng: &mut R,
+        device: &B::Device,
+    ) -> anyhow::Result<(Batch<B>, BatchOrigin)> {
         let n = self.sources.len();
         match self.mode {
             MixMode::Mixture => {
                 let source = self.weights.draw(rng);
-                let batch = self.sources[source].next(rng, device);
+                let batch = self.sources[source]
+                    .next(rng, device)
+                    .with_context(|| format!("source {}", self.names[source]))?;
                 let size = batch.batch_size();
-                (batch, BatchOrigin::single(source, n, size))
+                Ok((batch, BatchOrigin::single(source, n, size)))
             }
             MixMode::Composite => {
                 let mut parts = Vec::with_capacity(n);
                 for (i, source) in self.sources.iter_mut().enumerate() {
                     if self.slices[i] > 0 {
-                        parts.push(source.next(rng, device));
+                        parts.push(source.next(rng, device).with_context(|| format!("source {}", self.names[i]))?);
                     }
                 }
-                (crate::mix::concat_batches(parts), BatchOrigin { counts: self.slices.clone() })
+                Ok((crate::mix::concat_batches(parts)?, BatchOrigin { counts: self.slices.clone() }))
             }
         }
     }
@@ -1781,7 +1788,8 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
     let mut elapsed_before = 0.0f64;
     let mut start_step = 0usize;
     if let Some(state) = &restored {
-        let dir = TrainState::dir_for(config.resume.as_ref().expect("resume path"));
+        let resume = config.resume.as_ref().context("a training state was restored without a resume path")?;
+        let dir = TrainState::dir_for(resume);
         if let Some(file) = &state.optimizer {
             optim = optim.load_record(checkpoint::load_record::<B, _>(&dir, file, device)?);
         }

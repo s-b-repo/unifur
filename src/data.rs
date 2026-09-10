@@ -33,7 +33,9 @@ impl<B: Backend> Batch<B> {
 
 /// Dataset abstraction producing infinite training batches.
 pub trait TrainDataset<B: Backend> {
-    fn next_batch<R: Rng>(&mut self, rng: &mut R, device: &B::Device) -> Batch<B>;
+    /// Draw the next batch. Fails when the underlying source cannot supply
+    /// one (an I/O error on a streamed split, an empty split).
+    fn next_batch<R: Rng>(&mut self, rng: &mut R, device: &B::Device) -> anyhow::Result<Batch<B>>;
 }
 
 /// Randomly generated images/labels shaped like CIFAR-100. Useful for smoke
@@ -69,7 +71,7 @@ impl SyntheticDataset {
 }
 
 impl<B: Backend> TrainDataset<B> for SyntheticDataset {
-    fn next_batch<R: Rng>(&mut self, rng: &mut R, device: &B::Device) -> Batch<B> {
+    fn next_batch<R: Rng>(&mut self, rng: &mut R, device: &B::Device) -> anyhow::Result<Batch<B>> {
         // Draw pixel values directly on-device (uniform in [0,1)), then
         // normalize with the CIFAR-100 statistics to mirror real inputs.
         let shape = [self.batch_size, 3, self.image_size, self.image_size];
@@ -84,6 +86,6 @@ impl<B: Backend> TrainDataset<B> for SyntheticDataset {
             .collect();
         let labels = Tensor::<B, 1, Int>::from_ints(labels.as_slice(), device);
 
-        Batch { pixel_values: pixels, labels }
+        Ok(Batch { pixel_values: pixels, labels })
     }
 }

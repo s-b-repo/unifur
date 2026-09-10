@@ -83,25 +83,52 @@ pub struct LoadReport {
     pub rejected_by_license: usize,
     pub rejected_by_format: usize,
     pub skipped_empty: usize,
+    /// The first few rows rejected for format, with the parser's reason, so
+    /// a source that is silently all-rejected can be diagnosed.
+    #[serde(default)]
+    pub format_errors: Vec<String>,
 }
 
 impl LoadReport {
+    /// How many format errors are kept verbatim; the count is always exact.
+    pub const KEPT_FORMAT_ERRORS: usize = 5;
+
     pub fn merge(&mut self, other: &LoadReport) {
         self.loaded += other.loaded;
         self.rejected_by_license += other.rejected_by_license;
         self.rejected_by_format += other.rejected_by_format;
         self.skipped_empty += other.skipped_empty;
+        for e in &other.format_errors {
+            self.note_format_error(e.clone());
+        }
+    }
+
+    /// Count a row rejected for format and keep its reason while there is room.
+    fn reject_format(&mut self, line_no: usize, err: &serde_json::Error) {
+        self.rejected_by_format += 1;
+        self.note_format_error(format!("line {}: {err}", line_no + 1));
+    }
+
+    fn note_format_error(&mut self, message: String) {
+        if self.format_errors.len() < Self::KEPT_FORMAT_ERRORS {
+            self.format_errors.push(message);
+        }
     }
 
     pub fn render(&self, source: Source) -> String {
-        format!(
+        let mut out = format!(
             "{}: loaded={} | rejected (license={}, format={}, empty={})",
             source.name(),
             self.loaded,
             self.rejected_by_license,
             self.rejected_by_format,
             self.skipped_empty,
-        )
+        );
+        for e in &self.format_errors {
+            out.push_str("\n  format: ");
+            out.push_str(e);
+        }
+        out
     }
 }
 
@@ -166,8 +193,8 @@ pub fn load_code_reviewer(path: &Path) -> Result<(Vec<Example>, LoadReport)> {
         }
         let row: CodeReviewerRow = match serde_json::from_str(line) {
             Ok(row) => row,
-            Err(_) => {
-                report.rejected_by_format += 1;
+            Err(err) => {
+                report.reject_format(line_no, &err);
                 continue;
             }
         };
@@ -245,8 +272,8 @@ pub fn load_swe_bench(path: &Path) -> Result<(Vec<Example>, LoadReport)> {
         }
         let row: SweBenchRow = match serde_json::from_str(line) {
             Ok(row) => row,
-            Err(_) => {
-                report.rejected_by_format += 1;
+            Err(err) => {
+                report.reject_format(line_no, &err);
                 continue;
             }
         };
@@ -316,8 +343,8 @@ pub fn load_code_feedback(path: &Path) -> Result<(Vec<Example>, LoadReport)> {
         }
         let row: CodeFeedbackRow = match serde_json::from_str(line) {
             Ok(row) => row,
-            Err(_) => {
-                report.rejected_by_format += 1;
+            Err(err) => {
+                report.reject_format(line_no, &err);
                 continue;
             }
         };
@@ -512,8 +539,8 @@ mod tests {
 
     #[test]
     fn test_load_report_merges_correctly() {
-        let mut a = LoadReport { loaded: 10, rejected_by_license: 2, rejected_by_format: 1, skipped_empty: 0 };
-        let b = LoadReport { loaded: 5, rejected_by_license: 1, rejected_by_format: 0, skipped_empty: 3 };
+        let mut a = LoadReport { loaded: 10, rejected_by_license: 2, rejected_by_format: 1, skipped_empty: 0, format_errors: Vec::new() };
+        let b = LoadReport { loaded: 5, rejected_by_license: 1, rejected_by_format: 0, skipped_empty: 3, format_errors: Vec::new() };
         a.merge(&b);
         assert_eq!(a.loaded, 15);
         assert_eq!(a.rejected_by_license, 3);
@@ -523,7 +550,7 @@ mod tests {
 
     #[test]
     fn test_load_report_render_includes_source_name() {
-        let r = LoadReport { loaded: 100, rejected_by_license: 10, rejected_by_format: 5, skipped_empty: 2 };
+        let r = LoadReport { loaded: 100, rejected_by_license: 10, rejected_by_format: 5, skipped_empty: 2, format_errors: Vec::new() };
         let rendered = r.render(Source::SweBench);
         assert!(rendered.contains("swe-bench"));
         assert!(rendered.contains("100"));

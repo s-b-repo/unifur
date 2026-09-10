@@ -52,6 +52,7 @@ use crate::{
     stats::{erf, erfc, norm_cdf, norm_ppf},
     vit::ViTDiTConfig,
 };
+use anyhow::Context as _;
 use rand::SeedableRng;
 
 use burn::{
@@ -89,6 +90,28 @@ fn cert(
     tolerance: f64,
 ) -> Certificate {
     Certificate { group, name, theorem, residual, tolerance }
+}
+
+/// The residual of a check that could not run: infinite, so the certificate
+/// fails, with the reason on stderr rather than a panic.
+fn failed(what: &str, err: &anyhow::Error) -> f64 {
+    eprintln!("verify: {what}: {err:#}");
+    f64::INFINITY
+}
+
+/// Run a group's checks; if the group cannot even be set up, report that as
+/// a single failing certificate instead of unwinding the whole run.
+fn checks_or_failed(group: &'static str, checks: fn() -> anyhow::Result<Vec<Certificate>>) -> Vec<Certificate> {
+    match checks() {
+        Ok(certificates) => certificates,
+        Err(err) => vec![cert(
+            group,
+            "checks_ran",
+            "Every check in this group could be set up and evaluated.",
+            failed(group, &err),
+            0.0,
+        )],
+    }
 }
 
 /// Result of a full verification run.
@@ -922,6 +945,10 @@ fn loopgraph_certificates() -> Vec<Certificate> {
 // -------------------------------------------------------------------- moe --
 
 fn moe_certificates() -> Vec<Certificate> {
+    checks_or_failed("moe", moe_checks)
+}
+
+fn moe_checks() -> anyhow::Result<Vec<Certificate>> {
     let device = Default::default();
 
     // Renormalized top-k gates must be a distribution, or the layer rescales
@@ -1122,7 +1149,7 @@ fn moe_certificates() -> Vec<Certificate> {
     let mut host_entropy = 0.0f64;
     for row in 0..st {
         let r = &host_probs[row * se..(row + 1) * se];
-        let argmax = (0..se).max_by(|a, b| r[*a].partial_cmp(&r[*b]).unwrap()).unwrap();
+        let argmax = (0..se).fold(0, |best, e| if r[e] > r[best] { e } else { best });
         host_load[argmax] += 1.0 / st as f32;
         host_entropy -= r.iter().map(|&v| f64::from(v) * f64::from(v).ln()).sum::<f64>();
     }
@@ -1253,7 +1280,7 @@ fn moe_certificates() -> Vec<Certificate> {
     nudged.nudge_balance_bias(&[0.25, 0.25, 0.25, 0.25], 1e-3);
     let after: Vec<f32> = nudged
         .balance_bias()
-        .expect("bias attached")
+        .context("bias attached")?
         .into_data()
         .convert::<f32>()
         .iter::<f32>()
@@ -1263,7 +1290,7 @@ fn moe_certificates() -> Vec<Certificate> {
         after.iter().zip(&want).any(|(a, b)| a.to_bits() != b.to_bits()),
     ));
 
-    vec![
+    Ok(vec![
         cert(
             "moe",
             "routing_entropies_read_as_specified",
@@ -1351,12 +1378,16 @@ fn moe_certificates() -> Vec<Certificate> {
             // of the intermediate exponentials -- order 1e-6 on a probability.
             1e-5,
         ),
-    ]
+    ])
 }
 
 // ------------------------------------------------------------------ mosme --
 
 fn mosme_certificates() -> Vec<Certificate> {
+    checks_or_failed("mosme", mosme_checks)
+}
+
+fn mosme_checks() -> anyhow::Result<Vec<Certificate>> {
     use crate::expert_index::{BoxSpec, ExpertSpec, MosmeSpec};
     use crate::mosme::{MosmeConfig, MosmeFeedForward};
 
@@ -1423,7 +1454,7 @@ fn mosme_certificates() -> Vec<Certificate> {
     // generalization rather than a second, subtly different implementation.
     let flat_cfg = config(MosmeSpec::flat(4));
     let flat_layer = MosmeFeedForward::<B>::new(&flat_cfg, &device);
-    let reference = flat_layer.as_flat().expect("one box");
+    let reference = flat_layer.as_flat().context("one box")?;
     let (x, cond) = inputs();
     let hierarchical = flat_layer.forward(x.clone(), cond.clone());
     let flat = reference.forward(x, cond);
@@ -1456,8 +1487,8 @@ fn mosme_certificates() -> Vec<Certificate> {
     let before = layer.forward(x.clone(), cond.clone()).output;
     let grown_spec = spec
         .extended_with("coding", ExpertSpec::new("coding/go", "Go"))
-        .expect("extend");
-    let grown = layer.grown(&grown_spec, &cfg, &device).expect("grow");
+        .context("extend")?;
+    let grown = layer.grown(&grown_spec, &cfg, &device).context("grow")?;
     let after = grown.forward(x.clone(), cond.clone()).output;
     let hot_swap_err = (before - after).abs().max().into_scalar() as f64;
 
@@ -1545,14 +1576,15 @@ fn mosme_certificates() -> Vec<Certificate> {
     // an external engine is the whole reason it exists.
     let index = crate::expert_index::MosmeSpec::flat(3);
     let roundtrip_err = match serde_json::to_string(&index)
-        .ok()
-        .and_then(|t| serde_json::from_str::<MosmeSpec>(&t).ok())
+        .context("serialize spec")
+        .and_then(|t| serde_json::from_str::<MosmeSpec>(&t).context("parse spec"))
     {
-        Some(back) if back == index => 0.0,
-        _ => 1.0,
+        Ok(back) if back == index => 0.0,
+        Ok(_) => 1.0,
+        Err(err) => failed("mosme: spec round trip", &err),
     };
 
-    vec![
+    Ok(vec![
         cert(
             "mosme",
             "composed_gates_partition_of_unity",
@@ -1630,7 +1662,7 @@ fn mosme_certificates() -> Vec<Certificate> {
             roundtrip_err,
             0.0,
         ),
-    ]
+    ])
 }
 
 // --------------------------------------------------------------------- lm --
@@ -1808,6 +1840,10 @@ fn lm_certificates() -> Vec<Certificate> {
 // ------------------------------------------------------------ antipattern --
 
 fn antipattern_certificates() -> Vec<Certificate> {
+    checks_or_failed("antipattern", antipattern_checks)
+}
+
+fn antipattern_checks() -> anyhow::Result<Vec<Certificate>> {
     use crate::antipattern::{text_tokens, Labeler, RuleSet, CLEAN};
     use crate::corpus::TokenCorpus;
     use crate::lm::{label_weights, unlikelihood, LanguageModel, LmConfig, Unlikelihood};
@@ -1816,7 +1852,7 @@ fn antipattern_certificates() -> Vec<Certificate> {
     use burn::tensor::activation::log_softmax;
 
     let device = Default::default();
-    let labeler = Labeler::builtin();
+    let labeler = Labeler::builtin()?;
 
     // ------------------------------------------------------------------
     // The rules are the specification of what "bad code" means here, and
@@ -1865,7 +1901,7 @@ fn antipattern_certificates() -> Vec<Certificate> {
             .collect();
         Ok(mismatches as f64 + f64::from(u8::from(flagged != ":pass}")))
     })()
-    .unwrap_or(f64::INFINITY);
+    .unwrap_or_else(|err| failed("antipattern", &err));
 
     // ------------------------------------------------------------------
     // With nothing flagged, the penalized objective must be the plain one to
@@ -2012,7 +2048,7 @@ fn antipattern_certificates() -> Vec<Certificate> {
     }
     let raises_err = f64::from((before - after_rewarded).max(0.0));
 
-    vec![
+    Ok(vec![
         cert(
             "antipattern",
             "rules_match_their_examples_and_not_their_counterexamples",
@@ -2062,7 +2098,7 @@ fn antipattern_certificates() -> Vec<Certificate> {
             raises_err,
             0.0,
         ),
-    ]
+    ])
 }
 
 // ------------------------------------------------------------- codequality --
@@ -3113,6 +3149,10 @@ fn planner_certificates() -> Vec<Certificate> {
 // ------------------------------------------------------------- experiment --
 
 fn experiment_certificates() -> Vec<Certificate> {
+    checks_or_failed("experiment", experiment_checks)
+}
+
+fn experiment_checks() -> anyhow::Result<Vec<Certificate>> {
     use crate::experiment::{median, t_quantile_975, Summary};
 
     // ------------------------------------------------------------------
@@ -3120,7 +3160,7 @@ fn experiment_certificates() -> Vec<Certificate> {
     // contains the mean, and its half-width is exactly t_{0.975, n-1} s/sqrt(n)
     // for the sample standard deviation s. Measured through `Summary::of`.
     let sample = [3.1, 2.7, 3.9, 3.3, 2.5, 3.6, 3.0];
-    let summary = Summary::of(&sample).expect("non-empty");
+    let summary = Summary::of(&sample).context("non-empty")?;
     let mean = sample.iter().sum::<f64>() / sample.len() as f64;
     let var = sample.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (sample.len() - 1) as f64;
     let half = t_quantile_975(sample.len() - 1) * var.sqrt() / (sample.len() as f64).sqrt();
@@ -3140,7 +3180,7 @@ fn experiment_certificates() -> Vec<Certificate> {
     let mut previous = f64::INFINITY;
     for pairs in 1..=20 {
         let values: Vec<f64> = (0..pairs).flat_map(|_| [-1.0, 1.0]).collect();
-        let hw = Summary::of(&values).expect("non-empty").ci95_half_width;
+        let hw = Summary::of(&values).context("non-empty")?.ci95_half_width;
         shrink_err = shrink_err.max((hw - previous).max(0.0));
         previous = hw;
     }
@@ -3163,7 +3203,7 @@ fn experiment_certificates() -> Vec<Certificate> {
     }
     table_err = table_err.max((t_quantile_975(1000) - 1.96).abs());
 
-    vec![
+    Ok(vec![
         cert(
             "experiment",
             "ci_is_the_t_interval_on_the_mean",
@@ -3192,12 +3232,16 @@ fn experiment_certificates() -> Vec<Certificate> {
             table_err,
             0.0,
         ),
-    ]
+    ])
 }
 
 // ------------------------------------------------------------ multisource --
 
 fn multisource_certificates() -> Vec<Certificate> {
+    checks_or_failed("multisource", multisource_checks)
+}
+
+fn multisource_checks() -> anyhow::Result<Vec<Certificate>> {
     use crate::corpus::TokenCorpus;
     use crate::train::DefaultTrainBackend as A;
     use burn::optim::{GradientsParams, Optimizer, SgdConfig};
@@ -3214,7 +3258,7 @@ fn multisource_certificates() -> Vec<Certificate> {
     // Mixture: the source of each batch is drawn by weight. 4000 draws of a
     // 0.75 / 0.25 split have a binomial standard deviation of 0.0068 on the
     // share; the tolerance is 3.6 of those.
-    let weights = MixWeights::new(&[3.0, 1.0]).expect("valid");
+    let weights = MixWeights::new(&[3.0, 1.0]).context("valid")?;
     let mut rng = rand_chacha::ChaCha12Rng::seed_from_u64(29);
     let draws = 4000;
     let first = (0..draws).filter(|_| weights.draw(&mut rng) == 0).count();
@@ -3237,7 +3281,7 @@ fn multisource_certificates() -> Vec<Certificate> {
     // A single-source mix draws exactly the windows the corpus alone would,
     // from the same random stream; a 3:1 composite of eight slices 6 + 2.
     let scratch = std::env::temp_dir().join(format!("dblocks-verify-mix-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch).with_context(|| format!("create {}", scratch.display()))?;
     let corpus_path = scratch.join("mix.bin");
     let single_err = (|| -> anyhow::Result<f64> {
         TokenCorpus::write(&corpus_path, &(0..300).map(|i| (i % 250) as u16).collect::<Vec<_>>())?;
@@ -3250,7 +3294,7 @@ fn multisource_certificates() -> Vec<Certificate> {
         let (got, rows, origin) = mix.sample(3, 8, &mut b)?;
         Ok(f64::from(u8::from(got != expected || rows.is_some() || origin.counts != vec![3])))
     })()
-    .unwrap_or(f64::INFINITY);
+    .unwrap_or_else(|err| failed("multisource", &err));
     let composite_mix_err = (|| -> anyhow::Result<f64> {
         let mut x = TokenCorpus::in_memory(&corpus_path)?;
         let mut y = TokenCorpus::in_memory(&corpus_path)?;
@@ -3259,8 +3303,10 @@ fn multisource_certificates() -> Vec<Certificate> {
         let (got, _, origin) = mix.sample(8, 4, &mut r)?;
         Ok(f64::from(u8::from(got.len() != 8 || origin.counts != vec![6, 2])))
     })()
-    .unwrap_or(f64::INFINITY);
-    let _ = std::fs::remove_dir_all(&scratch);
+    .unwrap_or_else(|err| failed("multisource", &err));
+    if let Err(err) = std::fs::remove_dir_all(&scratch) {
+        eprintln!("verify: could not remove scratch {}: {err}", scratch.display());
+    }
 
     // ------------------------------------------------------------------
     // Teacher mixtures. One teacher's mixture is its own softened
@@ -3374,9 +3420,9 @@ fn multisource_certificates() -> Vec<Certificate> {
     let b_lin = LinearConfig::new(4, 3).init::<B>(&device);
     let fa = flatten::<B, _>(&a);
     let fb = flatten::<B, _>(&b_lin);
-    let same = merge_into::<B, _>(a.clone(), &[ParamSnapshot::of::<B, _>(&a)], &[1.0, 1.0]).expect("merge");
+    let same = merge_into::<B, _>(a.clone(), &[ParamSnapshot::of::<B, _>(&a)], &[1.0, 1.0]).context("merge")?;
     let mut merge_identity_err = f64::from(u8::from(flatten::<B, _>(&same) != fa));
-    let half = merge_into::<B, _>(a, &[ParamSnapshot::of::<B, _>(&b_lin)], &[1.0, 3.0]).expect("merge");
+    let half = merge_into::<B, _>(a, &[ParamSnapshot::of::<B, _>(&b_lin)], &[1.0, 3.0]).context("merge")?;
     let mut merge_linear_err = 0.0f64;
     for ((m, x), y) in flatten::<B, _>(&half).iter().zip(&fa).zip(&fb) {
         merge_linear_err = merge_linear_err.max(f64::from((m - (0.25 * x + 0.75 * y)).abs()));
@@ -3385,7 +3431,7 @@ fn multisource_certificates() -> Vec<Certificate> {
         merge_identity_err = 1.0; // two inits must differ for the test to mean anything
     }
 
-    vec![
+    Ok(vec![
         cert(
             "multisource",
             "mixture_draws_follow_the_weights",
@@ -3470,12 +3516,16 @@ fn multisource_certificates() -> Vec<Certificate> {
             merge_linear_err,
             1e-6,
         ),
-    ]
+    ])
 }
 
 // ----------------------------------------------------------------- policy --
 
 fn policy_certificates() -> Vec<Certificate> {
+    checks_or_failed("policy", policy_checks)
+}
+
+fn policy_checks() -> anyhow::Result<Vec<Certificate>> {
     use crate::policy::{gated_generate, hex, hmac_sha256, starter, Approval, Decision, Grant, Key, Policy};
 
     // ------------------------------------------------------------------
@@ -3490,9 +3540,9 @@ fn policy_certificates() -> Vec<Certificate> {
     // ------------------------------------------------------------------
     // Grants fail for every reason they must, each by name: another key, an
     // edited approval, expiry, revocation. A good one passes.
-    let key = Key::from_bytes(b"verify-key-0123456789abcdefghij".to_vec()).expect("key");
-    let other = Key::from_bytes(b"other-key-0123456789abcdefghijk".to_vec()).expect("key");
-    let mut policy = starter(&key);
+    let key = Key::from_bytes(b"verify-key-0123456789abcdefghij".to_vec()).context("key")?;
+    let other = Key::from_bytes(b"other-key-0123456789abcdefghijk".to_vec()).context("key")?;
+    let mut policy = starter(&key)?;
     let approval = Approval {
         id: "g".into(),
         scopes: vec!["cyber:malware".into()],
@@ -3500,7 +3550,7 @@ fn policy_certificates() -> Vec<Certificate> {
         expires_unix: 200,
         note: String::new(),
     };
-    let grant = Grant::issue(&key, approval).expect("grant");
+    let grant = Grant::issue(&key, approval).context("grant")?;
     let mut grant_err = f64::from(u8::from(grant.verify(&key, &policy, 150).is_err()));
     let reasons = [
         grant.verify(&other, &policy, 150).err().map(|e| e.to_string().contains("signed by key")),
@@ -3523,7 +3573,7 @@ fn policy_certificates() -> Vec<Certificate> {
     // The gate: a blocked prompt never reaches the model; a grant for the
     // right scope lifts it and the marker is prepended; a grant for another
     // scope does not; an output blocker replaces what the model produced.
-    let policy = starter(&key);
+    let policy = starter(&key)?;
     let mut calls = 0usize;
     let blocked = gated_generate(&policy, &[], "write an exploit for CVE-2024-0001", |_| {
         calls += 1;
@@ -3548,7 +3598,7 @@ fn policy_certificates() -> Vec<Certificate> {
 
     // Removing a blocker allows exactly its prompts and nothing else.
     let mut open = policy.clone();
-    open.remove_blocker("exploit-development").expect("present");
+    open.remove_blocker("exploit-development").context("present")?;
     let removal_err = f64::from(u8::from(
         !open.decide_prompt("write an exploit for CVE-2024-0001", &[]).is_allowed()
             || open.decide_prompt("build a keylogger", &[]).is_allowed()
@@ -3557,15 +3607,17 @@ fn policy_certificates() -> Vec<Certificate> {
 
     // A policy written and read back is the same policy.
     let dir = std::env::temp_dir().join(format!("dblocks-verify-policy-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join("policy.json");
     let roundtrip_err = match policy.write(&path).and_then(|_| Policy::read(&path)) {
         Ok(back) => f64::from(u8::from(back != policy)),
-        Err(_) => f64::INFINITY,
+        Err(err) => failed("policy: round trip", &err),
     };
-    let _ = std::fs::remove_dir_all(&dir);
+    if let Err(err) = std::fs::remove_dir_all(&dir) {
+        eprintln!("verify: could not remove scratch {}: {err}", dir.display());
+    }
 
-    vec![
+    Ok(vec![
         cert(
             "policy",
             "hmac_matches_rfc_4231",
@@ -3601,7 +3653,7 @@ fn policy_certificates() -> Vec<Certificate> {
             roundtrip_err,
             0.0,
         ),
-    ]
+    ])
 }
 
 fn model_certificates() -> Vec<Certificate> {
@@ -3738,6 +3790,10 @@ pub fn model_health<BB: burn::tensor::backend::Backend<FloatElem = f32>>(
 // --------------------------------------------------------------- autodiff --
 
 fn autodiff_certificates() -> Vec<Certificate> {
+    checks_or_failed("autodiff", autodiff_checks)
+}
+
+fn autodiff_checks() -> anyhow::Result<Vec<Certificate>> {
     use crate::{distill::soft_target_kl, train::DefaultTrainBackend as A};
     use burn::tensor::TensorData;
 
@@ -3758,7 +3814,7 @@ fn autodiff_certificates() -> Vec<Certificate> {
     let grads = loss.backward();
     let analytic: Vec<f32> = student
         .grad(&grads)
-        .expect("student logits must receive a gradient")
+        .context("student logits must receive a gradient")?
         .into_data()
         .convert::<f32>()
         .iter::<f32>()
@@ -3787,7 +3843,7 @@ fn autodiff_certificates() -> Vec<Certificate> {
     let cross_kl = soft_target_kl(teacher, student, 2.0).into_scalar() as f64;
     let gibbs_violation = self_kl.abs().max((-cross_kl).max(0.0));
 
-    vec![
+    Ok(vec![
         cert(
             "autodiff",
             "distillation_gradcheck",
@@ -3802,7 +3858,7 @@ fn autodiff_certificates() -> Vec<Certificate> {
             gibbs_violation,
             1e-6,
         ),
-    ]
+    ])
 }
 
 #[cfg(test)]

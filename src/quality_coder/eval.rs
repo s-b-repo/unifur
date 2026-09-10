@@ -126,8 +126,24 @@ pub struct EvalHarness {
 }
 
 impl Default for EvalHarness {
+    /// [`EvalHarness::new`], falling back to a harness without the lexical
+    /// dimension if the built-in rules do not compile; the reason goes to
+    /// stderr, since `Default` cannot report it.
     fn default() -> Self {
-        Self::new()
+        match Self::new() {
+            Ok(harness) => harness,
+            Err(err) => {
+                eprintln!("quality-coder: built-in rules unavailable, scoring without the lexical dimension: {err:#}");
+                Self {
+                    analyzer: CompositeAnalyzer::<IdentityAnalyzer>::new(
+                        Language::Generic,
+                        None,
+                        Some(StructuralAnalyzer::default()),
+                        Some(ExternalAnalyzer::new("none", Vec::new())),
+                    ),
+                }
+            }
+        }
     }
 }
 
@@ -136,16 +152,16 @@ impl EvalHarness {
     /// heuristics on, anti-pattern density on, external tools off.
     /// The composite score is the same one the regularizer uses, so
     /// improvements here are improvements there.
-    pub fn new() -> Self {
-        let labeler = crate::antipattern::Labeler::builtin();
-        Self {
+    pub fn new() -> anyhow::Result<Self> {
+        let labeler = crate::antipattern::Labeler::builtin()?;
+        Ok(Self {
             analyzer: CompositeAnalyzer::<IdentityAnalyzer>::new(
                 Language::Generic,
                 Some(labeler),
                 Some(StructuralAnalyzer::default()),
                 Some(ExternalAnalyzer::new("none", Vec::new())),
             ),
-        }
+        })
     }
 
     /// Score a held-out split. `examples` is the held-out set;
@@ -263,11 +279,7 @@ pub fn apply_unified_diff(prompt: &str, patch: &Patch) -> Option<String> {
     }
     // Whole-file rewrite marker from the dataset adapter: bypass the
     // diff parser and use the payload directly.
-    if patch.diff.starts_with("# quality-coder: whole-file-rewrite\n") {
-        let payload = patch
-            .diff
-            .strip_prefix("# quality-coder: whole-file-rewrite\n")
-            .unwrap();
+    if let Some(payload) = patch.diff.strip_prefix("# quality-coder: whole-file-rewrite\n") {
         return Some(payload.to_string());
     }
     apply_unified_diff_inner(&extract_source_from_prompt(prompt), &patch.diff)
@@ -278,7 +290,7 @@ fn apply_unified_diff_inner(source: &str, diff: &str) -> Option<String> {
     let source_lines: Vec<&str> = source.split_inclusive('\n').collect();
     let mut out = String::with_capacity(source.len());
     let mut source_idx = 0usize;
-    for (hunk_idx, hunk) in hunks.iter().enumerate() {
+    for hunk in &hunks {
         // Copy source lines up to the hunk's start.
         while source_idx < hunk.old_start.saturating_sub(1) && source_idx < source_lines.len() {
             out.push_str(source_lines[source_idx]);
@@ -320,7 +332,6 @@ fn apply_unified_diff_inner(source: &str, diff: &str) -> Option<String> {
                 }
             }
         }
-        let _ = hunk_idx;
     }
     // Copy any trailing lines.
     while source_idx < source_lines.len() {
@@ -439,9 +450,7 @@ fn touches_lines_outside_defect(patch: &Patch, prompt: &str) -> bool {
     // prompt's source block is the same length as the original. The
     // proxy is conservative: a patch that mentions any hunk header
     // whose old_start is well past the source length is suspicious.
-    let source_len = prompt.find("Source:\n```\n").unwrap_or(0);
     let source_block = extract_source_from_prompt(prompt);
-    let _ = source_len;
     let source_line_count = source_block.lines().count().max(1);
     for line in patch.diff.lines() {
         if let Some(rest) = line.strip_prefix("@@") {
@@ -559,7 +568,7 @@ mod tests {
             prompt,
             target: Patch { diff: good_patch.into(), refusal_reason: None },
         };
-        let harness = EvalHarness::new();
+        let harness = EvalHarness::new().expect("built-in rules");
         let (report, rows) = harness.score(Source::SweBench, std::slice::from_ref(&example), &[Patch { diff: good_patch.into(), refusal_reason: None }]);
         assert_eq!(report.evaluated, 1);
         assert_eq!(rows.len(), 1);

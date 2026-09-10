@@ -473,7 +473,7 @@ fn parse_class(bytes: &[u8], mut i: usize) -> Result<(Atom, usize)> {
             }
             b'-' if prev.is_some() && bytes.get(i).is_some_and(|n| *n != b']') => {
                 // A range `a-z`, where `z` may itself be escaped.
-                let lo = prev.take().expect("checked");
+                let lo = prev.take().context("range without a lower bound")?;
                 let mut hi = bytes[i];
                 i += 1;
                 if hi == b'\\' {
@@ -549,6 +549,11 @@ impl CompiledRule {
             Some((Atom::Literal(b), q)) if q.min >= 1 => Some(*b),
             _ => None,
         };
+        anyhow::ensure!(
+            atoms.iter().any(|(a, _)| matches!(a, Atom::Mark)),
+            "compiled rule {:?} lost its body mark",
+            rule.body
+        );
         Ok(Self { pattern: Pattern { atoms }, first })
     }
 
@@ -560,7 +565,9 @@ impl CompiledRule {
             }
         }
         let (end, mark) = self.pattern.match_at(text, at)?;
-        let start = mark.expect("every compiled rule carries a mark");
+        // `compile` guarantees the mark atom is present, so a match always
+        // reports where the body starts.
+        let start = mark?;
         (end > start).then_some((start, end))
     }
 
@@ -609,16 +616,19 @@ impl Labeler {
             .rules
             .iter()
             .map(|r| {
-                let index = set.category_index(&r.category).expect("validated");
-                u8::try_from(index + 1).expect("validated against MAX_CATEGORIES")
+                let index = set
+                    .category_index(&r.category)
+                    .with_context(|| format!("rule {:?} names unknown category {:?}", r.body, r.category))?;
+                u8::try_from(index + 1).with_context(|| format!("category index {index} does not fit a label byte"))
             })
-            .collect();
+            .collect::<Result<Vec<u8>>>()?;
         Ok(Self { set, compiled, labels })
     }
 
-    /// The shipped rule set, compiled.
-    pub fn builtin() -> Self {
-        Self::new(RuleSet::builtin()).expect("the built-in rule set validates")
+    /// The shipped rule set, compiled. Fails only if the shipped rules are
+    /// inconsistent, which `dblocks verify` certifies against.
+    pub fn builtin() -> Result<Self> {
+        Self::new(RuleSet::builtin()).context("compile the built-in rule set")
     }
 
     pub fn rule_set(&self) -> &RuleSet {
@@ -1260,7 +1270,7 @@ mod tests {
 
     #[test]
     fn test_body_alone_is_labeled_and_first_span_wins() {
-        let labeler = Labeler::builtin();
+        let labeler = Labeler::builtin().expect("built-in rules");
         let text = "try:\n    f()\nexcept:\n    pass\n";
         let (labels, spans) = labeler.label_with_spans(&text_tokens(text));
         let bytes = text.as_bytes();
@@ -1288,7 +1298,7 @@ mod tests {
 
     #[test]
     fn test_overlapping_rules_are_both_reported_but_one_label_survives() {
-        let labeler = Labeler::builtin();
+        let labeler = Labeler::builtin().expect("built-in rules");
         // Empty *and* catches Throwable: two findings, and the first span in
         // scan order owns the shared tokens.
         let text = "catch (Throwable t) {}";
@@ -1301,7 +1311,7 @@ mod tests {
 
     #[test]
     fn test_optional_context_reports_each_body_once() {
-        let labeler = Labeler::builtin();
+        let labeler = Labeler::builtin().expect("built-in rules");
         // `go-error-blank-identifier` has a context that starts with `,\s*`,
         // so it can anchor at several positions onto one body. One finding.
         let spans = labeler.scan(&text_tokens("n,    _ := strconv.Atoi(s)"));
@@ -1314,7 +1324,7 @@ mod tests {
         // certificate suite checks the same thing so a regression in the
         // matcher is a named failure.
         RuleSet::builtin().validate().unwrap();
-        let labeler = Labeler::builtin();
+        let labeler = Labeler::builtin().expect("built-in rules");
         for rule in &labeler.rule_set().rules {
             assert!(!rule.examples.is_empty(), "rule '{}' has no examples", rule.name);
             assert!(!rule.counterexamples.is_empty(), "rule '{}' has no counterexamples", rule.name);
@@ -1354,7 +1364,7 @@ mod tests {
 
     #[test]
     fn test_manifest_counts_and_weight_table() {
-        let labeler = Labeler::builtin();
+        let labeler = Labeler::builtin().expect("built-in rules");
         let text = "except:\n    pass\ncatch (e) {}\n";
         let tokens = text_tokens(text);
         let (labels, spans) = labeler.label_with_spans(&tokens);
@@ -1379,7 +1389,7 @@ mod tests {
 
     #[test]
     fn test_report_names_the_line_and_the_category() {
-        let labeler = Labeler::builtin();
+        let labeler = Labeler::builtin().expect("built-in rules");
         let report = labeler.report("x = 1\ntry:\n    f()\nexcept:\n    pass\n");
         assert!(report.contains("line 5: [error-swallowing] except-pass -> \"pass\""), "{report}");
         assert!(report.contains("line 4: [broad-catch] bare-except"), "{report}");

@@ -101,7 +101,7 @@ mod tests {
             &mut ds,
             &mut StdRng::seed_from_u64(1),
             &Default::default(),
-        );
+        ).expect("batch");
         assert_eq!(batch.pixel_values.dims(), [2, 3, 32, 32]);
         assert_eq!(batch.labels.dims(), [2]);
 

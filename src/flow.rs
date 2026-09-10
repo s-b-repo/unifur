@@ -131,7 +131,7 @@ pub fn train_flow_synthetic(
     let start = std::time::Instant::now();
 
     for step in 0..config.steps {
-        let batch = dataset.next_batch(&mut rng, &device);
+        let batch = dataset.next_batch(&mut rng, &device)?;
         let loss = flow_matching_loss(&model, &batch.pixel_values, batch.labels.clone(), &mut rng);
         let grads = loss.backward();
         let grads = GradientsParams::from_grads(grads, &model);
