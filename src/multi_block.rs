@@ -85,7 +85,10 @@ pub struct Gated {
 impl Gated {
     /// Strategy with one gate applied to every block.
     pub fn uniform(inner: Strategy, gate: QualityGateConfig) -> Self {
-        Self { inner, gate: LayerGates::uniform(gate) }
+        Self {
+            inner,
+            gate: LayerGates::uniform(gate),
+        }
     }
 }
 
@@ -173,7 +176,8 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
     ) -> (Tensor<B, 2>, SamplingStats) {
         let num_blocks = self.num_blocks();
         let steps = config.num_steps.unwrap_or(num_blocks).max(2);
-        let schedule = crate::sigma::discrete_sigmas_dblock(steps, SIGMA_MIN, SIGMA_MAX, P_MEAN, P_STD);
+        let schedule =
+            crate::sigma::discrete_sigmas_dblock(steps, SIGMA_MIN, SIGMA_MAX, P_MEAN, P_STD);
         crate::solver::assert_descending(&schedule);
 
         let b = pixel_values.dims()[0];
@@ -229,7 +233,8 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             let x0 = if config.guidance.is_identity() {
                 x0
             } else {
-                let uncond = self.x0_estimate_unconditional(pixel_values, &z, sigma, Some(span.clone()));
+                let uncond =
+                    self.x0_estimate_unconditional(pixel_values, &z, sigma, Some(span.clone()));
                 stats.model_calls += 1;
                 stats.layers_executed += span.len();
                 config.guidance.apply(x0, window_precision.round(uncond))
@@ -243,8 +248,13 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             // Adaptive depth: widen while the estimate looks unconfident and
             // narrow again once it is confident, so the extra depth is spent
             // only where it is needed.
-            if let (Strategy::Adaptive { conf_threshold, k_max }, Some(p)) =
-                (&config.strategy.inner, &probs)
+            if let (
+                Strategy::Adaptive {
+                    conf_threshold,
+                    k_max,
+                },
+                Some(p),
+            ) = (&config.strategy.inner, &probs)
             {
                 let mean_conf = mean_max_probability(p);
                 current_k = if mean_conf < *conf_threshold {
@@ -470,7 +480,10 @@ impl PlanTrace {
 type PathKey = Vec<(u64, usize)>;
 
 fn path_key(path: &crate::planner::Path<TrajectoryStep>) -> PathKey {
-    path.steps.iter().map(|s| (s.sigma.to_bits(), s.width)).collect()
+    path.steps
+        .iter()
+        .map(|s| (s.sigma.to_bits(), s.width))
+        .collect()
 }
 
 impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
@@ -562,10 +575,8 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             let mut calls = 0usize;
             let mut layers = 0usize;
 
-            let plan: Plan<TrajectoryStep> = planner.plan_with(
-                sigma,
-                sigma_floor,
-                |path, next_sigma, width, remaining| {
+            let plan: Plan<TrajectoryStep> =
+                planner.plan_with(sigma, sigma_floor, |path, next_sigma, width, remaining| {
                     let key = path_key(path);
                     let (z_here, solver_here) = states.get(&key)?.clone();
                     let here = path.steps.last().map_or(sigma, |s| s.sigma);
@@ -625,15 +636,16 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
 
                     let progress = config.progress_weight * (here.ln() - next_sigma.ln());
                     Some(score + progress)
-                },
-            );
+                });
 
             stats.model_calls += calls;
             stats.layers_executed += layers;
             stats.planning_calls += calls;
             stats.planning_layers += layers;
 
-            let Some(step) = plan.commit().copied() else { break };
+            let Some(step) = plan.commit().copied() else {
+                break;
+            };
 
             let base = crate::sigma::estimate_target_layer(&bounds, &[sigma]);
             let span = self.select_span(&Strategy::Parallel { k: step.width }, base, 1, sigma);
@@ -642,7 +654,10 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             // The committed width was scored at this node, so its estimate is
             // already in hand; recomputing it would be paying twice for the
             // same answer.
-            let x0 = match evaluated.remove(&(Vec::new(), step.width)).map(|(x0, _)| x0) {
+            let x0 = match evaluated
+                .remove(&(Vec::new(), step.width))
+                .map(|(x0, _)| x0)
+            {
                 Some(x0) => x0,
                 None => {
                     stats.model_calls += 1;
@@ -688,7 +703,10 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             };
             z = solver.step(sigma, sigma_floor, z.clone(), &x0, &mut predictor, rng);
 
-            trace.steps.push(TrajectoryStep { sigma: sigma_floor, width });
+            trace.steps.push(TrajectoryStep {
+                sigma: sigma_floor,
+                width,
+            });
             trace.evaluations.push(0);
             trace.depths.push(0);
             trace.forced_final_step = true;
@@ -700,7 +718,6 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         stats.model_calls += 1;
         (config.logit_norm.apply(logits), stats, trace)
     }
-
 }
 
 /// Batch-mean of the per-sample max class probability.
@@ -738,6 +755,25 @@ fn merge_kept<B: Backend>(new: &Tensor<B, 2>, old: &Tensor<B, 2>, keep: &[bool])
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use burn::backend::NdArray;
@@ -765,7 +801,11 @@ mod tests {
     #[test]
     fn test_strategy_metadata() {
         assert!(!Strategy::Sequential.needs_probabilities());
-        assert!(Strategy::Adaptive { k_max: 3, conf_threshold: 0.5 }.needs_probabilities());
+        assert!(Strategy::Adaptive {
+            k_max: 3,
+            conf_threshold: 0.5
+        }
+        .needs_probabilities());
         assert_eq!(Strategy::Sequential.max_width(), 1);
         assert_eq!(Strategy::Parallel { k: 4 }.max_width(), 4);
         // A zero width is meaningless; the API clamps rather than emitting an

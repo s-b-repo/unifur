@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Pre-commit hook.
+#
+# What this runs is the *fast* subset of `make gate`: the checks that finish in
+# seconds. The full suite is minutes long, and a hook that takes minutes is a hook
+# people reach for with `--no-verify` -- which would make it worse than no hook.
+#
+#   make fmt-check      -- seconds
+#   make lint-strict    -- ~20s cold, ~1s warm
+#   make audit          -- ~10s
+#
+# `make test` is not here on purpose: run it before pushing, or let CI run it.
+#
+# Install with `make install-hooks`, which sets `core.hooksPath`. Until then this
+# file is inert.
+#
+# On failure the commit is aborted. If a check is wrong for the change you are
+# making, fix the check -- do not pass `--no-verify`, because the next person to
+# read this repository will believe the gate ran.
+
+set -Eeuo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+RED=$'\033[31m'; YELLOW=$'\033[33m'; BOLD=$'\033[1m'; RESET=$'\033[0m'
+if [[ ! -t 1 ]]; then RED=""; YELLOW=""; BOLD=""; RESET=""; fi
+
+step=0
+run() {
+  local name="$1"; shift
+  step=$((step + 1))
+  printf '%s[%d/3] %s%s\n' "$BOLD" "$step" "$name" "$RESET"
+  if ! "$@"; then
+    printf '\n%spre-commit: %s failed.%s\n' "$RED" "$name" "$RESET" >&2
+    printf '%sThe commit was not created.%s Fix the check rather than\n' "$YELLOW" "$RESET" >&2
+    printf 'bypassing it with --no-verify, which is how the gate stops meaning anything.\n' >&2
+    exit 1
+  fi
+}
+
+# Formatting is fixed in place rather than refused: a diff that is only
+# whitespace is not a reviewer's problem, and an auto-formatted commit is the
+# difference between `cargo fmt` being the default and being the thing you run
+# when CI complains.
+format() {
+  cargo fmt --all
+  if ! cargo fmt --all -- --check; then
+    printf '%sformatted the files above; re-stage them and commit again.%s\n' "$YELLOW" "$RESET" >&2
+    return 1
+  fi
+}
+
+run "format"        format
+run "clippy"        make lint-strict
+run "pattern audit" make audit
+
+printf '\n%sgate: fast subset green.%s Run `make gate` for the full suite before pushing.\n' \
+  "$BOLD" "$RESET"

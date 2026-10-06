@@ -51,15 +51,18 @@ impl Direction {
     }
 
     pub fn read(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("read direction {}", path.display()))?;
-        let d: Self = serde_json::from_str(&text).with_context(|| format!("parse direction {}", path.display()))?;
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read direction {}", path.display()))?;
+        let d: Self = serde_json::from_str(&text)
+            .with_context(|| format!("parse direction {}", path.display()))?;
         anyhow::ensure!(!d.vector.is_empty(), "empty direction");
         Ok(d)
     }
 
     pub fn write(&self, path: &Path) -> anyhow::Result<()> {
         let text = serde_json::to_string_pretty(self).context("serialize direction")?;
-        std::fs::write(path, format!("{text}\n")).with_context(|| format!("write direction {}", path.display()))
+        std::fs::write(path, format!("{text}\n"))
+            .with_context(|| format!("write direction {}", path.display()))
     }
 
     /// The vector as a `[h]` tensor.
@@ -105,7 +108,8 @@ pub fn extract(layer: usize, target: &[Vec<f32>], baseline: &[Vec<f32>]) -> Opti
     let proj = |rows: &[Vec<f32>]| -> Vec<f32> { rows.iter().map(|r| dot(r, &vector)).collect() };
     let (pt, pb) = (proj(target), proj(baseline));
     let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
-    let var = |v: &[f32], m: f32| v.iter().map(|x| (x - m).powi(2)).sum::<f32>() / v.len().max(1) as f32;
+    let var =
+        |v: &[f32], m: f32| v.iter().map(|x| (x - m).powi(2)).sum::<f32>() / v.len().max(1) as f32;
     let (mtp, mbp) = (mean(&pt), mean(&pb));
     let pooled = (0.5 * (var(&pt, mtp) + var(&pb, mbp))).sqrt().max(1e-12);
     Some(Direction {
@@ -124,7 +128,11 @@ pub fn best(candidates: &[Direction]) -> Option<&Direction> {
     candidates
         .iter()
         .filter(|d| d.separation.is_finite())
-        .max_by(|a, b| a.separation.partial_cmp(&b.separation).unwrap_or(std::cmp::Ordering::Equal))
+        .max_by(|a, b| {
+            a.separation
+                .partial_cmp(&b.separation)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
 }
 
 /// `h - (h . d) d` along the last axis of a rank-3 `[b, n, h]` tensor.
@@ -145,7 +153,8 @@ pub fn projection_penalty<B: Backend>(h: &Tensor<B, 3>, d: &Tensor<B, 1>) -> Ten
 
 /// Which parameters are orthogonalized: those that write into the residual
 /// stream. Matched by the name of the module that owns them.
-pub const RESIDUAL_WRITERS: [&str; 4] = ["dense", "fc_out", "token_embedding", "position_embedding"];
+pub const RESIDUAL_WRITERS: [&str; 4] =
+    ["dense", "fc_out", "token_embedding", "position_embedding"];
 
 /// The adaLN gates of one layer at the conditioning a model runs under:
 /// `(gate_msa, gate_mlp)`, each `[h]`.
@@ -180,7 +189,11 @@ pub fn gated_direction(direction: &[f32], gate: &[f32]) -> Option<Vec<f32>> {
 /// The direction a parameter at `path` must be orthogonalized against:
 /// the gate-scaled one for a gated writer inside `layers/<l>`, the plain one
 /// for the embeddings, `None` for a silenced branch.
-pub fn direction_for_path(path: &[String], direction: &[f32], gates: Option<&[LayerGates]>) -> Option<Vec<f32>> {
+pub fn direction_for_path(
+    path: &[String],
+    direction: &[f32],
+    gates: Option<&[LayerGates]>,
+) -> Option<Vec<f32>> {
     let layer = path
         .iter()
         .position(|p| p == "layers")
@@ -218,7 +231,13 @@ pub struct Orthogonalizer<B: Backend> {
 
 impl<B: Backend> Orthogonalizer<B> {
     pub fn new(direction: &Direction) -> Self {
-        Self { direction: direction.vector.clone(), gates: None, path: Vec::new(), touched: 0, _backend: std::marker::PhantomData }
+        Self {
+            direction: direction.vector.clone(),
+            gates: None,
+            path: Vec::new(),
+            touched: 0,
+            _backend: std::marker::PhantomData,
+        }
     }
 
     /// Account for adaLN gates, one entry per layer.
@@ -228,19 +247,30 @@ impl<B: Backend> Orthogonalizer<B> {
     }
 
     fn writes_residual(&self) -> bool {
-        self.path.iter().any(|part| RESIDUAL_WRITERS.contains(&part.as_str()))
+        self.path
+            .iter()
+            .any(|part| RESIDUAL_WRITERS.contains(&part.as_str()))
     }
 }
 
 /// `w - (w . d) d` on every row of the last axis.
-pub(crate) fn project_rows<B: Backend<FloatElem = f32>, const D: usize>(w: Tensor<B, D>, direction: &[f32], alpha: f32) -> Tensor<B, D> {
+pub(crate) fn project_rows<B: Backend<FloatElem = f32>, const D: usize>(
+    w: Tensor<B, D>,
+    direction: &[f32],
+    alpha: f32,
+) -> Tensor<B, D> {
     let h = direction.len();
     let dims = w.dims();
     let device = w.device();
     let d = Tensor::<B, 1>::from_floats(direction, &device);
     let flat = w.clone().reshape([w.shape().num_elements() / h, h]);
-    let coeff = flat.clone().matmul(d.clone().reshape([h, 1])).mul_scalar(alpha); // [rows, 1]
-    (flat - coeff.matmul(d.reshape([1, h]))).reshape(dims).detach()
+    let coeff = flat
+        .clone()
+        .matmul(d.clone().reshape([h, 1]))
+        .mul_scalar(alpha); // [rows, 1]
+    (flat - coeff.matmul(d.reshape([1, h])))
+        .reshape(dims)
+        .detach()
 }
 
 impl<B: Backend<FloatElem = f32>> ModuleMapper<B> for Orthogonalizer<B> {
@@ -258,12 +288,16 @@ impl<B: Backend<FloatElem = f32>> ModuleMapper<B> for Orthogonalizer<B> {
         if !self.writes_residual() || dims[D - 1] != h {
             return param;
         }
-        let Some(direction) = direction_for_path(&self.path, &self.direction, self.gates.as_deref()) else {
+        let Some(direction) =
+            direction_for_path(&self.path, &self.direction, self.gates.as_deref())
+        else {
             return param;
         };
         self.touched += 1;
         let require_grad = param.is_require_grad();
-        param.map(|w| project_rows(w, &direction, 1.0)).set_require_grad(require_grad)
+        param
+            .map(|w| project_rows(w, &direction, 1.0))
+            .set_require_grad(require_grad)
     }
 }
 
@@ -309,10 +343,16 @@ pub fn residual_projection<B: Backend<FloatElem = f32>, M: Module<B>>(
             let h = self.direction.len();
             let w = param.val();
             let dims = w.dims();
-            if !self.path.iter().any(|p| RESIDUAL_WRITERS.contains(&p.as_str())) || dims[D - 1] != h {
+            if !self
+                .path
+                .iter()
+                .any(|p| RESIDUAL_WRITERS.contains(&p.as_str()))
+                || dims[D - 1] != h
+            {
                 return;
             }
-            let Some(direction) = direction_for_path(&self.path, &self.direction, self.gates) else {
+            let Some(direction) = direction_for_path(&self.path, &self.direction, self.gates)
+            else {
                 return;
             };
             let device = w.device();
@@ -322,12 +362,37 @@ pub fn residual_projection<B: Backend<FloatElem = f32>, M: Module<B>>(
             self.worst = self.worst.max(worst);
         }
     }
-    let mut probe = Probe::<B> { direction: direction.vector.clone(), gates, path: Vec::new(), worst: 0.0, _backend: std::marker::PhantomData };
+    let mut probe = Probe::<B> {
+        direction: direction.vector.clone(),
+        gates,
+        path: Vec::new(),
+        worst: 0.0,
+        _backend: std::marker::PhantomData,
+    };
     module.visit(&mut probe);
     probe.worst
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use burn::backend::NdArray;
@@ -339,35 +404,79 @@ mod tests {
     fn unit(h: usize, axis: usize) -> Direction {
         let mut v = vec![0.0f32; h];
         v[axis] = 1.0;
-        Direction { layer: 0, vector: v, separation: 1.0, target_mean_projection: 1.0, baseline_mean_projection: 0.0, target_count: 1, baseline_count: 1 }
+        Direction {
+            layer: 0,
+            vector: v,
+            separation: 1.0,
+            target_mean_projection: 1.0,
+            baseline_mean_projection: 0.0,
+            target_count: 1,
+            baseline_count: 1,
+        }
     }
 
     #[test]
     fn test_extract_finds_the_separating_axis() {
-        let target: Vec<Vec<f32>> = (0..8).map(|i| vec![2.0 + 0.01 * i as f32, 0.5, 0.0]).collect();
-        let baseline: Vec<Vec<f32>> = (0..8).map(|i| vec![-2.0 - 0.01 * i as f32, 0.5, 0.0]).collect();
+        let target: Vec<Vec<f32>> = (0..8)
+            .map(|i| vec![2.0 + 0.01 * i as f32, 0.5, 0.0])
+            .collect();
+        let baseline: Vec<Vec<f32>> = (0..8)
+            .map(|i| vec![-2.0 - 0.01 * i as f32, 0.5, 0.0])
+            .collect();
         let d = extract(3, &target, &baseline).unwrap();
         assert_eq!(d.layer, 3);
         assert!((d.vector[0] - 1.0).abs() < 1e-6 && d.vector[1].abs() < 1e-6);
         assert!(d.separation > 10.0, "{}", d.separation);
         assert!(d.target_mean_projection > d.baseline_mean_projection);
-        assert!(extract(0, &target, &target).is_none(), "identical sets have no direction");
-        let candidates = vec![d.clone(), Direction { separation: 0.1, ..d.clone() }];
+        assert!(
+            extract(0, &target, &target).is_none(),
+            "identical sets have no direction"
+        );
+        let candidates = vec![
+            d.clone(),
+            Direction {
+                separation: 0.1,
+                ..d.clone()
+            },
+        ];
         assert_eq!(best(&candidates).unwrap().separation, d.separation);
     }
 
     #[test]
     fn test_gated_direction_and_path_dispatch() {
         let d = vec![0.0f32, 1.0, 0.0, 0.0];
-        assert!(gated_direction(&d, &[1.0, 0.0, 1.0, 1.0]).is_none(), "a zero gate silences the writer");
+        assert!(
+            gated_direction(&d, &[1.0, 0.0, 1.0, 1.0]).is_none(),
+            "a zero gate silences the writer"
+        );
         let scaled = gated_direction(&d, &[1.0, 2.0, 1.0, 1.0]).unwrap();
         assert_eq!(scaled, vec![0.0, 1.0, 0.0, 0.0]);
-        let gates = vec![LayerGates { attention: vec![1.0, 0.5, 1.0, 1.0], mlp: vec![0.0; 4] }];
+        let gates = vec![LayerGates {
+            attention: vec![1.0, 0.5, 1.0, 1.0],
+            mlp: vec![0.0; 4],
+        }];
         let path = |parts: &[&str]| parts.iter().map(|p| p.to_string()).collect::<Vec<_>>();
-        assert_eq!(direction_for_path(&path(&["layers", "0", "attention", "dense"]), &d, Some(&gates)).unwrap(), vec![0.0, 1.0, 0.0, 0.0]);
-        assert!(direction_for_path(&path(&["layers", "0", "mlp", "fc_out"]), &d, Some(&gates)).is_none());
-        assert_eq!(direction_for_path(&path(&["token_embedding"]), &d, Some(&gates)).unwrap(), d);
-        assert_eq!(direction_for_path(&path(&["layers", "0", "attention", "dense"]), &d, None).unwrap(), d);
+        assert_eq!(
+            direction_for_path(
+                &path(&["layers", "0", "attention", "dense"]),
+                &d,
+                Some(&gates)
+            )
+            .unwrap(),
+            vec![0.0, 1.0, 0.0, 0.0]
+        );
+        assert!(
+            direction_for_path(&path(&["layers", "0", "mlp", "fc_out"]), &d, Some(&gates))
+                .is_none()
+        );
+        assert_eq!(
+            direction_for_path(&path(&["token_embedding"]), &d, Some(&gates)).unwrap(),
+            d
+        );
+        assert_eq!(
+            direction_for_path(&path(&["layers", "0", "attention", "dense"]), &d, None).unwrap(),
+            d
+        );
     }
 
     #[test]
@@ -376,7 +485,12 @@ mod tests {
         let h = Tensor::<B, 3>::random([2, 3, 4], Distribution::Uniform(-1.0, 1.0), &device);
         let d = unit(4, 1).tensor::<B>(&device);
         let out = project_out(h.clone(), &d);
-        let along: Vec<f32> = (out.clone() * d.clone().reshape([1, 1, 4])).sum_dim(2).into_data().convert::<f32>().iter::<f32>().collect();
+        let along: Vec<f32> = (out.clone() * d.clone().reshape([1, 1, 4]))
+            .sum_dim(2)
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
         assert!(along.iter().all(|v| *v == 0.0), "{along:?}");
         assert_eq!(projection_penalty(&out, &d).into_scalar(), 0.0);
         assert!(projection_penalty(&h, &d).into_scalar() > 0.0);
@@ -390,17 +504,48 @@ mod tests {
             query: burn::nn::Linear<B>,
         }
         let device = Default::default();
-        let block = Block::<B> { dense: LinearConfig::new(3, 4).init(&device), query: LinearConfig::new(4, 3).init(&device) };
+        let block = Block::<B> {
+            dense: LinearConfig::new(3, 4).init(&device),
+            query: LinearConfig::new(4, 3).init(&device),
+        };
         let d = unit(4, 2);
-        let before_q: Vec<f32> = block.query.weight.val().into_data().convert::<f32>().iter::<f32>().collect();
+        let before_q: Vec<f32> = block
+            .query
+            .weight
+            .val()
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
         let (once, touched) = orthogonalize::<B, _>(block, &d, None);
         assert_eq!(touched, 2, "dense weight and bias");
         assert!(residual_projection::<B, _>(&once, &d, None) == 0.0);
-        let after_q: Vec<f32> = once.query.weight.val().into_data().convert::<f32>().iter::<f32>().collect();
+        let after_q: Vec<f32> = once
+            .query
+            .weight
+            .val()
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
         assert_eq!(before_q, after_q, "a reader of the stream is untouched");
-        let first: Vec<f32> = once.dense.weight.val().into_data().convert::<f32>().iter::<f32>().collect();
+        let first: Vec<f32> = once
+            .dense
+            .weight
+            .val()
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
         let (twice, _) = orthogonalize::<B, _>(once, &d, None);
-        let second: Vec<f32> = twice.dense.weight.val().into_data().convert::<f32>().iter::<f32>().collect();
+        let second: Vec<f32> = twice
+            .dense
+            .weight
+            .val()
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
         assert_eq!(first, second, "idempotent to the bit");
     }
 }

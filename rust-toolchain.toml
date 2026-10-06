@@ -1,0 +1,8 @@
+# Pin the toolchain the project builds with. The machine's default `stable`
+# toolchain lost its `cargo` and `rustc` binaries during this session (a
+# component install left only the clippy drivers behind), so a build that names
+# no version simply refuses to start; naming one keeps every developer, CI run,
+# and teammate on the compiler the code was actually checked with.
+[toolchain]
+channel = "1.96"
+components = ["rustfmt", "clippy"]

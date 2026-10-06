@@ -128,14 +128,13 @@ impl RuleSet {
     }
 
     pub fn read(path: &Path) -> Result<Self> {
-        let json = std::fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let json =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         Self::from_json(&json).with_context(|| format!("in {}", path.display()))
     }
 
     pub fn write(&self, path: &Path) -> Result<()> {
-        std::fs::write(path, self.to_json()?)
-            .with_context(|| format!("write {}", path.display()))
+        std::fs::write(path, self.to_json()?).with_context(|| format!("write {}", path.display()))
     }
 
     /// Position of `name` in `categories`, if present.
@@ -149,7 +148,10 @@ impl RuleSet {
     /// a rule that matches nothing labels nothing, and the training run would
     /// report a penalty of zero as if the corpus were clean.
     pub fn validate(&self) -> Result<()> {
-        anyhow::ensure!(!self.categories.is_empty(), "a rule set needs at least one category");
+        anyhow::ensure!(
+            !self.categories.is_empty(),
+            "a rule set needs at least one category"
+        );
         anyhow::ensure!(
             self.categories.len() <= MAX_CATEGORIES,
             "{} categories, but labels are one byte with 0 reserved (max {MAX_CATEGORIES})",
@@ -214,7 +216,10 @@ enum Atom {
     Literal(u16),
     /// Any byte but newline.
     Any,
-    Class { negated: bool, set: Box<[bool; 256]> },
+    Class {
+        negated: bool,
+        set: Box<[bool; 256]>,
+    },
     /// Zero width: `is_word` differs on the two sides.
     WordBoundary,
     /// Zero width: end of text or just before a newline.
@@ -276,12 +281,30 @@ fn is_word_byte(b: u8) -> bool {
 /// `\x` outside a class. Returns the atom and whether it may take a quantifier.
 fn escape_atom(c: u8) -> Result<Atom> {
     Ok(match c {
-        b's' => Atom::Class { negated: false, set: class_of(is_space) },
-        b'S' => Atom::Class { negated: true, set: class_of(is_space) },
-        b'w' => Atom::Class { negated: false, set: class_of(is_word_byte) },
-        b'W' => Atom::Class { negated: true, set: class_of(is_word_byte) },
-        b'd' => Atom::Class { negated: false, set: class_of(|b| b.is_ascii_digit()) },
-        b'D' => Atom::Class { negated: true, set: class_of(|b| b.is_ascii_digit()) },
+        b's' => Atom::Class {
+            negated: false,
+            set: class_of(is_space),
+        },
+        b'S' => Atom::Class {
+            negated: true,
+            set: class_of(is_space),
+        },
+        b'w' => Atom::Class {
+            negated: false,
+            set: class_of(is_word_byte),
+        },
+        b'W' => Atom::Class {
+            negated: true,
+            set: class_of(is_word_byte),
+        },
+        b'd' => Atom::Class {
+            negated: false,
+            set: class_of(|b| b.is_ascii_digit()),
+        },
+        b'D' => Atom::Class {
+            negated: true,
+            set: class_of(|b| b.is_ascii_digit()),
+        },
         b'b' => Atom::WordBoundary,
         b'n' => Atom::Literal(u16::from(b'\n')),
         b't' => Atom::Literal(u16::from(b'\t')),
@@ -365,8 +388,20 @@ impl Pattern {
             let mut quant = ONE;
             if let Some(&q) = bytes.get(i) {
                 let parsed = match q {
-                    b'*' => Some((Quant { min: 0, max: usize::MAX }, i + 1)),
-                    b'+' => Some((Quant { min: 1, max: usize::MAX }, i + 1)),
+                    b'*' => Some((
+                        Quant {
+                            min: 0,
+                            max: usize::MAX,
+                        },
+                        i + 1,
+                    )),
+                    b'+' => Some((
+                        Quant {
+                            min: 1,
+                            max: usize::MAX,
+                        },
+                        i + 1,
+                    )),
                     b'?' => Some((Quant { min: 0, max: 1 }, i + 1)),
                     b'{' => Some(parse_braces(bytes, i + 1)?),
                     _ => None,
@@ -396,7 +431,9 @@ impl Pattern {
     }
 
     pub fn consumes(&self) -> bool {
-        self.atoms.iter().any(|(a, q)| !a.is_zero_width() && q.min >= 1)
+        self.atoms
+            .iter()
+            .any(|(a, q)| !a.is_zero_width() && q.min >= 1)
     }
 
     /// Anchored match at `at`. Returns the end of the match and, if a
@@ -420,7 +457,9 @@ impl Pattern {
             Atom::WordBoundary => {
                 let before = pos > 0 && is_word_token(text[pos - 1]);
                 let after = pos < text.len() && is_word_token(text[pos]);
-                (before != after).then(|| self.go(text, idx + 1, pos, mark)).flatten()
+                (before != after)
+                    .then(|| self.go(text, idx + 1, pos, mark))
+                    .flatten()
             }
             Atom::LineEnd => {
                 let at_end = pos >= text.len() || text[pos] == u16::from(b'\n');
@@ -482,7 +521,12 @@ fn parse_class(bytes: &[u8], mut i: usize) -> Result<(Atom, usize)> {
                     hi = escape_into_class(esc, &mut set)?
                         .with_context(|| format!("'\\{}' cannot end a range", char::from(esc)))?;
                 }
-                anyhow::ensure!(lo <= hi, "range {}-{} is backwards", char::from(lo), char::from(hi));
+                anyhow::ensure!(
+                    lo <= hi,
+                    "range {}-{} is backwards",
+                    char::from(lo),
+                    char::from(hi)
+                );
                 for b in lo..=hi {
                     set[usize::from(b)] = true;
                 }
@@ -494,7 +538,13 @@ fn parse_class(bytes: &[u8], mut i: usize) -> Result<(Atom, usize)> {
         }
         first = false;
     }
-    Ok((Atom::Class { negated, set: Box::new(set) }, i))
+    Ok((
+        Atom::Class {
+            negated,
+            set: Box::new(set),
+        },
+        i,
+    ))
 }
 
 /// Parse `n}` or `n,m}` starting just after the `{`.
@@ -506,16 +556,24 @@ fn parse_braces(bytes: &[u8], start: usize) -> Result<(Quant, usize)> {
     let inner = std::str::from_utf8(&bytes[start..start + close]).context("brace quantifier")?;
     let (min, max) = match inner.split_once(',') {
         Some((lo, hi)) => {
-            let lo: usize = lo.trim().parse().with_context(|| format!("bad quantifier {{{inner}}}"))?;
+            let lo: usize = lo
+                .trim()
+                .parse()
+                .with_context(|| format!("bad quantifier {{{inner}}}"))?;
             let hi = if hi.trim().is_empty() {
                 usize::MAX
             } else {
-                hi.trim().parse().with_context(|| format!("bad quantifier {{{inner}}}"))?
+                hi.trim()
+                    .parse()
+                    .with_context(|| format!("bad quantifier {{{inner}}}"))?
             };
             (lo, hi)
         }
         None => {
-            let n: usize = inner.trim().parse().with_context(|| format!("bad quantifier {{{inner}}}"))?;
+            let n: usize = inner
+                .trim()
+                .parse()
+                .with_context(|| format!("bad quantifier {{{inner}}}"))?;
             (n, n)
         }
     };
@@ -554,7 +612,10 @@ impl CompiledRule {
             "compiled rule {:?} lost its body mark",
             rule.body
         );
-        Ok(Self { pattern: Pattern { atoms }, first })
+        Ok(Self {
+            pattern: Pattern { atoms },
+            first,
+        })
     }
 
     /// The body span of the match anchored at `at`, if any.
@@ -616,13 +677,18 @@ impl Labeler {
             .rules
             .iter()
             .map(|r| {
-                let index = set
-                    .category_index(&r.category)
-                    .with_context(|| format!("rule {:?} names unknown category {:?}", r.body, r.category))?;
-                u8::try_from(index + 1).with_context(|| format!("category index {index} does not fit a label byte"))
+                let index = set.category_index(&r.category).with_context(|| {
+                    format!("rule {:?} names unknown category {:?}", r.body, r.category)
+                })?;
+                u8::try_from(index + 1)
+                    .with_context(|| format!("category index {index} does not fit a label byte"))
             })
             .collect::<Result<Vec<u8>>>()?;
-        Ok(Self { set, compiled, labels })
+        Ok(Self {
+            set,
+            compiled,
+            labels,
+        })
     }
 
     /// The shipped rule set, compiled. Fails only if the shipped rules are
@@ -673,7 +739,12 @@ impl Labeler {
                         continue;
                     }
                     last[rule] = Some(body);
-                    spans.push(Span { start: body.0, end: body.1, rule, label: self.labels[rule] });
+                    spans.push(Span {
+                        start: body.0,
+                        end: body.1,
+                        rule,
+                        label: self.labels[rule],
+                    });
                 }
             }
         }
@@ -758,8 +829,14 @@ impl Labeler {
         let names = self.rule_names();
         let mut out = String::new();
         for span in &spans {
-            let line = text.as_bytes()[..span.start].iter().filter(|b| **b == b'\n').count() + 1;
-            let category = self.category_of(span.label).map_or("?", |c| c.name.as_str());
+            let line = text.as_bytes()[..span.start]
+                .iter()
+                .filter(|b| **b == b'\n')
+                .count()
+                + 1;
+            let category = self
+                .category_of(span.label)
+                .map_or("?", |c| c.name.as_str());
             let snippet = String::from_utf8_lossy(&text.as_bytes()[span.start..span.end]);
             out.push_str(&format!(
                 "line {line}: [{category}] {} -> {:?}\n",
@@ -819,10 +896,10 @@ pub struct LabelManifest {
 
 impl LabelManifest {
     pub fn read(path: &Path) -> Result<Self> {
-        let json = std::fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
-        let manifest: Self = serde_json::from_str(&json)
-            .with_context(|| format!("parse {}", path.display()))?;
+        let json =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let manifest: Self =
+            serde_json::from_str(&json).with_context(|| format!("parse {}", path.display()))?;
         anyhow::ensure!(
             manifest.format_version == MANIFEST_VERSION,
             "{} is manifest version {}, this build reads {MANIFEST_VERSION}",
@@ -879,7 +956,10 @@ impl LabelManifest {
             ));
         }
         for r in self.rules.iter().filter(|r| r.spans > 0) {
-            out.push_str(&format!("      {:<32} {:<10} {:>7} spans\n", r.name, r.language, r.spans));
+            out.push_str(&format!(
+                "      {:<32} {:<10} {:>7} spans\n",
+                r.name, r.language, r.spans
+            ));
         }
         out
     }
@@ -1200,6 +1280,25 @@ fn builtin_rules() -> RuleSet {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
 
@@ -1229,7 +1328,10 @@ mod tests {
     fn test_greedy_quantifiers_backtrack() {
         // `\s*` must give back the whitespace it ate when the rest of the
         // pattern needs it -- and `[^:\n]*` must stop before the colon.
-        assert_eq!(matches(r"except\b[^:\n]*:\s*pass", "except ValueError:\n    pass"), Some((0, 27)));
+        assert_eq!(
+            matches(r"except\b[^:\n]*:\s*pass", "except ValueError:\n    pass"),
+            Some((0, 27))
+        );
         assert_eq!(matches(r"\s*$", "abc  \ndef"), Some((3, 5)));
         assert_eq!(matches(r"x[ \t]*$", "x   \n"), Some((0, 4)));
     }
@@ -1240,16 +1342,27 @@ mod tests {
         assert_eq!(matches(r"\bpass\b", "passthrough"), None);
         assert_eq!(matches(r"ignore$", "# type: ignore\nx"), Some((8, 14)));
         assert_eq!(matches(r"ignore$", "# type: ignore[x]\n"), None);
-        assert_eq!(matches(r"end$", "the end"), Some((4, 7)), "$ matches at the end of the text");
+        assert_eq!(
+            matches(r"end$", "the end"),
+            Some((4, 7)),
+            "$ matches at the end of the text"
+        );
     }
 
     #[test]
     fn test_unsupported_syntax_is_an_error_not_a_literal() {
-        for bad in ["(a|b)", "a|b", "*a", "a{", "a{3,1}", "[abc", r"\q", "a\\", r"\b+", "a]"] {
+        for bad in [
+            "(a|b)", "a|b", "*a", "a{", "a{3,1}", "[abc", r"\q", "a\\", r"\b+", "a]",
+        ] {
             assert!(Pattern::parse(bad).is_err(), "{bad:?} should be rejected");
         }
         // ...while every escape the docs list parses.
-        for good in [r"\(\)\[\]\{\}\*\+\?\.\|\\\^\$\/\-\#", r"[\]\[\-\\\s\w\d\n\t]", "[]a]", "[^]a]"] {
+        for good in [
+            r"\(\)\[\]\{\}\*\+\?\.\|\\\^\$\/\-\#",
+            r"[\]\[\-\\\s\w\d\n\t]",
+            "[]a]",
+            "[^]a]",
+        ] {
             assert!(Pattern::parse(good).is_ok(), "{good:?} should parse");
         }
     }
@@ -1287,12 +1400,23 @@ mod tests {
         assert_eq!(spans.len(), 2);
 
         let pass_at = text.find("pass").unwrap();
-        let swallow = labeler.rule_set().category_index("error-swallowing").unwrap() as u8 + 1;
+        let swallow = labeler
+            .rule_set()
+            .category_index("error-swallowing")
+            .unwrap() as u8
+            + 1;
         let broad = labeler.rule_set().category_index("broad-catch").unwrap() as u8 + 1;
         assert!(labels[pass_at..pass_at + 4].iter().all(|l| *l == swallow));
-        assert_eq!(labels[text.find(':').unwrap()], CLEAN, "the first colon belongs to `try:`");
+        assert_eq!(
+            labels[text.find(':').unwrap()],
+            CLEAN,
+            "the first colon belongs to `try:`"
+        );
         assert_eq!(labels[text.rfind(':').unwrap()], broad);
-        assert_eq!(labeler.category_of(swallow).unwrap().name, "error-swallowing");
+        assert_eq!(
+            labeler.category_of(swallow).unwrap().name,
+            "error-swallowing"
+        );
         assert_eq!(labeler.category_of(CLEAN), None);
     }
 
@@ -1306,7 +1430,10 @@ mod tests {
         let names = labeler.rule_names();
         let found: Vec<&str> = spans.iter().map(|s| names[s.rule]).collect();
         assert_eq!(found, vec!["empty-catch-block", "catch-throwable"]);
-        assert_eq!(labels.iter().filter(|l| **l != CLEAN).count(), "}".len() + "Throwable".len());
+        assert_eq!(
+            labels.iter().filter(|l| **l != CLEAN).count(),
+            "}".len() + "Throwable".len()
+        );
     }
 
     #[test]
@@ -1326,8 +1453,16 @@ mod tests {
         RuleSet::builtin().validate().unwrap();
         let labeler = Labeler::builtin().expect("built-in rules");
         for rule in &labeler.rule_set().rules {
-            assert!(!rule.examples.is_empty(), "rule '{}' has no examples", rule.name);
-            assert!(!rule.counterexamples.is_empty(), "rule '{}' has no counterexamples", rule.name);
+            assert!(
+                !rule.examples.is_empty(),
+                "rule '{}' has no examples",
+                rule.name
+            );
+            assert!(
+                !rule.counterexamples.is_empty(),
+                "rule '{}' has no counterexamples",
+                rule.name
+            );
         }
     }
 
@@ -1339,19 +1474,39 @@ mod tests {
 
         let mut unknown = set.clone();
         unknown.rules[0].category = "no-such-category".into();
-        assert!(unknown.validate().unwrap_err().to_string().contains("unknown category"));
+        assert!(unknown
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("unknown category"));
 
         let mut empty_body = set.clone();
         empty_body.rules[0].body = r"\s*".into();
-        assert!(empty_body.validate().unwrap_err().to_string().contains("empty string"));
+        assert!(empty_body
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("empty string"));
 
         let mut failing_example = set.clone();
-        failing_example.rules[0].examples.push("nothing to see here".into());
-        assert!(failing_example.validate().unwrap_err().to_string().contains("own example"));
+        failing_example.rules[0]
+            .examples
+            .push("nothing to see here".into());
+        assert!(failing_example
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("own example"));
 
         let mut failing_counter = set.clone();
-        failing_counter.rules[0].counterexamples.push("except:\n    pass".into());
-        assert!(failing_counter.validate().unwrap_err().to_string().contains("counterexample"));
+        failing_counter.rules[0]
+            .counterexamples
+            .push("except:\n    pass".into());
+        assert!(failing_counter
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("counterexample"));
 
         let mut negative = set.clone();
         negative.categories[0].weight = -1.0;
@@ -1359,7 +1514,11 @@ mod tests {
 
         let mut duplicate = set;
         duplicate.categories.push(duplicate.categories[0].clone());
-        assert!(duplicate.validate().unwrap_err().to_string().contains("twice"));
+        assert!(duplicate
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("twice"));
     }
 
     #[test]
@@ -1370,8 +1529,15 @@ mod tests {
         let (labels, spans) = labeler.label_with_spans(&tokens);
         let manifest = labeler.manifest(&labels, &spans);
         assert_eq!(manifest.tokens, tokens.len());
-        assert_eq!(manifest.labeled_tokens, labels.iter().filter(|l| **l != CLEAN).count());
-        let swallow = manifest.categories.iter().find(|c| c.name == "error-swallowing").unwrap();
+        assert_eq!(
+            manifest.labeled_tokens,
+            labels.iter().filter(|l| **l != CLEAN).count()
+        );
+        let swallow = manifest
+            .categories
+            .iter()
+            .find(|c| c.name == "error-swallowing")
+            .unwrap();
         assert_eq!(swallow.spans, 2, "except-pass and empty-catch-block");
         assert_eq!(swallow.tokens, "pass".len() + "}".len());
         let table = manifest.weight_table();
@@ -1391,7 +1557,13 @@ mod tests {
     fn test_report_names_the_line_and_the_category() {
         let labeler = Labeler::builtin().expect("built-in rules");
         let report = labeler.report("x = 1\ntry:\n    f()\nexcept:\n    pass\n");
-        assert!(report.contains("line 5: [error-swallowing] except-pass -> \"pass\""), "{report}");
-        assert!(report.contains("line 4: [broad-catch] bare-except"), "{report}");
+        assert!(
+            report.contains("line 5: [error-swallowing] except-pass -> \"pass\""),
+            "{report}"
+        );
+        assert!(
+            report.contains("line 4: [broad-catch] bare-except"),
+            "{report}"
+        );
     }
 }

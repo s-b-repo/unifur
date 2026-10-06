@@ -442,10 +442,7 @@ fn naming_consistency(source: &str) -> (usize, usize, usize) {
         if has_underscore && has_upper {
             snake_violations += 1;
         } else if has_upper
-            && word
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_uppercase())
+            && word.chars().next().is_some_and(|c| c.is_ascii_uppercase())
             && has_underscore
         {
             camel_violations += 1;
@@ -489,6 +486,25 @@ impl ExternalAnalyzer {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
 

@@ -285,7 +285,10 @@ impl<B: Backend<FloatElem = f32>> LoopGraph<B> {
     pub fn new(num_blocks: usize, hidden_size: usize, device: &B::Device) -> Self {
         Self {
             halting: HaltingHead::new(
-                &HaltingConfig { hidden_size, ..HaltingConfig::default() },
+                &HaltingConfig {
+                    hidden_size,
+                    ..HaltingConfig::default()
+                },
                 device,
             ),
             skip_weights: Param::from_tensor(Tensor::zeros([num_blocks, num_blocks], device)),
@@ -397,6 +400,25 @@ fn mean_square<B: Backend<FloatElem = f32>>(x: &Tensor<B, 2>) -> f32 {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use burn::backend::NdArray;
@@ -405,7 +427,12 @@ mod tests {
 
     /// Drive a planner to completion with a fixed confidence and halting
     /// probability, returning the trace-relevant facts.
-    fn drive(config: LoopGraphConfig, num_blocks: usize, confidence: f32, halt: f32) -> (Vec<usize>, Vec<f32>, usize) {
+    fn drive(
+        config: LoopGraphConfig,
+        num_blocks: usize,
+        confidence: f32,
+        halt: f32,
+    ) -> (Vec<usize>, Vec<f32>, usize) {
         let mut planner = LoopPlanner::new(config, num_blocks);
         let (mut run, mut weights) = (Vec::new(), Vec::new());
         let mut iterations = 0usize;
@@ -463,7 +490,11 @@ mod tests {
                 skip_threshold: f32::INFINITY,
             };
             let (run, _, _) = drive(config, 4, 0.0, 0.0);
-            assert!(run.len() <= budget, "{} executions exceeded budget {budget}", run.len());
+            assert!(
+                run.len() <= budget,
+                "{} executions exceeded budget {budget}",
+                run.len()
+            );
         }
     }
 
@@ -474,15 +505,17 @@ mod tests {
         // it the "x0 estimate" would be an arbitrarily scaled vector.
         for halt in [0.0f32, 0.05, 0.3, 0.5, 0.9, 1.0] {
             for num_blocks in [1usize, 2, 4, 7] {
-                let (run, weights, _) =
-                    drive(LoopGraphConfig::default(), num_blocks, 0.5, halt);
+                let (run, weights, _) = drive(LoopGraphConfig::default(), num_blocks, 0.5, halt);
                 assert!(!run.is_empty(), "at least one block must run");
                 let mass: f32 = weights.iter().sum();
                 assert!(
                     (mass - 1.0).abs() < 1e-5,
                     "weights sum to {mass}, not 1 (halt={halt}, blocks={num_blocks})"
                 );
-                assert!(weights.iter().all(|&w| (0.0..=1.0).contains(&w)), "weights must be probabilities");
+                assert!(
+                    weights.iter().all(|&w| (0.0..=1.0).contains(&w)),
+                    "weights must be probabilities"
+                );
             }
         }
     }
@@ -513,8 +546,16 @@ mod tests {
             ..LoopGraphConfig::default()
         };
         let mut planner = LoopPlanner::new(config, 3);
-        assert_eq!(planner.next(0.9), Decision::Skip(0), "confident input must skip");
-        assert_eq!(planner.next(0.1), Decision::Run(1), "unconfident input must run");
+        assert_eq!(
+            planner.next(0.9),
+            Decision::Skip(0),
+            "confident input must skip"
+        );
+        assert_eq!(
+            planner.next(0.1),
+            Decision::Run(1),
+            "unconfident input must run"
+        );
         // Skipping does not consume budget, only executions do.
         assert_eq!(planner.remainder(), 1.0);
     }
@@ -590,20 +631,19 @@ mod tests {
         let cfg = ViTDiTConfig::tiny(10);
         let model = DblockClassifier::<B>::new(
             &cfg,
-            &DblockConfig { num_blocks: 2, ..DblockConfig::default() },
+            &DblockConfig {
+                num_blocks: 2,
+                ..DblockConfig::default()
+            },
             &device,
-        );
+        )
+        .unwrap();
         let graph = LoopGraph::<B>::new(2, 32, &device);
 
         let pixels = Tensor::<B, 4>::zeros([2, 3, 32, 32], &device);
         let z = Tensor::<B, 2>::ones([2, 32], &device);
-        let (x0, trace) = graph.x0_estimate(
-            &model,
-            &pixels,
-            &z,
-            1.0,
-            &LoopGraphConfig::feedforward(2),
-        );
+        let (x0, trace) =
+            graph.x0_estimate(&model, &pixels, &z, 1.0, &LoopGraphConfig::feedforward(2));
 
         assert_eq!(x0.dims(), [2, 32]);
         assert!(!trace.blocks_run.is_empty());

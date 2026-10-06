@@ -86,6 +86,9 @@ impl<B: Backend> TrainDataset<B> for SyntheticDataset {
             .collect();
         let labels = Tensor::<B, 1, Int>::from_ints(labels.as_slice(), device);
 
-        Ok(Batch { pixel_values: pixels, labels })
+        Ok(Batch {
+            pixel_values: pixels,
+            labels,
+        })
     }
 }

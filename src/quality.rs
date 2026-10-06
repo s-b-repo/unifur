@@ -28,8 +28,8 @@
 //! Failing samples can then keep their previous latent (see
 //! `crate::multi_block`) or be filtered from training batches.
 
+use burn::tensor::{backend::Backend, Tensor};
 use serde::{Deserialize, Serialize};
-use burn::tensor::{Tensor, backend::Backend};
 
 /// Thresholds for the quality checks. Set a threshold to `None`/`f32::INFINITY`
 /// style sentinels to disable an individual check.
@@ -114,11 +114,20 @@ pub fn evaluate<B: Backend>(
         .sum_dim(1)
         / x0_new.dims()[1] as f32;
 
-    let cos_v = cos.into_data().convert::<f32>().iter::<f32>().collect::<Vec<_>>();
-    let mse_v = mse.into_data().convert::<f32>().iter::<f32>().collect::<Vec<_>>();
+    let cos_v = cos
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect::<Vec<_>>();
+    let mse_v = mse
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect::<Vec<_>>();
 
     let conf_v: Option<Vec<f32>> = probs_new.map(|p| {
-        p.clone().max_dim(1)
+        p.clone()
+            .max_dim(1)
             .into_data()
             .convert::<f32>()
             .iter::<f32>()
@@ -147,7 +156,11 @@ pub fn evaluate<B: Backend>(
         passed,
         mean_cosine: sum_cos / n.max(1) as f32,
         mean_mse: sum_mse / n.max(1) as f32,
-        mean_confidence: if conf_v.is_some() { Some(conf_mean) } else { None },
+        mean_confidence: if conf_v.is_some() {
+            Some(conf_mean)
+        } else {
+            None
+        },
     }
 }
 
@@ -169,7 +182,10 @@ pub struct LayerGates {
 impl LayerGates {
     /// One configuration for every block (equivalent to the batch-level gate).
     pub fn uniform(config: QualityGateConfig) -> Self {
-        Self { default: config, per_block: Vec::new() }
+        Self {
+            default: config,
+            per_block: Vec::new(),
+        }
     }
 
     /// Gates that tighten monotonically as sigma falls, i.e. as the block
@@ -179,7 +195,11 @@ impl LayerGates {
     /// `min_cosine` ramps linearly from `loose.min_cosine` to
     /// `strict.min_cosine` and `max_mse` geometrically from `loose` to
     /// `strict`, so both stay monotone in the block index by construction.
-    pub fn tightening(num_blocks: usize, loose: QualityGateConfig, strict: QualityGateConfig) -> Self {
+    pub fn tightening(
+        num_blocks: usize,
+        loose: QualityGateConfig,
+        strict: QualityGateConfig,
+    ) -> Self {
         let per_block = (0..num_blocks)
             .map(|b| {
                 let t = if num_blocks > 1 {
@@ -203,7 +223,10 @@ impl LayerGates {
                 })
             })
             .collect();
-        Self { default: strict, per_block }
+        Self {
+            default: strict,
+            per_block,
+        }
     }
 
     /// Gate governing `block_idx`.
@@ -224,7 +247,10 @@ pub struct GateLedger {
 
 impl GateLedger {
     pub fn new(num_blocks: usize) -> Self {
-        Self { evaluated: vec![0; num_blocks], rejected: vec![0; num_blocks] }
+        Self {
+            evaluated: vec![0; num_blocks],
+            rejected: vec![0; num_blocks],
+        }
     }
 
     /// Record one batch-level decision attributed to `block_idx`.
@@ -338,7 +364,10 @@ pub struct GradNormGate {
 
 impl Default for GradNormGate {
     fn default() -> Self {
-        Self { min_norm: 1e-8, max_norm: 1e4 }
+        Self {
+            min_norm: 1e-8,
+            max_norm: 1e4,
+        }
     }
 }
 
@@ -390,7 +419,10 @@ impl TrainingChecks {
 
     /// Everything on, including periodic re-verification.
     pub fn thorough(verify_every: usize) -> Self {
-        Self { verify_every: Some(verify_every), ..Self::default() }
+        Self {
+            verify_every: Some(verify_every),
+            ..Self::default()
+        }
     }
 }
 
@@ -421,12 +453,18 @@ pub struct StepVerdict {
 impl StepVerdict {
     /// A verdict with no failures.
     pub fn accepted() -> Self {
-        Self { accepted: true, ..Self::default() }
+        Self {
+            accepted: true,
+            ..Self::default()
+        }
     }
 
     pub fn reject(&mut self, phase: TrainingPhase, detail: impl Into<String>) {
         self.accepted = false;
-        self.failures.push(CheckFailure { phase, detail: detail.into() });
+        self.failures.push(CheckFailure {
+            phase,
+            detail: detail.into(),
+        });
     }
 
     /// Short reason for a log line, or `None` when the step was accepted.
@@ -527,7 +565,10 @@ const MAX_RETAINED_FAILURES: usize = 64;
 
 impl TrainingHealth {
     pub fn new(num_blocks: usize) -> Self {
-        Self { per_block: vec![BlockHealth::default(); num_blocks], ..Self::default() }
+        Self {
+            per_block: vec![BlockHealth::default(); num_blocks],
+            ..Self::default()
+        }
     }
 
     /// Fold one step's verdict in.
@@ -757,6 +798,25 @@ pub fn grad_norm_ok(norm: f32, min_norm: f32, max_norm: f32) -> bool {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use burn::backend::NdArray;
@@ -789,7 +849,10 @@ mod tests {
         let new = Tensor::<B, 1>::from_floats(new_data.as_slice(), &device).reshape([2, 4]);
 
         let report = evaluate(
-            &QualityGateConfig { min_cosine: 0.0, ..QualityGateConfig::default() },
+            &QualityGateConfig {
+                min_cosine: 0.0,
+                ..QualityGateConfig::default()
+            },
             &prev,
             &new,
             None,
@@ -805,10 +868,16 @@ mod tests {
         let prev = Tensor::<B, 2>::zeros([1, 4], &device);
         let new = Tensor::<B, 2>::full([1, 4], 2.0, &device); // MSE = 4
 
-        let cfg = QualityGateConfig { max_mse: 5.0, ..QualityGateConfig::default() };
+        let cfg = QualityGateConfig {
+            max_mse: 5.0,
+            ..QualityGateConfig::default()
+        };
         assert!(evaluate(&cfg, &prev, &new, None).all_passed());
 
-        let cfg = QualityGateConfig { max_mse: 3.0, ..QualityGateConfig::default() };
+        let cfg = QualityGateConfig {
+            max_mse: 3.0,
+            ..QualityGateConfig::default()
+        };
         assert!(!evaluate(&cfg, &prev, &new, None).all_passed());
         assert!(close(evaluate(&cfg, &prev, &new, None).mean_mse, 4.0, 1e-6));
     }
@@ -835,7 +904,11 @@ mod tests {
     fn test_layer_gates_fall_back_to_default() {
         let gates = LayerGates::uniform(QualityGateConfig::strict());
         assert_eq!(gates.for_block(0).min_cosine, 0.5);
-        assert_eq!(gates.for_block(99).min_cosine, 0.5, "out-of-range must not panic");
+        assert_eq!(
+            gates.for_block(99).min_cosine,
+            0.5,
+            "out-of-range must not panic"
+        );
 
         let mut custom = LayerGates::uniform(QualityGateConfig::lenient());
         custom.per_block = vec![None, Some(QualityGateConfig::strict())];
@@ -851,8 +924,16 @@ mod tests {
         for num_blocks in [1usize, 2, 3, 8] {
             let gates = LayerGates::tightening(
                 num_blocks,
-                QualityGateConfig { min_cosine: -0.5, max_mse: 100.0, min_confidence: None },
-                QualityGateConfig { min_cosine: 0.9, max_mse: 0.5, min_confidence: None },
+                QualityGateConfig {
+                    min_cosine: -0.5,
+                    max_mse: 100.0,
+                    min_confidence: None,
+                },
+                QualityGateConfig {
+                    min_cosine: 0.9,
+                    max_mse: 0.5,
+                    min_confidence: None,
+                },
             );
             let mut prev_cos = f32::NEG_INFINITY;
             let mut prev_mse = f32::INFINITY;
@@ -904,8 +985,7 @@ mod tests {
         for v in flipped[4..].iter_mut() {
             *v = -1.0;
         }
-        let half_bad =
-            Tensor::<B, 1>::from_floats(flipped.as_slice(), &device).reshape([2, 4]);
+        let half_bad = Tensor::<B, 1>::from_floats(flipped.as_slice(), &device).reshape([2, 4]);
         let all_good = Tensor::<B, 2>::ones([2, 4], &device);
 
         let cfg = QualityGateConfig::default();
@@ -997,7 +1077,10 @@ mod tests {
 
     #[test]
     fn test_abort_after_consecutive_rejections() {
-        let checks = TrainingChecks { max_consecutive_rejections: 3, ..TrainingChecks::default() };
+        let checks = TrainingChecks {
+            max_consecutive_rejections: 3,
+            ..TrainingChecks::default()
+        };
         let mut health = TrainingHealth::new(1);
         let mut bad = StepVerdict::accepted();
         bad.reject(TrainingPhase::Loss, "nan");
@@ -1016,7 +1099,10 @@ mod tests {
         assert_eq!(health.worst_consecutive_rejections, 3);
 
         // A zero threshold disables the abort entirely.
-        let never = TrainingChecks { max_consecutive_rejections: 0, ..TrainingChecks::default() };
+        let never = TrainingChecks {
+            max_consecutive_rejections: 0,
+            ..TrainingChecks::default()
+        };
         for step in 4..20 {
             health.record(step, 0, 1.0, &bad);
         }
@@ -1054,9 +1140,13 @@ mod tests {
         let device = Default::default();
         let model = DblockClassifier::<B>::new(
             &ViTDiTConfig::tiny(10),
-            &DblockConfig { num_blocks: 2, ..DblockConfig::default() },
+            &DblockConfig {
+                num_blocks: 2,
+                ..DblockConfig::default()
+            },
             &device,
-        );
+        )
+        .unwrap();
         assert_eq!(non_finite_parameters(&model), 0, "a fresh model is finite");
 
         for poison in [f32::NAN, f32::INFINITY] {
@@ -1066,9 +1156,13 @@ mod tests {
                 Param::from_tensor(Tensor::<B, 2>::full(shape, poison, &device));
             let broken = DblockClassifier::<B>::new(
                 &ViTDiTConfig::tiny(10),
-                &DblockConfig { num_blocks: 2, ..DblockConfig::default() },
+                &DblockConfig {
+                    num_blocks: 2,
+                    ..DblockConfig::default()
+                },
                 &device,
             )
+            .unwrap()
             .load_record(record);
             assert_eq!(
                 non_finite_parameters(&broken),

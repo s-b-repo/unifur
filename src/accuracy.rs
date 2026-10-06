@@ -58,11 +58,17 @@ impl Default for Guidance {
 impl Guidance {
     /// The identity: the conditional estimate, untouched.
     pub fn none() -> Self {
-        Self { scale: 1.0, rescale: 0.0 }
+        Self {
+            scale: 1.0,
+            rescale: 0.0,
+        }
     }
 
     pub fn new(scale: f64) -> Self {
-        Self { scale, rescale: 0.0 }
+        Self {
+            scale,
+            rescale: 0.0,
+        }
     }
 
     pub fn with_rescale(mut self, rescale: f64) -> Self {
@@ -117,7 +123,11 @@ impl Guidance {
 /// Per-sample standard deviation `[b]`.
 fn row_std<B: Backend<FloatElem = f32>>(x: &Tensor<B, 2>) -> Tensor<B, 1> {
     let mean = x.clone().mean_dim(1);
-    (x.clone() - mean).powf_scalar(2.0).mean_dim(1).sqrt().squeeze_dim::<1>(1)
+    (x.clone() - mean)
+        .powf_scalar(2.0)
+        .mean_dim(1)
+        .sqrt()
+        .squeeze_dim::<1>(1)
 }
 
 /// Per-sample logit normalization.
@@ -233,9 +243,7 @@ impl Ensemble {
             "probability" => Ok(Self::ProbabilityMean),
             "logit" => Ok(Self::LogitMean),
             "vote" => Ok(Self::MajorityVote),
-            other => anyhow::bail!(
-                "unknown ensemble '{other}' (expected probability|logit|vote)"
-            ),
+            other => anyhow::bail!("unknown ensemble '{other}' (expected probability|logit|vote)"),
         }
     }
 
@@ -300,7 +308,10 @@ fn one_hot_argmax<B: Backend<FloatElem = f32>>(logits: &Tensor<B, 2>) -> Tensor<
 }
 
 /// Top-1 accuracy of `logits` `[b, c]` against `labels` `[b]`.
-pub fn accuracy<B: Backend<FloatElem = f32>>(logits: &Tensor<B, 2>, labels: &Tensor<B, 1, Int>) -> f64 {
+pub fn accuracy<B: Backend<FloatElem = f32>>(
+    logits: &Tensor<B, 2>,
+    labels: &Tensor<B, 1, Int>,
+) -> f64 {
     let b = logits.dims()[0];
     if b == 0 {
         return 0.0;
@@ -325,8 +336,18 @@ pub struct ScalingPoint {
 }
 
 impl ScalingPoint {
-    pub fn new(label: impl Into<String>, model_calls: usize, layers_executed: usize, accuracy: f64) -> Self {
-        Self { label: label.into(), model_calls, layers_executed, accuracy }
+    pub fn new(
+        label: impl Into<String>,
+        model_calls: usize,
+        layers_executed: usize,
+        accuracy: f64,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            model_calls,
+            layers_executed,
+            accuracy,
+        }
     }
 }
 
@@ -390,9 +411,11 @@ impl ScalingCurve {
     pub fn pareto(&self) -> Vec<&ScalingPoint> {
         let mut sorted: Vec<&ScalingPoint> = self.points.iter().collect();
         sorted.sort_by(|a, b| {
-            a.layers_executed
-                .cmp(&b.layers_executed)
-                .then(b.accuracy.partial_cmp(&a.accuracy).unwrap_or(std::cmp::Ordering::Equal))
+            a.layers_executed.cmp(&b.layers_executed).then(
+                b.accuracy
+                    .partial_cmp(&a.accuracy)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
         });
 
         let mut frontier: Vec<&ScalingPoint> = Vec::new();
@@ -428,7 +451,8 @@ impl ScalingCurve {
     /// Human-readable table.
     pub fn render(&self) -> String {
         let frontier: Vec<&str> = self.pareto().iter().map(|p| p.label.as_str()).collect();
-        let mut out = String::from("  configuration                 calls   layers   top-1   frontier\n");
+        let mut out =
+            String::from("  configuration                 calls   layers   top-1   frontier\n");
         for p in &self.points {
             out.push_str(&format!(
                 "  {:<28} {:>5}  {:>7}  {:>6.3}   {}\n",
@@ -436,7 +460,11 @@ impl ScalingCurve {
                 p.model_calls,
                 p.layers_executed,
                 p.accuracy,
-                if frontier.contains(&p.label.as_str()) { "*" } else { "" }
+                if frontier.contains(&p.label.as_str()) {
+                    "*"
+                } else {
+                    ""
+                }
             ));
         }
         out
@@ -444,6 +472,25 @@ impl ScalingCurve {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use burn::backend::NdArray;
@@ -486,7 +533,11 @@ mod tests {
         // scale 2 extrapolates past the conditional estimate, which is the
         // whole point of guidance -- not an interpolation.
         let two = values(Guidance::new(2.0).apply(cond.clone(), uncond.clone()));
-        assert!((two[1] - 5.0).abs() < 1e-6, "expected 1 + 2*(3-1) = 5, got {}", two[1]);
+        assert!(
+            (two[1] - 5.0).abs() < 1e-6,
+            "expected 1 + 2*(3-1) = 5, got {}",
+            two[1]
+        );
     }
 
     #[test]
@@ -499,10 +550,16 @@ mod tests {
         let uncond = Tensor::<B, 2>::random([3, 8], Distribution::Uniform(-1.0, 1.0), &device);
 
         let raw = Guidance::new(6.0).apply(cond.clone(), uncond.clone());
-        let tamed = Guidance::new(6.0).with_rescale(1.0).apply(cond.clone(), uncond);
+        let tamed = Guidance::new(6.0)
+            .with_rescale(1.0)
+            .apply(cond.clone(), uncond);
 
         let spread = |t: Tensor<B, 2>| -> Vec<f32> {
-            row_std(&t).into_data().convert::<f32>().iter::<f32>().collect()
+            row_std(&t)
+                .into_data()
+                .convert::<f32>()
+                .iter::<f32>()
+                .collect()
         };
         let target = spread(cond);
         let before = spread(raw);
@@ -561,9 +618,7 @@ mod tests {
         let small = logits(&[1.0, 2.0, 0.5], 1, 3);
         let large = logits(&[10.0, 20.0, 5.0], 1, 3);
 
-        let conf = |t: Tensor<B, 2>| -> f32 {
-            softmax(t, 1).max_dim(1).into_scalar()
-        };
+        let conf = |t: Tensor<B, 2>| -> f32 { softmax(t, 1).max_dim(1).into_scalar() };
         assert!(
             (conf(small.clone()) - conf(large.clone())).abs() > 0.3,
             "raw confidences should disagree wildly"
@@ -594,7 +649,11 @@ mod tests {
             .map(|_| Tensor::<B, 2>::random([4, 5], Distribution::Uniform(-3.0, 3.0), &device))
             .collect();
 
-        for kind in [Ensemble::ProbabilityMean, Ensemble::LogitMean, Ensemble::MajorityVote] {
+        for kind in [
+            Ensemble::ProbabilityMean,
+            Ensemble::LogitMean,
+            Ensemble::MajorityVote,
+        ] {
             let combined = kind.combine(&members);
             assert_eq!(combined.dims(), [4, 5]);
             let sums: Vec<f32> = combined
@@ -621,14 +680,23 @@ mod tests {
         for kind in [Ensemble::ProbabilityMean, Ensemble::LogitMean] {
             let got = values(kind.combine(std::slice::from_ref(&only)));
             for (a, b) in got.iter().zip(&reference) {
-                assert!((a - b).abs() < 1e-6, "{} changed a lone member", kind.name());
+                assert!(
+                    (a - b).abs() < 1e-6,
+                    "{} changed a lone member",
+                    kind.name()
+                );
             }
         }
 
         // A one-member vote is the one-hot prediction, which is a different
         // distribution but the same arg-max.
         let voted = Ensemble::MajorityVote.combine(std::slice::from_ref(&only));
-        let a: Vec<i64> = voted.argmax(1).into_data().convert::<i64>().iter().collect();
+        let a: Vec<i64> = voted
+            .argmax(1)
+            .into_data()
+            .convert::<i64>()
+            .iter()
+            .collect();
         let b: Vec<i64> = only.argmax(1).into_data().convert::<i64>().iter().collect();
         assert_eq!(a, b);
     }
@@ -654,15 +722,30 @@ mod tests {
         let right_a = logits(&[0.0, 1.0], 1, 2);
         let right_b = logits(&[0.0, 1.2], 1, 2);
 
-        let voted = Ensemble::MajorityVote.combine(&[wrong.clone(), right_a.clone(), right_b.clone()]);
-        let idx: Vec<i64> = voted.argmax(1).into_data().convert::<i64>().iter().collect();
-        assert_eq!(idx, vec![1], "a plurality vote resists one confident outlier");
+        let voted =
+            Ensemble::MajorityVote.combine(&[wrong.clone(), right_a.clone(), right_b.clone()]);
+        let idx: Vec<i64> = voted
+            .argmax(1)
+            .into_data()
+            .convert::<i64>()
+            .iter()
+            .collect();
+        assert_eq!(
+            idx,
+            vec![1],
+            "a plurality vote resists one confident outlier"
+        );
 
         // The logit mean does not: a member with a large logit scale dominates
         // it. That is a documented property, not a bug -- and the reason
         // `LogitNorm` and `Ensemble::LogitMean` belong together.
         let averaged = Ensemble::LogitMean.combine(&[wrong, right_a, right_b]);
-        let idx: Vec<i64> = averaged.argmax(1).into_data().convert::<i64>().iter().collect();
+        let idx: Vec<i64> = averaged
+            .argmax(1)
+            .into_data()
+            .convert::<i64>()
+            .iter()
+            .collect();
         assert_eq!(idx, vec![0]);
     }
 
@@ -689,7 +772,10 @@ mod tests {
 
         let frontier: Vec<&str> = curve.pareto().iter().map(|p| p.label.as_str()).collect();
         assert_eq!(frontier, vec!["cheap", "mid", "best"]);
-        assert_eq!(curve.most_accurate().map(|p| p.label.as_str()), Some("best"));
+        assert_eq!(
+            curve.most_accurate().map(|p| p.label.as_str()),
+            Some("best")
+        );
         assert_eq!(curve.cheapest().map(|p| p.label.as_str()), Some("cheap"));
     }
 

@@ -62,6 +62,11 @@ pub fn manifest_path(corpus: &Path) -> PathBuf {
     corpus.with_extension("labels.json")
 }
 
+/// `book.bin` -> `book.mask`.
+pub fn mask_path(corpus: &Path) -> PathBuf {
+    corpus.with_extension("mask")
+}
+
 /// The windows of a batch and, aligned with them, their label bytes.
 pub type LabeledBatch = (Vec<Vec<u16>>, Vec<Vec<u8>>);
 
@@ -71,7 +76,11 @@ enum Source {
     /// The whole corpus, resident.
     Memory(Vec<u16>),
     /// A handle plus a reusable buffer; windows are read on demand.
-    Streaming { file: File, scratch: Vec<u8>, reads_issued: usize },
+    Streaming {
+        file: File,
+        scratch: Vec<u8>,
+        reads_issued: usize,
+    },
 }
 
 /// Where a corpus's labels read from; mirrors [`Source`].
@@ -81,22 +90,50 @@ enum LabelSource {
     Streaming { file: File, scratch: Vec<u8> },
 }
 
+#[derive(Debug)]
+enum MaskSource {
+    Memory(Vec<u8>),
+    Streaming { file: File, scratch: Vec<u8> },
+}
+
+#[derive(Debug)]
+enum GradeSource {
+    Memory(Vec<i8>),
+    Streaming { file: File, scratch: Vec<u8> },
+}
+
 /// A pre-tokenized corpus, addressed by token index.
 #[derive(Debug)]
 pub struct TokenCorpus {
     source: Source,
     /// Present once [`TokenCorpus::open_labels`] has succeeded.
     labels: Option<LabelSource>,
+    masks: Option<MaskSource>,
+    /// Present once [`TokenCorpus::open_grades`] has succeeded.
+    grades: Option<GradeSource>,
     path: PathBuf,
     /// Tokens in the file.
     len: usize,
 }
 
+/// One sampled batch plus the optional per-token side tables: labels, masks,
+/// grades. Named so that signatures stay readable instead of spelling out the
+/// four-tuple.
+pub type BatchWithSides = (
+    Vec<Vec<u16>>,
+    Option<Vec<Vec<u8>>>,
+    Option<Vec<Vec<u8>>>,
+    Option<Vec<Vec<i8>>>,
+);
+
+/// A sampled batch of token windows and the mask bytes marking which tokens in
+/// each window were masked out.
+pub type MaskedBatch = (Vec<Vec<u16>>, Vec<Vec<u8>>);
+
 impl TokenCorpus {
     /// Write `tokens` to `path` in the corpus format.
     pub fn write(path: &Path, tokens: &[u16]) -> Result<()> {
-        let mut file =
-            File::create(path).with_context(|| format!("create {}", path.display()))?;
+        let mut file = File::create(path).with_context(|| format!("create {}", path.display()))?;
         let mut bytes = Vec::with_capacity(tokens.len() * TOKEN_BYTES);
         for token in tokens {
             bytes.extend_from_slice(&token.to_le_bytes());
@@ -111,8 +148,8 @@ impl TokenCorpus {
     /// The whole document is wrapped in `<bos>` / `<eos>`. Returns the token
     /// count written.
     pub fn tokenize_file(input: &Path, output: &Path) -> Result<usize> {
-        let text = std::fs::read_to_string(input)
-            .with_context(|| format!("read {}", input.display()))?;
+        let text =
+            std::fs::read_to_string(input).with_context(|| format!("read {}", input.display()))?;
         let tokens = ByteTokenizer::new().encode_document(&text);
         Self::write(output, &tokens)?;
         Ok(tokens.len())
@@ -121,6 +158,10 @@ impl TokenCorpus {
     /// Write one label byte per token to `path`.
     pub fn write_labels(path: &Path, labels: &[u8]) -> Result<()> {
         std::fs::write(path, labels).with_context(|| format!("write {}", path.display()))
+    }
+
+    pub fn write_masks(path: &Path, masks: &[u8]) -> Result<()> {
+        std::fs::write(path, masks).with_context(|| format!("write {}", path.display()))
     }
 
     /// Label every token of the corpus at `corpus` with `labeler`, writing the
@@ -181,8 +222,121 @@ impl TokenCorpus {
         Ok(())
     }
 
+    pub fn open_mask(&mut self) -> Result<()> {
+        let path = mask_path(&self.path);
+        anyhow::ensure!(
+            path.exists(),
+            "{} has no mask sidecar {}",
+            self.path.display(),
+            path.display()
+        );
+        let bytes = std::fs::metadata(&path)
+            .with_context(|| format!("stat {}", path.display()))?
+            .len() as usize;
+        anyhow::ensure!(
+            bytes == self.len,
+            "{} holds {} mask bytes but {} holds {} tokens",
+            path.display(),
+            bytes,
+            self.path.display(),
+            self.len
+        );
+        let data = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        anyhow::ensure!(
+            data.iter().all(|value| *value <= 1),
+            "{} contains a value other than 0 or 1",
+            path.display()
+        );
+        self.masks = Some(match self.source {
+            Source::Memory(_) => MaskSource::Memory(data),
+            Source::Streaming { .. } => MaskSource::Streaming {
+                file: File::open(&path).with_context(|| format!("open {}", path.display()))?,
+                scratch: Vec::new(),
+            },
+        });
+        Ok(())
+    }
+
+    pub fn has_mask(&self) -> bool {
+        self.masks.is_some()
+    }
+
     pub fn has_labels(&self) -> bool {
         self.labels.is_some()
+    }
+
+    /// Open the `.grades` sidecar — one supervision point per token — in the
+    /// same mode as the tokens.
+    ///
+    /// # Errors
+    ///
+    /// If the sidecar is missing, holds a different number of grades than the
+    /// corpus has tokens, or holds a byte that is not one of the five grades.
+    pub fn open_grades(&mut self) -> Result<()> {
+        let path = crate::grade::grades_path(&self.path);
+        anyhow::ensure!(
+            path.exists(),
+            "{} has no grade sidecar {}; run `dblocks lm grade --corpus {}` first",
+            self.path.display(),
+            path.display(),
+            self.path.display()
+        );
+        let bytes = std::fs::metadata(&path)
+            .with_context(|| format!("stat {}", path.display()))?
+            .len() as usize;
+        anyhow::ensure!(
+            bytes / crate::grade::GRADE_BYTES == self.len,
+            "{} holds {} grades but {} holds {} tokens: the sidecar was made from a different corpus",
+            path.display(),
+            bytes / crate::grade::GRADE_BYTES,
+            self.path.display(),
+            self.len
+        );
+        // Decode once here, even in streaming mode: a corrupt byte found at
+        // train time, ten thousand steps in, is a corrupt byte found too late.
+        let data = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let plane = crate::grade::GradePlane::from_bytes(&data)
+            .with_context(|| format!("decoding {}", path.display()))?;
+        self.grades = Some(match self.source {
+            Source::Memory(_) => GradeSource::Memory(plane.as_i8().to_vec()),
+            Source::Streaming { .. } => GradeSource::Streaming {
+                file: File::open(&path).with_context(|| format!("open {}", path.display()))?,
+                scratch: Vec::new(),
+            },
+        });
+        Ok(())
+    }
+
+    pub fn has_grades(&self) -> bool {
+        self.grades.is_some()
+    }
+
+    /// Grade every token of the corpus at `corpus` from its own label sidecar:
+    /// a token a heavy rule fired on earns `−1`, a lightly-flagged one `−0.5`,
+    /// and an unflagged token stays *ungraded* rather than correct — the rules
+    /// say what is wrong, never what is right.
+    ///
+    /// Returns the manifest that was written.
+    pub fn grade_file_from_labels(corpus: &Path) -> Result<crate::grade::GradeManifest> {
+        let mut resident = Self::in_memory(corpus)?;
+        resident.open_labels()?;
+        let len = resident.len();
+        let ids = resident.window_labels(0, len)?;
+        let table = resident.manifest()?.weight_table();
+        let plane = crate::grade::GradePlane::from_label_ids(&ids, &table);
+        let manifest = crate::grade::GradeManifest::for_plane(
+            &plane,
+            "labels(rule weight >= 0.5 -> -1, 0 < weight < 0.5 -> -0.5, else ungraded)",
+            len,
+        );
+        plane.write(&crate::grade::grades_path(corpus))?;
+        manifest.write(&crate::grade::manifest_path(corpus))?;
+        Ok(manifest)
+    }
+
+    /// The grade manifest written next to the sidecar, if grading has run.
+    pub fn grade_manifest(&self) -> Result<crate::grade::GradeManifest> {
+        crate::grade::GradeManifest::read(&crate::grade::manifest_path(&self.path))
     }
 
     /// The manifest written next to the labels, if labeling has been run.
@@ -198,7 +352,14 @@ impl TokenCorpus {
             .chunks_exact(TOKEN_BYTES)
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
-        Ok(Self { source: Source::Memory(tokens), labels: None, path: path.to_path_buf(), len })
+        Ok(Self {
+            source: Source::Memory(tokens),
+            labels: None,
+            masks: None,
+            grades: None,
+            path: path.to_path_buf(),
+            len,
+        })
     }
 
     /// Read windows from disk on demand.
@@ -206,8 +367,14 @@ impl TokenCorpus {
         let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
         let len = Self::token_count(file.metadata()?.len() as usize, path)?;
         Ok(Self {
-            source: Source::Streaming { file, scratch: Vec::new(), reads_issued: 0 },
+            source: Source::Streaming {
+                file,
+                scratch: Vec::new(),
+                reads_issued: 0,
+            },
             labels: None,
+            masks: None,
+            grades: None,
             path: path.to_path_buf(),
             len,
         })
@@ -261,7 +428,9 @@ impl TokenCorpus {
     /// never see at inference.
     pub fn windows(&self, context: usize) -> usize {
         let span = context + 1;
-        self.len.saturating_sub(span).saturating_add(usize::from(self.len >= span))
+        self.len
+            .saturating_sub(span)
+            .saturating_add(usize::from(self.len >= span))
     }
 
     /// Read `count` tokens starting at token index `start`.
@@ -282,7 +451,11 @@ impl TokenCorpus {
 
         match &mut self.source {
             Source::Memory(tokens) => Ok(tokens[start..start + count].to_vec()),
-            Source::Streaming { file, scratch, reads_issued } => {
+            Source::Streaming {
+                file,
+                scratch,
+                reads_issued,
+            } => {
                 // One seek and one read per window: the fixed stride is what
                 // buys that, and it is why the format has no header.
                 scratch.resize(count * TOKEN_BYTES, 0);
@@ -314,7 +487,10 @@ impl TokenCorpus {
             self.path.display()
         );
         let labels = self.labels.as_mut().with_context(|| {
-            format!("{} has no labels open; call open_labels first", self.path.display())
+            format!(
+                "{} has no labels open; call open_labels first",
+                self.path.display()
+            )
         })?;
         match labels {
             LabelSource::Memory(all) => Ok(all[start..start + count].to_vec()),
@@ -328,6 +504,74 @@ impl TokenCorpus {
                     *reads_issued += 1;
                 }
                 Ok(scratch.clone())
+            }
+        }
+    }
+
+    pub fn window_mask(&mut self, start: usize, count: usize) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            start + count <= self.len,
+            "window [{start}, {}) runs past the {} tokens in {}",
+            start + count,
+            self.len,
+            self.path.display()
+        );
+        let masks = self.masks.as_mut().with_context(|| {
+            format!(
+                "{} has no mask open; call open_mask first",
+                self.path.display()
+            )
+        })?;
+        match masks {
+            MaskSource::Memory(all) => Ok(all[start..start + count].to_vec()),
+            MaskSource::Streaming { file, scratch } => {
+                scratch.resize(count, 0);
+                file.seek(SeekFrom::Start(start as u64))
+                    .with_context(|| format!("seek {}", mask_path(&self.path).display()))?;
+                file.read_exact(scratch)
+                    .with_context(|| format!("read {}", mask_path(&self.path).display()))?;
+                if let Source::Streaming { reads_issued, .. } = &mut self.source {
+                    *reads_issued += 1;
+                }
+                Ok(scratch.clone())
+            }
+        }
+    }
+
+    /// A window of grades, one per token, decoded and validated.
+    ///
+    /// # Errors
+    ///
+    /// If no sidecar is open, if the read fails or runs past the end, or if a
+    /// byte is not one of the five quantized grades.
+    pub fn window_grades(&mut self, start: usize, count: usize) -> Result<Vec<i8>> {
+        let path = crate::grade::grades_path(&self.path);
+        match &mut self.grades {
+            None => Err(anyhow::anyhow!(
+                "grades requested before open_grades on {}",
+                self.path.display()
+            )),
+            Some(GradeSource::Memory(values)) => {
+                anyhow::ensure!(
+                    start.saturating_add(count) <= values.len(),
+                    "grade window {start}+{count} runs past the {} grades of {}",
+                    values.len(),
+                    path.display()
+                );
+                Ok(values[start..start + count].to_vec())
+            }
+            Some(GradeSource::Streaming { file, scratch }) => {
+                scratch.resize(count * crate::grade::GRADE_BYTES, 0);
+                file.seek(SeekFrom::Start((start * crate::grade::GRADE_BYTES) as u64))
+                    .with_context(|| format!("seek {}", path.display()))?;
+                file.read_exact(scratch)
+                    .with_context(|| format!("read {}", path.display()))?;
+                if let Source::Streaming { reads_issued, .. } = &mut self.source {
+                    *reads_issued += 1;
+                }
+                let plane = crate::grade::GradePlane::from_bytes(scratch)
+                    .with_context(|| format!("decoding {}", path.display()))?;
+                Ok(plane.as_i8().to_vec())
             }
         }
     }
@@ -347,7 +591,72 @@ impl TokenCorpus {
     ) -> Result<Vec<Vec<u16>>> {
         let span = context + 1;
         let starts = self.draw_starts(batch_size, span, rng)?;
-        starts.into_iter().map(|start| self.window(start, span)).collect()
+        starts
+            .into_iter()
+            .map(|start| self.window(start, span))
+            .collect()
+    }
+
+    /// Token windows, optionally paired with their per-token label bytes, mask
+    /// bytes, and grade bytes. The side tables are `None` unless the matching
+    /// `want_*` flag was set *and* the corpus was opened with that side
+    /// (`open_labels`, `open_mask`, `open_grades`), so a caller that asks for a
+    /// side it does not have gets an error rather than silent default data.
+    pub fn sample_batch_with_sides<R: rand::Rng>(
+        &mut self,
+        batch_size: usize,
+        context: usize,
+        want_labels: bool,
+        want_masks: bool,
+        want_grades: bool,
+        rng: &mut R,
+    ) -> Result<BatchWithSides> {
+        let span = context + 1;
+        let has_labels = self.has_labels();
+        let has_masks = self.has_mask();
+        let has_grades = self.has_grades();
+        let starts = if want_masks {
+            self.draw_masked_starts(batch_size, span, rng)?
+        } else {
+            self.draw_starts(batch_size, span, rng)?
+        };
+        anyhow::ensure!(
+            !want_labels || has_labels,
+            "labels requested before open_labels"
+        );
+        anyhow::ensure!(!want_masks || has_masks, "masks requested before open_mask");
+        anyhow::ensure!(
+            !want_grades || has_grades,
+            "grades requested before open_grades"
+        );
+        let mut tokens = Vec::with_capacity(batch_size);
+        let mut labels = want_labels.then(|| Vec::with_capacity(batch_size));
+        let mut masks = want_masks.then(|| Vec::with_capacity(batch_size));
+        let mut grades = want_grades.then(|| Vec::with_capacity(batch_size));
+        for start in starts {
+            tokens.push(self.window(start, span)?);
+            if let Some(rows) = labels.as_mut() {
+                rows.push(self.window_labels(start, span)?);
+            }
+            if let Some(rows) = masks.as_mut() {
+                rows.push(self.window_mask(start, span)?);
+            }
+            if let Some(rows) = grades.as_mut() {
+                rows.push(self.window_grades(start, span)?);
+            }
+        }
+        Ok((tokens, labels, masks, grades))
+    }
+
+    pub fn sample_batch_masked<R: rand::Rng>(
+        &mut self,
+        batch_size: usize,
+        context: usize,
+        rng: &mut R,
+    ) -> Result<MaskedBatch> {
+        let (tokens, _, masks, _) =
+            self.sample_batch_with_sides(batch_size, context, false, true, false, rng)?;
+        Ok((tokens, masks.unwrap_or_default()))
     }
 
     /// [`Self::sample_batch`] plus the labels of every window, drawn from the
@@ -370,7 +679,41 @@ impl TokenCorpus {
         Ok((tokens, labels))
     }
 
-    fn draw_starts<R: rand::Rng>(&self, batch_size: usize, span: usize, rng: &mut R) -> Result<Vec<usize>> {
+    fn draw_masked_starts<R: rand::Rng>(
+        &mut self,
+        batch_size: usize,
+        span: usize,
+        rng: &mut R,
+    ) -> Result<Vec<usize>> {
+        anyhow::ensure!(self.has_mask(), "masked sampling requires an open mask");
+        let mut starts = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            let mut selected = None;
+            for _ in 0..128 {
+                let candidate = self.draw_starts(1, span, rng)?[0];
+                if self
+                    .window_mask(candidate, span)?
+                    .iter()
+                    .any(|value| *value != 0)
+                {
+                    selected = Some(candidate);
+                    break;
+                }
+            }
+            let candidate = selected.ok_or_else(|| {
+                anyhow::anyhow!("no supervised window found in {}", self.path.display())
+            })?;
+            starts.push(candidate);
+        }
+        Ok(starts)
+    }
+
+    fn draw_starts<R: rand::Rng>(
+        &self,
+        batch_size: usize,
+        span: usize,
+        rng: &mut R,
+    ) -> Result<Vec<usize>> {
         anyhow::ensure!(
             self.len >= span,
             "corpus has {} tokens, fewer than the {span} one window needs",
@@ -378,12 +721,37 @@ impl TokenCorpus {
         );
         let last_start = self.len - span;
         Ok((0..batch_size)
-            .map(|_| if last_start == 0 { 0 } else { rng.random_range(0..=last_start) })
+            .map(|_| {
+                if last_start == 0 {
+                    0
+                } else {
+                    rng.random_range(0..=last_start)
+                }
+            })
             .collect())
     }
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use crate::antipattern::CLEAN;
@@ -455,7 +823,10 @@ mod tests {
         let all = corpus.window(0, count).unwrap();
         assert_eq!(all.first(), Some(&Special::Bos.id()));
         assert_eq!(all.last(), Some(&Special::Eos.id()));
-        assert_eq!(ByteTokenizer::new().decode(&all).as_deref(), Some("hello corpus"));
+        assert_eq!(
+            ByteTokenizer::new().decode(&all).as_deref(),
+            Some("hello corpus")
+        );
     }
 
     #[test]
@@ -504,7 +875,11 @@ mod tests {
         assert_eq!(first, second, "the same seed must give the same batch");
         assert_eq!(first.len(), 4);
         for window in &first {
-            assert_eq!(window.len(), 8, "context + 1, so the last input has a target");
+            assert_eq!(
+                window.len(),
+                8,
+                "context + 1, so the last input has a target"
+            );
             // Contiguity: the corpus is 0..200, so a window must be a run.
             for pair in window.windows(2) {
                 assert_eq!(pair[1], pair[0] + 1, "windows must be contiguous");
@@ -531,7 +906,11 @@ mod tests {
         // the rule that flagged it -- across window boundaries included, since
         // labels are computed over the whole corpus before any window is cut.
         let source = scratch_dir().join("labeled.txt");
-        std::fs::write(&source, "ok()\ntry:\n    f()\nexcept:\n    pass\ncatch (e) {}\n").unwrap();
+        std::fs::write(
+            &source,
+            "ok()\ntry:\n    f()\nexcept:\n    pass\ncatch (e) {}\n",
+        )
+        .unwrap();
         let path = corpus_path("labeled");
         TokenCorpus::tokenize_file(&source, &path).unwrap();
 
@@ -543,7 +922,10 @@ mod tests {
         let mut memory = TokenCorpus::in_memory(&path).unwrap();
         let mut streamed = TokenCorpus::streaming(&path).unwrap();
         assert!(!memory.has_labels());
-        assert!(memory.window_labels(0, 4).is_err(), "labels must be opened explicitly");
+        assert!(
+            memory.window_labels(0, 4).is_err(),
+            "labels must be opened explicitly"
+        );
         memory.open_labels().unwrap();
         streamed.open_labels().unwrap();
         assert!(memory.has_labels() && streamed.has_labels());
@@ -563,9 +945,14 @@ mod tests {
         // Windows of 7 cut through "pass": both readers must agree and the
         // labels must follow the tokens, not the window.
         for start in (0..len - 7).step_by(5) {
-            let (t_mem, l_mem) = (memory.window(start, 7).unwrap(), memory.window_labels(start, 7).unwrap());
-            let (t_str, l_str) =
-                (streamed.window(start, 7).unwrap(), streamed.window_labels(start, 7).unwrap());
+            let (t_mem, l_mem) = (
+                memory.window(start, 7).unwrap(),
+                memory.window_labels(start, 7).unwrap(),
+            );
+            let (t_str, l_str) = (
+                streamed.window(start, 7).unwrap(),
+                streamed.window_labels(start, 7).unwrap(),
+            );
             assert_eq!(t_mem, t_str);
             assert_eq!(l_mem, l_str, "labels disagree at {start}");
             assert_eq!(l_mem, labels[start..start + 7].to_vec());
@@ -595,7 +982,38 @@ mod tests {
 
         let missing = corpus_path("unlabeled");
         TokenCorpus::write(&missing, &[65, 66]).unwrap();
-        let err = TokenCorpus::in_memory(&missing).unwrap().open_labels().unwrap_err().to_string();
-        assert!(err.contains("dblocks lm label"), "the error should say how to fix it: {err}");
+        let err = TokenCorpus::in_memory(&missing)
+            .unwrap()
+            .open_labels()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("dblocks lm label"),
+            "the error should say how to fix it: {err}"
+        );
+    }
+
+    #[test]
+    fn test_masks_follow_tokens_through_both_readers() {
+        let path = corpus_path("masked");
+        let tokens: Vec<u16> = (0..32u16).collect();
+        let masks: Vec<u8> = (0..32).map(|i| u8::from(i % 3 == 0)).collect();
+        TokenCorpus::write(&path, &tokens).unwrap();
+        TokenCorpus::write_masks(&mask_path(&path), &masks).unwrap();
+        let mut memory = TokenCorpus::in_memory(&path).unwrap();
+        let mut streamed = TokenCorpus::streaming(&path).unwrap();
+        assert!(!memory.has_mask());
+        memory.open_mask().unwrap();
+        streamed.open_mask().unwrap();
+        assert!(memory.has_mask() && streamed.has_mask());
+        assert_eq!(memory.window_mask(4, 9).unwrap(), masks[4..13].to_vec());
+        assert_eq!(streamed.window_mask(4, 9).unwrap(), masks[4..13].to_vec());
+        let mut rng = StdRng::seed_from_u64(9);
+        let (batch, batch_masks) = memory.sample_batch_masked(3, 7, &mut rng).unwrap();
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch_masks.len(), 3);
+        assert!(batch_masks
+            .iter()
+            .all(|row| row.len() == 8 && row.iter().any(|value| *value != 0)));
     }
 }

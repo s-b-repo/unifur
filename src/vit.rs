@@ -6,7 +6,6 @@
 //! restricted to the `time_conditioning = true` configuration used by
 //! DiffusionBlocks.
 
-use serde::{Deserialize, Serialize};
 use crate::hybrid::{AttentionMode, AttentionSchedule, LayerState};
 use crate::routing::RoutingState;
 use crate::tensor_ext::{exact_gelu, l2_normalize_rows, silu};
@@ -17,23 +16,20 @@ use burn::{
         Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear,
         LinearConfig,
     },
-    tensor::{
-        activation::softmax,
-        backend::Backend,
-        Distribution,
-        Int,
-        Tensor,
-    },
+    tensor::{activation::softmax, backend::Backend, Distribution, Int, Tensor},
 };
+use serde::{Deserialize, Serialize};
 
 /// Hyperparameters of the ViT-DiT backbone (mirrors `ViTDiTConfig`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ViTDiTConfig {
     pub image_size: usize,
     pub patch_size: usize,
     pub in_channels: usize,
     pub hidden_size: usize,
     pub intermediate_size: usize,
+    #[serde(default)]
+    pub ffn_kind: FfnKind,
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub layer_norm_eps: f64,
@@ -71,6 +67,58 @@ pub struct ViTDiTConfig {
     /// (roadmap 25.4); `0` builds none and leaves every router input as it
     /// was.
     pub routing_state: usize,
+    /// Grouped-query attention: keys and values use this many heads while
+    /// queries keep `num_attention_heads` (Qwen3 style GQA). `None` is full
+    /// multi-head attention, which is what every checkpoint to date holds.
+    /// Must divide `num_attention_heads` when set.
+    pub num_kv_heads: Option<usize>,
+    /// Fraction of each head dimension the rotary embedding covers (Qwen3-Next
+    /// style partial rotary, e.g. `0.25`); `1.0` is the full rotation this
+    /// crate always applied. Ignored unless `rotary` is set.
+    #[serde(default = "default_rotary_fraction")]
+    pub rotary_fraction: f64,
+    /// Qwen-style gated attention: the merged heads are scaled by
+    /// `1 + tanh(g(x))` with a zero-initialized gate, so an untrained gated
+    /// layer is exactly the ungated trunk.
+    #[serde(default)]
+    pub gated_attention: bool,
+    /// QK-Norm (Qwen3, GLM-4.5, LLaMA-4 Scout): per-head RMSNorm on queries
+    /// and keys before rotary. `false` is the historical trunk bit for bit.
+    #[serde(default)]
+    pub qk_norm: bool,
+    /// `Layer` is what every checkpoint to date holds; `Rms` is the Qwen
+    /// style RMSNorm (one weight, no centering). The default is `Layer`, so
+    /// existing checkpoints load unchanged.
+    #[serde(default)]
+    pub norm_kind: NormKind,
+}
+
+/// The rotary cover of a fresh trunk: the full head dimension.
+pub(crate) fn default_rotary_fraction() -> f64 {
+    1.0
+}
+
+/// Which normalization a trunk layer (and the trunk's final norm) uses.
+///
+/// Carried on the config rather than inferred from shapes so a checkpoint
+/// built with one kind fails loudly on a trunk built with the other instead
+/// of being silently reinterpreted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NormKind {
+    /// `LayerNorm`: weight plus bias per hidden unit.
+    #[default]
+    Layer,
+    /// RMSNorm: one scale per hidden unit, no centering (Qwen style).
+    Rms,
+}
+
+impl NormKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Layer => "layernorm",
+            Self::Rms => "rmsnorm",
+        }
+    }
 }
 
 /// Where and how mixture-of-experts layers enter the trunk.
@@ -93,7 +141,13 @@ pub struct MoeTrunkConfig {
 
 impl Default for MoeTrunkConfig {
     fn default() -> Self {
-        Self { num_experts: 4, top_k: 1, every_n_layers: 2, z_level: 1e-3, balance_bias: false }
+        Self {
+            num_experts: 4,
+            top_k: 1,
+            every_n_layers: 2,
+            z_level: 1e-3,
+            balance_bias: false,
+        }
     }
 }
 
@@ -112,7 +166,11 @@ pub struct MosmeTrunkConfig {
 
 impl MosmeTrunkConfig {
     pub fn new(spec: crate::expert_index::MosmeSpec) -> Self {
-        Self { spec, every_n_layers: 2, balance_bias: false }
+        Self {
+            spec,
+            every_n_layers: 2,
+            balance_bias: false,
+        }
     }
 
     pub fn with_every_n_layers(mut self, n: usize) -> Self {
@@ -149,7 +207,119 @@ impl MoeTrunkConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FfnKind {
+    #[default]
+    Gelu,
+    SwiGlu,
+}
+
+impl FfnKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Gelu => "gelu",
+            Self::SwiGlu => "swiglu",
+        }
+    }
+
+    pub(crate) fn validate(self, has_experts: bool) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self == Self::Gelu || !has_experts,
+            "SwiGLU is supported only for dense trunks; ffn_kind=swiglu cannot be combined with MoE or MoSME"
+        );
+        Ok(())
+    }
+}
+
+/// RMSNorm: one scale per hidden unit, no centering (Qwen style).
+///
+/// The weight starts at exactly one, so a fresh RMSNorm passes its input
+/// through up to the RMS rescaling; unlike `LayerNorm` there is no bias term,
+/// which is why a checkpoint records a single `[h]` tensor here against
+/// `LayerNorm`'s two.
+#[derive(Module, Debug)]
+pub struct RmsNorm<B: Backend> {
+    weight: Param<Tensor<B, 1>>,
+    #[module(skip)]
+    epsilon: f64,
+}
+
+impl<B: Backend> RmsNorm<B> {
+    pub fn new(hidden: usize, epsilon: f64, device: &B::Device) -> Self {
+        Self {
+            weight: Param::from_tensor(Tensor::<B, 1>::ones([hidden], device)),
+            epsilon,
+        }
+    }
+
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let h = x.dims()[2];
+        let ms = x.clone().powf_scalar(2.0).mean_dim(2);
+        let inv = (ms + self.epsilon).powf_scalar(-0.5);
+        x * inv * self.weight.val().reshape([1, 1, h])
+    }
+
+    /// Normalize over the last dim of a rank-4 tensor (per attention head):
+    /// reshape through the rank-3 path so there is exactly one RMSNorm
+    /// implementation for a divergence to hide in.
+    pub fn forward_4d(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+        let [b, h, n, d] = x.dims();
+        self.forward(x.reshape([b * h * n, 1, d]))
+            .reshape([b, h, n, d])
+    }
+}
+
+/// Either trunk normalization, as an enum so the record round-trips through
+/// Burn's serialization and a checkpoint carries which one it was built with.
+///
+/// `Layer` is what every checkpoint to date holds; selecting `Rms` on an old
+/// checkpoint fails on the record shapes rather than silently reinterpreting
+/// the weights.
+#[derive(Module, Debug)]
+pub enum TrunkNorm<B: Backend> {
+    Layer(LayerNorm<B>),
+    Rms(RmsNorm<B>),
+}
+
+impl<B: Backend> TrunkNorm<B> {
+    pub fn new(kind: NormKind, hidden: usize, epsilon: f64, device: &B::Device) -> Self {
+        match kind {
+            NormKind::Layer => Self::Layer(
+                LayerNormConfig::new(hidden)
+                    .with_epsilon(epsilon)
+                    .init(device),
+            ),
+            NormKind::Rms => Self::Rms(RmsNorm::new(hidden, epsilon, device)),
+        }
+    }
+
+    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        match self {
+            Self::Layer(norm) => norm.forward(x),
+            Self::Rms(norm) => norm.forward(x),
+        }
+    }
+
+    pub fn kind(&self) -> NormKind {
+        match self {
+            Self::Layer(_) => NormKind::Layer,
+            Self::Rms(_) => NormKind::Rms,
+        }
+    }
+}
+
 impl ViTDiTConfig {
+    pub fn with_ffn_kind(mut self, kind: FfnKind) -> Self {
+        self.ffn_kind = kind;
+        self
+    }
+
+    pub fn validate_ffn(&self) -> anyhow::Result<()> {
+        self.ffn_kind
+            .validate(self.moe.is_some() || self.mosme.is_some())
+    }
+
     /// CIFAR preset (image size 32): patch 4, 12 layers, hidden 128, 4 heads.
     pub fn cifar(num_labels: usize) -> Self {
         Self::with_image_size(32, num_labels)
@@ -193,6 +363,12 @@ impl ViTDiTConfig {
             attention: None,
             rotary: false,
             routing_state: 0,
+            num_kv_heads: None,
+            rotary_fraction: default_rotary_fraction(),
+            gated_attention: false,
+            qk_norm: false,
+            norm_kind: NormKind::Layer,
+            ffn_kind: FfnKind::Gelu,
         }
     }
 
@@ -221,9 +397,74 @@ impl ViTDiTConfig {
         self
     }
 
+    /// Grouped-query attention with this many key/value heads (Qwen3 style).
+    pub fn with_kv_heads(mut self, kv_heads: usize) -> Self {
+        self.num_kv_heads = Some(kv_heads);
+        self
+    }
+
+    /// Rotary cover as a fraction of the head dimension (Qwen3-Next style
+    /// partial rotary, e.g. `0.25`); `1.0` is the full rotation.
+    pub fn with_rotary_fraction(mut self, fraction: f64) -> Self {
+        self.rotary_fraction = fraction;
+        self
+    }
+
+    /// Qwen-style gated attention: the merged heads are scaled by
+    /// `1 + tanh(g(x))` with a zero-initialized gate.
+    pub fn with_gated_attention(mut self, gated: bool) -> Self {
+        self.gated_attention = gated;
+        self
+    }
+
+    /// QK-Norm on queries and keys before rotary (Qwen3/GLM-4.5/LLaMA-4).
+    pub fn with_qk_norm(mut self, enabled: bool) -> Self {
+        self.qk_norm = enabled;
+        self
+    }
+
+    /// LayerNorm (the default, every checkpoint to date) or RMSNorm.
+    pub fn with_norm_kind(mut self, kind: NormKind) -> Self {
+        self.norm_kind = kind;
+        self
+    }
+
+    /// The validated key/value head count: full MHA when unset.
+    pub fn kv_heads(&self) -> usize {
+        self.num_kv_heads.unwrap_or(self.num_attention_heads)
+    }
+
+    /// Cross-check the Qwen-style attention knobs together, since a bad
+    /// combination (more KV heads than query heads, an unrepresentable rotary
+    /// cover) would otherwise fail deep inside layer construction.
+    pub fn validate_attention(&self) -> anyhow::Result<()> {
+        let q = self.num_attention_heads;
+        let kv = self.kv_heads();
+        anyhow::ensure!(
+            q > 0 && kv > 0 && kv <= q,
+            "KV heads ({kv}) must divide the query heads ({q}) from below"
+        );
+        anyhow::ensure!(
+            q % kv == 0,
+            "query heads ({q}) must be a multiple of KV heads ({kv})"
+        );
+        anyhow::ensure!(
+            self.hidden_size % q == 0,
+            "hidden size must be divisible by head count"
+        );
+        anyhow::ensure!(
+            self.rotary_fraction > 0.0 && self.rotary_fraction <= 1.0,
+            "rotary fraction must be in (0, 1], got {}",
+            self.rotary_fraction
+        );
+        Ok(())
+    }
+
     /// The attention mode of layer `idx`.
     pub fn attention_mode(&self, idx: usize) -> AttentionMode {
-        self.attention.as_ref().map_or(AttentionMode::Dense, |s| s.mode(idx))
+        self.attention
+            .as_ref()
+            .map_or(AttentionMode::Dense, |s| s.mode(idx))
     }
 
     /// Enable hierarchical expert boxes in the trunk.
@@ -265,6 +506,12 @@ impl ViTDiTConfig {
             attention: None,
             rotary: false,
             routing_state: 0,
+            num_kv_heads: None,
+            rotary_fraction: default_rotary_fraction(),
+            gated_attention: false,
+            qk_norm: false,
+            norm_kind: NormKind::Layer,
+            ffn_kind: FfnKind::Gelu,
         }
     }
 
@@ -311,7 +558,11 @@ pub struct TimestepEmbedder<B: Backend> {
 }
 
 impl<B: Backend> TimestepEmbedder<B> {
-    pub fn new(cond_hidden_size: usize, frequency_embedding_size: usize, device: &B::Device) -> Self {
+    pub fn new(
+        cond_hidden_size: usize,
+        frequency_embedding_size: usize,
+        device: &B::Device,
+    ) -> Self {
         Self {
             linear_1: LinearConfig::new(frequency_embedding_size, cond_hidden_size)
                 .with_bias(true)
@@ -321,6 +572,25 @@ impl<B: Backend> TimestepEmbedder<B> {
                 .init(device),
             frequency_embedding_size,
         }
+    }
+
+    pub(crate) fn validate_specialist_shape(
+        &self,
+        cond: usize,
+        frequency: usize,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.frequency_embedding_size == frequency
+                && crate::mosme::module_shapes(self)
+                    == vec![
+                        vec![frequency, cond],
+                        vec![cond],
+                        vec![cond, cond],
+                        vec![cond]
+                    ],
+            "timestep embedder shape mismatch"
+        );
+        Ok(())
     }
 
     /// Sinusoidal timestep embedding (`timestep_embedding(t, dim)`):
@@ -431,32 +701,65 @@ struct Attention<B: Backend> {
     value: Linear<B>,
     dense: Linear<B>,
     num_heads: usize,
+    num_kv_heads: usize,
     head_dim: usize,
     attn_dropout: Dropout,
     output_dropout: Dropout,
     #[module(skip)]
     mode: AttentionMode,
     rotary: bool,
-    mix: Option<Param<Tensor<B, 1>>>,
+    /// Columns of each head the rotary embedding covers; `== head_dim` for
+    /// the full rotation (`rotary_fraction == 1.0`).
+    rotary_dim: usize,
+    /// Qwen-style output gate: `out * (1 + tanh(gate(x)))`, zero-initialized
+    /// so an untrained gated layer is exactly the ungated trunk. `None` when
+    /// the trunk was built without `--gated-attention`.
+    gate: Option<Linear<B>>,
+    /// QK-Norm (Qwen3, GLM-4.5, LLaMA-4 Scout): per-head RMSNorm on queries
+    /// and keys before rotary, bounding attention scores by the head dim no
+    /// matter how large the projections drift (the Kimi K2 postmortem is
+    /// logits past 100). `None` when built without `--qk-norm`.
+    q_norm: Option<RmsNorm<B>>,
+    k_norm: Option<RmsNorm<B>>,
+    /// Mixing logits for [`AttentionMode::Learned`]. Zero-initialized, so a
+    /// fresh learned layer mixes its two branches evenly. Not an `Option`:
+    /// every attention layer carries the two logits, and a mode other than
+    /// `Learned` simply never reads them. That removes the "is the mix present?"
+    /// question from the forward pass, which is the only thing that ever asked.
+    mix: Param<Tensor<B, 1>>,
 }
 
 impl<B: Backend> Attention<B> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         hidden_size: usize,
         num_heads: usize,
+        num_kv_heads: usize,
         attn_dropout: f64,
         output_dropout: f64,
         mode: AttentionMode,
         rotary: bool,
+        rotary_dim: usize,
+        gated: bool,
+        qk_norm: bool,
         device: &B::Device,
     ) -> Self {
+        assert!(
+            num_heads > 0
+                && num_kv_heads > 0
+                && num_kv_heads <= num_heads
+                && num_heads % num_kv_heads == 0,
+            "KV heads ({num_kv_heads}) must divide the query heads ({num_heads}) from below"
+        );
+        let head_dim = hidden_size / num_heads;
+        let kv_dim = num_kv_heads * head_dim;
         let mut query = LinearConfig::new(hidden_size, hidden_size)
             .with_bias(true)
             .init(device);
         // Fold the 1/sqrt(head_dim) attention scale into the Q projection so
         // the forward pass needs no extra elementwise multiply per layer.
         // Numerically identical to scaling q after projection.
-        let scale = (hidden_size / num_heads) as f64;
+        let scale = head_dim as f64;
         let inv_sqrt = (1.0 / scale.sqrt()) as f32;
         // set_require_grad(false): the scaled tensor must be an untracked
         // root before it can become a fresh parameter (detach() alone would
@@ -468,42 +771,106 @@ impl<B: Backend> Attention<B> {
             query.bias = Some(Param::from_tensor(bias));
         }
 
-        let mix = matches!(mode, AttentionMode::Learned)
-            .then(|| Param::from_tensor(Tensor::<B, 1>::zeros([2], device)));
+        // Zero logits, so `softmax` starts at an even 50/50 mixture; every mode
+        // carries them and only `Learned` reads them.
+        let mix = Param::from_tensor(Tensor::<B, 1>::zeros([2], device));
         if rotary {
             assert!(
-                (hidden_size / num_heads) % 2 == 0,
-                "rotary positions need an even head dimension, got {}",
-                hidden_size / num_heads
+                head_dim % 2 == 0,
+                "rotary positions need an even head dimension, got {head_dim}"
+            );
+            assert!(
+                rotary_dim <= head_dim && rotary_dim % 2 == 0,
+                "rotary cover {rotary_dim} must be an even number of columns of {head_dim}"
             );
         }
+        // Zero-initialized (Initializer::Zeros): tanh(0) is 0, so the gate
+        // scales by exactly 1.0 until training moves it.
+        let gate = gated.then(|| {
+            LinearConfig::new(hidden_size, hidden_size)
+                .with_bias(true)
+                .with_initializer(burn::module::Initializer::Zeros)
+                .init(device)
+        });
+        // Fresh RMSNorm carries weight exactly one: normalizing queries and
+        // keys that are already unit-RMS is a no-op, so enabling the flag on
+        // a normalized trunk starts close to it, and the scores can never
+        // exceed the head dim whatever the projections learn.
+        let (q_norm, k_norm) = match qk_norm {
+            true => {
+                let eps = 1e-6;
+                (
+                    Some(RmsNorm::new(head_dim, eps, device)),
+                    Some(RmsNorm::new(head_dim, eps, device)),
+                )
+            }
+            false => (None, None),
+        };
 
         Self {
             query,
-            key: LinearConfig::new(hidden_size, hidden_size).with_bias(true).init(device),
-            value: LinearConfig::new(hidden_size, hidden_size).with_bias(true).init(device),
-            dense: LinearConfig::new(hidden_size, hidden_size).with_bias(true).init(device),
+            key: LinearConfig::new(hidden_size, kv_dim)
+                .with_bias(true)
+                .init(device),
+            value: LinearConfig::new(hidden_size, kv_dim)
+                .with_bias(true)
+                .init(device),
+            dense: LinearConfig::new(hidden_size, hidden_size)
+                .with_bias(true)
+                .init(device),
             num_heads,
-            head_dim: hidden_size / num_heads,
+            num_kv_heads,
+            head_dim,
             attn_dropout: DropoutConfig::new(attn_dropout).init(),
             output_dropout: DropoutConfig::new(output_dropout).init(),
             mode,
             rotary,
+            rotary_dim,
+            gate,
+            q_norm,
+            k_norm,
             mix,
         }
     }
 
-    fn split_heads(&self, x: Tensor<B, 3>) -> Tensor<B, 4> {
+    fn split_q(&self, x: Tensor<B, 3>) -> Tensor<B, 4> {
         let [b, n, _] = x.dims();
         x.reshape([b, n, self.num_heads, self.head_dim])
             .swap_dims(1, 2) // [b, heads, n, head_dim]
     }
 
-    fn merge_heads(&self, ctx: Tensor<B, 4>) -> Tensor<B, 3> {
+    fn split_kv(&self, x: Tensor<B, 3>) -> Tensor<B, 4> {
+        let [b, n, _] = x.dims();
+        x.reshape([b, n, self.num_kv_heads, self.head_dim])
+            .swap_dims(1, 2) // [b, kv_heads, n, head_dim]
+    }
+
+    /// Repeat each key/value head for its query group. Tiling maps head `h`
+    /// to KV head `h % kv`; the from-scratch trunk is symmetric under query
+    /// head permutation at init, so this grouping is equivalent to any other
+    /// fixed partition up to a permutation the projections absorb.
+    fn repeat_kv(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
+        let groups = self.num_heads / self.num_kv_heads;
+        if groups <= 1 {
+            return x;
+        }
+        x.repeat_dim(1, groups)
+    }
+
+    fn merge_heads(&self, ctx: Tensor<B, 4>, gate_input: Option<Tensor<B, 3>>) -> Tensor<B, 3> {
         let ctx = ctx.swap_dims(1, 2); // [b, n, heads, head_dim]
         let [b, n, _, _] = ctx.dims();
         let ctx = ctx.reshape([b, n, self.num_heads * self.head_dim]);
-        self.output_dropout.forward(self.dense.forward(ctx))
+        let out = self.output_dropout.forward(self.dense.forward(ctx));
+        match (&self.gate, gate_input) {
+            (Some(gate), Some(xin)) => {
+                // Bounded in (0, 2), exactly 1.0 at init: a stabilizer the
+                // trunk can lean on or ignore, never a scale shock.
+                let scale = gate.forward(xin).tanh() + 1.0;
+                out * scale
+            }
+            _ => out,
+        }
     }
 
     /// The mode this layer attends in.
@@ -511,15 +878,98 @@ impl<B: Backend> Attention<B> {
         self.mode
     }
 
+    /// Per-head RMSNorm on queries and keys when the trunk was built with
+    /// `--qk-norm`, pass-through otherwise. Runs before rotary, matching
+    /// Qwen3/GLM-4.5/LLaMA-4: with unit-RMS queries and keys every attention
+    /// score is bounded by the head dim, so drifting projections cannot blow
+    /// logits past 100 the way Kimi K2's postmortem describes.
+    fn norm_qk(&self, q: Tensor<B, 4>, k: Tensor<B, 4>) -> (Tensor<B, 4>, Tensor<B, 4>) {
+        match (&self.q_norm, &self.k_norm) {
+            (Some(qn), Some(kn)) => (qn.forward_4d(q), kn.forward_4d(k)),
+            _ => (q, k),
+        }
+    }
+
     /// Rotate queries and keys by their absolute positions, when configured.
-    fn rotate(&self, q: Tensor<B, 4>, k: Tensor<B, 4>, offset: usize) -> (Tensor<B, 4>, Tensor<B, 4>) {
+    /// Only the first `rotary_dim` columns turn; the rest pass through, which
+    /// is what partial rotary (Qwen3-Next: 25% of dims) means here.
+    fn rotate(
+        &self,
+        q: Tensor<B, 4>,
+        k: Tensor<B, 4>,
+        offset: usize,
+    ) -> (Tensor<B, 4>, Tensor<B, 4>) {
         if !self.rotary {
             return (q, k);
         }
         (
-            crate::hybrid::apply_rotary(q, offset, crate::hybrid::ROTARY_BASE),
-            crate::hybrid::apply_rotary(k, offset, crate::hybrid::ROTARY_BASE),
+            crate::hybrid::apply_rotary_partial(
+                q,
+                offset,
+                crate::hybrid::ROTARY_BASE,
+                self.rotary_dim,
+            ),
+            crate::hybrid::apply_rotary_partial(
+                k,
+                offset,
+                crate::hybrid::ROTARY_BASE,
+                self.rotary_dim,
+            ),
         )
+    }
+
+    /// Largest (causally valid) attention score over `normed` `[b, n, h]`:
+    /// the Kimi K2 early-warning metric. Loss and gradient norms miss logit
+    /// blowup until it spikes the run; the max score shows it coming while it
+    /// is still a drift. `None` for pure linear attention, which keeps no
+    /// scores (its state is the `(S, z)` pair, not a score matrix).
+    ///
+    /// Scores only: no value projection, no softmax, no output map — roughly
+    /// a third of an attention forward for the number training stability is
+    /// actually read in. Returns the single-element score-maximum tensor;
+    /// callers in a `FloatElem = f32` context read the scalar out, which
+    /// keeps this method usable from the untyped `Backend` impl block.
+    pub(crate) fn max_logit(
+        &self,
+        normed: Tensor<B, 3>,
+        causal: bool,
+        offset: usize,
+    ) -> Option<Tensor<B, 1>> {
+        if self.mode == AttentionMode::Linear {
+            return None;
+        }
+        assert!(
+            causal || self.mode == AttentionMode::Dense,
+            "only dense attention is defined bidirectionally; this layer is {:?}",
+            self.mode
+        );
+        let n = normed.dims()[1];
+        let q = self.split_q(self.query.forward(normed.clone()));
+        let k = self.split_kv(self.key.forward(normed));
+        let (q, k) = self.norm_qk(q, k);
+        let (q, k) = self.rotate(q, k, offset);
+        let k = self.repeat_kv(k);
+        let device = q.device();
+        let mask = match self.mode {
+            AttentionMode::Dense => causal.then(|| causal_mask::<B>(n, &device)),
+            AttentionMode::Sliding { window } => Some(crate::hybrid::attention_mask::<B>(
+                n,
+                n,
+                0,
+                0,
+                Some(window),
+                &device,
+            )),
+            AttentionMode::Retrieval { .. } | AttentionMode::Learned => Some(
+                crate::hybrid::attention_mask::<B>(n, n, 0, 0, None, &device),
+            ),
+            AttentionMode::Linear => return None,
+        };
+        let mut scores = q.matmul(k.swap_dims(2, 3));
+        if let Some(mask) = mask {
+            scores = scores + mask;
+        }
+        Some(scores.max())
     }
 
     /// Softmax attention of `q` `[b, heads, m, d]` over `k`/`v`
@@ -551,8 +1001,7 @@ impl<B: Backend> Attention<B> {
 
     /// Softmax weights of the learned dense/linear mixture, `[2]`.
     fn mix_weights(&self) -> Tensor<B, 1> {
-        let logits = self.mix.as_ref().expect("a learned layer carries its mixing logits").val();
-        softmax(logits, 0)
+        softmax(self.mix.val(), 0)
     }
 
     fn mix_pair(&self, dense: Tensor<B, 4>, linear: Tensor<B, 4>) -> Tensor<B, 4> {
@@ -567,10 +1016,16 @@ impl<B: Backend> Attention<B> {
         use crate::hybrid::{attention_mask, feature_map, linear_attention};
 
         let n = x.dims()[1];
-        let q = self.split_heads(self.query.forward(x.clone()));
-        let k = self.split_heads(self.key.forward(x.clone()));
-        let v = self.split_heads(self.value.forward(x));
+        let gate_input = self.gate.is_some().then(|| x.clone());
+        let q = self.split_q(self.query.forward(x.clone()));
+        let k = self.split_kv(self.key.forward(x.clone()));
+        let v = self.split_kv(self.value.forward(x));
+        let (q, k) = self.norm_qk(q, k);
         let (q, k) = self.rotate(q, k, offset);
+        // Grouped-query heads read the repeated keys/values; with full MHA
+        // the repeat is a no-op returning its input.
+        let k = self.repeat_kv(k);
+        let v = self.repeat_kv(v);
         let device = q.device();
         let mode = self.mode;
         assert!(
@@ -593,17 +1048,19 @@ impl<B: Backend> Attention<B> {
                 self.softmax_attend(q, k, v, Some(mask), Some(top_k))
             }
             AttentionMode::Linear => {
-                let (ctx, _) = linear_attention(feature_map(q), feature_map(k), v, None, LINEAR_EPS);
+                let (ctx, _) =
+                    linear_attention(feature_map(q), feature_map(k), v, None, LINEAR_EPS);
                 ctx
             }
             AttentionMode::Learned => {
                 let mask = attention_mask::<B>(n, n, 0, 0, None, &device);
                 let dense = self.softmax_attend(q.clone(), k.clone(), v.clone(), Some(mask), None);
-                let (linear, _) = linear_attention(feature_map(q), feature_map(k), v, None, LINEAR_EPS);
+                let (linear, _) =
+                    linear_attention(feature_map(q), feature_map(k), v, None, LINEAR_EPS);
                 self.mix_pair(dense, linear)
             }
         };
-        self.merge_heads(ctx)
+        self.merge_heads(ctx, gate_input)
     }
 
     /// Causal attention over `x` (the *new* positions only), reusing and
@@ -625,11 +1082,16 @@ impl<B: Backend> Attention<B> {
 
         let m = x.dims()[1];
         let offset = state.positions;
-        let q = self.split_heads(self.query.forward(x.clone()));
-        let k_new = self.split_heads(self.key.forward(x.clone()));
-        let v_new = self.split_heads(self.value.forward(x));
+        let gate_input = self.gate.is_some().then(|| x.clone());
+        let q = self.split_q(self.query.forward(x.clone()));
+        let k_new = self.split_kv(self.key.forward(x.clone()));
+        let v_new = self.split_kv(self.value.forward(x));
+        let (q, k_new) = self.norm_qk(q, k_new);
         let (q, k_new) = self.rotate(q, k_new, offset);
         let device = q.device();
+        // The cache keeps the narrow KV heads (that is the whole saving);
+        // every read below repeats them for the query groups first.
+        let repeat = |t: Tensor<B, 4>| self.repeat_kv(t);
 
         let ctx = match self.mode {
             AttentionMode::Dense | AttentionMode::Retrieval { .. } => {
@@ -637,44 +1099,62 @@ impl<B: Backend> Attention<B> {
                     AttentionMode::Retrieval { top_k } => Some(top_k),
                     _ => None,
                 };
-                state.push_kv(k_new, v_new, None);
-                let (k, v) = state.kv();
+                let (k, v) = state.push_kv(k_new, v_new, None);
                 let total = k.dims()[2];
                 // Query j sits at absolute position `offset + j`, so it may
                 // attend to any key up to that index. The mask is rectangular,
                 // not triangular: the cached prefix is entirely in the past.
-                let mask = attention_mask::<B>(m, total, offset, state.first_key_position, None, &device);
-                self.softmax_attend(q, k, v, Some(mask), top_k)
+                let mask =
+                    attention_mask::<B>(m, total, offset, state.first_key_position, None, &device);
+                self.softmax_attend(q, repeat(k), repeat(v), Some(mask), top_k)
             }
             AttentionMode::Sliding { window } => {
-                state.push_kv(k_new, v_new, None);
-                let (k, v) = state.kv();
+                let (k, v) = state.push_kv(k_new, v_new, None);
                 let total = k.dims()[2];
-                let mask = attention_mask::<B>(m, total, offset, state.first_key_position, Some(window), &device);
-                let ctx = self.softmax_attend(q, k, v, Some(mask), None);
+                let mask = attention_mask::<B>(
+                    m,
+                    total,
+                    offset,
+                    state.first_key_position,
+                    Some(window),
+                    &device,
+                );
+                let ctx = self.softmax_attend(q, repeat(k), repeat(v), Some(mask), None);
                 // Only the last `window - 1` positions can be read by any
                 // future query; the rest is forgotten, position included.
                 state.trim(window.saturating_sub(1));
                 ctx
             }
             AttentionMode::Linear => {
-                let (ctx, next) = linear_attention(feature_map(q), feature_map(k_new), v_new, state.linear.take(), LINEAR_EPS);
+                let (ctx, next) = linear_attention(
+                    feature_map(q),
+                    feature_map(repeat(k_new)),
+                    repeat(v_new),
+                    state.linear.take(),
+                    LINEAR_EPS,
+                );
                 state.linear = Some(next);
                 ctx
             }
             AttentionMode::Learned => {
-                state.push_kv(k_new.clone(), v_new.clone(), None);
-                let (k, v) = state.kv();
+                let (k, v) = state.push_kv(k_new.clone(), v_new.clone(), None);
                 let total = k.dims()[2];
-                let mask = attention_mask::<B>(m, total, offset, state.first_key_position, None, &device);
-                let dense = self.softmax_attend(q.clone(), k, v, Some(mask), None);
-                let (linear, next) = linear_attention(feature_map(q), feature_map(k_new), v_new, state.linear.take(), LINEAR_EPS);
+                let mask =
+                    attention_mask::<B>(m, total, offset, state.first_key_position, None, &device);
+                let dense = self.softmax_attend(q.clone(), repeat(k), repeat(v), Some(mask), None);
+                let (linear, next) = linear_attention(
+                    feature_map(q),
+                    feature_map(repeat(k_new)),
+                    repeat(v_new),
+                    state.linear.take(),
+                    LINEAR_EPS,
+                );
                 state.linear = Some(next);
                 self.mix_pair(dense, linear)
             }
         };
         state.positions += m;
-        self.merge_heads(ctx)
+        self.merge_heads(ctx, gate_input)
     }
 }
 
@@ -724,6 +1204,39 @@ impl<B: Backend> Mlp<B> {
     }
 }
 
+#[derive(Module, Debug)]
+struct SwiGluMlp<B: Backend> {
+    fc_in: Linear<B>,
+    fc_gate: Linear<B>,
+    fc_out: Linear<B>,
+    output_dropout: Dropout,
+}
+
+impl<B: Backend> SwiGluMlp<B> {
+    fn new(hidden_size: usize, intermediate_size: usize, p_drop: f64, device: &B::Device) -> Self {
+        Self {
+            fc_in: LinearConfig::new(hidden_size, intermediate_size)
+                .with_bias(true)
+                .init(device),
+            fc_gate: LinearConfig::new(hidden_size, intermediate_size)
+                .with_bias(true)
+                .init(device),
+            fc_out: LinearConfig::new(intermediate_size, hidden_size)
+                .with_bias(true)
+                .init(device),
+            output_dropout: DropoutConfig::new(p_drop).init(),
+        }
+    }
+
+    fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let gate = self.fc_gate.forward(x.clone());
+        let [b, n, width] = gate.dims();
+        let gate = silu(gate.reshape([b * n, width])).reshape([b, n, width]);
+        let h = gate * self.fc_in.forward(x);
+        self.output_dropout.forward(self.fc_out.forward(h))
+    }
+}
+
 /// A layer's position-wise feed-forward: either a dense MLP or a sparse
 /// mixture of experts (roadmap 6.5).
 ///
@@ -740,6 +1253,7 @@ enum FeedForward<B: Backend> {
     /// Boxes of specialized micro experts, routed two-level
     /// (see [`crate::mosme`]).
     Hierarchical(crate::mosme::MosmeFeedForward<B>),
+    DenseSwiGlu(SwiGluMlp<B>),
 }
 
 /// The auxiliary losses a sparse layer produces.
@@ -771,15 +1285,26 @@ impl<B: Backend> RouterAux<B> {
     /// Sum two spans' losses and keep both spans' per-layer routing, in order.
     pub fn combine(mut self, other: Self) -> Self {
         self.layers.extend(other.layers);
-        Self { balance: self.balance + other.balance, z: self.z + other.z, layers: self.layers }
+        Self {
+            balance: self.balance + other.balance,
+            z: self.z + other.z,
+            layers: self.layers,
+        }
     }
 
     /// Per-layer routing statistics, synced to the host, with each layer's
     /// top-1 agreement with the routed layer before it (roadmap 25.6).
     pub fn to_host(&self) -> Vec<crate::moe::RoutingStats> {
-        let mut stats: Vec<crate::moe::RoutingStats> =
-            self.layers.iter().map(crate::moe::LayerRouting::to_host).collect();
-        let top1: Vec<Vec<i64>> = self.layers.iter().map(|l| crate::routing::top1_to_host(&l.top1)).collect();
+        let mut stats: Vec<crate::moe::RoutingStats> = self
+            .layers
+            .iter()
+            .map(crate::moe::LayerRouting::to_host)
+            .collect();
+        let top1: Vec<Vec<i64>> = self
+            .layers
+            .iter()
+            .map(|l| crate::routing::top1_to_host(&l.top1))
+            .collect();
         for i in 1..stats.len() {
             stats[i].agreement = crate::routing::layer_agreement(
                 &top1[i - 1],
@@ -826,23 +1351,43 @@ impl<B: Backend> FeedForward<B> {
         &self,
         x: Tensor<B, 3>,
         conditioning: &Tensor<B, 2>,
-        state: Option<&Tensor<B, 3>>,
+        state: &Tensor<B, 3>,
+        specialist: Option<(usize, usize)>,
     ) -> (Tensor<B, 3>, Option<RouterAux<B>>) {
         let [b, n, _] = x.dims();
         match self {
             Self::Dense(mlp) => (mlp.forward(x), None),
+            Self::DenseSwiGlu(mlp) => (mlp.forward(x), None),
             Self::Sparse(moe) => {
                 let out = moe.forward_with_state(x, conditioning.clone(), state);
                 let z = out.z_loss.mul_scalar(moe.z_level() as f32);
-                (out.output, Some(RouterAux { balance: out.balance, z, layers: vec![out.routing] }))
+                (
+                    out.output,
+                    Some(RouterAux {
+                        balance: out.balance,
+                        z,
+                        layers: vec![out.routing],
+                    }),
+                )
             }
             Self::Hierarchical(mosme) => {
+                if let Some((bi, ei)) = specialist {
+                    return (mosme.forward_specialist(x, bi, ei), None);
+                }
                 let out = mosme.forward_with_state(x, conditioning.clone(), state);
-                let z = out.balance.z_loss.clone().mul_scalar(mosme.z_level() as f32);
+                let z = out
+                    .balance
+                    .z_loss
+                    .clone()
+                    .mul_scalar(mosme.z_level() as f32);
                 let routing = out.gates.layer_routing().with_sequence(b, n);
                 (
                     out.output,
-                    Some(RouterAux { balance: out.balance.total.clone(), z, layers: vec![routing] }),
+                    Some(RouterAux {
+                        balance: out.balance.total.clone(),
+                        z,
+                        layers: vec![routing],
+                    }),
                 )
             }
         }
@@ -859,17 +1404,26 @@ pub(crate) struct LayerCarry<B: Backend> {
     pub routing_state: Option<Tensor<B, 3>>,
     /// Absolute position of the first token of this pass.
     pub offset: usize,
+    pub specialist: Option<(usize, usize)>,
 }
 
 impl<B: Backend> Default for LayerCarry<B> {
     fn default() -> Self {
-        Self { routing_state: None, offset: 0 }
+        Self {
+            routing_state: None,
+            offset: 0,
+            specialist: None,
+        }
     }
 }
 
 impl<B: Backend> LayerCarry<B> {
     pub(crate) fn at(offset: usize) -> Self {
-        Self { routing_state: None, offset }
+        Self {
+            routing_state: None,
+            offset,
+            specialist: None,
+        }
     }
 }
 
@@ -883,8 +1437,8 @@ impl<B: Backend> LayerCarry<B> {
 pub(crate) struct DbLayer<B: Backend> {
     attention: Attention<B>,
     mlp: FeedForward<B>,
-    layernorm_before: LayerNorm<B>,
-    layernorm_after: LayerNorm<B>,
+    layernorm_before: TrunkNorm<B>,
+    layernorm_after: TrunkNorm<B>,
     ada_ln: AdaLN<B>,
     /// Whether this layer attends causally. Set from
     /// [`ViTDiTConfig::causal`]; `false` for the image path, whose tokens are
@@ -896,7 +1450,16 @@ pub(crate) struct DbLayer<B: Backend> {
 }
 
 impl<B: Backend> DbLayer<B> {
-    pub(crate) fn new(config: &ViTDiTConfig, layer_idx: usize, device: &B::Device) -> Self {
+    /// Build one trunk layer. Fallsible for the reason
+    /// [`crate::lm::LanguageModel::new`] is: an invalid config is reported with
+    /// the field at fault, not by unwinding from inside an initializer.
+    pub(crate) fn new(
+        config: &ViTDiTConfig,
+        layer_idx: usize,
+        device: &B::Device,
+    ) -> anyhow::Result<Self> {
+        config.validate_ffn()?;
+        config.validate_attention()?;
         let h = config.hidden_size;
         // The MoE router is conditioned on the adaLN vector, which is a pure
         // function of sigma -- that is what makes the routing noise-aware
@@ -904,14 +1467,11 @@ impl<B: Backend> DbLayer<B> {
         let mlp = match (&config.mosme, config.moe) {
             // Hierarchical wins: it is the strict generalization.
             (Some(mosme), _) if mosme.applies_to(layer_idx) => {
-                let cfg = crate::mosme::MosmeConfig::new(
-                    h,
-                    config.cond_hidden_size,
-                    mosme.spec.clone(),
-                )
-                .with_intermediate_size(config.intermediate_size)
-                .with_balance_bias(mosme.balance_bias)
-                .with_state_size(config.routing_state);
+                let cfg =
+                    crate::mosme::MosmeConfig::new(h, config.cond_hidden_size, mosme.spec.clone())
+                        .with_intermediate_size(config.intermediate_size)
+                        .with_balance_bias(mosme.balance_bias)
+                        .with_state_size(config.routing_state);
                 FeedForward::Hierarchical(crate::mosme::MosmeFeedForward::new(&cfg, device))
             }
             (_, Some(moe)) if moe.applies_to(layer_idx) => {
@@ -923,6 +1483,12 @@ impl<B: Backend> DbLayer<B> {
                     .with_state_size(config.routing_state);
                 FeedForward::Sparse(crate::moe::MoELayer::new(&cfg, device))
             }
+            _ if config.ffn_kind == FfnKind::SwiGlu => FeedForward::DenseSwiGlu(SwiGluMlp::new(
+                h,
+                config.intermediate_size,
+                config.hidden_dropout_prob,
+                device,
+            )),
             _ => FeedForward::Dense(Mlp::new(
                 h,
                 config.intermediate_size,
@@ -936,32 +1502,243 @@ impl<B: Backend> DbLayer<B> {
             "layer {layer_idx} asks for {} attention, which is only defined causally",
             mode.name()
         );
-        Self {
+        Ok(Self {
             attention: Attention::new(
                 h,
                 config.num_attention_heads,
+                config.kv_heads(),
                 config.attention_probs_dropout_prob,
                 config.hidden_dropout_prob,
                 mode,
                 config.rotary,
+                crate::hybrid::rotary_dim_for(
+                    config.rotary_fraction,
+                    h / config.num_attention_heads,
+                ),
+                config.gated_attention,
+                config.qk_norm,
                 device,
             ),
             mlp,
-            layernorm_before: LayerNormConfig::new(h)
-                .with_epsilon(config.layer_norm_eps)
-                .init(device),
-            layernorm_after: LayerNormConfig::new(h)
-                .with_epsilon(config.layer_norm_eps)
-                .init(device),
+            layernorm_before: TrunkNorm::new(config.norm_kind, h, config.layer_norm_eps, device),
+            layernorm_after: TrunkNorm::new(config.norm_kind, h, config.layer_norm_eps, device),
             ada_ln: AdaLN::new(config.cond_hidden_size, 6 * h, device),
             causal: config.causal,
-            routing: (config.routing_state > 0).then(|| RoutingState::new(h, config.routing_state, device)),
+            routing: (config.routing_state > 0)
+                .then(|| RoutingState::new(h, config.routing_state, device)),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn router_param_ids(&self, ids: &mut Vec<burn::module::ParamId>) {
+        if let FeedForward::Hierarchical(site) = &self.mlp {
+            ids.extend(burn::module::list_param_ids::<_, B>(site.router()));
         }
     }
 
-    /// The attention mode this layer runs in.
+    pub(crate) fn validate_specialist_config(
+        &self,
+        config: &ViTDiTConfig,
+        idx: usize,
+    ) -> anyhow::Result<()> {
+        use crate::mosme::module_shapes;
+        let h = config.hidden_size;
+        let i = config.intermediate_size;
+        let c = config.cond_hidden_size;
+        anyhow::ensure!(
+            self.causal && self.routing.is_none(),
+            "unsupported specialist layer"
+        );
+        let kv_dim = config.kv_heads() * self.attention.head_dim;
+        anyhow::ensure!(
+            self.attention.num_heads == config.num_attention_heads
+                && self.attention.num_kv_heads == config.kv_heads()
+                && self.attention.head_dim * config.num_attention_heads == h
+                && self.attention.mode == config.attention_mode(idx)
+                && self.attention.rotary == config.rotary
+                && self.attention.rotary_dim
+                    == crate::hybrid::rotary_dim_for(
+                        config.rotary_fraction,
+                        self.attention.head_dim
+                    )
+                && self.attention.gate.is_some() == config.gated_attention
+                && self.attention.q_norm.is_some() == config.qk_norm
+                && self.attention.k_norm.is_some() == config.qk_norm
+                && self.attention.attn_dropout.prob == config.attention_probs_dropout_prob
+                && self.attention.output_dropout.prob == config.hidden_dropout_prob,
+            "specialist attention configuration mismatch"
+        );
+        anyhow::ensure!(
+            module_shapes(&self.attention.query) == vec![vec![h, h], vec![h]],
+            "attention q shape mismatch"
+        );
+        for linear in [&self.attention.key, &self.attention.value] {
+            anyhow::ensure!(
+                module_shapes(linear) == vec![vec![h, kv_dim], vec![kv_dim]],
+                "attention kv shape mismatch"
+            );
+        }
+        anyhow::ensure!(
+            module_shapes(&self.attention.dense) == vec![vec![h, h], vec![h]],
+            "attention out shape mismatch"
+        );
+        if let Some(gate) = &self.attention.gate {
+            anyhow::ensure!(
+                module_shapes(gate) == vec![vec![h, h], vec![h]],
+                "attention gate shape mismatch"
+            );
+        }
+        // Every layer carries the two mixing logits now, so the shape is the
+        // only thing left to check; whether `Learned` reads them is the mode's
+        // business, not a structural one.
+        anyhow::ensure!(
+            self.attention.mix.dims() == [2],
+            "attention mix must be two logits, got {:?}",
+            self.attention.mix.dims()
+        );
+        let expected_norm = match config.norm_kind {
+            NormKind::Layer => vec![vec![h], vec![h]],
+            NormKind::Rms => vec![vec![h]],
+        };
+        for norm in [&self.layernorm_before, &self.layernorm_after] {
+            anyhow::ensure!(
+                norm.kind() == config.norm_kind && module_shapes(norm) == expected_norm,
+                "layer norm shape mismatch"
+            );
+        }
+        anyhow::ensure!(
+            module_shapes(&self.ada_ln) == vec![vec![c, 6 * h], vec![6 * h]],
+            "conditioning shape mismatch"
+        );
+        let mosme = config
+            .mosme
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing MoSME config"))?;
+        match &self.mlp {
+            FeedForward::Hierarchical(site) if mosme.applies_to(idx) => {
+                site.validate_specialist_config(
+                    &crate::mosme::MosmeConfig::new(h, c, mosme.spec.clone())
+                        .with_intermediate_size(i)
+                        .with_balance_bias(mosme.balance_bias),
+                )?;
+            }
+            FeedForward::Dense(mlp) if !mosme.applies_to(idx) => {
+                anyhow::ensure!(
+                    module_shapes(mlp) == vec![vec![h, i], vec![i], vec![i, h], vec![h]]
+                        && mlp.output_dropout.prob == config.hidden_dropout_prob,
+                    "dense FFN mismatch"
+                );
+            }
+            _ => anyhow::bail!("specialist FFN site placement mismatch at layer {idx}"),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn compact_specialist(
+        &self,
+        position: (usize, usize),
+        config: &crate::mosme::MosmeConfig,
+    ) -> anyhow::Result<Self> {
+        crate::tensor_ext::force_initialization(self);
+        let mut result = self.clone();
+        if let FeedForward::Hierarchical(site) = &self.mlp {
+            result.mlp = FeedForward::Hierarchical(site.compact_specialist(position, config)?);
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn apply_specialist(
+        &self,
+        specialist: &Self,
+        position: (usize, usize),
+    ) -> anyhow::Result<Self> {
+        crate::tensor_ext::force_initialization(self);
+        let mut result = self.clone();
+        match (&self.mlp, &specialist.mlp) {
+            (FeedForward::Hierarchical(target), FeedForward::Hierarchical(source)) => {
+                result.mlp = FeedForward::Hierarchical(target.apply_specialist(source, position)?);
+            }
+            (FeedForward::Dense(_), FeedForward::Dense(_)) => {}
+            _ => anyhow::bail!("specialist FFN site mismatch"),
+        }
+        Ok(result)
+    }
+
+    pub(crate) fn specialist_ids(
+        &self,
+        position: (usize, usize),
+        expected: &[usize],
+    ) -> anyhow::Result<Option<Vec<burn::module::ParamId>>> {
+        match &self.mlp {
+            FeedForward::Hierarchical(site) => {
+                anyhow::ensure!(
+                    site.router().experts_per_box() == expected,
+                    "MoSME spec/module layout mismatch"
+                );
+                let expert = site
+                    .expert(position.0, position.1)
+                    .ok_or_else(|| anyhow::anyhow!("specialist is absent from MoSME site"))?;
+                Ok(Some(burn::module::list_param_ids::<_, B>(expert)))
+            }
+            FeedForward::Sparse(_) => {
+                anyhow::bail!("resident specialist training does not support flat MoE sites")
+            }
+            _ => Ok(None),
+        }
+    }
+
     pub(crate) fn attention_mode(&self) -> AttentionMode {
         self.attention.mode()
+    }
+
+    /// Query/KV head counts, for cross-checking a model against a config.
+    pub(crate) fn attention_heads(&self) -> (usize, usize) {
+        (self.attention.num_heads, self.attention.num_kv_heads)
+    }
+
+    /// Whether this layer's attention carries the zero-initialized output gate.
+    pub(crate) fn attention_gated(&self) -> bool {
+        self.attention.gate.is_some()
+    }
+
+    /// Whether this layer normalizes queries and keys before rotary.
+    pub(crate) fn attention_qk_norm(&self) -> bool {
+        self.attention.q_norm.is_some() && self.attention.k_norm.is_some()
+    }
+
+    /// This layer's attention input: LayerNorm plus the adaLN shift/scale,
+    /// without the residual add or the attention itself. The max-logit probe
+    /// reads the same tensor the attention branch does.
+    pub(crate) fn normed_for_attention(
+        &self,
+        hidden_states: Tensor<B, 3>,
+        conditioning: &Tensor<B, 2>,
+    ) -> Tensor<B, 3> {
+        let mods = self.ada_ln.forward(conditioning.clone());
+        let h = mods.dims()[1] / 6;
+        let shift_msa = mods.clone().narrow(1, 0, h).unsqueeze_dim::<3>(1);
+        let scale_msa = mods.clone().narrow(1, h, h).unsqueeze_dim::<3>(1);
+        modulate(
+            self.layernorm_before.forward(hidden_states),
+            shift_msa,
+            scale_msa,
+        )
+    }
+
+    /// Largest causally-valid attention score for this layer on an input
+    /// already run through [`Self::normed_for_attention`], if the layer's
+    /// mode keeps scores.
+    pub(crate) fn attention_max_logit(
+        &self,
+        normed: Tensor<B, 3>,
+        offset: usize,
+    ) -> Option<Tensor<B, 1>> {
+        self.attention.max_logit(normed, self.causal, offset)
+    }
+
+    /// Which normalization this layer uses.
+    pub(crate) fn norm_kind(&self) -> NormKind {
+        self.layernorm_before.kind()
     }
 
     /// Whether this layer carries a routing-state updater.
@@ -974,7 +1751,7 @@ impl<B: Backend> DbLayer<B> {
     /// their boxes' expert-level biases.
     pub(crate) fn balance_bias_values(&self) -> Option<Vec<f32>> {
         match &self.mlp {
-            FeedForward::Dense(_) => None,
+            FeedForward::Dense(_) | FeedForward::DenseSwiGlu(_) => None,
             FeedForward::Sparse(layer) => layer
                 .router()
                 .balance_bias()
@@ -998,7 +1775,7 @@ impl<B: Backend> DbLayer<B> {
     /// The sparse feed-forward, if this layer has one.
     pub(crate) fn sparse_mut(&mut self) -> Option<SparseLayerMut<'_, B>> {
         match &mut self.mlp {
-            FeedForward::Dense(_) => None,
+            FeedForward::Dense(_) | FeedForward::DenseSwiGlu(_) => None,
             FeedForward::Sparse(layer) => Some(SparseLayerMut::Flat(layer)),
             FeedForward::Hierarchical(layer) => Some(SparseLayerMut::Hierarchical(layer)),
         }
@@ -1059,9 +1836,18 @@ impl<B: Backend> DbLayer<B> {
     {
         // The routing state is updated from this layer's *input*, so the
         // routers inside the layer can already read it (roadmap 25.4).
-        if let Some(routing) = &self.routing {
-            carry.routing_state = Some(routing.step(&hidden_states, carry.routing_state.as_ref()));
-        }
+        carry.routing_state = self
+            .routing
+            .as_ref()
+            .map(|routing| routing.step(&hidden_states, carry.routing_state.as_ref()));
+        // Downstream the routers take a tensor, and "this layer keeps no state"
+        // is a zero-width tensor rather than a missing one. That way no call
+        // site between here and the router has to unwrap anything, and the
+        // router's own width check is what rejects a state of the wrong size.
+        let routing_state = match &carry.routing_state {
+            Some(state) => state.clone(),
+            None => Tensor::<B, 3>::zeros([1, 1, 0], &hidden_states.device()),
+        };
         let residual = hidden_states.clone();
 
         // Chunk the modulation vector [b, 6h] into six [b, h] slices.
@@ -1075,7 +1861,11 @@ impl<B: Backend> DbLayer<B> {
         let gate_mlp = mods.narrow(1, 5 * h, h).unsqueeze_dim::<3>(1);
 
         // Attention branch.
-        let normed = modulate(self.layernorm_before.forward(hidden_states), shift_msa, scale_msa);
+        let normed = modulate(
+            self.layernorm_before.forward(hidden_states),
+            shift_msa,
+            scale_msa,
+        );
         let attended = attend(&self.attention, normed);
         let hidden_states = attended * gate_msa + residual;
 
@@ -1086,7 +1876,8 @@ impl<B: Backend> DbLayer<B> {
             scale_mlp,
         );
         let (layer_output, balance_loss) =
-            self.mlp.forward(layer_output, conditioning, carry.routing_state.as_ref());
+            self.mlp
+                .forward(layer_output, conditioning, &routing_state, carry.specialist);
         (layer_output * gate_mlp + hidden_states, balance_loss)
     }
 }
@@ -1125,12 +1916,16 @@ pub struct ViTDiTModel<B: Backend> {
     embeddings: ViTDiTEmbeddings<B>,
     time_embedder: TimestepEmbedder<B>,
     layers: Vec<DbLayer<B>>,
-    final_layernorm: LayerNorm<B>,
+    final_layernorm: TrunkNorm<B>,
 }
 
 impl<B: Backend> ViTDiTModel<B> {
-    pub fn new(config: &ViTDiTConfig, device: &B::Device) -> Self {
-        Self {
+    /// Build the image/vision trunk. Fallsible for the reason
+    /// [`crate::lm::LanguageModel::new`] is.
+    pub fn new(config: &ViTDiTConfig, device: &B::Device) -> anyhow::Result<Self> {
+        config.validate_ffn()?;
+        config.validate_attention()?;
+        Ok(Self {
             embeddings: ViTDiTEmbeddings::new(config, device),
             time_embedder: TimestepEmbedder::new(
                 config.cond_hidden_size,
@@ -1139,11 +1934,14 @@ impl<B: Backend> ViTDiTModel<B> {
             ),
             layers: (0..config.num_hidden_layers)
                 .map(|idx| DbLayer::new(config, idx, device))
-                .collect(),
-            final_layernorm: LayerNormConfig::new(config.hidden_size)
-                .with_epsilon(config.layer_norm_eps)
-                .init(device),
-        }
+                .collect::<anyhow::Result<_>>()?,
+            final_layernorm: TrunkNorm::new(
+                config.norm_kind,
+                config.hidden_size,
+                config.layer_norm_eps,
+                device,
+            ),
+        })
     }
 
     /// Number of transformer layers.
@@ -1153,7 +1951,10 @@ impl<B: Backend> ViTDiTModel<B> {
 
     /// Selection biases of every sparse layer that has one, in layer order.
     pub fn balance_biases(&self) -> Vec<Vec<f32>> {
-        self.layers.iter().filter_map(DbLayer::balance_bias_values).collect()
+        self.layers
+            .iter()
+            .filter_map(DbLayer::balance_bias_values)
+            .collect()
     }
 
     /// Visit every sparse layer in `range`, in execution order -- the same
@@ -1274,7 +2075,11 @@ impl<B: Backend> DbOutputHead<B> {
 
     /// adaLN-modulated CLS-token hidden `[b, h]`, before the classifier.
     /// Used by vector-prediction objectives such as flow matching.
-    pub fn modulated_cls(&self, model_out: Tensor<B, 3>, conditioning: Tensor<B, 2>) -> Tensor<B, 2> {
+    pub fn modulated_cls(
+        &self,
+        model_out: Tensor<B, 3>,
+        conditioning: Tensor<B, 2>,
+    ) -> Tensor<B, 2> {
         let mods = self.ada_ln.forward(conditioning);
         let h = self.hidden_size;
         let shift = mods.clone().narrow(1, 0, h).unsqueeze_dim::<3>(1);
@@ -1293,11 +2098,13 @@ pub struct ViTDiTForImageClassification<B: Backend> {
 }
 
 impl<B: Backend> ViTDiTForImageClassification<B> {
-    pub fn new(config: &ViTDiTConfig, device: &B::Device) -> Self {
-        Self {
-            vit: ViTDiTModel::new(config, device),
+    /// Build the classification model. Fallsible, like [`Self::new`] on the
+    /// trunk it wraps.
+    pub fn new(config: &ViTDiTConfig, device: &B::Device) -> anyhow::Result<Self> {
+        Ok(Self {
+            vit: ViTDiTModel::new(config, device)?,
             head: DbOutputHead::new(config, device),
-        }
+        })
     }
 
     /// Apply the DiT-specific initialization from `_init_dit`:
@@ -1306,7 +2113,7 @@ impl<B: Backend> ViTDiTForImageClassification<B> {
     /// - timestep MLP weights ~ N(0, initializer_range^2)
     /// - all adaLN modulation linears zeroed
     /// - classifier weight and bias zeroed
-    pub fn with_dit_init(self, config: &ViTDiTConfig, device: &B::Device) -> Self {
+    pub fn with_dit_init(self, config: &ViTDiTConfig, device: &B::Device) -> anyhow::Result<Self> {
         use burn::module::Param;
 
         let std = config.initializer_range;
@@ -1315,15 +2122,24 @@ impl<B: Backend> ViTDiTForImageClassification<B> {
         // Label embedding table.
         {
             let shape = rec.vit.embeddings.label_embeddings.weight.shape();
-            rec.vit.embeddings.label_embeddings.weight =
-                Param::from_tensor(Tensor::random(shape, Distribution::Normal(0.0, std), device));
+            rec.vit.embeddings.label_embeddings.weight = Param::from_tensor(Tensor::random(
+                shape,
+                Distribution::Normal(0.0, std),
+                device,
+            ));
         }
         // Timestep embedder MLP weights (biases keep their default init,
         // mirroring nn.init.normal_ which only touches weights).
-        for lin in [&mut rec.vit.time_embedder.linear_1, &mut rec.vit.time_embedder.linear_2] {
+        for lin in [
+            &mut rec.vit.time_embedder.linear_1,
+            &mut rec.vit.time_embedder.linear_2,
+        ] {
             let shape = lin.weight.shape();
-            lin.weight =
-                Param::from_tensor(Tensor::random(shape, Distribution::Normal(0.0, std), device));
+            lin.weight = Param::from_tensor(Tensor::random(
+                shape,
+                Distribution::Normal(0.0, std),
+                device,
+            ));
         }
         // Zero all adaLN modulation linears (DiT zero-init trick).
         for layer in rec.vit.layers.iter_mut() {
@@ -1333,7 +2149,7 @@ impl<B: Backend> ViTDiTForImageClassification<B> {
         // Zero the classifier.
         zero_linear_params(&mut rec.head.classifier);
 
-        Self::new(config, device).load_record(rec)
+        Ok(Self::new(config, device)?.load_record(rec))
     }
 
     /// Run only the layers in `layer_indices` and produce class logits
@@ -1345,7 +2161,9 @@ impl<B: Backend> ViTDiTForImageClassification<B> {
         noisy_embeds: Tensor<B, 2>,
         timesteps: Tensor<B, 1>,
     ) -> Tensor<B, 2> {
-        let out = self.vit.forward_block(layer_indices, pixel_values, noisy_embeds, timesteps);
+        let out = self
+            .vit
+            .forward_block(layer_indices, pixel_values, noisy_embeds, timesteps);
         let pooled = out.last_hidden_state.narrow(1, 0, 1); // CLS token slot
         self.head.forward(pooled, out.conditioning)
     }
@@ -1359,7 +2177,9 @@ impl<B: Backend> ViTDiTForImageClassification<B> {
         noisy_embeds: Tensor<B, 2>,
         timesteps: Tensor<B, 1>,
     ) -> Tensor<B, 2> {
-        let out = self.vit.forward_block(layer_indices, pixel_values, noisy_embeds, timesteps);
+        let out = self
+            .vit
+            .forward_block(layer_indices, pixel_values, noisy_embeds, timesteps);
         let pooled = out.last_hidden_state.narrow(1, 0, 1);
         self.head.modulated_cls(pooled, out.conditioning)
     }
@@ -1415,6 +2235,25 @@ fn zero_linear_params<B: Backend>(linear: &mut burn::nn::LinearRecord<B>) {
     }
 }
 
+// A test says "this must have worked" with `unwrap`, which is the right thing
+// for a test to say. The grant is scoped to this module: production code in the
+// same file is still denied it (see the `[lints]` table in `Cargo.toml` and the
+// contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1427,10 +2266,158 @@ mod tests {
     }
 
     #[test]
+    fn test_ffn_config_defaults_and_roundtrip() {
+        for cfg in [
+            ViTDiTConfig::tiny(10),
+            ViTDiTConfig::cifar(10),
+            ViTDiTConfig::tiny_imagenet(200),
+        ] {
+            assert_eq!(cfg.ffn_kind, FfnKind::Gelu);
+            let mut old = serde_json::to_value(&cfg).unwrap();
+            old.as_object_mut().unwrap().remove("ffn_kind");
+            let parsed: ViTDiTConfig = serde_json::from_value(old).unwrap();
+            assert_eq!(parsed.ffn_kind, FfnKind::Gelu);
+            for kind in [FfnKind::Gelu, FfnKind::SwiGlu] {
+                let value = serde_json::to_value(cfg.clone().with_ffn_kind(kind)).unwrap();
+                assert_eq!(value["ffn_kind"], kind.name());
+                let back: ViTDiTConfig = serde_json::from_value(value.clone()).unwrap();
+                assert_eq!(back.ffn_kind, kind);
+                assert_eq!(serde_json::to_value(back).unwrap(), value);
+            }
+        }
+    }
+
+    #[test]
+    fn test_default_ffn_is_unchanged_gelu() {
+        let device = Default::default();
+        let layer = DbLayer::<B>::new(&tiny_config(), 0, &device).unwrap();
+        let FeedForward::Dense(mlp) = layer.mlp else {
+            panic!("default must use the legacy dense MLP")
+        };
+        let x = Tensor::<B, 3>::random([2, 3, 32], Distribution::Uniform(-2.0, 2.0), &device);
+        let expected = mlp.fc_out.forward(exact_gelu(mlp.fc_in.forward(x.clone())));
+        assert_eq!((mlp.forward(x) - expected).abs().max().into_scalar(), 0.0);
+        assert_eq!(
+            mlp.num_params(),
+            crate::cost::dense_mlp_cost(32, 64).active_params
+        );
+    }
+
+    #[test]
+    fn test_swiglu_formula_and_gradients() {
+        use burn::backend::Autodiff;
+        type A = Autodiff<B>;
+        let device = Default::default();
+        let mut mlp = SwiGluMlp::<A>::new(1, 1, 0.0, &device);
+        for (linear, weight, bias) in [
+            (&mut mlp.fc_in, 2.0, 0.3),
+            (&mut mlp.fc_gate, -0.7, 0.2),
+            (&mut mlp.fc_out, 1.3, -0.1),
+        ] {
+            linear.weight = Param::from_tensor(Tensor::full([1, 1], weight, &device));
+            linear.bias = Some(Param::from_tensor(Tensor::full([1], bias, &device)));
+        }
+        let xs = [-2.0f32, 0.0, 1.0, 3.0];
+        let x = Tensor::<A, 1>::from_floats(xs, &device)
+            .reshape([2, 2, 1])
+            .require_grad();
+        let y = mlp.forward(x.clone());
+        assert_eq!(y.dims(), [2, 2, 1]);
+        let values: Vec<f32> = y.clone().into_data().iter::<f32>().collect();
+        let grads = y.sum().backward();
+        let dx: Vec<f32> = x.grad(&grads).unwrap().into_data().iter::<f32>().collect();
+        let mut expected_params = [0.0f32; 6];
+        for (i, x) in xs.into_iter().enumerate() {
+            let up = 2.0 * x + 0.3;
+            let gate = -0.7 * x + 0.2;
+            let sigmoid = 1.0 / (1.0 + (-gate).exp());
+            let activated = gate * sigmoid;
+            let d_up = 1.3 * activated;
+            let d_gate = 1.3 * up * sigmoid * (1.0 + gate * (1.0 - sigmoid));
+            let expected = 1.3 * activated * up - 0.1;
+            assert!(
+                (values[i] - expected).abs() < 2e-5,
+                "{} vs {expected}",
+                values[i]
+            );
+            assert!((dx[i] - (2.0 * d_up - 0.7 * d_gate)).abs() < 2e-5);
+            for (sum, term) in expected_params.iter_mut().zip([
+                x * d_up,
+                d_up,
+                x * d_gate,
+                d_gate,
+                activated * up,
+                1.0,
+            ]) {
+                *sum += term;
+            }
+        }
+        let mut actual = Vec::new();
+        for linear in [&mlp.fc_in, &mlp.fc_gate, &mlp.fc_out] {
+            actual.push(
+                linear
+                    .weight
+                    .val()
+                    .grad(&grads)
+                    .unwrap()
+                    .reshape([1])
+                    .into_scalar(),
+            );
+            actual.push(
+                linear
+                    .bias
+                    .as_ref()
+                    .unwrap()
+                    .val()
+                    .grad(&grads)
+                    .unwrap()
+                    .into_scalar(),
+            );
+        }
+        for (got, expected) in actual.into_iter().zip(expected_params) {
+            assert!(
+                got.is_finite() && (got - expected).abs() < 3e-5,
+                "{got} vs {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_swiglu_layer_shape_and_parameter_cost() {
+        let device = Default::default();
+        let cfg = tiny_config().with_ffn_kind(FfnKind::SwiGlu);
+        let layer = DbLayer::<B>::new(&cfg, 0, &device).unwrap();
+        let FeedForward::DenseSwiGlu(mlp) = layer.mlp else {
+            panic!("SwiGLU was not selected")
+        };
+        assert_eq!(mlp.fc_gate.weight.dims(), [32, 64]);
+        assert_eq!(
+            mlp.num_params(),
+            crate::cost::dense_ffn_cost(32, 64, FfnKind::SwiGlu).active_params
+        );
+        let x = Tensor::<B, 3>::ones([2, 3, 32], &device);
+        assert_eq!(mlp.forward(x).dims(), [2, 3, 32]);
+    }
+
+    #[test]
+    fn test_swiglu_rejects_expert_trunks() {
+        let cfg = tiny_config()
+            .with_ffn_kind(FfnKind::SwiGlu)
+            .with_moe(MoeTrunkConfig::default());
+        let err = ViTDiTModel::<B>::new(&cfg, &Default::default())
+            .expect_err("SwiGLU cannot be combined with an expert trunk");
+        assert!(
+            err.to_string()
+                .contains("cannot be combined with MoE or MoSME"),
+            "the error must name the conflict, got: {err}"
+        );
+    }
+
+    #[test]
     fn test_forward_shapes() {
         let device = Default::default();
         let cfg = tiny_config();
-        let model = ViTDiTForImageClassification::new(&cfg, &device);
+        let model = ViTDiTForImageClassification::new(&cfg, &device).unwrap();
 
         let pixels = Tensor::<B, 4>::zeros([2, 3, 32, 32], &device);
         let zt = Tensor::<B, 2>::zeros([2, 32], &device);
@@ -1444,7 +2431,7 @@ mod tests {
     fn test_layer_subset_changes_output() {
         let device = Default::default();
         let cfg = tiny_config();
-        let model = ViTDiTForImageClassification::new(&cfg, &device);
+        let model = ViTDiTForImageClassification::new(&cfg, &device).unwrap();
 
         let pixels = Tensor::<B, 4>::ones([1, 3, 32, 32], &device);
         let zt = Tensor::<B, 2>::ones([1, 32], &device);
@@ -1460,7 +2447,7 @@ mod tests {
     fn test_normalized_label_embeds_unit_norm() {
         let device = Default::default();
         let cfg = tiny_config();
-        let model = ViTDiTForImageClassification::new(&cfg, &device);
+        let model = ViTDiTForImageClassification::new(&cfg, &device).unwrap();
         let labels = Tensor::<B, 1, Int>::from_ints([0, 3, 9], &device);
         let e = model.normalized_label_embeds(labels);
         assert_eq!(e.dims(), [3, 32]);
@@ -1472,7 +2459,13 @@ mod tests {
     #[test]
     fn test_moe_trunk_placement_and_balance_loss() {
         let device = Default::default();
-        let moe = MoeTrunkConfig { num_experts: 4, top_k: 2, every_n_layers: 2, z_level: 1e-3, balance_bias: false };
+        let moe = MoeTrunkConfig {
+            num_experts: 4,
+            top_k: 2,
+            every_n_layers: 2,
+            z_level: 1e-3,
+            balance_bias: false,
+        };
 
         // Placement is arithmetic, so check it directly before building
         // anything: every second layer, i.e. layers 1 and 3 of 4.
@@ -1481,29 +2474,46 @@ mod tests {
             vec![1, 3]
         );
         assert_eq!(moe.num_sparse_layers(4), 2);
-        assert_eq!(MoeTrunkConfig { every_n_layers: 1, ..moe }.num_sparse_layers(4), 4);
+        assert_eq!(
+            MoeTrunkConfig {
+                every_n_layers: 1,
+                ..moe
+            }
+            .num_sparse_layers(4),
+            4
+        );
 
         let cfg = ViTDiTConfig::tiny(10).with_moe(moe);
-        let model = ViTDiTForImageClassification::<B>::new(&cfg, &device);
+        let model = ViTDiTForImageClassification::<B>::new(&cfg, &device).unwrap();
 
         let pixels = Tensor::<B, 4>::ones([2, 3, 32, 32], &device);
         let zt = Tensor::<B, 2>::ones([2, 32], &device);
         let t = Tensor::<B, 1>::zeros([2], &device);
 
         // A span containing no sparse layer reports no auxiliary loss...
-        let dense_span = model.vit().forward_block(0..1, pixels.clone(), zt.clone(), t.clone());
+        let dense_span = model
+            .vit()
+            .forward_block(0..1, pixels.clone(), zt.clone(), t.clone());
         assert!(dense_span.balance_loss.is_none(), "layer 0 is dense");
 
         // ...and one containing sparse layers reports a finite, positive one.
-        let sparse_span = model.vit().forward_block(0..4, pixels.clone(), zt.clone(), t.clone());
+        let sparse_span = model
+            .vit()
+            .forward_block(0..4, pixels.clone(), zt.clone(), t.clone());
         let aux: f32 = sparse_span
             .balance_loss
             .map(|a| a.balance)
             .expect("layers 1 and 3 are sparse")
             .into_scalar();
-        assert!(aux.is_finite() && aux > 0.0, "balance loss must be positive: {aux}");
+        assert!(
+            aux.is_finite() && aux > 0.0,
+            "balance loss must be positive: {aux}"
+        );
         // Two sparse layers, each contributing at least the uniform minimum 1.
-        assert!(aux >= 2.0 - 1e-4, "two sparse layers must each contribute >= 1: {aux}");
+        assert!(
+            aux >= 2.0 - 1e-4,
+            "two sparse layers must each contribute >= 1: {aux}"
+        );
         assert!(aux <= 2.0 * moe.num_experts as f32 + 1e-4);
 
         // The sparse trunk still produces well-shaped logits.
@@ -1546,23 +2556,37 @@ mod tests {
         assert_eq!(trunk.num_hierarchical_layers(4), 2);
 
         let cfg = ViTDiTConfig::tiny(10).with_mosme(trunk);
-        let model = ViTDiTForImageClassification::<B>::new(&cfg, &device);
+        let model = ViTDiTForImageClassification::<B>::new(&cfg, &device).unwrap();
 
         let pixels = Tensor::<B, 4>::ones([2, 3, 32, 32], &device);
         let zt = Tensor::<B, 2>::ones([2, 32], &device);
         let t = Tensor::<B, 1>::zeros([2], &device);
 
         // A span with no hierarchical layer reports no auxiliary loss...
-        let dense = model.vit().forward_block(0..1, pixels.clone(), zt.clone(), t.clone());
+        let dense = model
+            .vit()
+            .forward_block(0..1, pixels.clone(), zt.clone(), t.clone());
         assert!(dense.balance_loss.is_none(), "layer 0 is dense");
 
         // ...and one that includes them reports a finite, positive one. Each
         // hierarchical layer contributes a box term and an expert term, both
         // at least 1 on the diagonal, so two layers give at least 4.
-        let sparse = model.vit().forward_block(0..4, pixels.clone(), zt.clone(), t.clone());
-        let aux: f32 = sparse.balance_loss.expect("layers 1 and 3 are hierarchical").balance.into_scalar();
-        assert!(aux.is_finite() && aux > 0.0, "balance loss must be positive: {aux}");
-        assert!(aux >= 2.0, "two hierarchical layers must each contribute: {aux}");
+        let sparse = model
+            .vit()
+            .forward_block(0..4, pixels.clone(), zt.clone(), t.clone());
+        let aux: f32 = sparse
+            .balance_loss
+            .expect("layers 1 and 3 are hierarchical")
+            .balance
+            .into_scalar();
+        assert!(
+            aux.is_finite() && aux > 0.0,
+            "balance loss must be positive: {aux}"
+        );
+        assert!(
+            aux >= 2.0,
+            "two hierarchical layers must each contribute: {aux}"
+        );
 
         assert_eq!(model.forward_all(pixels, zt, t).dims(), [2, 10]);
     }
@@ -1575,9 +2599,15 @@ mod tests {
         use crate::expert_index::MosmeSpec;
         let device = Default::default();
         let cfg = ViTDiTConfig::tiny(10)
-            .with_moe(MoeTrunkConfig { num_experts: 4, top_k: 1, every_n_layers: 1, z_level: 1e-3, balance_bias: false })
+            .with_moe(MoeTrunkConfig {
+                num_experts: 4,
+                top_k: 1,
+                every_n_layers: 1,
+                z_level: 1e-3,
+                balance_bias: false,
+            })
             .with_mosme(MosmeTrunkConfig::new(MosmeSpec::flat(2)).with_every_n_layers(1));
-        let model = ViTDiTForImageClassification::<B>::new(&cfg, &device);
+        let model = ViTDiTForImageClassification::<B>::new(&cfg, &device).unwrap();
 
         // A single-box hierarchical layer reports a box loss of exactly 1 on
         // top of its expert loss, which a flat layer would not.
@@ -1587,7 +2617,11 @@ mod tests {
             Tensor::<B, 2>::ones([1, 32], &device),
             Tensor::<B, 1>::zeros([1], &device),
         );
-        let aux: f32 = out.balance_loss.expect("layer 0 is hierarchical").balance.into_scalar();
+        let aux: f32 = out
+            .balance_loss
+            .expect("layer 0 is hierarchical")
+            .balance
+            .into_scalar();
         assert!(aux >= 1.0, "hierarchical path should be active, got {aux}");
     }
 
@@ -1601,7 +2635,19 @@ mod tests {
     fn prefix_drift_from_future_perturbation(causal: bool) -> (f32, f32) {
         let device = Default::default();
         let (hidden, heads, seq) = (16usize, 4usize, 6usize);
-        let attention = Attention::<B>::new(hidden, heads, 0.0, 0.0, AttentionMode::Dense, false, &device);
+        let attention = Attention::<B>::new(
+            hidden,
+            heads,
+            heads,
+            0.0,
+            0.0,
+            AttentionMode::Dense,
+            false,
+            hidden / heads,
+            false,
+            false,
+            &device,
+        );
 
         let base = Tensor::<B, 3>::random(
             [1, seq, hidden],
@@ -1665,7 +2711,10 @@ mod tests {
                 if key <= query {
                     assert_eq!(v, 0.0, "({query},{key}) should be visible");
                 } else {
-                    assert!(v.is_infinite() && v < 0.0, "({query},{key}) should be masked");
+                    assert!(
+                        v.is_infinite() && v < 0.0,
+                        "({query},{key}) should be masked"
+                    );
                 }
             }
         }
@@ -1675,7 +2724,10 @@ mod tests {
     fn test_dit_init_zero_logits_and_gates() {
         let device = Default::default();
         let cfg = tiny_config();
-        let model = ViTDiTForImageClassification::new(&cfg, &device).with_dit_init(&cfg, &device);
+        let model = ViTDiTForImageClassification::new(&cfg, &device)
+            .unwrap()
+            .with_dit_init(&cfg, &device)
+            .unwrap();
 
         let pixels = Tensor::<B, 4>::zeros([1, 3, 32, 32], &device);
         let zt = Tensor::<B, 2>::zeros([1, 32], &device);

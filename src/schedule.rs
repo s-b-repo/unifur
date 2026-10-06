@@ -20,12 +20,12 @@
 //! - [`LossScales`] — per-block loss normalization, which is the direct answer
 //!   to the imbalance above.
 
-use serde::{Deserialize, Serialize};
 use burn::{
     module::{AutodiffModule, Module, ModuleMapper, Param},
     optim::GradientsParams,
     tensor::{backend::AutodiffBackend, backend::Backend, Tensor},
 };
+use serde::{Deserialize, Serialize};
 
 /// How the learning rate varies over a run.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -73,9 +73,9 @@ impl LrSchedule {
                 peak,
                 warmup_steps: (total_steps / 20).max(1),
             }),
-            other => anyhow::bail!(
-                "unknown lr schedule '{other}' (expected constant|cosine|warmup)"
-            ),
+            other => {
+                anyhow::bail!("unknown lr schedule '{other}' (expected constant|cosine|warmup)")
+            }
         }
     }
 
@@ -92,7 +92,12 @@ impl LrSchedule {
         match *self {
             Self::Constant { lr } => lr,
             Self::WarmupConstant { peak, warmup_steps } => peak * warmup_factor(step, warmup_steps),
-            Self::WarmupCosine { peak, min_lr, warmup_steps, total_steps } => {
+            Self::WarmupCosine {
+                peak,
+                min_lr,
+                warmup_steps,
+                total_steps,
+            } => {
                 if step < warmup_steps {
                     return peak * warmup_factor(step, warmup_steps);
                 }
@@ -148,7 +153,12 @@ pub struct GradientAccumulator {
 
 impl GradientAccumulator {
     pub fn new(every: usize) -> Self {
-        Self { every: every.max(1), pending: 0, buffer: None, folded: 0 }
+        Self {
+            every: every.max(1),
+            pending: 0,
+            buffer: None,
+            folded: 0,
+        }
     }
 
     pub fn every(&self) -> usize {
@@ -327,7 +337,10 @@ pub struct GlobalLoad {
 
 impl GlobalLoad {
     pub fn new(k: usize) -> Self {
-        Self { windows: Vec::new(), k: k.max(1) }
+        Self {
+            windows: Vec::new(),
+            k: k.max(1),
+        }
     }
 
     pub fn window(&self) -> usize {
@@ -343,7 +356,10 @@ impl GlobalLoad {
         // An expert count that changed under us (a grown model) invalidates
         // the history: start the window over rather than average mismatched
         // vectors.
-        if window.front().is_some_and(|front| front.len() != load.len()) {
+        if window
+            .front()
+            .is_some_and(|front| front.len() != load.len())
+        {
             window.clear();
         }
         window.push_back(load.to_vec());
@@ -448,7 +464,12 @@ impl BalanceSchedule {
     pub fn at(&self, step: usize) -> f64 {
         match *self {
             Self::Constant { weight } => weight,
-            Self::Anneal { start, end, hold_steps, total_steps } => {
+            Self::Anneal {
+                start,
+                end,
+                hold_steps,
+                total_steps,
+            } => {
                 if step <= hold_steps {
                     return start;
                 }
@@ -498,7 +519,11 @@ where
     }
     let scale = max_norm / total_norm;
 
-    let mut visitor = ClipVisitor::<B> { grads, scale, _backend: std::marker::PhantomData };
+    let mut visitor = ClipVisitor::<B> {
+        grads,
+        scale,
+        _backend: std::marker::PhantomData,
+    };
     module.visit(&mut visitor);
     scale
 }
@@ -537,7 +562,11 @@ impl<M: Clone> Ema<M> {
     /// `decay` is clamped to `[0, 1]`: outside that range the recursion either
     /// diverges or inverts the sign of the history.
     pub fn new(module: &M, decay: f64) -> Self {
-        Self { shadow: module.clone(), decay: decay.clamp(0.0, 1.0), updates: 0 }
+        Self {
+            shadow: module.clone(),
+            decay: decay.clamp(0.0, 1.0),
+            updates: 0,
+        }
     }
 
     pub fn decay(&self) -> f64 {
@@ -552,7 +581,11 @@ impl<M: Clone> Ema<M> {
     /// 28): a resumed run must continue the average, not restart it from the
     /// live weights, or the warm-up ramp in [`Self::effective_decay`] replays.
     pub fn from_parts(shadow: M, decay: f64, updates: usize) -> Self {
-        Self { shadow, decay: decay.clamp(0.0, 1.0), updates }
+        Self {
+            shadow,
+            decay: decay.clamp(0.0, 1.0),
+            updates,
+        }
     }
 
     pub fn shadow(&self) -> &M {
@@ -623,7 +656,9 @@ impl LiveParams {
     fn collect<B: Backend<FloatElem = f32>, M: Module<B>>(module: &M) -> Self {
         let mut visitor = LiveCollector { values: Vec::new() };
         module.visit(&mut visitor);
-        Self { values: visitor.values }
+        Self {
+            values: visitor.values,
+        }
     }
 }
 
@@ -737,8 +772,7 @@ impl LossScales {
         if own <= 0.0 {
             return 1.0;
         }
-        let log_mean: f64 =
-            observed.iter().map(|m| m.ln()).sum::<f64>() / observed.len() as f64;
+        let log_mean: f64 = observed.iter().map(|m| m.ln()).sum::<f64>() / observed.len() as f64;
         (log_mean.exp() / own).clamp(self.min_scale, self.max_scale)
     }
 
@@ -748,6 +782,25 @@ impl LossScales {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
 
@@ -757,7 +810,11 @@ mod tests {
         assert_eq!(window.window(), 2);
         assert_eq!(window.observe(0, &[1.0, 0.0]), vec![1.0, 0.0]);
         assert_eq!(window.observe(0, &[0.0, 1.0]), vec![0.5, 0.5]);
-        assert_eq!(window.observe(0, &[0.0, 1.0]), vec![0.0, 1.0], "the first entry fell out");
+        assert_eq!(
+            window.observe(0, &[0.0, 1.0]),
+            vec![0.0, 1.0],
+            "the first entry fell out"
+        );
         assert_eq!(window.filled(0), 2);
         // A second layer has its own window.
         assert_eq!(window.observe(1, &[0.25, 0.75]), vec![0.25, 0.75]);
@@ -782,7 +839,10 @@ mod tests {
 
     #[test]
     fn test_warmup_ramps_then_holds() {
-        let s = LrSchedule::WarmupConstant { peak: 1.0, warmup_steps: 4 };
+        let s = LrSchedule::WarmupConstant {
+            peak: 1.0,
+            warmup_steps: 4,
+        };
         // Step 0 is non-zero: a first step of exactly zero wastes a batch and
         // leaves the optimizer's moments untouched.
         assert!(s.at(0) > 0.0);
@@ -791,14 +851,22 @@ mod tests {
         assert_eq!(s.at(50), 1.0, "the plateau must hold");
 
         // Zero warmup is immediate, not a division by zero.
-        let none = LrSchedule::WarmupConstant { peak: 2.0, warmup_steps: 0 };
+        let none = LrSchedule::WarmupConstant {
+            peak: 2.0,
+            warmup_steps: 0,
+        };
         assert_eq!(none.at(0), 2.0);
     }
 
     #[test]
     fn test_cosine_decays_monotonically_after_warmup() {
         let s = LrSchedule::cosine(1e-3, 1000);
-        let LrSchedule::WarmupCosine { warmup_steps, min_lr, .. } = s else {
+        let LrSchedule::WarmupCosine {
+            warmup_steps,
+            min_lr,
+            ..
+        } = s
+        else {
             panic!("expected cosine");
         };
         assert_eq!(warmup_steps, 50);
@@ -825,12 +893,19 @@ mod tests {
         // done against its nominal peak.
         for s in [
             LrSchedule::cosine(1e-3, 500),
-            LrSchedule::WarmupConstant { peak: 5e-4, warmup_steps: 10 },
+            LrSchedule::WarmupConstant {
+                peak: 5e-4,
+                warmup_steps: 10,
+            },
             LrSchedule::Constant { lr: 2e-3 },
         ] {
             for step in 0..600 {
                 let lr = s.at(step);
-                assert!(lr <= s.peak() + 1e-15, "{} overshot at {step}: {lr}", s.name());
+                assert!(
+                    lr <= s.peak() + 1e-15,
+                    "{} overshot at {step}: {lr}",
+                    s.name()
+                );
                 assert!(lr >= 0.0);
             }
         }
@@ -838,9 +913,18 @@ mod tests {
 
     #[test]
     fn test_schedule_parsing() {
-        assert_eq!(LrSchedule::parse("constant", 1e-3, 100).unwrap().name(), "constant");
-        assert_eq!(LrSchedule::parse("cosine", 1e-3, 100).unwrap().name(), "cosine");
-        assert_eq!(LrSchedule::parse("warmup", 1e-3, 100).unwrap().name(), "warmup");
+        assert_eq!(
+            LrSchedule::parse("constant", 1e-3, 100).unwrap().name(),
+            "constant"
+        );
+        assert_eq!(
+            LrSchedule::parse("cosine", 1e-3, 100).unwrap().name(),
+            "cosine"
+        );
+        assert_eq!(
+            LrSchedule::parse("warmup", 1e-3, 100).unwrap().name(),
+            "warmup"
+        );
         assert!(LrSchedule::parse("triangular", 1e-3, 100).is_err());
     }
 
@@ -849,7 +933,10 @@ mod tests {
         let mut acc = GradientAccumulator::new(3);
         assert!(!acc.skip().is_ready());
         assert!(!acc.skip().is_ready());
-        assert!(acc.skip().is_ready(), "third micro-batch must trigger a step");
+        assert!(
+            acc.skip().is_ready(),
+            "third micro-batch must trigger a step"
+        );
         assert!(!acc.has_pending(), "the cycle resets");
         assert!((acc.loss_scale() - 1.0 / 3.0).abs() < 1e-12);
 
@@ -869,8 +956,14 @@ mod tests {
         let mut acc = GradientAccumulator::new(2);
         assert!(!acc.skip().is_ready());
         let cycle = acc.skip();
-        assert!(cycle.is_ready(), "the cycle must complete even with nothing folded");
-        assert!(cycle.into_gradients().is_none(), "but there is nothing to apply");
+        assert!(
+            cycle.is_ready(),
+            "the cycle must complete even with nothing folded"
+        );
+        assert!(
+            cycle.into_gradients().is_none(),
+            "but there is nothing to apply"
+        );
     }
 
     #[test]
@@ -931,7 +1024,10 @@ mod tests {
         for every in [1usize, 2, 8] {
             let acc = GradientAccumulator::new(every);
             let total: f64 = (0..every).map(|_| 4.0 * acc.loss_scale()).sum();
-            assert!((total - 4.0).abs() < 1e-12, "accumulating {every} micro-batches");
+            assert!(
+                (total - 4.0).abs() < 1e-12,
+                "accumulating {every} micro-batches"
+            );
         }
     }
 
@@ -990,9 +1086,13 @@ mod tests {
         let device = Default::default();
         let model = DblockClassifier::<A>::new(
             &ViTDiTConfig::tiny(10),
-            &DblockConfig { num_blocks: 2, ..DblockConfig::default() },
+            &DblockConfig {
+                num_blocks: 2,
+                ..DblockConfig::default()
+            },
             &device,
-        );
+        )
+        .unwrap();
         let pixels =
             Tensor::<A, 4>::random([2, 3, 32, 32], Distribution::Uniform(-0.5, 0.5), &device);
         let labels = Tensor::<A, 1, burn::tensor::Int>::from_ints([1i64, 4].as_slice(), &device);
@@ -1006,7 +1106,10 @@ mod tests {
         // A bound far below the norm must rescale to exactly the bound.
         let max_norm = before / 4.0;
         let scale = clip_gradients(&mut grads, &model, before, max_norm);
-        assert!((scale - 0.25).abs() < 1e-5, "scale should be max/total, got {scale}");
+        assert!(
+            (scale - 0.25).abs() < 1e-5,
+            "scale should be max/total, got {scale}"
+        );
         let after = crate::quality::global_grad_norm(&model, &grads);
         assert!(
             (after - max_norm).abs() < max_norm * 1e-3,
@@ -1042,19 +1145,25 @@ mod tests {
         let device = Default::default();
         let model = DblockClassifier::<N>::new(
             &ViTDiTConfig::tiny(10),
-            &DblockConfig { num_blocks: 2, ..DblockConfig::default() },
+            &DblockConfig {
+                num_blocks: 2,
+                ..DblockConfig::default()
+            },
             &device,
-        );
+        )
+        .unwrap();
         crate::tensor_ext::force_initialization(&model);
 
         let mut ema = Ema::new(&model, 0.99);
-        let table = |m: &DblockClassifier<N>| -> Tensor<N, 2> {
-            m.model().label_embedding_weight()
-        };
+        let table =
+            |m: &DblockClassifier<N>| -> Tensor<N, 2> { m.model().label_embedding_weight() };
 
         // A fresh shadow is exactly the model.
         assert_eq!(
-            (table(ema.shadow()) - table(&model)).abs().max().into_scalar(),
+            (table(ema.shadow()) - table(&model))
+                .abs()
+                .max()
+                .into_scalar(),
             0.0
         );
 
@@ -1067,17 +1176,30 @@ mod tests {
             burn::module::Param::from_tensor(shifted.detach());
         let moved = DblockClassifier::<N>::new(
             &ViTDiTConfig::tiny(10),
-            &DblockConfig { num_blocks: 2, ..DblockConfig::default() },
+            &DblockConfig {
+                num_blocks: 2,
+                ..DblockConfig::default()
+            },
             &device,
         )
+        .unwrap()
         .load_record(moved);
 
         ema.update::<N>(&moved);
         assert_eq!(ema.updates(), 1);
 
-        let gap_to_old = (table(ema.shadow()) - table(&model)).abs().max().into_scalar();
-        let gap_to_new = (table(ema.shadow()) - table(&moved)).abs().max().into_scalar();
-        assert!(gap_to_old > 0.0 && gap_to_new > 0.0, "must sit between the two");
+        let gap_to_old = (table(ema.shadow()) - table(&model))
+            .abs()
+            .max()
+            .into_scalar();
+        let gap_to_new = (table(ema.shadow()) - table(&moved))
+            .abs()
+            .max()
+            .into_scalar();
+        assert!(
+            gap_to_old > 0.0 && gap_to_new > 0.0,
+            "must sit between the two"
+        );
         assert!(
             gap_to_old + gap_to_new <= 1.0 + 1e-4,
             "the shadow must lie on the segment: {gap_to_old} + {gap_to_new}"
@@ -1087,8 +1209,14 @@ mod tests {
         for _ in 0..40 {
             ema.update::<N>(&moved);
         }
-        let converged = (table(ema.shadow()) - table(&moved)).abs().max().into_scalar();
-        assert!(converged < gap_to_new, "the shadow must approach the live weights");
+        let converged = (table(ema.shadow()) - table(&moved))
+            .abs()
+            .max()
+            .into_scalar();
+        assert!(
+            converged < gap_to_new,
+            "the shadow must approach the live weights"
+        );
     }
 
     #[test]
@@ -1104,22 +1232,28 @@ mod tests {
         type N = NdArray<f32>;
         let device = Default::default();
         let cfg = ViTDiTConfig::tiny(10);
-        let db = DblockConfig { num_blocks: 2, ..DblockConfig::default() };
+        let db = DblockConfig {
+            num_blocks: 2,
+            ..DblockConfig::default()
+        };
 
-        let model = DblockClassifier::<N>::new(&cfg, &db, &device);
+        let model = DblockClassifier::<N>::new(&cfg, &db, &device).unwrap();
         crate::tensor_ext::force_initialization(&model);
         let mut ema = Ema::new(&model, 0.5);
 
         // Round-trip the live model through a record, which reassigns ids.
-        let reloaded =
-            DblockClassifier::<N>::new(&cfg, &db, &device).load_record(model.clone().into_record());
+        let reloaded = DblockClassifier::<N>::new(&cfg, &db, &device)
+            .unwrap()
+            .load_record(model.clone().into_record());
 
         // Perturb it so an update has something to move toward.
         let mut rec = reloaded.into_record();
         let shifted = rec.model.vit.embeddings.label_embeddings.weight.val() + 2.0;
         rec.model.vit.embeddings.label_embeddings.weight =
             burn::module::Param::from_tensor(shifted.detach());
-        let reloaded = DblockClassifier::<N>::new(&cfg, &db, &device).load_record(rec);
+        let reloaded = DblockClassifier::<N>::new(&cfg, &db, &device)
+            .unwrap()
+            .load_record(rec);
 
         let before = ema.shadow().model().label_embedding_weight();
         ema.update::<N>(&reloaded);
@@ -1143,7 +1277,10 @@ mod tests {
         // Early updates use a ramped decay so the shadow is not stuck on its
         // initialization.
         let ema = Ema::new(&1.0f64, 0.999);
-        assert!(ema.effective_decay() < 0.2, "first update must track closely");
+        assert!(
+            ema.effective_decay() < 0.2,
+            "first update must track closely"
+        );
         let mut later = Ema::new(&1.0f64, 0.999);
         later.updates = 10_000;
         assert!((later.effective_decay() - 0.999).abs() < 1e-9);
@@ -1170,7 +1307,10 @@ mod tests {
 
         // Held over the first tenth.
         for step in [0usize, 50, 100] {
-            assert!((schedule.at(step) - 1e-2).abs() < 1e-12, "step {step} should hold");
+            assert!(
+                (schedule.at(step) - 1e-2).abs() < 1e-12,
+                "step {step} should hold"
+            );
         }
 
         // Then strictly decreasing, and never above the start or below the end.
@@ -1178,10 +1318,16 @@ mod tests {
         for step in 101..=total {
             let w = schedule.at(step);
             assert!(w <= previous + 1e-15, "step {step}: {w} > {previous}");
-            assert!((1e-4 - 1e-12..=1e-2 + 1e-12).contains(&w), "step {step}: {w} out of range");
+            assert!(
+                (1e-4 - 1e-12..=1e-2 + 1e-12).contains(&w),
+                "step {step}: {w} out of range"
+            );
             previous = w;
         }
-        assert!((schedule.at(total) - 1e-4).abs() < 1e-9, "should land on the endpoint");
+        assert!(
+            (schedule.at(total) - 1e-4).abs() < 1e-9,
+            "should land on the endpoint"
+        );
 
         // ...and stays there past the end rather than continuing down.
         assert!((schedule.at(total * 3) - 1e-4).abs() < 1e-9);
@@ -1203,7 +1349,10 @@ mod tests {
             (midpoint - geometric).abs() < geometric * 0.05,
             "midpoint {midpoint} should be the geometric mean {geometric}"
         );
-        assert!(midpoint < linear / 2.0, "and nowhere near the arithmetic mean");
+        assert!(
+            midpoint < linear / 2.0,
+            "and nowhere near the arithmetic mean"
+        );
     }
 
     #[test]
@@ -1216,13 +1365,24 @@ mod tests {
             assert!(w.is_finite(), "step {step} gave {w}");
             assert!((0.0..=1e-2 + 1e-12).contains(&w), "step {step} gave {w}");
         }
-        assert!(schedule.at(200).abs() < 1e-12, "it should actually reach zero");
+        assert!(
+            schedule.at(200).abs() < 1e-12,
+            "it should actually reach zero"
+        );
     }
 
     #[test]
     fn test_balance_schedule_parsing_round_trips() {
-        assert_eq!(BalanceSchedule::parse("constant", 0.02, 100).unwrap().name(), "constant");
-        assert_eq!(BalanceSchedule::parse("anneal", 0.02, 100).unwrap().name(), "anneal");
+        assert_eq!(
+            BalanceSchedule::parse("constant", 0.02, 100)
+                .unwrap()
+                .name(),
+            "constant"
+        );
+        assert_eq!(
+            BalanceSchedule::parse("anneal", 0.02, 100).unwrap().name(),
+            "anneal"
+        );
         assert!(BalanceSchedule::parse("nope", 0.02, 100).is_err());
 
         // Annealing ends two decades below where it starts.

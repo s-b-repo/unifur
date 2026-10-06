@@ -38,7 +38,9 @@ impl MetricsLogger {
             .append(append)
             .truncate(!append)
             .open(path)?;
-        Ok(Self { writer: BufWriter::new(file) })
+        Ok(Self {
+            writer: BufWriter::new(file),
+        })
     }
 
     /// Write one flat key/value record with a `step` field.
@@ -66,6 +68,25 @@ pub fn jnum(v: f32) -> String {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
 
@@ -76,19 +97,26 @@ mod tests {
         let path = dir.join("metrics.jsonl");
 
         let mut logger = MetricsLogger::open_with(&path, false).unwrap();
-        logger.log(0, &[("loss", jnum(1.5)), ("block", "0".to_string())]).unwrap();
+        logger
+            .log(0, &[("loss", jnum(1.5)), ("block", "0".to_string())])
+            .unwrap();
         drop(logger);
 
         // Re-opening must append, not truncate: a resumed run keeps history.
         let mut logger = MetricsLogger::open(&path).unwrap();
-        logger.log(1, &[("loss", jnum(f32::NAN)), ("note", "\"nan-case\"".to_string())]).unwrap();
+        logger
+            .log(
+                1,
+                &[
+                    ("loss", jnum(f32::NAN)),
+                    ("note", "\"nan-case\"".to_string()),
+                ],
+            )
+            .unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();
         let mut lines = contents.lines();
-        assert_eq!(
-            lines.next().unwrap(),
-            r#"{"step":0,"loss":1.5,"block":0}"#
-        );
+        assert_eq!(lines.next().unwrap(), r#"{"step":0,"loss":1.5,"block":0}"#);
         assert_eq!(
             lines.next().unwrap(),
             r#"{"step":1,"loss":null,"note":"nan-case"}"#

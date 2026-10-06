@@ -26,9 +26,9 @@ use burn::{
     module::{Module, ModuleMapper, Param},
     tensor::{backend::Backend, Tensor},
 };
-use std::path::Path;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 use crate::ablation::{gated_direction, project_rows, Direction, LayerGates};
 
@@ -48,7 +48,10 @@ pub struct Kernel {
 impl Kernel {
     /// The ablation weight applied at `layer`.
     pub fn weight(&self, layer: usize) -> f32 {
-        let (lo, hi) = (self.min_weight.min(self.max_weight), self.max_weight.max(self.min_weight));
+        let (lo, hi) = (
+            self.min_weight.min(self.max_weight),
+            self.max_weight.max(self.min_weight),
+        );
         let distance = (layer as f32 - self.max_weight_position).abs();
         if self.min_weight_distance <= 0.0 {
             return if distance == 0.0 { hi } else { lo };
@@ -62,7 +65,12 @@ impl Kernel {
 
     /// Everything off: the identity ablation.
     pub fn zero() -> Self {
-        Self { max_weight: 0.0, max_weight_position: 0.0, min_weight: 0.0, min_weight_distance: 0.0 }
+        Self {
+            max_weight: 0.0,
+            max_weight_position: 0.0,
+            min_weight: 0.0,
+            min_weight_distance: 0.0,
+        }
     }
 }
 
@@ -85,8 +93,14 @@ pub struct HereticParams {
 
 impl HereticParams {
     pub fn identity() -> Self {
-        let off = ComponentParams { direction_index: 0.0, kernel: Kernel::zero() };
-        Self { attention: off, mlp: off }
+        let off = ComponentParams {
+            direction_index: 0.0,
+            kernel: Kernel::zero(),
+        };
+        Self {
+            attention: off,
+            mlp: off,
+        }
     }
 }
 
@@ -169,7 +183,11 @@ impl<B: Backend<FloatElem = f32>> ModuleMapper<B> for WeightedOrthogonalizer<'_,
         // branch cannot reach the stream and is left alone.
         let direction = match self.gates.and_then(|g| g.get(layer)) {
             Some(g) => {
-                let gate = if self.component == "dense" { &g.attention } else { &g.mlp };
+                let gate = if self.component == "dense" {
+                    &g.attention
+                } else {
+                    &g.mlp
+                };
                 match gated_direction(&self.direction, gate) {
                     Some(d) => d,
                     None => return param,
@@ -179,7 +197,9 @@ impl<B: Backend<FloatElem = f32>> ModuleMapper<B> for WeightedOrthogonalizer<'_,
         };
         self.touched += 1;
         let require_grad = param.is_require_grad();
-        param.map(|w| project_rows(w, &direction, alpha)).set_require_grad(require_grad)
+        param
+            .map(|w| project_rows(w, &direction, alpha))
+            .set_require_grad(require_grad)
     }
 }
 
@@ -195,7 +215,8 @@ pub fn apply<B: Backend<FloatElem = f32>, M: Module<B>>(
     let mut touched = 0;
     let mut model = model;
     for (component, cp) in [("dense", params.attention), ("fc_out", params.mlp)] {
-        let direction = interpolate(directions, cp.direction_index).context("no directions to interpolate")?;
+        let direction =
+            interpolate(directions, cp.direction_index).context("no directions to interpolate")?;
         let mut mapper = WeightedOrthogonalizer::<B> {
             component,
             direction,
@@ -222,9 +243,24 @@ impl Default for RefusalDetector {
     fn default() -> Self {
         Self {
             phrases: [
-                "i can't", "i cannot", "i can not", "i won't", "i will not", "i'm unable", "i am unable",
-                "i'm not able", "i am not able", "as an ai", "i'm sorry", "i am sorry", "cannot help",
-                "can't help", "not able to help", "against my", "i must decline", "i refuse",
+                "i can't",
+                "i cannot",
+                "i can not",
+                "i won't",
+                "i will not",
+                "i'm unable",
+                "i am unable",
+                "i'm not able",
+                "i am not able",
+                "as an ai",
+                "i'm sorry",
+                "i am sorry",
+                "cannot help",
+                "can't help",
+                "not able to help",
+                "against my",
+                "i must decline",
+                "i refuse",
                 "this capability is gated",
             ]
             .iter()
@@ -255,7 +291,10 @@ impl RefusalDetector {
 pub fn mean_kl<B: Backend<FloatElem = f32>>(p_logits: Tensor<B, 2>, q_logits: Tensor<B, 2>) -> f32 {
     let log_p = burn::tensor::activation::log_softmax(p_logits, 1);
     let log_q = burn::tensor::activation::log_softmax(q_logits, 1);
-    (log_p.clone().exp() * (log_p - log_q)).sum_dim(1).mean().into_scalar()
+    (log_p.clone().exp() * (log_p - log_q))
+        .sum_dim(1)
+        .mean()
+        .into_scalar()
 }
 
 /// One evaluated parameter set.
@@ -287,7 +326,14 @@ pub struct SearchConfig {
 
 impl SearchConfig {
     pub fn new(trials: usize, num_layers: usize) -> Self {
-        Self { trials, startup: trials.clamp(1, 8), kl_weight: 1.0, seed: 0, num_layers: num_layers.max(1), max_weight_bound: 1.5 }
+        Self {
+            trials,
+            startup: trials.clamp(1, 8),
+            kl_weight: 1.0,
+            seed: 0,
+            num_layers: num_layers.max(1),
+            max_weight_bound: 1.5,
+        }
     }
 }
 
@@ -297,7 +343,8 @@ pub fn pareto_front(trials: &[Trial]) -> Vec<Trial> {
         .iter()
         .filter(|a| {
             !trials.iter().any(|b| {
-                (b.refusals <= a.refusals && b.kl <= a.kl) && (b.refusals < a.refusals || b.kl < a.kl)
+                (b.refusals <= a.refusals && b.kl <= a.kl)
+                    && (b.refusals < a.refusals || b.kl < a.kl)
             })
         })
         .cloned()
@@ -312,7 +359,10 @@ pub struct Sampler {
 
 impl Sampler {
     pub fn new(config: &SearchConfig) -> Self {
-        Self { rng: rand_chacha::ChaCha12Rng::seed_from_u64(config.seed), config: config.clone() }
+        Self {
+            rng: rand_chacha::ChaCha12Rng::seed_from_u64(config.seed),
+            config: config.clone(),
+        }
     }
 
     fn uniform_component(&mut self) -> ComponentParams {
@@ -344,9 +394,19 @@ impl Sampler {
             direction_index: gauss(base.direction_index, 0.25 * layers, 0.0, last),
             kernel: Kernel {
                 max_weight: gauss(base.kernel.max_weight, 0.25 * bound, 0.0, bound),
-                max_weight_position: gauss(base.kernel.max_weight_position, 0.25 * layers, 0.0, last),
+                max_weight_position: gauss(
+                    base.kernel.max_weight_position,
+                    0.25 * layers,
+                    0.0,
+                    last,
+                ),
                 min_weight: gauss(base.kernel.min_weight, 0.25 * bound, 0.0, bound),
-                min_weight_distance: gauss(base.kernel.min_weight_distance, 0.25 * layers, 0.0, layers),
+                min_weight_distance: gauss(
+                    base.kernel.min_weight_distance,
+                    0.25 * layers,
+                    0.0,
+                    layers,
+                ),
             },
         }
     }
@@ -354,12 +414,19 @@ impl Sampler {
     /// The next parameter set to try, given every trial so far.
     pub fn propose(&mut self, history: &[Trial]) -> HereticParams {
         if history.len() < self.config.startup {
-            return HereticParams { attention: self.uniform_component(), mlp: self.uniform_component() };
+            return HereticParams {
+                attention: self.uniform_component(),
+                mlp: self.uniform_component(),
+            };
         }
         // Exploit: the better quartile of what was seen, a Gaussian around a
         // random member of it, narrowing as the search matures.
         let mut sorted: Vec<&Trial> = history.iter().collect();
-        sorted.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal));
+        sorted.sort_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         let good = &sorted[..(sorted.len() / 4).max(1)];
         let pick = good[self.rng.random_range(0..good.len())].params;
         let progress = history.len() as f32 / self.config.trials.max(1) as f32;
@@ -386,7 +453,14 @@ where
         let params = sampler.propose(&trials);
         let (refusals, kl, touched) = evaluate(&params)?;
         let score = refusals + config.kl_weight * kl;
-        trials.push(Trial { index, params, refusals, kl, score, touched });
+        trials.push(Trial {
+            index,
+            params,
+            refusals,
+            kl,
+            score,
+            touched,
+        });
     }
     Ok(trials)
 }
@@ -409,8 +483,14 @@ pub struct HereticConfig {
 
 impl HereticConfig {
     pub fn read_prompts(path: &Path) -> anyhow::Result<Vec<String>> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let lines: Vec<String> = text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect();
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let lines: Vec<String> = text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
         anyhow::ensure!(!lines.is_empty(), "{} holds no prompts", path.display());
         Ok(lines)
     }
@@ -438,14 +518,20 @@ pub fn decensor<B: Backend<FloatElem = f32>>(
 ) -> anyhow::Result<(crate::lm::LanguageModel<B>, HereticReport)> {
     use crate::ablation::extract;
     use crate::tokenizer::ByteTokenizer;
-    anyhow::ensure!(!config.target.is_empty() && !config.baseline.is_empty(), "heretic needs target and baseline prompts");
+    anyhow::ensure!(
+        !config.target.is_empty() && !config.baseline.is_empty(),
+        "heretic needs target and baseline prompts"
+    );
     let tokenizer = ByteTokenizer::new();
     let encode = |p: &str| tokenizer.encode(p);
 
     // Per-layer residuals at the last prompt position, then one direction
     // per layer.
     let residuals = |prompts: &[String]| -> Vec<Vec<Vec<f32>>> {
-        prompts.iter().map(|p| model.residuals_at_last_position(&encode(p), device)).collect()
+        prompts
+            .iter()
+            .map(|p| model.residuals_at_last_position(&encode(p), device))
+            .collect()
     };
     let (t_res, b_res) = (residuals(&config.target), residuals(&config.baseline));
     let layers = t_res.first().map_or(0, Vec::len);
@@ -453,20 +539,31 @@ pub fn decensor<B: Backend<FloatElem = f32>>(
     for layer in 0..layers {
         let t: Vec<Vec<f32>> = t_res.iter().map(|r| r[layer].clone()).collect();
         let b: Vec<Vec<f32>> = b_res.iter().map(|r| r[layer].clone()).collect();
-        let d = extract(layer, &t, &b).with_context(|| format!("layer {layer}: target and baseline means coincide"))?;
+        let d = extract(layer, &t, &b)
+            .with_context(|| format!("layer {layer}: target and baseline means coincide"))?;
         directions.push(d);
     }
     let gates = model.layer_gates(device);
     let detector = config.detector.clone().unwrap_or_default();
 
-    let baseline_logits: Vec<Tensor<B, 1>> = config.baseline.iter().map(|p| model.next_token_logits(&encode(p), device)).collect();
+    let baseline_logits: Vec<Tensor<B, 1>> = config
+        .baseline
+        .iter()
+        .map(|p| model.next_token_logits(&encode(p), device))
+        .collect();
     let refusal_rate = |m: &crate::lm::LanguageModel<B>| -> f64 {
         let texts: Vec<String> = config
             .target
             .iter()
             .map(|p| {
                 let ids = encode(p);
-                let out = m.generate(&ids, config.max_new, &crate::lm::Sampling::Greedy, &mut rand_chacha::ChaCha12Rng::seed_from_u64(config.seed), device);
+                let out = m.generate(
+                    &ids,
+                    config.max_new,
+                    &crate::lm::Sampling::Greedy,
+                    &mut rand_chacha::ChaCha12Rng::seed_from_u64(config.seed),
+                    device,
+                );
                 tokenizer.decode_lossy(&out[ids.len().min(out.len())..])
             })
             .collect();
@@ -474,7 +571,14 @@ pub fn decensor<B: Backend<FloatElem = f32>>(
     };
     let baseline_refusals = refusal_rate(&model);
 
-    let search_config = SearchConfig { trials: config.trials, startup: config.trials.clamp(1, 8), kl_weight: config.kl_weight, seed: config.seed, num_layers: layers.max(1), max_weight_bound: 1.5 };
+    let search_config = SearchConfig {
+        trials: config.trials,
+        startup: config.trials.clamp(1, 8),
+        kl_weight: config.kl_weight,
+        seed: config.seed,
+        num_layers: layers.max(1),
+        max_weight_bound: 1.5,
+    };
     let trials = search(&search_config, |params| {
         let (ablated, touched) = apply::<B, _>(model.clone(), &directions, params, Some(&gates))?;
         let refusals = refusal_rate(&ablated);
@@ -491,7 +595,15 @@ pub fn decensor<B: Backend<FloatElem = f32>>(
         Some(t) => apply::<B, _>(model, &directions, &t.params, Some(&gates))?.0,
         None => model,
     };
-    Ok((final_model, HereticReport { directions, trials, best: chosen, baseline_refusals }))
+    Ok((
+        final_model,
+        HereticReport {
+            directions,
+            trials,
+            best: chosen,
+            baseline_refusals,
+        },
+    ))
 }
 
 /// The lowest-scoring trial.
@@ -499,17 +611,28 @@ pub fn best(trials: &[Trial]) -> Option<&Trial> {
     trials
         .iter()
         .filter(|t| t.score.is_finite())
-        .min_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
+        .min_by(|a, b| {
+            a.score
+                .partial_cmp(&b.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
 }
 
 /// A table of the front and the best.
 pub fn render(trials: &[Trial]) -> String {
-    let mut out = format!("{:>5} {:>9} {:>9} {:>9} {:>7}  params\n", "trial", "refusals", "kl", "score", "touched");
+    let mut out = format!(
+        "{:>5} {:>9} {:>9} {:>9} {:>7}  params\n",
+        "trial", "refusals", "kl", "score", "touched"
+    );
     out.push_str(&"-".repeat(90));
     out.push('\n');
     let front = pareto_front(trials);
     for t in trials {
-        let mark = if front.iter().any(|f| f.index == t.index) { "*" } else { " " };
+        let mark = if front.iter().any(|f| f.index == t.index) {
+            "*"
+        } else {
+            " "
+        };
         out.push_str(&format!(
             "{mark}{:>4} {:>9.3} {:>9.4} {:>9.4} {:>7}  attn(dir {:.1}, max {:.2}@{:.1}, min {:.2}, dist {:.1}) mlp(dir {:.1}, max {:.2}@{:.1}, min {:.2}, dist {:.1})\n",
             t.index,
@@ -530,18 +653,46 @@ pub fn render(trials: &[Trial]) -> String {
         ));
     }
     if let Some(b) = best(trials) {
-        out.push_str(&format!("\n* = Pareto front ({} trial(s)); best by score: trial {}\n", front.len(), b.index));
+        out.push_str(&format!(
+            "\n* = Pareto front ({} trial(s)); best by score: trial {}\n",
+            front.len(),
+            b.index
+        ));
     }
     out
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_kernel_is_a_trapezoid() {
-        let k = Kernel { max_weight: 1.0, max_weight_position: 4.0, min_weight: 0.2, min_weight_distance: 2.0 };
+        let k = Kernel {
+            max_weight: 1.0,
+            max_weight_position: 4.0,
+            min_weight: 0.2,
+            min_weight_distance: 2.0,
+        };
         assert_eq!(k.weight(4), 1.0);
         assert!((k.weight(5) - 0.6).abs() < 1e-6);
         assert!((k.weight(3) - 0.6).abs() < 1e-6);
@@ -550,7 +701,10 @@ mod tests {
         for l in 0..12 {
             assert!((0.2..=1.0).contains(&k.weight(l)));
         }
-        let spike = Kernel { min_weight_distance: 0.0, ..k };
+        let spike = Kernel {
+            min_weight_distance: 0.0,
+            ..k
+        };
         assert_eq!(spike.weight(4), 1.0);
         assert_eq!(spike.weight(5), 0.2);
         assert!(Kernel::zero().weight(3) == 0.0);
@@ -558,11 +712,22 @@ mod tests {
 
     #[test]
     fn test_interpolation_and_front_and_search() {
-        let d = |v: [f32; 2], layer| Direction { layer, vector: v.to_vec(), separation: 1.0, target_mean_projection: 0.0, baseline_mean_projection: 0.0, target_count: 1, baseline_count: 1 };
+        let d = |v: [f32; 2], layer| Direction {
+            layer,
+            vector: v.to_vec(),
+            separation: 1.0,
+            target_mean_projection: 0.0,
+            baseline_mean_projection: 0.0,
+            target_count: 1,
+            baseline_count: 1,
+        };
         let dirs = vec![d([1.0, 0.0], 0), d([0.0, 1.0], 1)];
         assert_eq!(interpolate(&dirs, 1.0).unwrap(), vec![0.0, 1.0]);
         let mid = interpolate(&dirs, 0.5).unwrap();
-        assert!((mid[0] - mid[1]).abs() < 1e-6 && (mid[0] * mid[0] + mid[1] * mid[1] - 1.0).abs() < 1e-6);
+        assert!(
+            (mid[0] - mid[1]).abs() < 1e-6
+                && (mid[0] * mid[0] + mid[1] * mid[1] - 1.0).abs() < 1e-6
+        );
         assert!(interpolate(&[], 0.0).is_none());
 
         let det = RefusalDetector::default();
@@ -572,7 +737,14 @@ mod tests {
 
         // A search over a synthetic objective: the best is never worse than
         // any trial, and the front is the undominated set.
-        let config = SearchConfig { trials: 20, startup: 4, kl_weight: 1.0, seed: 3, num_layers: 6, max_weight_bound: 1.5 };
+        let config = SearchConfig {
+            trials: 20,
+            startup: 4,
+            kl_weight: 1.0,
+            seed: 3,
+            num_layers: 6,
+            max_weight_bound: 1.5,
+        };
         let trials = search(&config, |p| {
             let r = f64::from((1.0 - p.mlp.kernel.max_weight).abs());
             let k = f64::from(p.mlp.kernel.max_weight * 0.3);
@@ -585,7 +757,9 @@ mod tests {
         let front = pareto_front(&trials);
         assert!(!front.is_empty());
         for f in &front {
-            assert!(!trials.iter().any(|t| t.refusals <= f.refusals && t.kl <= f.kl && (t.refusals < f.refusals || t.kl < f.kl)));
+            assert!(!trials.iter().any(|t| t.refusals <= f.refusals
+                && t.kl <= f.kl
+                && (t.refusals < f.refusals || t.kl < f.kl)));
         }
         assert!(render(&trials).contains("Pareto front"));
     }

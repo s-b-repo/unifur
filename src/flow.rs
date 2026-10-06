@@ -21,7 +21,7 @@ use burn::{
     optim::{AdamWConfig, GradientsParams, Optimizer},
     tensor::{backend::Backend, Distribution, Tensor},
 };
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 
 /// Flow-matching hyperparameters.
 #[derive(Debug, Clone)]
@@ -88,12 +88,9 @@ where
 
     // Feed scaled time so its magnitude resembles EDM c_noise magnitudes.
     let timesteps = t * 1000.0;
-    let v_pred = model.model().forward_pooled_block(
-        span,
-        pixel_values.clone(),
-        xt,
-        timesteps,
-    );
+    let v_pred = model
+        .model()
+        .forward_pooled_block(span, pixel_values.clone(), xt, timesteps);
 
     (v_pred - v_target).powf_scalar(2.0).mean()
 }
@@ -116,10 +113,14 @@ pub fn train_flow_synthetic(
         ..crate::dblock::DblockConfig::default()
     };
     let mut model =
-        DblockClassifier::<DefaultTrainBackend>::new(&vit_config, &dblock_config, &device);
+        DblockClassifier::<DefaultTrainBackend>::new(&vit_config, &dblock_config, &device)?;
 
-    let mut dataset =
-        SyntheticDataset::new(config.image_size, config.num_labels, config.batch_size, config.seed);
+    let mut dataset = SyntheticDataset::new(
+        config.image_size,
+        config.num_labels,
+        config.batch_size,
+        config.seed,
+    );
     let mut rng = StdRng::seed_from_u64(config.seed);
 
     let mut optim = AdamWConfig::new()
@@ -173,9 +174,12 @@ pub fn flow_sample<B: Backend<FloatElem = f32>, R: Rng>(
         let t_val = 1.0 - i as f32 * dt;
         let t = Tensor::<B, 1>::full([b], t_val * 1000.0, &device);
         let block_idx = (i * model.num_blocks() / num_steps.max(1)).min(model.num_blocks() - 1);
-        let v = model
-            .model()
-            .forward_pooled_block(model.layer_range(block_idx), pixel_values.clone(), z.clone(), t);
+        let v = model.model().forward_pooled_block(
+            model.layer_range(block_idx),
+            pixel_values.clone(),
+            z.clone(),
+            t,
+        );
         z = z - v.mul_scalar(dt); // descend from t=1 to t=0
     }
 

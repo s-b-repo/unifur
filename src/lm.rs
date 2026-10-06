@@ -27,10 +27,9 @@
 //! `denoise_span` does for images. So the block-wise objectives — and the
 //! gradient routing that comes free with them — apply here without change.
 
-use serde::{Deserialize, Serialize};
 use burn::{
     module::{Module, Param},
-    nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig},
+    nn::{Embedding, EmbeddingConfig, Linear, LinearConfig},
     tensor::{
         activation::{log_softmax, softmax},
         backend::Backend,
@@ -38,12 +37,13 @@ use burn::{
     },
 };
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     hybrid::{AttentionMode, AttentionSchedule, LayerState, PositionKind},
     planner::{Budget, LookaheadDecoder},
     tokenizer::{Special, VOCAB_SIZE},
-    vit::{DbLayer, LayerCarry, TimestepEmbedder, ViTDiTConfig},
+    vit::{DbLayer, FfnKind, LayerCarry, NormKind, TimestepEmbedder, TrunkNorm, ViTDiTConfig},
 };
 
 /// Unlikelihood penalty on labeled targets (roadmap Phase 24).
@@ -80,13 +80,19 @@ pub struct Unlikelihood {
 
 impl Default for Unlikelihood {
     fn default() -> Self {
-        Self { alpha: 1.0, epsilon: 1e-6 }
+        Self {
+            alpha: 1.0,
+            epsilon: 1e-6,
+        }
     }
 }
 
 impl Unlikelihood {
     pub fn new(alpha: f32) -> Self {
-        Self { alpha, ..Self::default() }
+        Self {
+            alpha,
+            ..Self::default()
+        }
     }
 
     /// Metrics only, no charge.
@@ -161,6 +167,8 @@ pub struct LmConfig {
     pub num_layers: usize,
     pub num_heads: usize,
     pub intermediate_size: usize,
+    #[serde(default)]
+    pub ffn_kind: FfnKind,
     pub cond_hidden_size: usize,
     pub frequency_embedding_size: usize,
     pub dropout: f64,
@@ -182,6 +190,32 @@ pub struct LmConfig {
     /// (roadmap 25.4); `0` is none.
     #[serde(default)]
     pub routing_state: usize,
+    /// Grouped-query attention: keys/values use this many heads (Qwen3 style
+    /// GQA). `None` is full MHA, what every checkpoint to date holds.
+    #[serde(default)]
+    pub num_kv_heads: Option<usize>,
+    /// Fraction of each head dimension the rotary embedding covers
+    /// (Qwen3-Next style partial rotary); `1.0` is the full rotation.
+    #[serde(default = "crate::vit::default_rotary_fraction")]
+    pub rotary_fraction: f64,
+    /// Qwen-style gated attention: merged heads scaled by `1 + tanh(g(x))`
+    /// with a zero-initialized gate (identity until trained).
+    #[serde(default)]
+    pub gated_attention: bool,
+    /// QK-Norm on queries and keys before rotary (Qwen3/GLM-4.5/LLaMA-4).
+    #[serde(default)]
+    pub qk_norm: bool,
+    /// LayerNorm (every checkpoint to date) or RMSNorm (Qwen style).
+    #[serde(default)]
+    pub norm_kind: NormKind,
+    /// Multi-token prediction depth (Qwen MTP style): how many future offsets
+    /// `1..=mtp_steps` carry an auxiliary CE loss. `0` disables MTP exactly.
+    #[serde(default)]
+    pub mtp_steps: usize,
+    /// Weight on the MTP auxiliary loss; `0.0` adds nothing and the objective
+    /// is the plain next-token loss bit for bit.
+    #[serde(default)]
+    pub mtp_weight: f64,
 }
 
 impl Default for LmConfig {
@@ -193,6 +227,7 @@ impl Default for LmConfig {
             num_layers: 8,
             num_heads: 8,
             intermediate_size: 1024,
+            ffn_kind: FfnKind::Gelu,
             cond_hidden_size: 256 / 6,
             frequency_embedding_size: 256,
             dropout: 0.0,
@@ -204,11 +239,28 @@ impl Default for LmConfig {
             attention: None,
             positions: PositionKind::Learned,
             routing_state: 0,
+            num_kv_heads: None,
+            rotary_fraction: crate::vit::default_rotary_fraction(),
+            gated_attention: false,
+            qk_norm: false,
+            norm_kind: NormKind::Layer,
+            mtp_steps: 0,
+            mtp_weight: 0.0,
         }
     }
 }
 
 impl LmConfig {
+    pub fn with_ffn_kind(mut self, kind: FfnKind) -> Self {
+        self.ffn_kind = kind;
+        self
+    }
+
+    pub fn validate_ffn(&self) -> anyhow::Result<()> {
+        self.ffn_kind
+            .validate(self.moe.is_some() || self.mosme.is_some())
+    }
+
     /// A small configuration for tests and smoke runs.
     pub fn tiny() -> Self {
         Self {
@@ -254,23 +306,116 @@ impl LmConfig {
         self
     }
 
+    /// Grouped-query attention with this many key/value heads.
+    pub fn with_kv_heads(mut self, kv_heads: usize) -> Self {
+        self.num_kv_heads = Some(kv_heads);
+        self
+    }
+
+    /// Rotary cover as a fraction of the head dimension.
+    pub fn with_rotary_fraction(mut self, fraction: f64) -> Self {
+        self.rotary_fraction = fraction;
+        self
+    }
+
+    /// Qwen-style gated attention on every layer.
+    pub fn with_gated_attention(mut self, gated: bool) -> Self {
+        self.gated_attention = gated;
+        self
+    }
+
+    /// QK-Norm on queries and keys on every layer.
+    pub fn with_qk_norm(mut self, enabled: bool) -> Self {
+        self.qk_norm = enabled;
+        self
+    }
+
+    /// LayerNorm or RMSNorm for the trunk layers and final norm.
+    pub fn with_norm_kind(mut self, kind: NormKind) -> Self {
+        self.norm_kind = kind;
+        self
+    }
+
+    /// Multi-token prediction: auxiliary CE on `steps` future offsets at
+    /// `weight`. Both zero disables MTP exactly.
+    pub fn with_mtp(mut self, steps: usize, weight: f64) -> Self {
+        self.mtp_steps = steps;
+        self.mtp_weight = weight;
+        self
+    }
+
+    /// The validated key/value head count: full MHA when unset.
+    pub fn kv_heads(&self) -> usize {
+        self.num_kv_heads.unwrap_or(self.num_heads)
+    }
+
+    /// Cross-check the Qwen-style attention knobs together (mirrors
+    /// [`ViTDiTConfig::validate_attention`], which the trunk runs again at
+    /// layer construction).
+    pub fn validate_attention(&self) -> anyhow::Result<()> {
+        let q = self.num_heads;
+        let kv = self.kv_heads();
+        anyhow::ensure!(
+            q > 0 && kv > 0 && kv <= q,
+            "KV heads ({kv}) must divide the query heads ({q}) from below"
+        );
+        anyhow::ensure!(
+            q % kv == 0,
+            "query heads ({q}) must be a multiple of KV heads ({kv})"
+        );
+        anyhow::ensure!(
+            self.hidden_size % q == 0,
+            "hidden size must be divisible by head count"
+        );
+        anyhow::ensure!(
+            self.rotary_fraction > 0.0 && self.rotary_fraction <= 1.0,
+            "rotary fraction must be in (0, 1], got {}",
+            self.rotary_fraction
+        );
+        Ok(())
+    }
+
+    /// Whether the MTP auxiliary loss contributes anything this run.
+    pub fn mtp_active(&self) -> bool {
+        self.mtp_steps > 0 && self.mtp_weight > 0.0
+    }
+
     /// The attention schedule, dense when none was set.
     pub fn attention_schedule(&self) -> AttentionSchedule {
-        self.attention.clone().unwrap_or_else(|| AttentionSchedule::dense(self.num_layers))
+        self.attention
+            .clone()
+            .unwrap_or_else(|| AttentionSchedule::dense(self.num_layers))
     }
 
     /// What one token costs in this trunk when it sees `positions` keys:
     /// active parameters, FLOPs and decode-time state per layer, counted
     /// from the shapes (roadmap 25.8, [`crate::cost`]).
-    pub fn cost(&self, positions: usize) -> crate::cost::TrunkCost {
+    pub fn cost(&self, positions: usize) -> anyhow::Result<crate::cost::TrunkCost> {
+        self.validate_ffn()?;
         let schedule = self.attention_schedule();
         let state = self.routing_state;
         let router_in = |route_on_tokens: bool| {
-            (if route_on_tokens { self.cond_hidden_size + self.hidden_size } else { self.cond_hidden_size }) + state
+            (if route_on_tokens {
+                self.cond_hidden_size + self.hidden_size
+            } else {
+                self.cond_hidden_size
+            }) + state
         };
         let layers = (0..self.num_layers)
             .map(|idx| {
-                let attention = crate::cost::attention_cost(schedule.mode(idx), self.hidden_size, self.num_heads, positions);
+                let attention = crate::cost::attention_cost_full(
+                    schedule.mode(idx),
+                    self.hidden_size,
+                    self.num_heads,
+                    self.kv_heads(),
+                    self.gated_attention,
+                    positions,
+                )
+                .plus(if self.qk_norm {
+                    crate::cost::qk_norm_cost(self.hidden_size, self.num_heads)
+                } else {
+                    crate::cost::LayerCost::default()
+                });
                 let ffn = match (&self.mosme, self.moe) {
                     (Some(mosme), _) if mosme.applies_to(idx) => crate::cost::moe_cost(
                         self.hidden_size,
@@ -288,23 +433,35 @@ impl LmConfig {
                         router_in(true),
                         None,
                     ),
-                    _ => crate::cost::dense_mlp_cost(self.hidden_size, self.intermediate_size),
+                    _ => crate::cost::dense_ffn_cost(
+                        self.hidden_size,
+                        self.intermediate_size,
+                        self.ffn_kind,
+                    ),
                 };
                 let routing = crate::cost::LayerCost {
-                    active_params: if state > 0 { (self.hidden_size + state) * state + state + 2 * self.hidden_size } else { 0 },
-                    flops: if state > 0 { 2.0 * ((self.hidden_size + state) * state) as f64 } else { 0.0 },
+                    active_params: if state > 0 {
+                        (self.hidden_size + state) * state + state + 2 * self.hidden_size
+                    } else {
+                        0
+                    },
+                    flops: if state > 0 {
+                        2.0 * ((self.hidden_size + state) * state) as f64
+                    } else {
+                        0.0
+                    },
                     keys_read: 0,
                     state_floats: 0,
                 };
                 attention.plus(ffn).plus(routing)
             })
             .collect();
-        crate::cost::TrunkCost { layers }
+        Ok(crate::cost::TrunkCost { layers })
     }
 
     /// One line naming the architecture, for banners and records.
     pub fn describe(&self) -> String {
-        format!(
+        let mut description = format!(
             "layers={} hidden={} context={} attention={} positions={} routing_state={}",
             self.num_layers,
             self.hidden_size,
@@ -312,7 +469,32 @@ impl LmConfig {
             self.attention_schedule().summary(),
             self.positions.name(),
             self.routing_state
-        )
+        );
+        if self.ffn_kind != FfnKind::Gelu {
+            description = format!("{description} ffn={}", self.ffn_kind.name());
+        }
+        if self.kv_heads() != self.num_heads {
+            description = format!("{description} gqa={}", self.kv_heads());
+        }
+        if self.rotary_fraction < 1.0 {
+            description = format!("{description} rope={:.2}", self.rotary_fraction);
+        }
+        if self.gated_attention {
+            description = format!("{description} gated");
+        }
+        if self.qk_norm {
+            description = format!("{description} qknorm");
+        }
+        if self.norm_kind != NormKind::Layer {
+            description = format!("{description} norm={}", self.norm_kind.name());
+        }
+        if self.mtp_steps > 0 && self.mtp_weight > 0.0 {
+            description = format!(
+                "{description} mtp={}x{:.2}",
+                self.mtp_steps, self.mtp_weight
+            );
+        }
+        description
     }
 
     /// Layers per block.
@@ -331,6 +513,7 @@ impl LmConfig {
             in_channels: 3,
             hidden_size: self.hidden_size,
             intermediate_size: self.intermediate_size,
+            ffn_kind: self.ffn_kind,
             num_hidden_layers: self.num_layers,
             num_attention_heads: self.num_heads,
             layer_norm_eps: self.layer_norm_eps,
@@ -346,7 +529,75 @@ impl LmConfig {
             attention: self.attention.clone(),
             rotary: self.positions == PositionKind::Rotary,
             routing_state: self.routing_state,
+            num_kv_heads: self.num_kv_heads,
+            rotary_fraction: self.rotary_fraction,
+            gated_attention: self.gated_attention,
+            qk_norm: self.qk_norm,
+            norm_kind: self.norm_kind,
         }
+    }
+}
+
+/// What a trunk pass returned, plus the span it covered: the logits, the
+/// per-layer hidden states, and the layer range those states belong to.
+///
+/// Named because it crosses several functions and the tuple spelling is not
+/// readable at a call site.
+pub type SpanStates<B> = (std::ops::Range<usize>, (LmOutput<B>, Vec<Tensor<B, 3>>));
+
+/// The optional auxiliary terms a training step can carry.
+///
+/// Every one of these is independently absent, and "absent" has to mean the
+/// *exact* same objective, bit for bit, not an approximation of it. Grouping
+/// them into one struct makes that contract a single value: a caller that wants
+/// the plain objective passes [`LmExtras::default`] rather than a run of
+/// `None`s, and adding a term is a field rather than another positional
+/// argument to every step entry point.
+#[derive(Default)]
+pub struct LmExtras<'a, B: Backend> {
+    /// Labeled negative targets and the charge on them.
+    pub negatives: Option<(Tensor<B, 2>, Unlikelihood)>,
+    /// Tokens a negative teacher proposed, with their charge.
+    pub extra: Option<ExtraNegatives<B>>,
+    /// Distillation toward a weighted mixture of teachers.
+    pub distill: Option<Distillation<'a, B>>,
+    /// Projection penalty on a direction at a chosen layer.
+    pub direction: Option<DirectionPenalty<'a, B>>,
+}
+
+impl<'a, B: Backend> LmExtras<'a, B> {
+    /// The plain next-token objective and nothing else.
+    pub fn plain() -> Self {
+        Self::default()
+    }
+
+    /// The direction penalty only, for the call sites that add just one term.
+    pub fn with_direction(direction: DirectionPenalty<'a, B>) -> Self {
+        Self {
+            direction: Some(direction),
+            ..Self::default()
+        }
+    }
+
+    /// The labeled negatives only.
+    pub fn with_negatives(negatives: (Tensor<B, 2>, Unlikelihood)) -> Self {
+        Self {
+            negatives: Some(negatives),
+            ..Self::default()
+        }
+    }
+
+    /// This, with labeled negatives attached.
+    pub fn and_negatives(mut self, negatives: (Tensor<B, 2>, Unlikelihood)) -> Self {
+        self.negatives = Some(negatives);
+        self
+    }
+
+    /// Whether a direction penalty will actually contribute. The trunk uses
+    /// this to decide whether it has to keep the per-layer hidden states alive,
+    /// so the answer must be computed the same way the loss computes it.
+    pub fn has_active_direction(&self) -> bool {
+        self.direction.as_ref().is_some_and(|d| d.weight > 0.0)
     }
 }
 
@@ -371,7 +622,19 @@ pub struct LanguageModel<B: Backend> {
     position_embedding: Option<Param<Tensor<B, 3>>>,
     time_embedder: TimestepEmbedder<B>,
     layers: Vec<DbLayer<B>>,
-    final_norm: LayerNorm<B>,
+    final_norm: TrunkNorm<B>,
+    /// Multi-token prediction heads (Qwen MTP style): `mtp_heads[k]` reads
+    /// the final hidden state at position `t` to predict token `t + k + 1`.
+    /// Each head is a zero-initialized residual (`pred = h + head(h)`), so an
+    /// untrained head is exactly the main head's prediction shifted — the MTP
+    /// loss starts finite and meaningful, and with `mtp_weight == 0` the
+    /// objective is the plain loss bit for bit. `None` when the config has
+    /// `mtp_steps == 0`, which is also what every checkpoint to date holds.
+    mtp_heads: Option<Vec<Linear<B>>>,
+    /// Weight on the MTP auxiliary loss, carried on the model so the training
+    /// objective and any resumed run agree on what the loss was.
+    #[module(skip)]
+    mtp_weight: f64,
     context: usize,
     vocab_size: usize,
     layers_per_block: usize,
@@ -381,17 +644,24 @@ pub struct LanguageModel<B: Backend> {
 }
 
 impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
-    pub fn new(config: &LmConfig, device: &B::Device) -> Self {
-        assert!(
+    /// Build a trunk from `config`.
+    ///
+    /// Fallsible: the config is checked here rather than assumed, so a bad
+    /// architecture is reported with the field that is wrong instead of
+    /// panicking somewhere inside a weight initializer. Every `?` names the
+    /// constraint it enforces.
+    pub fn new(config: &LmConfig, device: &B::Device) -> anyhow::Result<Self> {
+        config.validate_ffn()?;
+        config.validate_attention()?;
+        anyhow::ensure!(
             config.num_layers % config.num_blocks.max(1) == 0,
             "num_layers ({}) must be divisible by num_blocks ({})",
             config.num_layers,
             config.num_blocks
         );
         if let Some(schedule) = &config.attention {
-            assert_eq!(
-                schedule.num_layers(),
-                config.num_layers,
+            anyhow::ensure!(
+                schedule.num_layers() == config.num_layers,
                 "the attention schedule covers {} layers, the model has {}",
                 schedule.num_layers(),
                 config.num_layers
@@ -410,7 +680,7 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             )
         });
 
-        Self {
+        Ok(Self {
             // Burn's default embedding initializer is N(0, 1), which with a
             // *tied* output head gives logits of scale ~sqrt(hidden) and an
             // untrained model that is confidently wrong: the initial loss lands
@@ -431,16 +701,278 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             ),
             layers: (0..config.num_layers)
                 .map(|idx| DbLayer::new(&trunk, idx, device))
-                .collect(),
-            final_norm: LayerNormConfig::new(config.hidden_size)
-                .with_epsilon(config.layer_norm_eps)
-                .init(device),
+                .collect::<anyhow::Result<_>>()?,
+            final_norm: TrunkNorm::new(
+                config.norm_kind,
+                config.hidden_size,
+                config.layer_norm_eps,
+                device,
+            ),
+            mtp_heads: (config.mtp_steps > 0).then(|| {
+                (0..config.mtp_steps)
+                    .map(|_| {
+                        LinearConfig::new(config.hidden_size, config.hidden_size)
+                            .with_bias(true)
+                            .with_initializer(burn::module::Initializer::Zeros)
+                            .init(device)
+                    })
+                    .collect()
+            }),
+            mtp_weight: if config.mtp_steps > 0 {
+                config.mtp_weight
+            } else {
+                0.0
+            },
             context: config.context,
             vocab_size: config.vocab_size,
             layers_per_block: config.layers_per_block(),
             num_blocks: config.num_blocks.max(1),
             bounded: config.positions.is_bounded(),
+        })
+    }
+
+    fn compact_specialist_config(
+        &self,
+        config: &LmConfig,
+        expert_id: &str,
+    ) -> anyhow::Result<LmConfig> {
+        self.specialist_trainable(config, expert_id)?;
+        anyhow::ensure!(
+            config.num_heads > 0
+                && config.hidden_size % config.num_heads == 0
+                && config.num_layers > 0
+                && config.num_layers % config.num_blocks.max(1) == 0
+                && config.frequency_embedding_size > 0
+                && config.frequency_embedding_size % 2 == 0,
+            "invalid specialist dimensions"
+        );
+        anyhow::ensure!(
+            config
+                .attention
+                .as_ref()
+                .is_none_or(|a| a.num_layers() == self.num_layers()),
+            "specialist attention schedule length mismatch"
+        );
+        anyhow::ensure!(
+            self.num_blocks == config.num_blocks.max(1)
+                && self.layers_per_block == config.layers_per_block()
+                && self.bounded == config.positions.is_bounded()
+                && self.token_embedding.weight.dims() == [config.vocab_size, config.hidden_size]
+                && self.position_embedding.is_some() == self.bounded
+                && self
+                    .position_embedding
+                    .as_ref()
+                    .is_none_or(|p| p.dims() == [1, config.context, config.hidden_size]),
+            "specialist trunk layout mismatch"
+        );
+        let expected_final_norm = match config.norm_kind {
+            NormKind::Layer => vec![vec![config.hidden_size], vec![config.hidden_size]],
+            NormKind::Rms => vec![vec![config.hidden_size]],
+        };
+        anyhow::ensure!(
+            crate::mosme::module_shapes(&self.final_norm) == expected_final_norm,
+            "specialist final norm shape mismatch"
+        );
+        anyhow::ensure!(
+            self.layers.iter().all(|l| {
+                let (q, kv) = l.attention_heads();
+                q == config.num_heads
+                    && kv == config.kv_heads()
+                    && l.attention_gated() == config.gated_attention
+                    && l.attention_qk_norm() == config.qk_norm
+                    && l.norm_kind() == config.norm_kind
+            }),
+            "specialist attention configuration mismatch"
+        );
+        anyhow::ensure!(
+            (self.mtp_heads.as_ref().map_or(0, Vec::len) == config.mtp_steps)
+                && self.mtp_weight == config.mtp_weight,
+            "specialist MTP configuration mismatch"
+        );
+        self.time_embedder
+            .validate_specialist_shape(config.cond_hidden_size, config.frequency_embedding_size)?;
+        let trunk = config.trunk();
+        for (idx, layer) in self.layers.iter().enumerate() {
+            layer.validate_specialist_config(&trunk, idx)?;
         }
+        let mut compact = config.clone();
+        let spec = &mut compact
+            .mosme
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("resident specialist training requires MoSME"))?
+            .spec;
+        let (bi, ei) = spec
+            .position(expert_id)
+            .ok_or_else(|| anyhow::anyhow!("no expert '{expert_id}' in this MoSME spec"))?;
+        let mut selected_box = spec.boxes[bi].clone();
+        let mut selected = selected_box.experts[ei].clone();
+        selected.enabled = true;
+        selected_box.experts = vec![selected];
+        spec.boxes = vec![selected_box];
+        spec.top_box = 1;
+        spec.top_expert = 1;
+        Ok(compact)
+    }
+
+    pub fn compact_specialist(
+        &self,
+        config: &LmConfig,
+        expert_id: &str,
+    ) -> anyhow::Result<(Self, LmConfig)> {
+        let compact_config = self.compact_specialist_config(config, expert_id)?;
+        let position = config
+            .mosme
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("resident specialist training requires MoSME"))?
+            .spec
+            .position(expert_id)
+            .ok_or_else(|| anyhow::anyhow!("no expert '{expert_id}' in this MoSME spec"))?;
+        let mosme = compact_config
+            .mosme
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("the compacted configuration lost its MoSME spec"))?;
+        let singleton = crate::mosme::MosmeConfig::new(
+            config.hidden_size,
+            config.cond_hidden_size,
+            mosme.spec.clone(),
+        )
+        .with_intermediate_size(config.intermediate_size)
+        .with_balance_bias(mosme.balance_bias);
+        crate::tensor_ext::force_initialization(self);
+        let mut compact = self.clone();
+        compact.layers = self
+            .layers
+            .iter()
+            .map(|layer| layer.compact_specialist(position, &singleton))
+            .collect::<anyhow::Result<_>>()?;
+        Ok((compact, compact_config))
+    }
+
+    pub fn apply_specialist(
+        &self,
+        config: &LmConfig,
+        specialist: &Self,
+        specialist_config: &LmConfig,
+        expert_id: &str,
+    ) -> anyhow::Result<Self> {
+        let expected = self.compact_specialist_config(config, expert_id)?;
+        anyhow::ensure!(
+            serde_json::to_value(&expected)? == serde_json::to_value(specialist_config)?,
+            "incompatible compact specialist configuration or identity"
+        );
+        specialist.compact_specialist_config(specialist_config, expert_id)?;
+        anyhow::ensure!(
+            self.embedding_weight().device() == specialist.embedding_weight().device(),
+            "specialist device mismatch"
+        );
+        let position = config
+            .mosme
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("resident specialist training requires MoSME"))?
+            .spec
+            .position(expert_id)
+            .ok_or_else(|| anyhow::anyhow!("no expert '{expert_id}' in this MoSME spec"))?;
+        crate::tensor_ext::force_initialization(self);
+        let mut result = self.clone();
+        result.layers = self
+            .layers
+            .iter()
+            .zip(&specialist.layers)
+            .map(|(target, source)| target.apply_specialist(source, position))
+            .collect::<anyhow::Result<_>>()?;
+        Ok(result)
+    }
+
+    pub fn specialist_trainable(
+        &self,
+        config: &LmConfig,
+        expert_id: &str,
+    ) -> anyhow::Result<crate::mosme::TrainableSet> {
+        let (position, expected) = self.specialist_position(config, expert_id)?;
+        let mut ids = Vec::new();
+        for (i, layer) in self.layers.iter().enumerate() {
+            let selected = layer.specialist_ids(position, &expected)?;
+            let applies = config.mosme.as_ref().is_some_and(|m| m.applies_to(i));
+            anyhow::ensure!(
+                selected.is_some() == applies,
+                "MoSME site placement mismatch at layer {i}"
+            );
+            if let Some(selected) = selected {
+                ids.extend(selected);
+            }
+        }
+        anyhow::ensure!(
+            !ids.is_empty(),
+            "resident specialist training requires at least one MoSME FFN site"
+        );
+        Ok(crate::mosme::TrainableSet::from_ids(ids))
+    }
+
+    fn specialist_position(
+        &self,
+        config: &LmConfig,
+        expert_id: &str,
+    ) -> anyhow::Result<((usize, usize), Vec<usize>)> {
+        config.validate_ffn()?;
+        anyhow::ensure!(
+            config.moe.is_none(),
+            "resident specialist training does not support flat MoE"
+        );
+        anyhow::ensure!(
+            config.routing_state == 0 && !self.has_routing_state(),
+            "resident specialist training does not support routing state"
+        );
+        anyhow::ensure!(
+            config.num_layers == self.num_layers()
+                && config.hidden_size == self.hidden_size()
+                && config.context == self.context()
+                && config.vocab_size == self.vocab_size(),
+            "specialist model configuration mismatch"
+        );
+        let mosme = config
+            .mosme
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("resident specialist training requires MoSME"))?;
+        mosme.spec.validate()?;
+        let position = mosme
+            .spec
+            .position(expert_id)
+            .ok_or_else(|| anyhow::anyhow!("no expert '{expert_id}' in this spec"))?;
+        Ok((position, mosme.spec.experts_per_box()))
+    }
+
+    pub fn forward_specialist(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        config: &LmConfig,
+        expert_id: &str,
+    ) -> anyhow::Result<LmOutput<B>> {
+        self.specialist_trainable(config, expert_id)?;
+        let position = self.specialist_position(config, expert_id)?.0;
+        Ok(self
+            .forward_span_states_with(tokens, 0..self.num_layers(), None, Some(position))
+            .0)
+    }
+
+    pub(crate) fn next_token_specialist_step(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        config: &LmConfig,
+        expert_id: &str,
+    ) -> anyhow::Result<LmStep<B>> {
+        let position = self.specialist_position(config, expert_id)?.0;
+        let output = self.forward_span_states_with(
+            tokens.clone(),
+            0..self.num_layers(),
+            None,
+            Some(position),
+        );
+        Ok(self.objective_from_output(
+            tokens,
+            (0..self.num_layers(), output),
+            LmExtras::plain(),
+            None,
+        ))
     }
 
     pub fn context(&self) -> usize {
@@ -482,7 +1014,10 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
 
     /// Contiguous layer window owned by `block_idx`.
     pub fn layer_range(&self, block_idx: usize) -> std::ops::Range<usize> {
-        assert!(block_idx < self.num_blocks, "block {block_idx} out of range");
+        assert!(
+            block_idx < self.num_blocks,
+            "block {block_idx} out of range"
+        );
         let start = block_idx * self.layers_per_block;
         start..start + self.layers_per_block
     }
@@ -531,7 +1066,10 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
     /// The conditioning vector every layer sees on the language path: the
     /// timestep-zero embedding, `[b, cond]`.
     fn conditioning(&self, b: usize, device: &B::Device) -> Tensor<B, 2> {
-        crate::vit::silu_public(self.time_embedder.forward(Tensor::<B, 1>::zeros([b], device)))
+        crate::vit::silu_public(
+            self.time_embedder
+                .forward(Tensor::<B, 1>::zeros([b], device)),
+        )
     }
 
     /// The adaLN gates of every layer under the language conditioning
@@ -551,6 +1089,31 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             .collect()
     }
 
+    /// Largest causally-valid attention score per layer on `tokens` (Kimi K2
+    /// early-warning metric): `None` for layers whose mode keeps no scores
+    /// (pure linear). Reads the same normed inputs the attention branches
+    /// see, so the number tracks what training stability actually depends on
+    /// rather than a re-derived approximation. Costs one extra trunk pass;
+    /// callers probe a truncated prefix, not the full batch.
+    pub fn max_attention_logits(&self, tokens: Tensor<B, 2, Int>) -> Vec<Option<f32>> {
+        let device = tokens.device();
+        let b = tokens.dims()[0];
+        let cond = self.conditioning(b, &device);
+        let (_, states) = self.forward_span_states(tokens.clone(), 0..self.layers.len(), None);
+        let mut hidden = self.embed(tokens);
+        let mut out = Vec::with_capacity(self.layers.len());
+        for (layer, state) in self.layers.iter().zip(states.iter()) {
+            let normed = layer.normed_for_attention(hidden, &cond);
+            out.push(
+                layer
+                    .attention_max_logit(normed, 0)
+                    .map(|t| t.into_scalar()),
+            );
+            hidden = state.clone();
+        }
+        out
+    }
+
     /// [`Self::forward_span`] that also returns every layer's output (the
     /// residual stream before the final norm), and optionally projects a
     /// direction out of the stream after every layer (roadmap 31.1).
@@ -559,6 +1122,16 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         tokens: Tensor<B, 2, Int>,
         span: std::ops::Range<usize>,
         ablate: Option<&Tensor<B, 1>>,
+    ) -> (LmOutput<B>, Vec<Tensor<B, 3>>) {
+        self.forward_span_states_with(tokens, span, ablate, None)
+    }
+
+    fn forward_span_states_with(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        span: std::ops::Range<usize>,
+        ablate: Option<&Tensor<B, 1>>,
+        specialist: Option<(usize, usize)>,
     ) -> (LmOutput<B>, Vec<Tensor<B, 3>>) {
         let device = tokens.device();
         let b = tokens.dims()[0];
@@ -574,13 +1147,16 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         let mut states = Vec::with_capacity(self.layers.len());
         let mut balance: Option<crate::vit::RouterAux<B>> = None;
         let mut carry = LayerCarry::at(0);
+        carry.specialist = specialist;
         for i in span.start..span.end.min(self.layers.len()) {
             let (mut next, aux) = self.layers[i].forward(hidden, &cond, &mut carry);
             if let Some(d) = ablate {
                 next = crate::ablation::project_out(next, d);
             }
             hidden = next;
-            states.push(hidden.clone());
+            if specialist.is_none() {
+                states.push(hidden.clone());
+            }
             if let Some(aux) = aux {
                 balance = Some(match balance {
                     None => aux,
@@ -597,7 +1173,13 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             .matmul(self.embedding_weight().transpose())
             .reshape([bb, n, self.vocab_size]);
 
-        (LmOutput { logits, balance_loss: balance }, states)
+        (
+            LmOutput {
+                logits,
+                balance_loss: balance,
+            },
+            states,
+        )
     }
 
     /// Every layer.
@@ -607,19 +1189,29 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
 
     /// Every layer's output for `tokens`, before the final norm.
     pub fn hidden_states(&self, tokens: Tensor<B, 2, Int>) -> Vec<Tensor<B, 3>> {
-        self.forward_span_states(tokens, 0..self.layers.len(), None).1
+        self.forward_span_states(tokens, 0..self.layers.len(), None)
+            .1
     }
 
     /// Forward with `direction` projected out of the residual stream after
     /// the embedding and after every layer: inference-time ablation.
-    pub fn forward_ablated(&self, tokens: Tensor<B, 2, Int>, direction: &Tensor<B, 1>) -> LmOutput<B> {
-        self.forward_span_states(tokens, 0..self.layers.len(), Some(direction)).0
+    pub fn forward_ablated(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        direction: &Tensor<B, 1>,
+    ) -> LmOutput<B> {
+        self.forward_span_states(tokens, 0..self.layers.len(), Some(direction))
+            .0
     }
 
     /// The residual stream at the last position of `ids`, one `[h]` vector
     /// per layer, on the host: the raw material of a behaviour direction.
     pub fn residuals_at_last_position(&self, ids: &[u16], device: &B::Device) -> Vec<Vec<f32>> {
-        let ids: Vec<i64> = if ids.is_empty() { vec![i64::from(Special::Bos.id())] } else { ids.iter().map(|t| i64::from(*t)).collect() };
+        let ids: Vec<i64> = if ids.is_empty() {
+            vec![i64::from(Special::Bos.id())]
+        } else {
+            ids.iter().map(|t| i64::from(*t)).collect()
+        };
         let start = ids.len().saturating_sub(self.context);
         let window = &ids[start..];
         let n = window.len();
@@ -628,29 +1220,49 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             .into_iter()
             .map(|h| {
                 let width = h.dims()[2];
-                h.narrow(1, n - 1, 1).reshape([width]).into_data().convert::<f32>().iter::<f32>().collect()
+                h.narrow(1, n - 1, 1)
+                    .reshape([width])
+                    .into_data()
+                    .convert::<f32>()
+                    .iter::<f32>()
+                    .collect()
             })
             .collect()
     }
 
     /// Next-token logits after `ids`, `[vocab]` on the device.
     pub fn next_token_logits(&self, ids: &[u16], device: &B::Device) -> Tensor<B, 1> {
-        let ids: Vec<i64> = if ids.is_empty() { vec![i64::from(Special::Bos.id())] } else { ids.iter().map(|t| i64::from(*t)).collect() };
+        let ids: Vec<i64> = if ids.is_empty() {
+            vec![i64::from(Special::Bos.id())]
+        } else {
+            ids.iter().map(|t| i64::from(*t)).collect()
+        };
         let start = ids.len().saturating_sub(self.context);
         let window = &ids[start..];
         let n = window.len();
         let tokens = Tensor::<B, 1, Int>::from_ints(window, device).reshape([1, n]);
-        self.forward(tokens).logits.narrow(1, n - 1, 1).reshape([self.vocab_size])
+        self.forward(tokens)
+            .logits
+            .narrow(1, n - 1, 1)
+            .reshape([self.vocab_size])
     }
 
     /// Next-token probabilities after `ids`, `[vocab]` on the device.
     pub fn next_token_probs(&self, ids: &[u16], device: &B::Device) -> Tensor<B, 1> {
-        let ids: Vec<i64> = if ids.is_empty() { vec![i64::from(Special::Bos.id())] } else { ids.iter().map(|t| i64::from(*t)).collect() };
+        let ids: Vec<i64> = if ids.is_empty() {
+            vec![i64::from(Special::Bos.id())]
+        } else {
+            ids.iter().map(|t| i64::from(*t)).collect()
+        };
         let start = ids.len().saturating_sub(self.context);
         let window = &ids[start..];
         let n = window.len();
         let tokens = Tensor::<B, 1, Int>::from_ints(window, device).reshape([1, n]);
-        let logits = self.forward(tokens).logits.narrow(1, n - 1, 1).reshape([self.vocab_size]);
+        let logits = self
+            .forward(tokens)
+            .logits
+            .narrow(1, n - 1, 1)
+            .reshape([self.vocab_size]);
         softmax(logits, 0)
     }
 
@@ -693,7 +1305,8 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         );
 
         let cond = crate::vit::silu_public(
-            self.time_embedder.forward(Tensor::<B, 1>::zeros([b], &device)),
+            self.time_embedder
+                .forward(Tensor::<B, 1>::zeros([b], &device)),
         );
 
         // Positions are absolute: the new tokens sit *after* the cached ones,
@@ -722,7 +1335,10 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             .matmul(self.embedding_weight().transpose())
             .reshape([bb, n, self.vocab_size]);
 
-        LmOutput { logits, balance_loss: balance }
+        LmOutput {
+            logits,
+            balance_loss: balance,
+        }
     }
 
     /// A cache sized for this model.
@@ -741,8 +1357,28 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         tokens: Tensor<B, 2, Int>,
         span: std::ops::Range<usize>,
     ) -> (Tensor<B, 1>, LmMetrics) {
-        let step = self.objective(tokens, span, None, None, None, None);
+        let step = self.objective(tokens, span, LmExtras::plain());
         (step.loss, step.metrics)
+    }
+
+    pub fn next_token_loss_masked(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        mask: Tensor<B, 2>,
+        span: std::ops::Range<usize>,
+    ) -> (Tensor<B, 1>, LmMetrics) {
+        let step = self.objective_masked(tokens, span, mask);
+        (step.loss, step.metrics)
+    }
+
+    pub fn next_token_step_masked(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        mask: Tensor<B, 2>,
+        extras: LmExtras<'_, B>,
+        span: std::ops::Range<usize>,
+    ) -> LmStep<B> {
+        self.objective_masked_with(tokens, span, mask, extras)
     }
 
     /// The training step with everything a trainer needs: the loss, the
@@ -751,10 +1387,10 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
     pub fn next_token_step(
         &self,
         tokens: Tensor<B, 2, Int>,
-        negatives: Option<(Tensor<B, 2>, Unlikelihood)>,
+        extras: LmExtras<'_, B>,
         span: std::ops::Range<usize>,
     ) -> LmStep<B> {
-        self.objective(tokens, span, negatives, None, None, None)
+        self.objective(tokens, span, extras)
     }
 
     /// [`Self::next_token_step`] with the two open-weight signals of roadmap
@@ -764,12 +1400,10 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
     pub fn next_token_step_full(
         &self,
         tokens: Tensor<B, 2, Int>,
-        negatives: Option<(Tensor<B, 2>, Unlikelihood)>,
-        extra: Option<ExtraNegatives<B>>,
-        distill: Option<Distillation<'_, B>>,
+        extras: LmExtras<'_, B>,
         span: std::ops::Range<usize>,
     ) -> LmStep<B> {
-        self.objective(tokens, span, negatives, extra, distill, None)
+        self.objective(tokens, span, extras)
     }
 
     /// [`Self::next_token_step_full`] with a direction penalty (roadmap 31.2):
@@ -778,13 +1412,10 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
     pub fn next_token_step_directed(
         &self,
         tokens: Tensor<B, 2, Int>,
-        negatives: Option<(Tensor<B, 2>, Unlikelihood)>,
-        extra: Option<ExtraNegatives<B>>,
-        distill: Option<Distillation<'_, B>>,
-        direction: Option<DirectionPenalty<'_, B>>,
+        extras: LmExtras<'_, B>,
         span: std::ops::Range<usize>,
     ) -> LmStep<B> {
-        self.objective(tokens, span, negatives, extra, distill, direction)
+        self.objective(tokens, span, extras)
     }
 
     /// What a frozen **negative** model would say next (roadmap 29.3): at
@@ -799,7 +1430,11 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
     ) -> (Tensor<B, 2, Int>, Tensor<B, 2>) {
         let [b, n] = tokens.dims();
         assert!(n >= 2, "proposals need at least two positions");
-        let logits = self.forward(tokens.clone()).logits.narrow(1, 0, n - 1).detach();
+        let logits = self
+            .forward(tokens.clone())
+            .logits
+            .narrow(1, 0, n - 1)
+            .detach();
         let probs = softmax(logits, 2);
         let (max_p, argmax) = probs.max_dim_with_indices(2);
         let argmax = argmax.reshape([b, n - 1]);
@@ -825,32 +1460,84 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         penalty: Unlikelihood,
         span: std::ops::Range<usize>,
     ) -> (Tensor<B, 1>, LmMetrics) {
-        let step = self.objective(tokens, span, Some((weights, penalty)), None, None, None);
+        let step = self.objective(tokens, span, LmExtras::with_negatives((weights, penalty)));
         (step.loss, step.metrics)
+    }
+
+    /// Whether this model carries MTP heads *and* a positive MTP weight, so
+    /// the auxiliary loss contributes. Either being off is exactly the plain
+    /// next-token objective.
+    fn mtp_active(&self) -> bool {
+        self.mtp_weight > 0.0 && self.mtp_heads.is_some()
     }
 
     fn objective(
         &self,
         tokens: Tensor<B, 2, Int>,
         span: std::ops::Range<usize>,
-        negatives: Option<(Tensor<B, 2>, Unlikelihood)>,
-        extra: Option<ExtraNegatives<B>>,
-        distill: Option<Distillation<'_, B>>,
-        direction: Option<DirectionPenalty<'_, B>>,
+        extras: LmExtras<'_, B>,
     ) -> LmStep<B> {
+        assert!(
+            tokens.dims()[1] >= 2,
+            "next-token loss needs at least two positions"
+        );
+        // MTP reads the executed span's last hidden states, so like the
+        // direction penalty it needs the per-layer states, not just the logits.
+        let need_states = extras.has_active_direction() || self.mtp_active();
+        let (out, states) = match need_states {
+            true => self.forward_span_states(tokens.clone(), span.clone(), None),
+            false => (self.forward_span(tokens.clone(), span.clone()), Vec::new()),
+        };
+
+        self.objective_from_output(tokens, (span, (out, states)), extras, None)
+    }
+
+    fn objective_masked(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        span: std::ops::Range<usize>,
+        mask: Tensor<B, 2>,
+    ) -> LmStep<B> {
+        self.objective_masked_with(tokens, span, mask, LmExtras::plain())
+    }
+
+    fn objective_masked_with(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        span: std::ops::Range<usize>,
+        mask: Tensor<B, 2>,
+        extras: LmExtras<'_, B>,
+    ) -> LmStep<B> {
+        assert_eq!(mask.dims()[0], tokens.dims()[0]);
+        assert_eq!(mask.dims()[1], tokens.dims()[1]);
+        let (out, states) = match extras.has_active_direction() {
+            true => self.forward_span_states(tokens.clone(), span.clone(), None),
+            false => (self.forward_span(tokens.clone(), span.clone()), Vec::new()),
+        };
+        self.objective_from_output(tokens, (span, (out, states)), extras, Some(mask))
+    }
+
+    fn objective_from_output(
+        &self,
+        tokens: Tensor<B, 2, Int>,
+        output: SpanStates<B>,
+        extras: LmExtras<'_, B>,
+        loss_mask: Option<Tensor<B, 2>>,
+    ) -> LmStep<B> {
+        let LmExtras {
+            negatives,
+            extra,
+            distill,
+            direction,
+        } = extras;
+        // A zero weight is exactly the absent term, resolved once here so the
+        // two trunk paths and the loss below cannot disagree about it.
+        let active_direction = direction.filter(|d| d.weight > 0.0);
+        let (span, (out, states)) = output;
         let device = tokens.device();
         let [b, n] = tokens.dims();
         assert!(n >= 2, "next-token loss needs at least two positions");
 
-        // States are only collected when a direction penalty will read them;
-        // the plain path is untouched.
-        let active_direction = direction.filter(|d| d.weight > 0.0);
-        let (out, states) = match active_direction {
-            Some(_) => self.forward_span_states(tokens.clone(), span.clone(), None),
-            None => (self.forward_span(tokens.clone(), span.clone()), Vec::new()),
-        };
-
-        // Drop the last position (no target) and the first target (no input).
         let logits = out.logits.narrow(1, 0, n - 1);
         let targets = tokens.clone().narrow(1, 1, n - 1);
 
@@ -858,31 +1545,47 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         let flat_targets = targets.clone().reshape([b * (n - 1), 1]);
 
         let log_probs = log_softmax(flat_logits.clone(), 1);
-        let target_log_prob = log_probs.clone().gather(1, flat_targets).squeeze_dim::<1>(1); // [b*(n-1)]
+        let target_log_prob = log_probs
+            .clone()
+            .gather(1, flat_targets)
+            .squeeze_dim::<1>(1); // [b*(n-1)]
         let nll = -target_log_prob.clone();
 
         // Mask padding out of both the numerator and the denominator.
         let pad = Tensor::<B, 1, Int>::full([b * (n - 1)], Special::Pad.id() as i64, &device);
-        let keep = targets
-            .reshape([b * (n - 1)])
-            .equal(pad)
-            .bool_not()
-            .float();
-        let counted = keep.clone().sum().clamp_min(1.0);
-        let keep_all = keep.clone();
+        let keep = targets.reshape([b * (n - 1)]).equal(pad).bool_not().float();
+        let loss_keep = match &loss_mask {
+            None => keep.clone(),
+            Some(mask) => {
+                assert_eq!(mask.dims(), [b, n], "loss mask must be shaped like tokens");
+                mask.clone()
+                    .narrow(1, 1, n - 1)
+                    .reshape([b * (n - 1)])
+                    .clamp_min(0.0)
+                    * keep.clone()
+            }
+        };
+        let counted = loss_keep.clone().sum().clamp_min(1.0);
+        let keep_all = loss_keep.clone();
 
         let (loss, penalized_tokens, penalty, penalized_prob) = match negatives {
-            None => ((nll * keep).sum() / counted.clone(), 0, 0.0, 0.0),
+            None => ((nll * loss_keep).sum() / counted.clone(), 0, 0.0, 0.0),
             Some((weights, unlikelihood_term)) => {
-                assert_eq!(weights.dims(), [b, n], "weights must be shaped like the tokens");
+                assert_eq!(
+                    weights.dims(),
+                    [b, n],
+                    "weights must be shaped like the tokens"
+                );
                 let w = weights.narrow(1, 1, n - 1).reshape([b * (n - 1)]);
                 // A flagged target is measured whether or not it is charged;
                 // a padded position is neither.
-                let flagged = w.clone().greater_elem(0.0).float() * keep.clone();
+                let flagged = w.clone().greater_elem(0.0).float() * loss_keep.clone();
                 let count = flagged.clone().sum();
                 let per_flagged = count.clone().clamp_min(1.0);
-                let prob = (target_log_prob.clone().exp() * flagged.clone()).sum() / per_flagged.clone();
-                let charge = unlikelihood(target_log_prob, unlikelihood_term.epsilon) * w * flagged.clone();
+                let prob =
+                    (target_log_prob.clone().exp() * flagged.clone()).sum() / per_flagged.clone();
+                let charge =
+                    unlikelihood(target_log_prob, unlikelihood_term.epsilon) * w * flagged.clone();
                 let charge_sum = charge.sum();
 
                 // With the penalty off, the objective *is* the plain one: the
@@ -897,7 +1600,7 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
                 } else {
                     flagged
                 };
-                let positive = keep - negative;
+                let positive = loss_keep - negative;
                 let likelihood = (nll * positive).sum();
 
                 // Both terms share the denominator, so a batch with few
@@ -922,7 +1625,11 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         let (loss, negative_teacher_tokens, negative_teacher_prob) = match extra {
             None => (loss, 0, 0.0),
             Some(extra) => {
-                assert_eq!(extra.tokens.dims(), [b, n - 1], "proposals must cover every predicting position");
+                assert_eq!(
+                    extra.tokens.dims(),
+                    [b, n - 1],
+                    "proposals must cover every predicting position"
+                );
                 assert_eq!(extra.weights.dims(), [b, n - 1], "one weight per proposal");
                 let idx = extra.tokens.reshape([b * (n - 1), 1]);
                 let lp = log_probs.gather(1, idx).squeeze_dim::<1>(1);
@@ -957,10 +1664,14 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
                     })
                     .collect();
                 // Log-domain mixture (roadmap 33.1): no clamp, no underflow.
-                let log_p = crate::distill::log_teacher_mixture(&teacher_logits, d.temperature);
+                // Non-empty and positive-weight by the guard on this arm.
+                let log_p =
+                    crate::distill::log_teacher_mixture_nonempty(&teacher_logits, d.temperature);
                 let t = d.temperature.max(1e-6) as f32;
                 let log_q = log_softmax(flat_logits.div_scalar(t), 1);
-                let per_row = (log_p.clone().exp() * (log_p - log_q)).sum_dim(1).reshape([b * (n - 1)]);
+                let per_row = (log_p.clone().exp() * (log_p - log_q))
+                    .sum_dim(1)
+                    .reshape([b * (n - 1)]);
                 let kl = (per_row * keep_all).sum() / counted.clone() * (t * t);
                 let value: f32 = kl.clone().into_scalar();
                 (loss + kl.mul_scalar(d.weight as f32), value)
@@ -972,7 +1683,10 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         let (loss, direction_projection) = match active_direction {
             None => (loss, 0.0),
             Some(d) => {
-                let local = d.layer.saturating_sub(span.start).min(states.len().saturating_sub(1));
+                let local = d
+                    .layer
+                    .saturating_sub(span.start)
+                    .min(states.len().saturating_sub(1));
                 let h = &states[local];
                 let penalty = crate::ablation::projection_penalty(h, d.direction);
                 let value: f32 = penalty.clone().into_scalar();
@@ -980,9 +1694,75 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             }
         };
 
+        // --- multi-token prediction (Qwen MTP style) --------------------------
+        // `mtp_heads[k]` predicts token `t + k + 1` from the final hidden
+        // state at `t`, through the same tied head as the main loss. Each
+        // head is a zero-initialized residual, so at init this term is the
+        // shifted next-token loss — finite and meaningful — and with
+        // `mtp_weight == 0` (or no heads) nothing is added and the objective
+        // is the plain one bit for bit.
+        let (loss, mtp_loss) = match (&self.mtp_heads, self.mtp_weight) {
+            (Some(heads), w) if w > 0.0 && !heads.is_empty() => match states.last() {
+                None => (loss, 0.0),
+                Some(h_last) => {
+                    let h = self.final_norm.forward(h_last.clone()); // [b, n, h]
+                    let [_bb, nn, hdim] = h.dims();
+                    let embed = self.embedding_weight();
+                    let mut acc: Option<Tensor<B, 1>> = None;
+                    let mut depths = 0usize;
+                    for (k, head) in heads.iter().enumerate() {
+                        let ahead = k + 1;
+                        if ahead >= nn {
+                            continue;
+                        }
+                        let m = nn - ahead;
+                        let pred = h.clone().narrow(1, 0, m);
+                        let pred = pred.clone() + head.forward(pred);
+                        let logits_k = pred
+                            .reshape([b * m, hdim])
+                            .matmul(embed.clone().transpose());
+                        let targets_k = tokens.clone().narrow(1, ahead, m).reshape([b * m, 1]);
+                        let log_probs_k = log_softmax(logits_k, 1);
+                        let nll_k = -log_probs_k.gather(1, targets_k.clone()).squeeze_dim::<1>(1);
+                        let pad_k =
+                            Tensor::<B, 1, Int>::full([b * m], Special::Pad.id() as i64, &device);
+                        let keep_k = targets_k.reshape([b * m]).equal(pad_k).bool_not().float();
+                        let keep_k = match &loss_mask {
+                            None => keep_k,
+                            Some(mask) => {
+                                mask.clone()
+                                    .narrow(1, ahead, m)
+                                    .reshape([b * m])
+                                    .clamp_min(0.0)
+                                    * keep_k
+                            }
+                        };
+                        let counted_k = keep_k.clone().sum().clamp_min(1.0);
+                        let term = (nll_k * keep_k).sum() / counted_k;
+                        acc = Some(match acc {
+                            None => term,
+                            Some(a) => a + term,
+                        });
+                        depths += 1;
+                    }
+                    match (acc, depths) {
+                        (Some(sum), d) if d > 0 => {
+                            let mean = sum / (d as f32);
+                            let value: f32 = mean.clone().into_scalar();
+                            (loss + mean.mul_scalar(w as f32), value)
+                        }
+                        _ => (loss, 0.0),
+                    }
+                }
+            },
+            _ => (loss, 0.0),
+        };
+
         let value: f32 = loss.clone().into_scalar();
-        let routing: Vec<crate::moe::RoutingStats> =
-            out.balance_loss.as_ref().map_or_else(Vec::new, |aux| aux.to_host());
+        let routing: Vec<crate::moe::RoutingStats> = out
+            .balance_loss
+            .as_ref()
+            .map_or_else(Vec::new, |aux| aux.to_host());
         let (_, routing_entropy, _, routing_max_load) =
             crate::moe::RoutingStats::summarize(&routing);
         let metrics = LmMetrics {
@@ -1002,6 +1782,7 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             negative_teacher_prob,
             distill_loss,
             direction_projection,
+            mtp_loss,
         };
 
         // The balance term is scaled; the z-loss already carries its own
@@ -1011,13 +1792,20 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             Some(aux) => loss + aux.balance.mul_scalar(0.01) + aux.z,
             None => loss,
         };
-        LmStep { loss, metrics, routing }
+        LmStep {
+            loss,
+            metrics,
+            routing,
+        }
     }
 
     /// Selection biases of every sparse layer that has one, in layer order
     /// (roadmap 23.5).
     pub fn balance_biases(&self) -> Vec<Vec<f32>> {
-        self.layers.iter().filter_map(|l| l.balance_bias_values()).collect()
+        self.layers
+            .iter()
+            .filter_map(|l| l.balance_bias_values())
+            .collect()
     }
 
     /// Attach zero selection biases to every sparse layer that lacks one
@@ -1076,10 +1864,11 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             let n = window.len();
 
             let tokens = Tensor::<B, 1, Int>::from_ints(window.as_slice(), device).reshape([1, n]);
-            let logits = self.forward(tokens).logits.narrow(1, n - 1, 1).reshape([
-                1,
-                self.vocab_size,
-            ]);
+            let logits = self
+                .forward(tokens)
+                .logits
+                .narrow(1, n - 1, 1)
+                .reshape([1, self.vocab_size]);
 
             let next = sampling.pick(&logits, rng);
             ids.push(next);
@@ -1130,8 +1919,7 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
                 break;
             }
             let window: Vec<i64> = pending.iter().map(|t| *t as i64).collect();
-            let tokens =
-                Tensor::<B, 1, Int>::from_ints(window.as_slice(), device).reshape([1, n]);
+            let tokens = Tensor::<B, 1, Int>::from_ints(window.as_slice(), device).reshape([1, n]);
 
             let logits = self
                 .forward_cached(tokens, &mut cache)
@@ -1383,6 +2171,8 @@ pub struct LmMetrics {
     /// Mean squared projection of the penalized layer's states onto the
     /// direction (before its weight); 0 without one (roadmap 31.2).
     pub direction_projection: f32,
+    /// The MTP auxiliary loss (before its weight); 0 without MTP heads.
+    pub mtp_loss: f32,
 }
 
 /// A behaviour direction penalized during training (roadmap 31.2).
@@ -1430,7 +2220,10 @@ impl Sampling {
     pub fn parse(name: &str, k: usize, temperature: f64) -> anyhow::Result<Self> {
         match name {
             "greedy" => Ok(Self::Greedy),
-            "topk" => Ok(Self::TopK { k: k.max(1), temperature }),
+            "topk" => Ok(Self::TopK {
+                k: k.max(1),
+                temperature,
+            }),
             other => anyhow::bail!("unknown sampling '{other}' (expected greedy|topk)"),
         }
     }
@@ -1482,6 +2275,25 @@ impl Sampling {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use crate::tokenizer::ByteTokenizer;
@@ -1490,22 +2302,476 @@ mod tests {
 
     type B = NdArray<f32>;
 
-    fn model() -> (LanguageModel<B>, <B as burn::tensor::backend::BackendTypes>::Device) {
+    fn model() -> (
+        LanguageModel<B>,
+        <B as burn::tensor::backend::BackendTypes>::Device,
+    ) {
         let device = Default::default();
-        (LanguageModel::<B>::new(&LmConfig::tiny(), &device), device)
+        (
+            LanguageModel::<B>::new(&LmConfig::tiny(), &device).unwrap(),
+            device,
+        )
     }
 
-    fn tokens(device: &<B as burn::tensor::backend::BackendTypes>::Device, ids: &[u16]) -> Tensor<B, 2, Int> {
+    fn tokens(
+        device: &<B as burn::tensor::backend::BackendTypes>::Device,
+        ids: &[u16],
+    ) -> Tensor<B, 2, Int> {
         let v: Vec<i64> = ids.iter().map(|t| *t as i64).collect();
         Tensor::<B, 1, Int>::from_ints(v.as_slice(), device).reshape([1, v.len()])
     }
 
-    fn logp_of_targets(m: &LanguageModel<B>, ids: &[u16], device: &<B as burn::tensor::backend::BackendTypes>::Device) -> Vec<f32> {
+    fn logp_of_targets(
+        m: &LanguageModel<B>,
+        ids: &[u16],
+        device: &<B as burn::tensor::backend::BackendTypes>::Device,
+    ) -> Vec<f32> {
         // log p(target_j | prefix) for j = 0..n-1, straight from the logits.
         let n = ids.len();
-        let logits = m.forward(tokens(device, ids)).logits.narrow(1, 0, n - 1).reshape([n - 1, VOCAB_SIZE]);
-        let lp: Vec<f32> = log_softmax(logits, 1).into_data().convert::<f32>().iter::<f32>().collect();
-        (0..n - 1).map(|j| lp[j * VOCAB_SIZE + ids[j + 1] as usize]).collect()
+        let logits = m
+            .forward(tokens(device, ids))
+            .logits
+            .narrow(1, 0, n - 1)
+            .reshape([n - 1, VOCAB_SIZE]);
+        let lp: Vec<f32> = log_softmax(logits, 1)
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
+        (0..n - 1)
+            .map(|j| lp[j * VOCAB_SIZE + ids[j + 1] as usize])
+            .collect()
+    }
+
+    #[test]
+    fn test_compact_specialist_training_transplant_preserves_every_other_parameter() {
+        use crate::expert_index::{BoxSpec, ExpertSpec, MosmeSpec};
+        use crate::train::DefaultTrainBackend as A;
+        use crate::vit::MosmeTrunkConfig;
+        use burn::module::{ModuleMapper, ModuleVisitor, ParamId};
+        use burn::optim::{AdamWConfig, Optimizer};
+        let device = Default::default();
+        let mut spec = MosmeSpec::flat(3);
+        spec.boxes.push(BoxSpec::new(
+            "other",
+            "Other",
+            vec![
+                ExpertSpec::new("other/a", "A"),
+                ExpertSpec::new("other/b", "B").disabled(),
+            ],
+        ));
+        let config =
+            LmConfig::tiny().with_mosme(MosmeTrunkConfig::new(spec).with_balance_bias(true));
+        let full = LanguageModel::<A>::new(&config, &device).unwrap();
+        let (compact, compact_config) = full.compact_specialist(&config, "other/b").unwrap();
+        let selected = full.specialist_trainable(&config, "other/b").unwrap();
+        let compact_selected = compact
+            .specialist_trainable(&compact_config, "other/b")
+            .unwrap();
+        assert_eq!(selected.ids(), compact_selected.ids());
+        let input = Tensor::<A, 2, Int>::from_ints([[4, 8, 15, 16, 23, 42]], &device);
+        let train = |model: LanguageModel<A>, cfg: &LmConfig| {
+            let allowed = model.specialist_trainable(cfg, "other/b").unwrap();
+            let model = allowed.freeze(model);
+            let step = model
+                .next_token_specialist_step(input.clone(), cfg, "other/b")
+                .unwrap();
+            let mut grads = step.loss.backward();
+            let params = allowed.gradients(&mut grads, &model);
+            assert!(!params.is_empty());
+            AdamWConfig::new().init().step(1e-2, model, params)
+        };
+        let trained_full = train(full.clone(), &config);
+        let trained_compact = train(compact, &compact_config);
+        let applied = full
+            .apply_specialist(&config, &trained_compact, &compact_config, "other/b")
+            .unwrap();
+        let expected = trained_compact
+            .forward_specialist(input.clone(), &compact_config, "other/b")
+            .unwrap()
+            .logits;
+        let actual = applied
+            .forward_specialist(input.clone(), &config, "other/b")
+            .unwrap()
+            .logits;
+        assert_eq!((actual - expected).abs().max().into_scalar(), 0.0);
+        assert_eq!(
+            crate::checkpoint::canonical_hash_hex::<A, _>(&trained_full),
+            crate::checkpoint::canonical_hash_hex::<A, _>(&applied)
+        );
+        assert!(
+            (full
+                .forward_specialist(input.clone(), &config, "other/b")
+                .unwrap()
+                .logits
+                - applied
+                    .forward_specialist(input, &config, "other/b")
+                    .unwrap()
+                    .logits)
+                .abs()
+                .max()
+                .into_scalar()
+                > 0.0
+        );
+        struct Snapshot(Vec<(ParamId, Vec<u32>)>);
+        impl ModuleVisitor<A> for Snapshot {
+            fn visit_float<const D: usize>(&mut self, p: &Param<Tensor<A, D>>) {
+                self.0.push((
+                    p.id,
+                    p.val()
+                        .into_data()
+                        .iter::<f32>()
+                        .map(f32::to_bits)
+                        .collect(),
+                ));
+            }
+        }
+        let mut protected = compact_selected.ids().unwrap().to_vec();
+        for layer in &trained_compact.layers {
+            layer.router_param_ids(&mut protected);
+        }
+        struct ReidentifyAndPoison<'a>(&'a [ParamId]);
+        impl ModuleMapper<A> for ReidentifyAndPoison<'_> {
+            fn map_float<const D: usize>(
+                &mut self,
+                mut p: Param<Tensor<A, D>>,
+            ) -> Param<Tensor<A, D>> {
+                if !self.0.contains(&p.id) {
+                    p = p.map(|v| v.full_like(123.0));
+                }
+                p.id = ParamId::new();
+                p
+            }
+        }
+        let reidentified = trained_compact.map(&mut ReidentifyAndPoison(&protected));
+        let transplanted = full
+            .apply_specialist(&config, &reidentified, &compact_config, "other/b")
+            .unwrap();
+        let mut before = Snapshot(Vec::new());
+        let mut after = Snapshot(Vec::new());
+        full.visit(&mut before);
+        transplanted.visit(&mut after);
+        assert_eq!(before.0.len(), after.0.len());
+        let mut moved = false;
+        for ((old_id, old), (new_id, new)) in before.0.iter().zip(&after.0) {
+            assert_eq!(old_id, new_id);
+            if selected.ids().unwrap().contains(old_id) {
+                moved |= old != new;
+            } else {
+                assert_eq!(old, new);
+            }
+        }
+        assert!(moved);
+        assert_eq!(
+            crate::checkpoint::canonical_hash_hex::<A, _>(&applied),
+            crate::checkpoint::canonical_hash_hex::<A, _>(&transplanted)
+        );
+    }
+
+    #[test]
+    fn test_compact_specialist_rejects_incompatible_inputs() {
+        use crate::expert_index::MosmeSpec;
+        use crate::vit::MosmeTrunkConfig;
+        let device = Default::default();
+        let config = LmConfig::tiny().with_mosme(MosmeTrunkConfig::new(MosmeSpec::flat(3)));
+        let full = LanguageModel::<B>::new(&config, &device).unwrap();
+        let (compact, compact_config) = full.compact_specialist(&config, "flat/1").unwrap();
+        assert!(full.compact_specialist(&config, "absent").is_err());
+        assert!(full
+            .apply_specialist(&config, &full, &config, "flat/1")
+            .is_err());
+        assert!(full
+            .apply_specialist(&config, &compact, &compact_config, "flat/2")
+            .is_err());
+        for field in [
+            "intermediate_size",
+            "cond_hidden_size",
+            "frequency_embedding_size",
+            "num_heads",
+            "num_blocks",
+            "num_layers",
+            "context",
+            "vocab_size",
+        ] {
+            let mut value = serde_json::to_value(&config).unwrap();
+            value[field] = serde_json::json!(value[field].as_u64().unwrap() + 1);
+            let wrong: LmConfig = serde_json::from_value(value).unwrap();
+            assert!(
+                full.compact_specialist(&wrong, "flat/1").is_err(),
+                "{field}"
+            );
+        }
+        let mut wrong = config.clone();
+        wrong.mosme.as_mut().unwrap().every_n_layers = 1;
+        assert!(full.compact_specialist(&wrong, "flat/1").is_err());
+        wrong = config.clone();
+        wrong.mosme.as_mut().unwrap().spec = MosmeSpec::flat(2);
+        assert!(full.compact_specialist(&wrong, "flat/1").is_err());
+        wrong = config.clone();
+        wrong.mosme.as_mut().unwrap().spec.boxes[0].experts[0].enabled = false;
+        assert!(full.compact_specialist(&wrong, "flat/1").is_err());
+        let mut malformed = compact.clone();
+        malformed.layers[1] = full.layers[1].clone();
+        assert!(full
+            .apply_specialist(&config, &malformed, &compact_config, "flat/1")
+            .is_err());
+        let wider = LmConfig {
+            intermediate_size: compact_config.intermediate_size + 1,
+            ..compact_config.clone()
+        };
+        let malformed = LanguageModel::<B>::new(&wider, &device).unwrap();
+        assert!(full
+            .apply_specialist(&config, &malformed, &compact_config, "flat/1")
+            .is_err());
+        let dense = LmConfig::tiny();
+        assert!(LanguageModel::<B>::new(&dense, &device)
+            .unwrap()
+            .compact_specialist(&dense, "flat/1")
+            .is_err());
+        let routing = config.clone().with_routing_state(2);
+        assert!(LanguageModel::<B>::new(&routing, &device)
+            .unwrap()
+            .compact_specialist(&routing, "flat/1")
+            .is_err());
+    }
+
+    #[test]
+    fn test_compact_specialist_checkpoint_parity_and_bounded_parameters() {
+        use crate::expert_index::MosmeSpec;
+        use crate::vit::MosmeTrunkConfig;
+        use burn::record::{FullPrecisionSettings, NamedMpkBytesRecorder, Recorder};
+        let device = Default::default();
+        let mut counts = Vec::new();
+        for experts in [2, 8, 32] {
+            let config =
+                LmConfig::tiny().with_mosme(MosmeTrunkConfig::new(MosmeSpec::flat(experts)));
+            let full = LanguageModel::<B>::new(&config, &device).unwrap();
+            let (compact, compact_config) = full.compact_specialist(&config, "flat/1").unwrap();
+            assert_eq!(
+                compact_config
+                    .mosme
+                    .as_ref()
+                    .unwrap()
+                    .spec
+                    .position("flat/1"),
+                Some((0, 0))
+            );
+            assert_eq!(compact_config.mosme.as_ref().unwrap().spec.num_experts(), 1);
+            counts.push(compact.num_params());
+            assert!(compact.num_params() < full.num_params());
+            let input = tokens(&device, &[4, 8, 15, 16, 23, 42]);
+            let expected = full
+                .forward_specialist(input.clone(), &config, "flat/1")
+                .unwrap()
+                .logits;
+            let recorder = NamedMpkBytesRecorder::<FullPrecisionSettings>::default();
+            let bytes = recorder.record(compact.into_record(), ()).unwrap();
+            let restored = LanguageModel::<B>::new(&compact_config, &device)
+                .unwrap()
+                .load_record(recorder.load(bytes, &device).unwrap());
+            assert_eq!(restored.num_params(), *counts.last().unwrap());
+            let actual = restored
+                .forward_specialist(input, &compact_config, "flat/1")
+                .unwrap()
+                .logits;
+            assert_eq!((expected - actual).abs().max().into_scalar(), 0.0);
+            let applied = full
+                .apply_specialist(&config, &restored, &compact_config, "flat/1")
+                .unwrap();
+            assert_eq!(
+                crate::checkpoint::canonical_hash_hex::<B, _>(&full),
+                crate::checkpoint::canonical_hash_hex::<B, _>(&applied)
+            );
+        }
+        assert!(counts.windows(2).all(|w| w[0] == w[1]));
+    }
+
+    #[test]
+    fn test_resident_specialist_matches_dense_routing_and_skips_router_gradients() {
+        use crate::expert_index::MosmeSpec;
+        use crate::train::DefaultTrainBackend as A;
+        use crate::vit::MosmeTrunkConfig;
+        let device = Default::default();
+        let cfg = LmConfig::tiny()
+            .with_mosme(MosmeTrunkConfig::new(MosmeSpec::flat(2)).with_every_n_layers(2));
+        let model = LanguageModel::<A>::new(&cfg, &device).unwrap();
+        crate::tensor_ext::force_initialization(&model);
+        let ids = [4u16, 8, 15, 16, 23, 42];
+        let tokens = tokens(&device, &ids);
+        let tokens = Tensor::<A, 2, _>::from_data(tokens.into_data(), &device);
+        let specialist = model
+            .forward_specialist(tokens.clone(), &cfg, "flat/1")
+            .unwrap();
+        assert!(
+            specialist.balance_loss.is_none(),
+            "forced routing runs no router"
+        );
+        assert!(specialist
+            .logits
+            .clone()
+            .abs()
+            .max()
+            .into_scalar()
+            .is_finite());
+        let mut grads = specialist.logits.sum().backward();
+        assert!(
+            model.token_embedding.weight.grad(&grads).is_some(),
+            "input-side gradients must survive the forced routing"
+        );
+        let router = crate::mosme::TrainableSet::from_ids({
+            let mut ids = Vec::new();
+            model.layers[1].router_param_ids(&mut ids);
+            ids
+        });
+        assert!(
+            router
+                .gradients::<A, LanguageModel<A>>(&mut grads, &model)
+                .is_empty(),
+            "forced routing must leave the router without gradients"
+        );
+    }
+
+    #[test]
+    fn test_resident_specialist_aggregates_model_wide_ids() {
+        use crate::expert_index::MosmeSpec;
+        use crate::train::DefaultTrainBackend as A;
+        use crate::vit::MosmeTrunkConfig;
+        let device = Default::default();
+        let cfg = LmConfig::tiny()
+            .with_mosme(MosmeTrunkConfig::new(MosmeSpec::flat(3)).with_every_n_layers(2));
+        let model = LanguageModel::<A>::new(&cfg, &device).unwrap();
+        let set = model.specialist_trainable(&cfg, "flat/2").unwrap();
+        let per_site = (1..cfg.num_layers).step_by(2).count();
+        assert_eq!(
+            set.len(),
+            Some(per_site * 4),
+            "two leaves per expert per site"
+        );
+        let cfg_small = LmConfig::tiny()
+            .with_mosme(MosmeTrunkConfig::new(MosmeSpec::flat(2)).with_every_n_layers(2));
+        let model = LanguageModel::<A>::new(&cfg_small, &device).unwrap();
+        assert!(model.specialist_trainable(&cfg_small, "nope").is_err());
+        let flat_moe = LmConfig {
+            moe: Some(Default::default()),
+            ..LmConfig::tiny()
+        };
+        assert!(LanguageModel::<A>::new(&flat_moe, &device)
+            .unwrap()
+            .specialist_trainable(&flat_moe, "flat/0")
+            .is_err());
+    }
+
+    #[test]
+    fn test_ffn_config_defaults_roundtrip_and_validation() {
+        for cfg in [LmConfig::default(), LmConfig::tiny()] {
+            assert_eq!(cfg.ffn_kind, FfnKind::Gelu);
+            let mut old = serde_json::to_value(&cfg).unwrap();
+            old.as_object_mut().unwrap().remove("ffn_kind");
+            let parsed: LmConfig = serde_json::from_value(old).unwrap();
+            assert_eq!(parsed.ffn_kind, FfnKind::Gelu);
+            assert_eq!(parsed.cost(8).unwrap(), cfg.cost(8).unwrap());
+            for kind in [FfnKind::Gelu, FfnKind::SwiGlu] {
+                let configured = cfg.clone().with_ffn_kind(kind);
+                assert_eq!(configured.trunk().ffn_kind, kind);
+                let value = serde_json::to_value(&configured).unwrap();
+                assert_eq!(value["ffn_kind"], kind.name());
+                let back: LmConfig = serde_json::from_value(value.clone()).unwrap();
+                assert_eq!(back.ffn_kind, kind);
+                assert_eq!(serde_json::to_value(back).unwrap(), value);
+            }
+        }
+        let swiglu = LmConfig::tiny().with_ffn_kind(FfnKind::SwiGlu);
+        assert!(swiglu.describe().contains("ffn=swiglu"));
+        assert!(swiglu.validate_ffn().is_ok());
+        let flat = LmConfig {
+            moe: Some(Default::default()),
+            ..swiglu.clone()
+        };
+        let hierarchical = swiglu.with_mosme(crate::vit::MosmeTrunkConfig::new(
+            crate::expert_index::MosmeSpec::flat(2),
+        ));
+        for cfg in [flat, hierarchical] {
+            assert!(cfg
+                .validate_ffn()
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be combined"));
+            assert!(cfg.trunk().validate_ffn().is_err());
+            assert!(cfg.with_ffn_kind(FfnKind::Gelu).validate_ffn().is_ok());
+        }
+        let mut invalid = serde_json::to_value(LmConfig::tiny()).unwrap();
+        invalid["ffn_kind"] = serde_json::json!("unknown");
+        assert!(serde_json::from_value::<LmConfig>(invalid).is_err());
+    }
+
+    #[test]
+    fn test_swiglu_cost_charges_the_extra_projection() {
+        let cfg = LmConfig::tiny();
+        let gelu = cfg.cost(7).unwrap();
+        let swiglu = cfg.clone().with_ffn_kind(FfnKind::SwiGlu).cost(7).unwrap();
+        for (a, b) in gelu.layers.iter().zip(&swiglu.layers) {
+            assert_eq!(
+                b.active_params - a.active_params,
+                (cfg.hidden_size + 1) * cfg.intermediate_size
+            );
+            assert_eq!(
+                b.flops - a.flops,
+                2.0 * (cfg.hidden_size * cfg.intermediate_size) as f64
+            );
+            assert_eq!(a.state_floats, b.state_floats);
+            assert_eq!(a.keys_read, b.keys_read);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot be combined with MoE or MoSME")]
+    fn test_swiglu_cost_rejects_experts() {
+        LmConfig {
+            moe: Some(Default::default()),
+            ..LmConfig::tiny()
+        }
+        .with_ffn_kind(FfnKind::SwiGlu)
+        .cost(8)
+        .unwrap();
+    }
+
+    #[test]
+    fn test_swiglu_cached_full_and_record_roundtrip() {
+        use burn::record::{FullPrecisionSettings, NamedMpkBytesRecorder, Recorder};
+        let device = Default::default();
+        let cfg = LmConfig::tiny().with_ffn_kind(FfnKind::SwiGlu);
+        let ids = [4u16, 8, 15, 16, 23, 42];
+        let m = LanguageModel::<B>::new(&cfg, &device).unwrap();
+        let full = m.forward(tokens(&device, &ids)).logits;
+        for chunks in [vec![6], vec![1; 6], vec![2, 3, 1]] {
+            let mut cache = m.new_cache();
+            let mut at = 0;
+            let mut outputs = Vec::new();
+            for size in chunks {
+                let out = m.forward_cached(tokens(&device, &ids[at..at + size]), &mut cache);
+                assert!(out.balance_loss.is_none());
+                outputs.push(out.logits);
+                at += size;
+            }
+            assert_eq!(cache.position(), ids.len());
+            let error = (Tensor::cat(outputs, 1) - full.clone())
+                .abs()
+                .max()
+                .into_scalar();
+            assert!(error < 2e-4, "cached/full divergence: {error}");
+        }
+        let recorder = NamedMpkBytesRecorder::<FullPrecisionSettings>::default();
+        let bytes = recorder.record(m.into_record(), ()).unwrap();
+        let restored = LanguageModel::<B>::new(&cfg, &device)
+            .unwrap()
+            .load_record(recorder.load(bytes, &device).unwrap());
+        assert_eq!(
+            (restored.forward(tokens(&device, &ids)).logits - full)
+                .abs()
+                .max()
+                .into_scalar(),
+            0.0
+        );
     }
 
     #[test]
@@ -1516,11 +2782,21 @@ mod tests {
         let ids = [65u16, 66, 67, 68, 69, 70];
         let (plain, pm) = m.next_token_loss(tokens(&device, &ids), 0..m.num_layers());
         let zeros = Tensor::<B, 2>::zeros([1, ids.len()], &device);
-        let (penalized, qm) =
-            m.next_token_loss_penalized(tokens(&device, &ids), zeros, Unlikelihood::default(), 0..m.num_layers());
-        assert_eq!(plain.into_scalar().to_bits(), penalized.into_scalar().to_bits());
+        let (penalized, qm) = m.next_token_loss_penalized(
+            tokens(&device, &ids),
+            zeros,
+            Unlikelihood::default(),
+            0..m.num_layers(),
+        );
+        assert_eq!(
+            plain.into_scalar().to_bits(),
+            penalized.into_scalar().to_bits()
+        );
         assert_eq!(qm.tokens_counted, pm.tokens_counted);
-        assert_eq!((qm.penalized_tokens, qm.penalty, qm.penalized_prob), (0, 0.0, 0.0));
+        assert_eq!(
+            (qm.penalized_tokens, qm.penalty, qm.penalized_prob),
+            (0, 0.0, 0.0)
+        );
     }
 
     #[test]
@@ -1535,7 +2811,10 @@ mod tests {
         // Token 2 (target of position 1) at half weight, token 4 at full.
         let w = [0.0f32, 0.0, 0.5, 0.0, 1.0];
         let weights = Tensor::<B, 1>::from_floats(w.as_slice(), &device).reshape([1, 5]);
-        let penalty = Unlikelihood { alpha: 2.0, epsilon: 1e-6 };
+        let penalty = Unlikelihood {
+            alpha: 2.0,
+            epsilon: 1e-6,
+        };
         let (loss, metrics) =
             m.next_token_loss_penalized(tokens(&device, &ids), weights, penalty, 0..m.num_layers());
 
@@ -1553,9 +2832,17 @@ mod tests {
         }
         let expected = (likelihood + penalty.alpha * charge) / 4.0;
         let got = loss.into_scalar();
-        assert!((got - expected).abs() < 1e-5 * expected.abs().max(1.0), "loss {got} vs hand {expected}");
+        assert!(
+            (got - expected).abs() < 1e-5 * expected.abs().max(1.0),
+            "loss {got} vs hand {expected}"
+        );
         assert_eq!(metrics.penalized_tokens, 2);
-        assert!((metrics.penalty - charge / 2.0).abs() < 1e-5, "{} vs {}", metrics.penalty, charge / 2.0);
+        assert!(
+            (metrics.penalty - charge / 2.0).abs() < 1e-5,
+            "{} vs {}",
+            metrics.penalty,
+            charge / 2.0
+        );
         assert!((metrics.penalized_prob - prob / 2.0).abs() < 1e-6);
         assert_eq!(metrics.tokens_counted, 4);
     }
@@ -1571,11 +2858,18 @@ mod tests {
         let w = [0.0f32, 0.0, 1.0, 0.0, 0.5];
         let weights = Tensor::<B, 1>::from_floats(w.as_slice(), &device).reshape([1, 5]);
         let (plain, _) = m.next_token_loss(tokens(&device, &ids), 0..m.num_layers());
-        let (off, metrics) =
-            m.next_token_loss_penalized(tokens(&device, &ids), weights, Unlikelihood::off(), 0..m.num_layers());
+        let (off, metrics) = m.next_token_loss_penalized(
+            tokens(&device, &ids),
+            weights,
+            Unlikelihood::off(),
+            0..m.num_layers(),
+        );
         assert_eq!(plain.into_scalar().to_bits(), off.into_scalar().to_bits());
         assert_eq!(metrics.penalized_tokens, 2, "still counted");
-        assert!(metrics.penalized_prob > 0.0 && metrics.penalty > 0.0, "still measured");
+        assert!(
+            metrics.penalized_prob > 0.0 && metrics.penalty > 0.0,
+            "still measured"
+        );
     }
 
     #[test]
@@ -1588,11 +2882,18 @@ mod tests {
         let w = [0.0f32, 0.0, 1.0, 1.0];
         let weights = Tensor::<B, 1>::from_floats(w.as_slice(), &device).reshape([1, 4]);
         let (plain, _) = m.next_token_loss(tokens(&device, &ids), 0..m.num_layers());
-        let (penalized, metrics) =
-            m.next_token_loss_penalized(tokens(&device, &ids), weights, Unlikelihood::default(), 0..m.num_layers());
+        let (penalized, metrics) = m.next_token_loss_penalized(
+            tokens(&device, &ids),
+            weights,
+            Unlikelihood::default(),
+            0..m.num_layers(),
+        );
         assert_eq!(metrics.penalized_tokens, 0);
         assert_eq!(metrics.tokens_counted, 1);
-        assert_eq!(plain.into_scalar().to_bits(), penalized.into_scalar().to_bits());
+        assert_eq!(
+            plain.into_scalar().to_bits(),
+            penalized.into_scalar().to_bits()
+        );
     }
 
     #[test]
@@ -1611,8 +2912,22 @@ mod tests {
         .collect();
         assert!(term[0].abs() < 1e-12, "impossible token: {}", term[0]);
         assert!((term[1] - 2f32.ln()).abs() < 1e-6, "p = 1/2: {}", term[1]);
-        assert!((term[2] - Unlikelihood { alpha: 1.0, epsilon: eps }.ceiling()).abs() < 1e-4, "certain token: {}", term[2]);
-        assert!(term[0] < term[1] && term[1] < term[2], "must increase with p");
+        assert!(
+            (term[2]
+                - Unlikelihood {
+                    alpha: 1.0,
+                    epsilon: eps
+                }
+                .ceiling())
+            .abs()
+                < 1e-4,
+            "certain token: {}",
+            term[2]
+        );
+        assert!(
+            term[0] < term[1] && term[1] < term[2],
+            "must increase with p"
+        );
     }
 
     #[test]
@@ -1635,7 +2950,10 @@ mod tests {
         let (m, device) = model();
         let out = m.forward(tokens(&device, &[1, 2, 3, 4]));
         assert_eq!(out.logits.dims(), [1, 4, VOCAB_SIZE]);
-        assert!(out.balance_loss.is_none(), "a dense trunk has no balance loss");
+        assert!(
+            out.balance_loss.is_none(),
+            "a dense trunk has no balance loss"
+        );
 
         // Weight tying is structural: the logits ARE a product with the
         // embedding table, so there is no separate output projection to drift.
@@ -1741,8 +3059,20 @@ mod tests {
         let tok = ByteTokenizer::new();
         let prompt = tok.encode("hi");
 
-        let a = m.generate(&prompt, 5, &Sampling::Greedy, &mut StdRng::seed_from_u64(1), &device);
-        let b = m.generate(&prompt, 5, &Sampling::Greedy, &mut StdRng::seed_from_u64(9), &device);
+        let a = m.generate(
+            &prompt,
+            5,
+            &Sampling::Greedy,
+            &mut StdRng::seed_from_u64(1),
+            &device,
+        );
+        let b = m.generate(
+            &prompt,
+            5,
+            &Sampling::Greedy,
+            &mut StdRng::seed_from_u64(9),
+            &device,
+        );
         assert_eq!(a, b, "greedy decoding must not depend on the rng");
         assert!(a.len() <= prompt.len() + 5);
         assert!(a.starts_with(&prompt), "the prompt must be preserved");
@@ -1753,7 +3083,10 @@ mod tests {
     fn test_sampling_is_reproducible_from_the_seed() {
         let (m, device) = model();
         let prompt = vec![Special::Bos.id(), 65];
-        let s = Sampling::TopK { k: 8, temperature: 1.0 };
+        let s = Sampling::TopK {
+            k: 8,
+            temperature: 1.0,
+        };
 
         let a = m.generate(&prompt, 6, &s, &mut StdRng::seed_from_u64(4), &device);
         let b = m.generate(&prompt, 6, &s, &mut StdRng::seed_from_u64(4), &device);
@@ -1763,11 +3096,20 @@ mod tests {
         let top1 = m.generate(
             &prompt,
             4,
-            &Sampling::TopK { k: 1, temperature: 1.0 },
+            &Sampling::TopK {
+                k: 1,
+                temperature: 1.0,
+            },
             &mut StdRng::seed_from_u64(7),
             &device,
         );
-        let greedy = m.generate(&prompt, 4, &Sampling::Greedy, &mut StdRng::seed_from_u64(0), &device);
+        let greedy = m.generate(
+            &prompt,
+            4,
+            &Sampling::Greedy,
+            &mut StdRng::seed_from_u64(0),
+            &device,
+        );
         assert_eq!(top1, greedy, "top-1 sampling is greedy decoding");
     }
 
@@ -1777,13 +3119,22 @@ mod tests {
         // panic on the position slice.
         let (m, device) = model();
         let long: Vec<u16> = (0..m.context() as u16 + 5).map(|i| 65 + (i % 26)).collect();
-        let out = m.generate(&long, 3, &Sampling::Greedy, &mut StdRng::seed_from_u64(2), &device);
+        let out = m.generate(
+            &long,
+            3,
+            &Sampling::Greedy,
+            &mut StdRng::seed_from_u64(2),
+            &device,
+        );
         assert_eq!(out.len(), long.len() + 3);
     }
 
     #[test]
     fn test_sampling_parse() {
-        assert!(matches!(Sampling::parse("greedy", 1, 1.0).unwrap(), Sampling::Greedy));
+        assert!(matches!(
+            Sampling::parse("greedy", 1, 1.0).unwrap(),
+            Sampling::Greedy
+        ));
         assert!(matches!(
             Sampling::parse("topk", 5, 0.8).unwrap(),
             Sampling::TopK { k: 5, .. }
@@ -1803,8 +3154,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(7);
         let greedy = m.generate(&prompt, 12, &Sampling::Greedy, &mut rng, &device);
 
-        let (looked, stats) =
-            m.generate_lookahead(&prompt, 12, 1, Budget::greedy(), &device);
+        let (looked, stats) = m.generate_lookahead(&prompt, 12, 1, Budget::greedy(), &device);
 
         assert_eq!(looked, greedy, "depth-0 lookahead must be greedy decoding");
         assert!(!stats.budget_exhausted);
@@ -1824,10 +3174,17 @@ mod tests {
         let prompt = ByteTokenizer::new().encode("abc");
 
         for max_evaluations in [1usize, 3, 8] {
-            let budget = Budget { max_evaluations, max_depth: 3, beam_width: 3 };
+            let budget = Budget {
+                max_evaluations,
+                max_depth: 3,
+                beam_width: 3,
+            };
             let (out, stats) = m.generate_lookahead(&prompt, 4, 4, budget, &device);
 
-            assert!(out.len() > prompt.len(), "decoding should still emit tokens");
+            assert!(
+                out.len() > prompt.len(),
+                "decoding should still emit tokens"
+            );
             assert!(
                 stats.model_calls <= max_evaluations * stats.committed,
                 "{} calls for {} tokens at a budget of {max_evaluations}",
@@ -1845,7 +3202,11 @@ mod tests {
         // the cost quadratic in beam width for no new information.
         let (m, device) = model();
         let prompt = ByteTokenizer::new().encode("xy");
-        let budget = Budget { max_evaluations: 64, max_depth: 2, beam_width: 3 };
+        let budget = Budget {
+            max_evaluations: 64,
+            max_depth: 2,
+            beam_width: 3,
+        };
 
         let (_out, stats) = m.generate_lookahead(&prompt, 3, 3, budget, &device);
         assert!(
@@ -1863,7 +3224,11 @@ mod tests {
         // would fail here.
         let (m, device) = model();
         let prompt = ByteTokenizer::new().encode("determinism");
-        let budget = Budget { max_evaluations: 40, max_depth: 2, beam_width: 2 };
+        let budget = Budget {
+            max_evaluations: 40,
+            max_depth: 2,
+            beam_width: 2,
+        };
 
         let (first, _) = m.generate_lookahead(&prompt, 6, 3, budget, &device);
         let (second, _) = m.generate_lookahead(&prompt, 6, 3, budget, &device);
@@ -1876,7 +3241,11 @@ mod tests {
         // commits <eos> must end the sequence, not decode past it.
         let (m, device) = model();
         let prompt = vec![Special::Bos.id(), Special::Eos.id()];
-        let budget = Budget { max_evaluations: 16, max_depth: 1, beam_width: 2 };
+        let budget = Budget {
+            max_evaluations: 16,
+            max_depth: 1,
+            beam_width: 2,
+        };
         let (out, stats) = m.generate_lookahead(&prompt, 8, 2, budget, &device);
         assert!(out.len() <= prompt.len() + 8);
         assert_eq!(stats.committed, out.len() - prompt.len());
@@ -1902,7 +3271,11 @@ mod tests {
 
         // Feed the same tokens in several different chunkings; every one must
         // land on the same logits.
-        for chunks in [vec![ids.len()], vec![1; ids.len()], vec![3, 1, 5, ids.len() - 9]] {
+        for chunks in [
+            vec![ids.len()],
+            vec![1; ids.len()],
+            vec![3, 1, 5, ids.len() - 9],
+        ] {
             let mut cache = m.new_cache();
             let mut produced: Vec<f32> = Vec::new();
             let mut at = 0usize;
@@ -1910,9 +3283,7 @@ mod tests {
                 let slice = &ids[at..at + size];
                 let out = m.forward_cached(tokens(&device, slice), &mut cache);
                 assert_eq!(out.logits.dims(), [1, size, VOCAB_SIZE]);
-                produced.extend(
-                    out.logits.into_data().convert::<f32>().iter::<f32>(),
-                );
+                produced.extend(out.logits.into_data().convert::<f32>().iter::<f32>());
                 at += size;
             }
             assert_eq!(cache.position(), ids.len());
@@ -1937,9 +3308,20 @@ mod tests {
         // two paths legitimately diverge, since uncached generation slides its
         // window left and a cache cannot.
         let max_new = m.context() - prompt.len();
-        for sampling in [Sampling::Greedy, Sampling::TopK { k: 3, temperature: 0.8 }] {
-            let plain =
-                m.generate(&prompt, max_new, &sampling, &mut StdRng::seed_from_u64(4), &device);
+        for sampling in [
+            Sampling::Greedy,
+            Sampling::TopK {
+                k: 3,
+                temperature: 0.8,
+            },
+        ] {
+            let plain = m.generate(
+                &prompt,
+                max_new,
+                &sampling,
+                &mut StdRng::seed_from_u64(4),
+                &device,
+            );
             let cached = m.generate_cached(
                 &prompt,
                 max_new,
@@ -1975,7 +3357,10 @@ mod tests {
             cached.len(),
             m.context() + 1
         );
-        assert!(cached.len() > prompt.len(), "it should still emit something");
+        assert!(
+            cached.len() > prompt.len(),
+            "it should still emit something"
+        );
     }
 
     #[test]
@@ -2042,11 +3427,27 @@ mod tests {
         let prompt = ByteTokenizer::new().encode("once ");
         for schedule in schedules {
             assert!(schedule.modes.iter().any(|m| *m != AttentionMode::Dense));
-            let m = LanguageModel::<B>::new(&LmConfig::tiny().with_attention(schedule.clone()), &device);
+            let m = LanguageModel::<B>::new(
+                &LmConfig::tiny().with_attention(schedule.clone()),
+                &device,
+            )
+            .unwrap();
             assert_eq!(m.attention_modes(), schedule.modes);
             let max_new = m.context() - prompt.len();
-            let plain = m.generate(&prompt, max_new, &Sampling::Greedy, &mut StdRng::seed_from_u64(4), &device);
-            let cached = m.generate_cached(&prompt, max_new, &Sampling::Greedy, &mut StdRng::seed_from_u64(4), &device);
+            let plain = m.generate(
+                &prompt,
+                max_new,
+                &Sampling::Greedy,
+                &mut StdRng::seed_from_u64(4),
+                &device,
+            );
+            let cached = m.generate_cached(
+                &prompt,
+                max_new,
+                &Sampling::Greedy,
+                &mut StdRng::seed_from_u64(4),
+                &device,
+            );
             assert_eq!(cached, plain, "schedule {} diverged", schedule.pattern());
         }
     }
@@ -2059,23 +3460,45 @@ mod tests {
         use crate::hybrid::{AttentionMode, AttentionSchedule, PositionKind};
         let device = Default::default();
         let base = LmConfig::tiny();
-        let schedule = AttentionSchedule::ratio(base.num_layers, 1, AttentionMode::Linear, AttentionMode::Sliding { window: 4 });
-        let unbounded = LanguageModel::<B>::new(
-            &base.clone().with_attention(schedule.clone()).with_positions(PositionKind::Rotary),
-            &device,
+        let schedule = AttentionSchedule::ratio(
+            base.num_layers,
+            1,
+            AttentionMode::Linear,
+            AttentionMode::Sliding { window: 4 },
         );
+        let unbounded = LanguageModel::<B>::new(
+            &base
+                .clone()
+                .with_attention(schedule.clone())
+                .with_positions(PositionKind::Rotary),
+            &device,
+        )
+        .unwrap();
         assert!(!unbounded.positions_bounded());
         let prompt = vec![Special::Bos.id(), 65, 66];
         let want = base.context * 2;
-        let out = unbounded.generate_cached(&prompt, want, &Sampling::Greedy, &mut StdRng::seed_from_u64(1), &device);
+        let out = unbounded.generate_cached(
+            &prompt,
+            want,
+            &Sampling::Greedy,
+            &mut StdRng::seed_from_u64(1),
+            &device,
+        );
         // Greedy decoding may hit <eos> early; then the run is simply shorter.
         let stopped_at_eos = out.last() == Some(&Special::Eos.id());
-        assert!(out.len() == prompt.len() + want || stopped_at_eos, "stopped at {} of {}", out.len(), prompt.len() + want);
+        assert!(
+            out.len() == prompt.len() + want || stopped_at_eos,
+            "stopped at {} of {}",
+            out.len(),
+            prompt.len() + want
+        );
 
         // The footprint of the state is what the modes promise: a window of 4
         // holds at most 3 keys per sliding layer, a linear layer holds d^2 + d.
         let mut cache = unbounded.new_cache();
-        let ids: Vec<i64> = (0..(base.context as i64 + 9)).map(|i| 40 + i % 50).collect();
+        let ids: Vec<i64> = (0..(base.context as i64 + 9))
+            .map(|i| 40 + i % 50)
+            .collect();
         for chunk in ids.chunks(4) {
             let t = Tensor::<B, 1, Int>::from_ints(chunk, &device).reshape([1, chunk.len()]);
             unbounded.forward_cached(t, &mut cache);
@@ -2083,16 +3506,25 @@ mod tests {
         assert_eq!(cache.position(), ids.len());
         for (state, mode) in cache.layers().iter().zip(unbounded.attention_modes()) {
             match mode {
-                AttentionMode::Sliding { window } => assert!(state.len() < window, "window kept {} keys", state.len()),
+                AttentionMode::Sliding { window } => {
+                    assert!(state.len() < window, "window kept {} keys", state.len())
+                }
                 AttentionMode::Linear => assert!(state.keys.is_none() && state.linear.is_some()),
                 _ => unreachable!(),
             }
         }
 
         // A learned table still stops where it always did.
-        let bounded = LanguageModel::<B>::new(&base.clone().with_attention(schedule), &device);
+        let bounded =
+            LanguageModel::<B>::new(&base.clone().with_attention(schedule), &device).unwrap();
         assert!(bounded.positions_bounded());
-        let out = bounded.generate_cached(&prompt, want, &Sampling::Greedy, &mut StdRng::seed_from_u64(1), &device);
+        let out = bounded.generate_cached(
+            &prompt,
+            want,
+            &Sampling::Greedy,
+            &mut StdRng::seed_from_u64(1),
+            &device,
+        );
         assert!(out.len() <= base.context + 1);
     }
 
@@ -2102,26 +3534,57 @@ mod tests {
         // reports token stability and layer agreement (roadmap 25.4-25.6).
         use crate::vit::MoeTrunkConfig;
         let device = Default::default();
-        let moe = MoeTrunkConfig { num_experts: 3, top_k: 1, every_n_layers: 2, z_level: 1e-3, balance_bias: false };
-        let config = LmConfig { moe: Some(moe), ..LmConfig::tiny() }.with_routing_state(6);
-        let m = LanguageModel::<B>::new(&config, &device);
+        let moe = MoeTrunkConfig {
+            num_experts: 3,
+            top_k: 1,
+            every_n_layers: 2,
+            z_level: 1e-3,
+            balance_bias: false,
+        };
+        let config = LmConfig {
+            moe: Some(moe),
+            ..LmConfig::tiny()
+        }
+        .with_routing_state(6);
+        let m = LanguageModel::<B>::new(&config, &device).unwrap();
         assert!(m.has_routing_state());
         let ids = [65u16, 66, 67, 68, 69, 70, 71, 72];
-        let step = m.next_token_step(tokens(&device, &ids), None, 0..m.num_layers());
+        let step = m.next_token_step(tokens(&device, &ids), LmExtras::plain(), 0..m.num_layers());
         assert!(step.metrics.loss.is_finite());
         assert_eq!(step.routing.len(), 2, "two sparse layers");
         for stats in &step.routing {
-            assert!((0.0..=1.0).contains(&stats.stability), "{}", stats.stability);
+            assert!(
+                (0.0..=1.0).contains(&stats.stability),
+                "{}",
+                stats.stability
+            );
             assert_eq!(stats.kind, crate::routing::RouterKind::Ffn);
         }
-        assert!(step.routing[0].agreement.is_none(), "the first routed layer has nothing before it");
-        let agreement = step.routing[1].agreement.expect("equal widths are comparable");
+        assert!(
+            step.routing[0].agreement.is_none(),
+            "the first routed layer has nothing before it"
+        );
+        let agreement = step.routing[1]
+            .agreement
+            .expect("equal widths are comparable");
         assert!((0.0..=1.0).contains(&agreement));
 
         // The state also decodes: cached and uncached generation still agree.
         let prompt = ByteTokenizer::new().encode("ab");
-        let plain = m.generate(&prompt, 6, &Sampling::Greedy, &mut StdRng::seed_from_u64(2), &device);
-        let cached = m.generate_cached(&prompt, 6, &Sampling::Greedy, &mut StdRng::seed_from_u64(2), &device);
+        let plain = m.generate(
+            &prompt,
+            6,
+            &Sampling::Greedy,
+            &mut StdRng::seed_from_u64(2),
+            &device,
+        );
+        let cached = m.generate_cached(
+            &prompt,
+            6,
+            &Sampling::Greedy,
+            &mut StdRng::seed_from_u64(2),
+            &device,
+        );
         assert_eq!(plain, cached);
     }
 
@@ -2138,9 +3601,36 @@ mod tests {
         assert_eq!(back.positions, PositionKind::Rotary);
         assert_eq!(back.routing_state, 3);
         // A Phase 19 state file, written before these fields existed, still parses.
-        let old = serde_json::to_string(&LmConfig::tiny()).unwrap().replace(",\"attention\":null", "").replace(",\"positions\":\"learned\"", "").replace(",\"routing_state\":0", "");
+        let old = serde_json::to_string(&LmConfig::tiny())
+            .unwrap()
+            .replace(",\"attention\":null", "")
+            .replace(",\"positions\":\"learned\"", "")
+            .replace(",\"routing_state\":0", "");
         assert!(!old.contains("routing_state"));
         let parsed: LmConfig = serde_json::from_str(&old).unwrap();
-        assert!(parsed.attention.is_none() && parsed.positions == PositionKind::Learned && parsed.routing_state == 0);
+        assert!(
+            parsed.attention.is_none()
+                && parsed.positions == PositionKind::Learned
+                && parsed.routing_state == 0
+        );
+    }
+
+    #[test]
+    fn test_masked_loss_counts_only_response_targets() {
+        let (m, device) = model();
+        let ids = [4u16, 8, 15, 16, 23, 42];
+        let input = tokens(&device, &ids);
+        let (plain_loss, plain_metrics) = m.next_token_loss(input.clone(), 0..m.num_layers());
+        let all = Tensor::<B, 1>::ones([ids.len()], &device).reshape([1, ids.len()]);
+        let (all_loss, all_metrics) =
+            m.next_token_loss_masked(input.clone(), all, 0..m.num_layers());
+        assert!((plain_loss.into_scalar() - all_loss.into_scalar()).abs() < 1e-6);
+        assert_eq!(all_metrics.tokens_counted, plain_metrics.tokens_counted);
+        let mask = Tensor::<B, 1>::from_floats([0.0, 0.0, 0.0, 0.0, 1.0, 1.0], &device)
+            .reshape([1, ids.len()]);
+        let (masked_loss, masked_metrics) =
+            m.next_token_loss_masked(input, mask, 0..m.num_layers());
+        assert!(masked_loss.into_scalar().is_finite());
+        assert_eq!(masked_metrics.tokens_counted, 2);
     }
 }

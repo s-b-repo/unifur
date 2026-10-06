@@ -37,10 +37,13 @@
 //! | `moe` | Gates are a probability distribution; the balance loss stays in `[1, E]` on the diagonal |
 //! | `mosme` | Composed two-level gates form a distribution; one box reduces exactly to flat MoE; adding a disabled expert is a bit-exact identity |
 //! | `lm` | Tokenization is lossless; causal attention leaks nothing backwards; an untrained tied head starts at `ln(vocab)` |
-//! | `hybrid` | A dense schedule is the Phase 19 trunk bit for bit; a window or a retrieval set covering the context is dense; linear attention's recurrent state equals its masked form; rotary scores depend only on distance; every mode decodes from its state exactly as it recomputes; rotary decoding continues past the table; the routing state is bounded and carries history; routing locality reads as specified |
+//! | `hybrid` | A dense schedule is the Phase 19 trunk bit for bit; a window or a retrieval set covering the context is dense; linear attention's recurrent state equals its masked form; rotary scores depend only on distance; every mode decodes from its state exactly as it recomputes; rotary decoding continues past the table; the routing state is bounded and carries history; routing locality reads as specified; partial rotary is full rotary at fraction one and leaves the suffix; GQA with full heads is dense and narrow KV shrinks the decode state; gated attention is identity at init; RMSNorm starts at unit RMS; MTP at weight zero is the plain loss |
+//! | `deltanet` | Gated DeltaNet: alpha = 1 is the pure delta rule, beta = 0 is pure decay, the zero-state first output is closed-form, L2 rows are unit, the short convolution is causal, and the tensor-alpha step and batched rollout are the scalar core bit for bit |
+//! | `geom` | The learned metric `G = L Lᵀ` is positive definite by construction; geodesic attention rows are distributions; the closed-form Lipschitz step never increases the relaxation energy; and the exact rational kernel keeps `1/3 + 1/6 = 1/2` exact, intersects segments exactly, refuses degenerate figures, derives facts with their rule certificate to a fixed point, and both rejects a false claim and survives a true one in falsification |
 //! | `antipattern` | Every shipped rule matches its examples and none of its counterexamples; labels follow tokens through both corpus readers; zero weights reproduce the plain loss bitwise; the unlikelihood term is 0 for an impossible token and finite for a certain one; a penalized target leaves the likelihood; one penalized step lowers p(bad) where one plain step raises it |
 //! | `model` | Softmax partition, unit-norm label embeddings, DiT zero-init, and that every `x0` estimate lies in the convex hull of the label table |
 //! | `autodiff` | Finite-difference gradient check on the distillation objective |
+//! | `qwennet` | Qwen3.8 trunk: full attention decodes from its KV cache bit for bit, a mixed linear+full trunk decodes to its prefill logits bit for bit, and the zero-centered RMSNorm is identity at zero weight |
 
 use crate::{
     dblock::{DblockClassifier, DblockConfig},
@@ -90,7 +93,13 @@ fn cert(
     residual: f64,
     tolerance: f64,
 ) -> Certificate {
-    Certificate { group, name, theorem, residual, tolerance }
+    Certificate {
+        group,
+        name,
+        theorem,
+        residual,
+        tolerance,
+    }
 }
 
 /// The residual of a check that could not run: infinite, so the certificate
@@ -102,7 +111,10 @@ fn failed(what: &str, err: &anyhow::Error) -> f64 {
 
 /// Run a group's checks; if the group cannot even be set up, report that as
 /// a single failing certificate instead of unwinding the whole run.
-fn checks_or_failed(group: &'static str, checks: fn() -> anyhow::Result<Vec<Certificate>>) -> Vec<Certificate> {
+fn checks_or_failed(
+    group: &'static str,
+    checks: fn() -> anyhow::Result<Vec<Certificate>>,
+) -> Vec<Certificate> {
     match checks() {
         Ok(certificates) => certificates,
         Err(err) => vec![cert(
@@ -204,14 +216,17 @@ impl Report {
             self.certificates.len()
         ));
         for f in self.failures() {
-            out.push_str(&format!("\nFAILED {}::{}\n  {}\n", f.group, f.name, f.theorem));
+            out.push_str(&format!(
+                "\nFAILED {}::{}\n  {}\n",
+                f.group, f.name, f.theorem
+            ));
         }
         out
     }
 }
 
 /// Names of every certificate group, in the order [`run_all`] emits them.
-pub const GROUPS: [&str; 22] = [
+pub const GROUPS: [&str; 27] = [
     "schedule",
     "preconditioning",
     "stats",
@@ -223,6 +238,8 @@ pub const GROUPS: [&str; 22] = [
     "mosme",
     "lm",
     "hybrid",
+    "deltanet",
+    "geom",
     "antipattern",
     "codequality",
     "planner",
@@ -234,6 +251,9 @@ pub const GROUPS: [&str; 22] = [
     "ablation",
     "model",
     "autodiff",
+    "qwennet",
+    "cheat",
+    "codegen_eval",
 ];
 
 /// Run only the certificates in `group`.
@@ -272,8 +292,10 @@ pub fn run_all() -> Report {
     certificates.extend(loopgraph_certificates());
     certificates.extend(moe_certificates());
     certificates.extend(mosme_certificates());
-    certificates.extend(lm_certificates());
-    certificates.extend(hybrid_certificates());
+    certificates.extend(checks_or_failed("lm", lm_checks));
+    certificates.extend(checks_or_failed("hybrid", hybrid_checks));
+    certificates.extend(deltanet_certificates());
+    certificates.extend(checks_or_failed("geom", geom_checks));
     certificates.extend(antipattern_certificates());
     certificates.extend(codequality_certificates());
     certificates.extend(planner_certificates());
@@ -283,8 +305,11 @@ pub fn run_all() -> Report {
     certificates.extend(multisource_certificates());
     certificates.extend(policy_certificates());
     certificates.extend(ablation_certificates());
-    certificates.extend(model_certificates());
+    certificates.extend(checks_or_failed("model", model_checks));
     certificates.extend(autodiff_certificates());
+    certificates.extend(checks_or_failed("qwennet", qwennet_checks));
+    certificates.extend(cheat_certificates());
+    certificates.extend(codegen_eval_certificates());
     Report { certificates }
 }
 
@@ -407,7 +432,11 @@ fn schedule_certificates() -> Vec<Certificate> {
     let edm = sigma::discrete_sigmas_edm(64, SIGMA_MIN, SIGMA_MAX, sigma::RHO);
     let edm_err = ((edm[0] - SIGMA_MAX).abs() / SIGMA_MAX)
         .max((edm[edm.len() - 1] - SIGMA_MIN).abs() / SIGMA_MIN)
-        .max(if edm.windows(2).all(|w| w[0] > w[1]) { 0.0 } else { 1.0 });
+        .max(if edm.windows(2).all(|w| w[0] > w[1]) {
+            0.0
+        } else {
+            1.0
+        });
     out.push(cert(
         "schedule",
         "edm_schedule_endpoints",
@@ -605,8 +634,7 @@ fn solver_certificates() -> Vec<Certificate> {
             &mut rng,
         );
         let expected = z0 * (schedule[schedule.len() - 1] / schedule[0]) as f32;
-        closed_form_err =
-            closed_form_err.max((z_end - expected).abs().max().into_scalar() as f64);
+        closed_form_err = closed_form_err.max((z_end - expected).abs().max().into_scalar() as f64);
     }
     out.push(cert(
         "solver",
@@ -649,7 +677,9 @@ fn solver_certificates() -> Vec<Certificate> {
             let [wa_a, wa_b, wb_a, wb_b] = solver::quadratic_interp_weights(g0, g1);
             let (a, b) = (wa_a * a_n + wa_b * b_n, wb_a * a_n + wb_b * b_n);
             let p = |s: f64| b * s + a * s * s;
-            interp_err = interp_err.max((p(-g0) - a_n).abs()).max((p(-g1) - b_n).abs());
+            interp_err = interp_err
+                .max((p(-g0) - a_n).abs())
+                .max((p(-g1) - b_n).abs());
         }
     }
     out.push(cert(
@@ -671,7 +701,10 @@ fn solver_certificates() -> Vec<Certificate> {
             .iter()
             .map(|&n| {
                 let grid = uniform_lambda_grid(schedule[0], schedule[schedule.len() - 1], n);
-                ((n as f64).log2(), oracle_error(kind, &grid, oracle).max(1e-12).log2())
+                (
+                    (n as f64).log2(),
+                    oracle_error(kind, &grid, oracle).max(1e-12).log2(),
+                )
             })
             .collect();
         let m = points.len() as f64;
@@ -737,8 +770,8 @@ fn precision_certificates() -> Vec<Certificate> {
                     let r = precision.round_scalar(signed);
                     let rel = ((r - signed) / signed).abs() as f64;
                     bound_excess = bound_excess.max((rel - u).max(0.0) / u);
-                    idempotence_err = idempotence_err
-                        .max((precision.round_scalar(r) - r).abs() as f64);
+                    idempotence_err =
+                        idempotence_err.max((precision.round_scalar(r) - r).abs() as f64);
                 }
             }
         }
@@ -762,9 +795,8 @@ fn precision_certificates() -> Vec<Certificate> {
         let values: Vec<f32> = (0..64)
             .map(|i| (1.0 + i as f32 / 64.0) * 2f32.powi((i % 9) - 4))
             .collect();
-        let rounded = precision.round(
-            Tensor::<B, 1>::from_floats(values.as_slice(), &device).reshape([8, 8]),
-        );
+        let rounded = precision
+            .round(Tensor::<B, 1>::from_floats(values.as_slice(), &device).reshape([8, 8]));
         let got: Vec<f32> = rounded.into_data().convert::<f32>().iter::<f32>().collect();
         for (tensor_value, scalar_input) in got.iter().zip(&values) {
             let want = precision.round_scalar(*scalar_input);
@@ -807,7 +839,10 @@ fn quantize_certificates() -> Vec<Certificate> {
     // Round-to-nearest on a fixed grid cannot err by more than half the widest
     // gap, scaled by the block's absmax. This is the bound that makes 4-bit
     // weights usable at all.
-    let max_gap = NF4_LEVELS.windows(2).map(|w| w[1] - w[0]).fold(0.0f32, f32::max);
+    let max_gap = NF4_LEVELS
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .fold(0.0f32, f32::max);
     let values: Vec<f32> = Tensor::<B, 1>::random([2048], Distribution::Normal(0.0, 1.0), &device)
         .into_data()
         .convert::<f32>()
@@ -842,6 +877,70 @@ fn quantize_certificates() -> Vec<Certificate> {
     let x = Tensor::<B, 2>::random([4, 32], Distribution::Uniform(-1.0, 1.0), &device);
     let lora_err = adapter.forward(x).abs().max().into_scalar() as f64;
 
+    // Packing two codes per byte is a STORAGE detail: the packed form must
+    // dequantize bit-identically to the simulated one-code-per-byte form,
+    // plain and double-quantized.
+    use crate::quantize::PackedNf4Tensor;
+    let mut packed_gap: f64 = 0.0;
+    for n in [2048usize, 1000, 63] {
+        let v: Vec<f32> = Tensor::<B, 1>::random([n], Distribution::Normal(0.0, 1.3), &device)
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
+        let pairs = [
+            (
+                PackedNf4Tensor::quantize(&v).dequantize(),
+                Nf4Tensor::quantize(&v).dequantize(),
+            ),
+            (
+                PackedNf4Tensor::quantize(&v)
+                    .with_double_quantization()
+                    .dequantize(),
+                Nf4Tensor::quantize(&v)
+                    .with_double_quantization()
+                    .dequantize(),
+            ),
+        ];
+        for (packed, simulated) in &pairs {
+            packed_gap = packed_gap.max(
+                packed
+                    .iter()
+                    .zip(simulated)
+                    .map(|(a, b)| f64::from((a - b).abs()))
+                    .fold(0.0, f64::max),
+            );
+        }
+    }
+
+    // An Nf4Linear is exactly "dequantize, then matmul": same values, same
+    // burn linear op as an f32 Linear holding the dequantized weight.
+    use crate::qwennet::Nf4Linear;
+    let w: Vec<f32> = Tensor::<B, 2>::random([8, 6], Distribution::Normal(0.0, 1.0), &device)
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect();
+    let packed = PackedNf4Tensor::quantize(&w).with_double_quantization();
+    let deq = packed.dequantize();
+    let nf4 = Nf4Linear::<B>::from_packed(packed, 8, 6, None);
+    let f32lin = burn::nn::Linear::<B> {
+        weight: burn::module::Param::from_tensor(
+            Tensor::<B, 1>::from_floats(deq.as_slice(), &device).reshape([8, 6]),
+        ),
+        bias: None,
+    };
+    let x3 = Tensor::<B, 3>::random([1, 4, 8], Distribution::Uniform(-1.0, 1.0), &device);
+    let flat =
+        |t: Tensor<B, 3>| -> Vec<f32> { t.into_data().convert::<f32>().iter::<f32>().collect() };
+    let a = flat(nf4.forward(x3.clone()));
+    let b = flat(f32lin.forward(x3));
+    let nf4_linear_gap: f64 = a
+        .iter()
+        .zip(&b)
+        .map(|(x, y)| f64::from((x - y).abs()))
+        .fold(0.0, f64::max);
+
     vec![
         cert(
             "quantize",
@@ -862,6 +961,20 @@ fn quantize_certificates() -> Vec<Certificate> {
             "lora_identity_at_init",
             "A zero-initialized LoRA adapter is an exact no-op.",
             lora_err,
+            0.0,
+        ),
+        cert(
+            "quantize",
+            "packed_nf4_storage_roundtrip_is_exact",
+            "Packing two NF4 codes per byte (low nibble first) is a pure storage detail: the packed form dequantizes bit-identically to the simulated one-code-per-byte form, plain and double-quantized.",
+            packed_gap,
+            0.0,
+        ),
+        cert(
+            "quantize",
+            "nf4_linear_is_dequantize_then_matmul",
+            "A frozen NF4-resident linear produces bit-identical outputs to an f32 linear holding its dequantized weight: the only thing quantization changes is residency, never arithmetic.",
+            nf4_linear_gap,
             0.0,
         ),
     ]
@@ -967,12 +1080,7 @@ fn moe_checks() -> anyhow::Result<Vec<Certificate>> {
         let probs = softmax(layer.router_logits(&x, &cond), 1);
         let (vals, _) = probs.topk_with_indices(top_k, 1);
         let gates = vals.clone() / vals.sum_dim(1).clamp_min(1e-12);
-        for s in gates
-            .sum_dim(1)
-            .into_data()
-            .convert::<f32>()
-            .iter::<f32>()
-        {
+        for s in gates.sum_dim(1).into_data().convert::<f32>().iter::<f32>() {
             gate_err = gate_err.max((s as f64 - 1.0).abs());
         }
     }
@@ -1010,9 +1118,8 @@ fn moe_checks() -> anyhow::Result<Vec<Certificate>> {
         let ids = Tensor::<B, 1, Int>::arange(0..e as i64, &device).reshape([e, 1]);
         let dense = probs.clone().repeat_dim(0, e);
         let weights = probs.clone().reshape([e, 1]);
-        let loss = f64::from(
-            crate::moe::weighted_switch_loss(&dense, &ids, &weights, e).into_scalar(),
-        );
+        let loss =
+            f64::from(crate::moe::weighted_switch_loss(&dense, &ids, &weights, e).into_scalar());
         bound_violation = bound_violation
             .max((1.0 - loss).max(0.0))
             .max((loss - e as f64).max(0.0));
@@ -1049,8 +1156,8 @@ fn moe_checks() -> anyhow::Result<Vec<Certificate>> {
             let values: Vec<f32> = (0..width)
                 .map(|_| ((next() * 2.0 - 1.0) * scale) as f32)
                 .collect();
-            let logits = Tensor::<B, 1>::from_floats(values.as_slice(), &device)
-                .reshape([1, width]);
+            let logits =
+                Tensor::<B, 1>::from_floats(values.as_slice(), &device).reshape([1, width]);
             // `router_z_loss` returns the *squared* log-sum-exp, so recover it.
             let z: f64 = f64::from(crate::moe::router_z_loss(&logits).into_scalar());
             let lse = z.sqrt();
@@ -1086,8 +1193,16 @@ fn moe_checks() -> anyhow::Result<Vec<Certificate>> {
     // is precisely why a balance loss alone cannot prevent logit drift.
     let base = Tensor::<B, 2>::random([8, 6], Distribution::Uniform(-2.0, 2.0), &device);
     let shifted = base.clone() + 40.0;
-    let p0: Vec<f32> = softmax(base.clone(), 1).into_data().convert::<f32>().iter::<f32>().collect();
-    let p1: Vec<f32> = softmax(shifted.clone(), 1).into_data().convert::<f32>().iter::<f32>().collect();
+    let p0: Vec<f32> = softmax(base.clone(), 1)
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect();
+    let p1: Vec<f32> = softmax(shifted.clone(), 1)
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect();
     let mut shift_invariance: f64 = 0.0;
     for (a, b) in p0.iter().zip(&p1) {
         shift_invariance = shift_invariance.max(f64::from((a - b).abs()));
@@ -1156,7 +1271,10 @@ fn moe_checks() -> anyhow::Result<Vec<Certificate>> {
         let r = &host_probs[row * se..(row + 1) * se];
         let argmax = (0..se).fold(0, |best, e| if r[e] > r[best] { e } else { best });
         host_load[argmax] += 1.0 / st as f32;
-        host_entropy -= r.iter().map(|&v| f64::from(v) * f64::from(v).ln()).sum::<f64>();
+        host_entropy -= r
+            .iter()
+            .map(|&v| f64::from(v) * f64::from(v).ln())
+            .sum::<f64>();
     }
     let host = RoutingStats::from_load(host_load, (host_entropy / st as f64) as f32, st);
     let got = reported.to_host();
@@ -1181,8 +1299,9 @@ fn moe_checks() -> anyhow::Result<Vec<Certificate>> {
         micro.routing.prob_mass.clone().reshape([1, se]),
         se,
     );
-    let window_one_err =
-        f64::from(u8::from(global.into_scalar().to_bits() != micro.balance.into_scalar().to_bits()));
+    let window_one_err = f64::from(u8::from(
+        global.into_scalar().to_bits() != micro.balance.into_scalar().to_bits(),
+    ));
 
     // And the reason to want it: two micro-batches that each route entirely to
     // a *different* expert are perfectly balanced together and perfectly
@@ -1199,8 +1318,10 @@ fn moe_checks() -> anyhow::Result<Vec<Certificate>> {
     let ones_col = Tensor::<B, 2>::ones([gt, 1], &device);
     let (probs_a, top_a) = (onehot(0), Tensor::<B, 2, Int>::zeros([gt, 1], &device));
     let (probs_b, top_b) = (onehot(1), Tensor::<B, 2, Int>::ones([gt, 1], &device));
-    let micro_a = f64::from(crate::moe::weighted_switch_loss(&probs_a, &top_a, &ones_col, ge).into_scalar());
-    let micro_b = f64::from(crate::moe::weighted_switch_loss(&probs_b, &top_b, &ones_col, ge).into_scalar());
+    let micro_a =
+        f64::from(crate::moe::weighted_switch_loss(&probs_a, &top_a, &ones_col, ge).into_scalar());
+    let micro_b =
+        f64::from(crate::moe::weighted_switch_loss(&probs_b, &top_b, &ones_col, ge).into_scalar());
     let mut two = crate::schedule::GlobalLoad::new(2);
     two.observe(0, &layer_routing(&probs_a, &top_a, ge).to_host().load);
     let f_b = two.observe(0, &layer_routing(&probs_b, &top_b, ge).to_host().load);
@@ -1242,12 +1363,19 @@ fn moe_checks() -> anyhow::Result<Vec<Certificate>> {
         )
     };
     let bits = |t: Tensor<B, 3>| -> Vec<u32> {
-        t.into_data().convert::<f32>().iter::<f32>().map(f32::to_bits).collect()
+        t.into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .map(f32::to_bits)
+            .collect()
     };
     let plain_bits = bits(plain_out.output.clone());
     let plain_balance = plain_out.balance.into_scalar().to_bits();
     let mut identity_err = 0.0f64;
-    for bias in [Tensor::<B, 2>::zeros([1, 4], &device), Tensor::<B, 2>::full([1, 4], 3.5, &device)] {
+    for bias in [
+        Tensor::<B, 2>::zeros([1, 4], &device),
+        Tensor::<B, 2>::full([1, 4], 3.5, &device),
+    ] {
         let out = rebias(bias).forward(bx.clone(), bc.clone());
         if bits(out.output) != plain_bits || out.balance.into_scalar().to_bits() != plain_balance {
             identity_err = 1.0;
@@ -1258,7 +1386,9 @@ fn moe_checks() -> anyhow::Result<Vec<Certificate>> {
     let logits = plain.router_logits(&bx, &bc);
     let probs = softmax(logits.clone(), 1);
     let steered = TopKRouter::from_parts(plain.router().weight(), plain.router().bias())
-        .with_balance_bias(Some(Tensor::<B, 1>::from_floats([0.0f32, 0.0, 50.0, 0.0], &device).reshape([1, 4])));
+        .with_balance_bias(Some(
+            Tensor::<B, 1>::from_floats([0.0f32, 0.0, 50.0, 0.0], &device).reshape([1, 4]),
+        ));
     let (vals, idx) = steered.select(&logits, &probs, 2);
     let idx: Vec<i64> = idx.into_data().convert::<i64>().iter::<i64>().collect();
     let vals: Vec<f32> = vals.into_data().convert::<f32>().iter::<f32>().collect();
@@ -1292,7 +1422,10 @@ fn moe_checks() -> anyhow::Result<Vec<Certificate>> {
         .collect();
     let want = [-1e-3f32, 1e-3, 1e-3, 1e-3];
     let nudge_err = f64::from(u8::from(
-        after.iter().zip(&want).any(|(a, b)| a.to_bits() != b.to_bits()),
+        after
+            .iter()
+            .zip(&want)
+            .any(|(a, b)| a.to_bits() != b.to_bits()),
     ));
 
     Ok(vec![
@@ -1480,7 +1613,10 @@ fn mosme_checks() -> anyhow::Result<Vec<Certificate>> {
     let degenerate_err = (hierarchical.balance.box_loss.into_scalar() as f64 - 1.0)
         .abs()
         .max(f64::from(
-            (hierarchical.balance.z_loss - flat.z_loss).abs().max().into_scalar(),
+            (hierarchical.balance.z_loss - flat.z_loss)
+                .abs()
+                .max()
+                .into_scalar(),
         ));
 
     // Growing a model with a disabled expert must be a bit-exact identity;
@@ -1538,8 +1674,14 @@ fn mosme_checks() -> anyhow::Result<Vec<Certificate>> {
     // at one point.
     let base: burn::nn::Linear<B> = burn::nn::LinearConfig::new(8, 6).init(&device);
     crate::tensor_ext::force_initialization(&base);
-    let bank =
-        crate::mosme::MosmeAdapterBank::<B>::from_linear(base.clone(), &ragged(1, 2), 4, 4, 4.0, &device);
+    let bank = crate::mosme::MosmeAdapterBank::<B>::from_linear(
+        base.clone(),
+        &ragged(1, 2),
+        4,
+        4,
+        4.0,
+        &device,
+    );
     let mut bank_err: f64 = 0.0;
     for _ in 0..4 {
         let xb = Tensor::<B, 2>::random([3, 8], Distribution::Uniform(-2.0, 2.0), &device);
@@ -1556,9 +1698,12 @@ fn mosme_checks() -> anyhow::Result<Vec<Certificate>> {
     // outputs, so it is still a distribution -- which is what lets the two
     // `model` certificates keep holding over an ensemble.
     let vit = ViTDiTConfig::tiny(10);
-    let dblock_cfg = DblockConfig { num_blocks: 2, ..DblockConfig::default() };
+    let dblock_cfg = DblockConfig {
+        num_blocks: 2,
+        ..DblockConfig::default()
+    };
     let ensemble =
-        crate::mosme::MosmeEnsemble::<B>::fresh(&ragged(1, 1), &vit, &dblock_cfg, 4, &device);
+        crate::mosme::MosmeEnsemble::<B>::fresh(&ragged(1, 1), &vit, &dblock_cfg, 4, &device)?;
     let pixels = Tensor::<B, 4>::random([2, 3, 32, 32], Distribution::Uniform(-1.0, 1.0), &device);
     let zt = Tensor::<B, 2>::random([2, 32], Distribution::Normal(0.0, 1.0), &device);
     let ens_cond = Tensor::<B, 2>::random([2, 4], Distribution::Uniform(-1.0, 1.0), &device);
@@ -1672,7 +1817,9 @@ fn mosme_checks() -> anyhow::Result<Vec<Certificate>> {
 
 // --------------------------------------------------------------------- lm --
 
-fn lm_certificates() -> Vec<Certificate> {
+/// Trunk certificates. `anyhow::Result`: a check that cannot be set up is a
+/// failing certificate, not a panic and not a silent pass.
+fn lm_checks() -> anyhow::Result<Vec<Certificate>> {
     use crate::lm::{LanguageModel, LmConfig, Sampling};
     use crate::tokenizer::{ByteTokenizer, Special, BYTE_TOKENS, VOCAB_SIZE};
     use rand::{rngs::StdRng, SeedableRng};
@@ -1708,12 +1855,10 @@ fn lm_certificates() -> Vec<Certificate> {
     // The property that makes next-token training meaningful. If position i
     // could see i+1 the model would learn to copy the answer and the loss would
     // fall without anything being learned.
-    let model = LanguageModel::<B>::new(&LmConfig::tiny(), &device);
+    let model = LanguageModel::<B>::new(&LmConfig::tiny(), &device)?;
     let ids: Vec<i64> = vec![5, 6, 7, 8, 9];
     let n = ids.len();
-    let as_tensor = |v: &[i64]| {
-        Tensor::<B, 1, Int>::from_ints(v, &device).reshape([1, v.len()])
-    };
+    let as_tensor = |v: &[i64]| Tensor::<B, 1, Int>::from_ints(v, &device).reshape([1, v.len()]);
     let reference = model.forward(as_tensor(&ids)).logits;
     let mut perturbed_ids = ids.clone();
     perturbed_ids[n - 1] = 200;
@@ -1732,11 +1877,20 @@ fn lm_certificates() -> Vec<Certificate> {
     // Top-1 sampling is greedy decoding by definition; if they diverge, the
     // sampling path is not selecting what it claims to.
     let prompt = vec![Special::Bos.id(), 65];
-    let greedy = model.generate(&prompt, 4, &Sampling::Greedy, &mut StdRng::seed_from_u64(0), &device);
+    let greedy = model.generate(
+        &prompt,
+        4,
+        &Sampling::Greedy,
+        &mut StdRng::seed_from_u64(0),
+        &device,
+    );
     let top1 = model.generate(
         &prompt,
         4,
-        &Sampling::TopK { k: 1, temperature: 1.0 },
+        &Sampling::TopK {
+            k: 1,
+            temperature: 1.0,
+        },
         &mut StdRng::seed_from_u64(3),
         &device,
     );
@@ -1749,7 +1903,11 @@ fn lm_certificates() -> Vec<Certificate> {
     // speed-for-accuracy trade -- and it is checked against several chunkings,
     // because a cache that is right for one token at a time can still be wrong
     // for a batch of them.
-    let cached_ids: Vec<i64> = tokenizer.encode("cache me").iter().map(|t| *t as i64).collect();
+    let cached_ids: Vec<i64> = tokenizer
+        .encode("cache me")
+        .iter()
+        .map(|t| *t as i64)
+        .collect();
     let reference: Vec<f32> = model
         .forward(as_tensor(&cached_ids))
         .logits
@@ -1783,7 +1941,13 @@ fn lm_certificates() -> Vec<Certificate> {
 
     // ...and the same statement end to end: identical text out of both
     // decoders from the same seed.
-    let plain = model.generate(&prompt, 6, &Sampling::Greedy, &mut StdRng::seed_from_u64(9), &device);
+    let plain = model.generate(
+        &prompt,
+        6,
+        &Sampling::Greedy,
+        &mut StdRng::seed_from_u64(9),
+        &device,
+    );
     let cached = model.generate_cached(
         &prompt,
         6,
@@ -1793,7 +1957,7 @@ fn lm_certificates() -> Vec<Certificate> {
     );
     let decode_err = f64::from(u8::from(plain != cached));
 
-    vec![
+    Ok(vec![
         cert(
             "lm",
             "tokenizer_roundtrip_is_lossless",
@@ -1839,12 +2003,12 @@ fn lm_certificates() -> Vec<Certificate> {
             decode_err,
             0.0,
         ),
-    ]
+    ])
 }
 
 // ----------------------------------------------------------------- hybrid --
 
-fn hybrid_certificates() -> Vec<Certificate> {
+fn hybrid_checks() -> anyhow::Result<Vec<Certificate>> {
     use crate::hybrid::{
         apply_rotary, feature_map, linear_attention, AttentionMode, AttentionSchedule, LinearState,
         PositionKind, ROTARY_BASE,
@@ -1858,13 +2022,21 @@ fn hybrid_certificates() -> Vec<Certificate> {
     let device: <B as burn::tensor::backend::BackendTypes>::Device = Default::default();
     let as_tensor = |v: &[i64]| Tensor::<B, 1, Int>::from_ints(v, &device).reshape([1, v.len()]);
     let logits_of = |m: &LanguageModel<B>, ids: &[i64]| -> Vec<f32> {
-        m.forward(as_tensor(ids)).logits.into_data().convert::<f32>().iter::<f32>().collect()
+        m.forward(as_tensor(ids))
+            .logits
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect()
     };
     let max_abs_diff = |a: &[f32], b: &[f32]| -> f64 {
         if a.len() != b.len() {
             return f64::INFINITY;
         }
-        a.iter().zip(b).map(|(x, y)| f64::from((x - y).abs())).fold(0.0, f64::max)
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| f64::from((x - y).abs()))
+            .fold(0.0, f64::max)
     };
     let max_rel_diff = |a: &[f32], b: &[f32]| -> f64 {
         if a.len() != b.len() {
@@ -1875,10 +2047,10 @@ fn hybrid_certificates() -> Vec<Certificate> {
             .map(|(x, y)| f64::from((x - y).abs()) / f64::from(y.abs()).max(1.0))
             .fold(0.0, f64::max)
     };
-    let build = |config: &LmConfig| -> LanguageModel<B> {
-        let model = LanguageModel::<B>::new(config, &device);
+    let build = |config: &LmConfig| -> anyhow::Result<LanguageModel<B>> {
+        let model = LanguageModel::<B>::new(config, &device)?;
         crate::tensor_ext::force_initialization(&model);
-        model
+        Ok(model)
     };
     let tiny = LmConfig::tiny();
     let n_layers = tiny.num_layers;
@@ -1888,32 +2060,47 @@ fn hybrid_certificates() -> Vec<Certificate> {
     // model's record loads into a model of the other mode and the two share
     // every weight bit for bit -- without depending on the global RNG, which
     // any concurrently running test may draw from.
-    let plain = build(&tiny);
-    let same_weights = |config: &LmConfig| -> LanguageModel<B> {
-        LanguageModel::<B>::new(config, &device).load_record(plain.clone().into_record())
+    let plain = build(&tiny)?;
+    let same_weights = |config: &LmConfig| -> anyhow::Result<LanguageModel<B>> {
+        Ok(LanguageModel::<B>::new(config, &device)?.load_record(plain.clone().into_record()))
     };
 
     // 1. An explicit all-dense schedule is the Phase 19 trunk.
-    let dense = same_weights(&LmConfig { attention: Some(AttentionSchedule::dense(n_layers)), ..tiny.clone() });
+    let dense = same_weights(&LmConfig {
+        attention: Some(AttentionSchedule::dense(n_layers)),
+        ..tiny.clone()
+    })?;
     let reference = logits_of(&plain, &ids);
     let dense_gap = max_abs_diff(&reference, &logits_of(&dense, &ids));
 
     // 2. A window covering the whole sequence is dense; so is reading every key.
     let wide = same_weights(&LmConfig {
-        attention: Some(AttentionSchedule { modes: vec![AttentionMode::Sliding { window: 64 }; n_layers] }),
+        attention: Some(AttentionSchedule {
+            modes: vec![AttentionMode::Sliding { window: 64 }; n_layers],
+        }),
         ..tiny.clone()
-    });
+    })?;
     let window_gap = max_abs_diff(&reference, &logits_of(&wide, &ids));
     let all_keys = same_weights(&LmConfig {
-        attention: Some(AttentionSchedule { modes: vec![AttentionMode::Retrieval { top_k: 64 }; n_layers] }),
+        attention: Some(AttentionSchedule {
+            modes: vec![AttentionMode::Retrieval { top_k: 64 }; n_layers],
+        }),
         ..tiny.clone()
-    });
+    })?;
     let retrieval_gap = max_abs_diff(&reference, &logits_of(&all_keys, &ids));
 
     // 3. Linear attention: the chunked recurrence equals the masked matrix form.
     let (b, h, n, d) = (2usize, 2usize, 7usize, 4usize);
-    let q = feature_map(Tensor::<B, 4>::random([b, h, n, d], Distribution::Uniform(-1.0, 1.0), &device));
-    let k = feature_map(Tensor::<B, 4>::random([b, h, n, d], Distribution::Uniform(-1.0, 1.0), &device));
+    let q = feature_map(Tensor::<B, 4>::random(
+        [b, h, n, d],
+        Distribution::Uniform(-1.0, 1.0),
+        &device,
+    ));
+    let k = feature_map(Tensor::<B, 4>::random(
+        [b, h, n, d],
+        Distribution::Uniform(-1.0, 1.0),
+        &device,
+    ));
     let v = Tensor::<B, 4>::random([b, h, n, d], Distribution::Uniform(-1.0, 1.0), &device);
     let (full, _) = linear_attention(q.clone(), k.clone(), v.clone(), None, 1e-6);
     let full: Vec<f32> = full.into_data().convert::<f32>().iter::<f32>().collect();
@@ -1934,7 +2121,11 @@ fn hybrid_certificates() -> Vec<Certificate> {
             state = Some(next);
             at += size;
         }
-        let produced: Vec<f32> = Tensor::cat(outputs, 2).into_data().convert::<f32>().iter::<f32>().collect();
+        let produced: Vec<f32> = Tensor::cat(outputs, 2)
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
         linear_gap = linear_gap.max(max_rel_diff(&produced, &full));
     }
 
@@ -1942,28 +2133,69 @@ fn hybrid_certificates() -> Vec<Certificate> {
     let rq = Tensor::<B, 4>::random([1, 1, 1, 8], Distribution::Uniform(-1.0, 1.0), &device);
     let rk = Tensor::<B, 4>::random([1, 1, 1, 8], Distribution::Uniform(-1.0, 1.0), &device);
     let score = |qo: usize, ko: usize| -> f64 {
-        let s: f32 = (apply_rotary(rq.clone(), qo, ROTARY_BASE) * apply_rotary(rk.clone(), ko, ROTARY_BASE)).sum().into_scalar();
+        let s: f32 = (apply_rotary(rq.clone(), qo, ROTARY_BASE)
+            * apply_rotary(rk.clone(), ko, ROTARY_BASE))
+        .sum()
+        .into_scalar();
         f64::from(s)
     };
     let base_score = score(9, 4);
-    let rotary_gap = [1usize, 7, 30, 250].iter().map(|s| (score(9 + s, 4 + s) - base_score).abs()).fold(0.0, f64::max);
+    let rotary_gap = [1usize, 7, 30, 250]
+        .iter()
+        .map(|s| (score(9 + s, 4 + s) - base_score).abs())
+        .fold(0.0, f64::max);
 
     // 5. Every mode decodes from its state exactly as it recomputes, under
     //    several chunkings.
     let schedules: Vec<(&str, AttentionSchedule)> = vec![
         ("dense", AttentionSchedule::dense(n_layers)),
-        ("sliding3", AttentionSchedule { modes: vec![AttentionMode::Sliding { window: 3 }; n_layers] }),
-        ("retrieval2", AttentionSchedule { modes: vec![AttentionMode::Retrieval { top_k: 2 }; n_layers] }),
-        ("linear", AttentionSchedule { modes: vec![AttentionMode::Linear; n_layers] }),
-        ("learned", AttentionSchedule { modes: vec![AttentionMode::Learned; n_layers] }),
-        ("3:1", AttentionSchedule::ratio(n_layers, 3, AttentionMode::Linear, AttentionMode::Dense)),
+        (
+            "sliding3",
+            AttentionSchedule {
+                modes: vec![AttentionMode::Sliding { window: 3 }; n_layers],
+            },
+        ),
+        (
+            "retrieval2",
+            AttentionSchedule {
+                modes: vec![AttentionMode::Retrieval { top_k: 2 }; n_layers],
+            },
+        ),
+        (
+            "linear",
+            AttentionSchedule {
+                modes: vec![AttentionMode::Linear; n_layers],
+            },
+        ),
+        (
+            "learned",
+            AttentionSchedule {
+                modes: vec![AttentionMode::Learned; n_layers],
+            },
+        ),
+        (
+            "3:1",
+            AttentionSchedule::ratio(n_layers, 3, AttentionMode::Linear, AttentionMode::Dense),
+        ),
     ];
     let mut cache_gap: f64 = 0.0;
     for (_, schedule) in &schedules {
-        for positions in [PositionKind::Learned, PositionKind::Rotary, PositionKind::None] {
-            let model = build(&LmConfig { attention: Some(schedule.clone()), positions, ..tiny.clone() });
+        for positions in [
+            PositionKind::Learned,
+            PositionKind::Rotary,
+            PositionKind::None,
+        ] {
+            let model = build(&LmConfig {
+                attention: Some(schedule.clone()),
+                positions,
+                ..tiny.clone()
+            })?;
             let reference = logits_of(&model, &ids);
-            for chunks in [vec![ids.len()], vec![1; ids.len()], vec![3, 1, ids.len() - 4]] {
+            for chunks in [
+                vec![ids.len()],
+                vec![1; ids.len()],
+                vec![3, 1, ids.len() - 4],
+            ] {
                 let mut cache = model.new_cache();
                 let mut produced: Vec<f32> = Vec::new();
                 let mut at = 0usize;
@@ -1981,18 +2213,35 @@ fn hybrid_certificates() -> Vec<Certificate> {
     //    the table, and what it emits there is what a full recompute over the
     //    whole (longer-than-context) sequence emits.
     let long_model = build(&LmConfig {
-        attention: Some(AttentionSchedule::ratio(n_layers, 1, AttentionMode::Linear, AttentionMode::Sliding { window: 4 })),
+        attention: Some(AttentionSchedule::ratio(
+            n_layers,
+            1,
+            AttentionMode::Linear,
+            AttentionMode::Sliding { window: 4 },
+        )),
         positions: PositionKind::Rotary,
         ..tiny.clone()
-    });
+    })?;
     let prompt: Vec<u16> = vec![crate::tokenizer::Special::Bos.id(), 65, 66];
     let want = tiny.context + 6;
-    let emitted = long_model.generate_cached(&prompt, want, &Sampling::Greedy, &mut StdRng::seed_from_u64(0), &device);
+    let emitted = long_model.generate_cached(
+        &prompt,
+        want,
+        &Sampling::Greedy,
+        &mut StdRng::seed_from_u64(0),
+        &device,
+    );
     // Greedy decoding from random weights may legitimately emit <eos> early;
     // what must not happen is stopping at the table's edge for no reason.
     let stopped_at_eos = emitted.last() == Some(&crate::tokenizer::Special::Eos.id());
-    let past_table = if emitted.len() == prompt.len() + want || stopped_at_eos { 0.0 } else { 1.0 };
-    let long_ids: Vec<i64> = (0..tiny.context as i64 + 5).map(|i| 40 + (i * 7) % 60).collect();
+    let past_table = if emitted.len() == prompt.len() + want || stopped_at_eos {
+        0.0
+    } else {
+        1.0
+    };
+    let long_ids: Vec<i64> = (0..tiny.context as i64 + 5)
+        .map(|i| 40 + (i * 7) % 60)
+        .collect();
     let long_reference = logits_of(&long_model, &long_ids);
     let mut long_cache = long_model.new_cache();
     let mut long_produced: Vec<f32> = Vec::new();
@@ -2000,7 +2249,11 @@ fn hybrid_certificates() -> Vec<Certificate> {
         let out = long_model.forward_cached(as_tensor(chunk), &mut long_cache);
         long_produced.extend(out.logits.into_data().convert::<f32>().iter::<f32>());
     }
-    let ran_past = if long_cache.position() > tiny.context { 0.0 } else { 1.0 };
+    let ran_past = if long_cache.position() > tiny.context {
+        0.0
+    } else {
+        1.0
+    };
     let long_gap = max_rel_diff(&long_produced, &long_reference) + past_table + ran_past;
 
     // 7. The routing state is bounded by its tanh and carries history.
@@ -2009,16 +2262,35 @@ fn hybrid_certificates() -> Vec<Certificate> {
     let r0 = state.step(&hidden, None);
     let bound: f32 = r0.clone().abs().max().into_scalar();
     let history = Tensor::<B, 3>::full([2, 3, 4], 0.9, &device);
-    let moved: f32 = (state.step(&hidden, Some(&history)) - r0).abs().max().into_scalar();
+    let moved: f32 = (state.step(&hidden, Some(&history)) - r0)
+        .abs()
+        .max()
+        .into_scalar();
     let state_residual = f64::from((bound - 1.0).max(0.0)) + if moved > 1e-4 { 0.0 } else { 1.0 };
     // ...and a trunk built without one has exactly the parameters it had.
     let count = |m: &LanguageModel<B>| m.num_params();
-    let without = count(&build(&tiny));
-    let zero = count(&build(&LmConfig { routing_state: 0, ..tiny.clone() }));
-    let with = count(&build(&LmConfig { routing_state: 4, ..tiny.clone() }));
-    let params_residual = if without == zero && with > without { 0.0 } else { 1.0 };
-    let width_residual = if MoEConfig::new(8, 4, 3).with_state_size(0).router_input_size() == MoEConfig::new(8, 4, 3).router_input_size()
-        && MoEConfig::new(8, 4, 3).with_state_size(5).router_input_size() == MoEConfig::new(8, 4, 3).router_input_size() + 5
+    let without = count(&build(&tiny)?);
+    let zero = count(&build(&LmConfig {
+        routing_state: 0,
+        ..tiny.clone()
+    })?);
+    let with = count(&build(&LmConfig {
+        routing_state: 4,
+        ..tiny.clone()
+    })?);
+    let params_residual = if without == zero && with > without {
+        0.0
+    } else {
+        1.0
+    };
+    let width_residual = if MoEConfig::new(8, 4, 3)
+        .with_state_size(0)
+        .router_input_size()
+        == MoEConfig::new(8, 4, 3).router_input_size()
+        && MoEConfig::new(8, 4, 3)
+            .with_state_size(5)
+            .router_input_size()
+            == MoEConfig::new(8, 4, 3).router_input_size() + 5
     {
         0.0
     } else {
@@ -2032,10 +2304,192 @@ fn hybrid_certificates() -> Vec<Certificate> {
     let across = token_stability(&ids_of(&[0, 0, 1, 1]), 2, 2);
     let agreement = layer_agreement(&[0, 1, 2], &[0, 1, 0], 3, 3).unwrap_or(f32::NAN);
     let incomparable = layer_agreement(&[0, 1], &[0, 1], 2, 3).is_none();
-    let locality_residual = f64::from(alternating.abs() + (constant - 1.0).abs() + (across - 1.0).abs() + (agreement - 2.0 / 3.0).abs())
-        + if incomparable { 0.0 } else { 1.0 };
+    let locality_residual = f64::from(
+        alternating.abs()
+            + (constant - 1.0).abs()
+            + (across - 1.0).abs()
+            + (agreement - 2.0 / 3.0).abs(),
+    ) + if incomparable { 0.0 } else { 1.0 };
 
-    vec![
+    // 9. Qwen-style trunk knobs: identity at their defaults, invariants on.
+    use crate::hybrid::{apply_rotary_partial, rotary_dim_for};
+    use crate::vit::{NormKind, TrunkNorm};
+    let to_vec4 = |t: Tensor<B, 4>| {
+        t.into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect::<Vec<f32>>()
+    };
+    // 9a. Partial rotary at fraction 1.0 is the full rotation (it delegates),
+    //     and below 1.0 the suffix passes through untouched while the prefix
+    //     still scores by distance only.
+    let px = Tensor::<B, 4>::random([1, 2, 5, 8], Distribution::Uniform(-1.0, 1.0), &device);
+    let full = apply_rotary(px.clone(), 13, ROTARY_BASE);
+    let partial_full = apply_rotary_partial(px.clone(), 13, ROTARY_BASE, 8);
+    let partial_identity_gap = max_abs_diff(&to_vec4(full), &to_vec4(partial_full));
+    let half = apply_rotary_partial(px.clone(), 13, ROTARY_BASE, 4);
+    let half_v = to_vec4(half);
+    let px_v = to_vec4(px.clone());
+    let mut suffix_gap = 0.0f64;
+    for r in 0..half_v.len() / 8 {
+        for c in 4..8 {
+            suffix_gap = suffix_gap.max(f64::from((half_v[r * 8 + c] - px_v[r * 8 + c]).abs()));
+        }
+    }
+    let rq2 = Tensor::<B, 4>::random([1, 1, 1, 8], Distribution::Uniform(-1.0, 1.0), &device);
+    let rk2 = Tensor::<B, 4>::random([1, 1, 1, 8], Distribution::Uniform(-1.0, 1.0), &device);
+    let pscore = |qo: usize, ko: usize| -> f64 {
+        let a = apply_rotary_partial(rq2.clone(), qo, ROTARY_BASE, 4);
+        let b = apply_rotary_partial(rk2.clone(), ko, ROTARY_BASE, 4);
+        let s: f32 = (a * b).sum().into_scalar();
+        f64::from(s)
+    };
+    let pbase = pscore(9, 4);
+    let partial_rotary_gap = [1usize, 7, 30]
+        .iter()
+        .map(|s| (pscore(9 + s, 4 + s) - pbase).abs())
+        .fold(0.0, f64::max);
+    let cover_ok = if rotary_dim_for(1.0, 8) == 8 && rotary_dim_for(0.25, 8) == 2 {
+        0.0
+    } else {
+        1.0
+    };
+    let partial_gap = partial_identity_gap + suffix_gap + partial_rotary_gap + cover_ok;
+    // 9b. GQA with as many KV heads as query heads is full MHA, bit for bit;
+    //     one KV head keeps strictly less decode state than the full trunk.
+    let queries = tiny.num_heads;
+    let gqa_same = same_weights(&LmConfig {
+        num_kv_heads: Some(queries),
+        ..tiny.clone()
+    })?;
+    let gqa_gap = max_abs_diff(&reference, &logits_of(&gqa_same, &ids));
+    let full_cache_model = build(&tiny)?;
+    let gqa_cache_model = build(&LmConfig {
+        num_kv_heads: Some(1),
+        ..tiny.clone()
+    })?;
+    let mut full_cache = full_cache_model.new_cache();
+    let mut gqa_cache = gqa_cache_model.new_cache();
+    full_cache_model.forward_cached(as_tensor(&ids[0..4]), &mut full_cache);
+    gqa_cache_model.forward_cached(as_tensor(&ids[0..4]), &mut gqa_cache);
+    let gqa_cache_gap = if gqa_cache.resident_floats() < full_cache.resident_floats() {
+        0.0
+    } else {
+        1.0
+    };
+    // 9c. The gated-attention reference carries the zero-initialized gate in
+    //     its record; the plain model drops it, so the gap is the gate's
+    //     at-init effect alone: exactly 1.0 up to tanh's rounding.
+    let gated_ref = build(&LmConfig {
+        gated_attention: true,
+        ..tiny.clone()
+    })?;
+    let gated_logits = logits_of(&gated_ref, &ids);
+    let plain_from_gated =
+        LanguageModel::<B>::new(&tiny, &device)?.load_record(gated_ref.clone().into_record());
+    let gate_gap = max_abs_diff(&gated_logits, &logits_of(&plain_from_gated, &ids));
+    // 9c2. QK-Norm: a normalized trunk decodes from its state exactly as it
+    //      recomputes, and normalizing moves the output (the path is live).
+    //      Like the gate cert the reference is built directly: loading the
+    //      plain record into a normalized model would null the norms.
+    let qk_ref = build(&LmConfig {
+        qk_norm: true,
+        ..tiny.clone()
+    })?;
+    let qk_reference = logits_of(&qk_ref, &ids);
+    // Whole-prefix then token-by-token cached decodes must both reproduce
+    // the full recompute, exactly as the existing cache certificate demands.
+    let mut qk_cache_gap = 0.0f64;
+    for chunk in [vec![ids.len()], vec![1; ids.len()]] {
+        let mut cache = qk_ref.new_cache();
+        let mut produced: Vec<f32> = Vec::new();
+        let mut at = 0usize;
+        for size in chunk {
+            let out = qk_ref.forward_cached(as_tensor(&ids[at..at + size]), &mut cache);
+            produced.extend(out.logits.into_data().convert::<f32>().iter::<f32>());
+            at += size;
+        }
+        qk_cache_gap = qk_cache_gap.max(max_rel_diff(&produced, &qk_reference));
+    }
+    let plain_from_qk =
+        LanguageModel::<B>::new(&tiny, &device)?.load_record(qk_ref.clone().into_record());
+    let qk_moves = max_abs_diff(&qk_reference, &logits_of(&plain_from_qk, &ids));
+    let qk_gap = qk_cache_gap + if qk_moves > 1e-6 { 0.0 } else { 1.0 };
+    // 9c3. Every causal mode reads the past: perturbing the first token
+    //      moves a later logit under every schedule. A mask that excluded
+    //      everything would still be "causal" and still decode exactly, so
+    //      the cache certificates cannot see it; only a past-dependence
+    //      check can (Anthropic circuits lesson: recurrent/linear variants
+    //      must preserve the previous-token path or in-context reasoning
+    //      fails). Residual = shortfall below the minimum visible movement.
+    let perturbed: Vec<i64> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, v)| if i == 0 { (v + 1) % 259 } else { *v })
+        .collect();
+    let mut past_gap = 0.0f64;
+    for (_, schedule) in &schedules {
+        let model = build(&LmConfig {
+            attention: Some(schedule.clone()),
+            ..tiny.clone()
+        })?;
+        let before = logits_of(&model, &ids);
+        let after = logits_of(&model, &perturbed);
+        let v = tiny.vocab_size;
+        let mut moved = 0.0f64;
+        for p in 1..ids.len() {
+            for c in 0..v {
+                moved = moved.max(f64::from((after[p * v + c] - before[p * v + c]).abs()));
+            }
+        }
+        past_gap = past_gap.max((1e-6 - moved).max(0.0));
+    }
+    // 9d. A fresh RMSNorm (weight exactly one) gives unit-RMS rows.
+    let rms = TrunkNorm::<B>::new(NormKind::Rms, 12, 1e-12, &device);
+    let rx = Tensor::<B, 3>::random([2, 5, 12], Distribution::Normal(0.0, 3.0), &device);
+    let rout: Vec<f32> = rms
+        .forward(rx)
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect();
+    let mut rms_gap = 0.0f64;
+    for row in rout.chunks_exact(12) {
+        let ms = row
+            .iter()
+            .map(|v| f64::from(*v) * f64::from(*v))
+            .sum::<f64>()
+            / 12.0;
+        rms_gap = rms_gap.max((ms.sqrt() - 1.0).abs());
+    }
+    // 9e. MTP heads at weight zero are the plain loss, bit for bit; a live
+    //     MTP term stays finite.
+    let mtp_ref = build(&LmConfig {
+        mtp_steps: 2,
+        mtp_weight: 0.0,
+        ..tiny.clone()
+    })?;
+    let plain_from_mtp =
+        LanguageModel::<B>::new(&tiny, &device)?.load_record(mtp_ref.clone().into_record());
+    let toks = as_tensor(&ids);
+    let (plain_loss, _) = plain_from_mtp.next_token_loss(toks.clone(), 0..n_layers);
+    let (mtp_loss, _) = mtp_ref.next_token_loss(toks.clone(), 0..n_layers);
+    let mtp_gap =
+        f64::from((plain_loss.mean().into_scalar() - mtp_loss.mean().into_scalar()).abs());
+    let mtp_live = build(&LmConfig {
+        mtp_steps: 2,
+        mtp_weight: 0.5,
+        ..tiny.clone()
+    })?;
+    let (live_loss, live_metrics) = mtp_live.next_token_loss(toks, 0..n_layers);
+    let live_value: f32 = live_loss.mean().into_scalar();
+    let mtp_finite_gap = if live_value.is_finite() && live_metrics.mtp_loss.is_finite() {
+        0.0
+    } else {
+        1.0
+    };
+
+    Ok(vec![
         cert(
             "hybrid",
             "dense_schedule_is_the_phase19_trunk",
@@ -2099,13 +2553,1717 @@ fn hybrid_certificates() -> Vec<Certificate> {
             locality_residual,
             1e-6,
         ),
+        cert(
+            "hybrid",
+            "partial_rotary_is_full_at_fraction_one_and_leaves_the_suffix",
+            "Partial rotary at fraction 1.0 delegates to the full rotation bit for bit; below 1.0 the uncovered suffix passes through untouched while the rotated prefix still scores by distance only.",
+            partial_gap,
+            1e-4,
+        ),
+        cert(
+            "hybrid",
+            "gqa_with_full_heads_is_dense_and_narrow_kv_shrinks_state",
+            "Grouped-query attention with as many KV heads as query heads is full multi-head attention bit for bit, and one KV head keeps strictly fewer decode-state floats than the full trunk after the same prefix.",
+            gqa_gap + gqa_cache_gap,
+            0.0,
+        ),
+        cert(
+            "hybrid",
+            "gated_attention_is_identity_at_init",
+            "A zero-initialized output gate scales the merged heads by 1 + tanh(0) = 1, so a gated trunk at init matches the ungated trunk on the shared weights up to tanh's rounding.",
+            gate_gap,
+            1e-6,
+        ),
+        cert(
+            "hybrid",
+            "causal_modes_read_the_past",
+            "Perturbing the first token moves a later logit under every attention schedule: no causal mode is deaf to its own past.",
+            past_gap,
+            0.0,
+        ),
+        cert(
+            "hybrid",
+            "qk_norm_decodes_from_state_exactly_and_moves_output",
+            "A QK-normalized trunk decodes from its per-mode state exactly as it recomputes, and normalizing moves the output versus the shared weights without it.",
+            qk_gap,
+            1e-4,
+        ),
+        cert(
+            "hybrid",
+            "rmsnorm_starts_at_unit_rms",
+            "A fresh RMSNorm carries weight exactly one, so every output row has root-mean-square one up to float rounding.",
+            rms_gap,
+            1e-5,
+        ),
+        cert(
+            "hybrid",
+            "mtp_weight_zero_is_the_plain_loss",
+            "MTP heads at weight zero add nothing, so the loss matches the plain next-token loss bit for bit on the shared weights; a live MTP term stays finite.",
+            mtp_gap + mtp_finite_gap,
+            0.0,
+        ),
+    ])
+}
+
+// --------------------------------------------------------------- deltanet --
+
+fn deltanet_certificates() -> Vec<Certificate> {
+    use crate::deltanet::{
+        causal_depthwise_conv, gated_delta_recurrent, gated_delta_recurrent_batched,
+        gated_delta_step, gated_delta_step_tensor, l2norm_last_dim,
+    };
+    use burn::tensor::Distribution;
+
+    let device: <B as burn::tensor::backend::BackendTypes>::Device = Default::default();
+    let flat =
+        |t: Tensor<B, 2>| -> Vec<f32> { t.into_data().convert::<f32>().iter::<f32>().collect() };
+    let gap = |a: &[f32], b: &[f32]| -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| f64::from((x - y).abs()))
+            .fold(0.0, f64::max)
+    };
+
+    // 1. alpha = 1 is the pure delta rule, against the direct Householder form.
+    let dk = 4;
+    let dv = 3;
+    let state = Tensor::<B, 2>::random([dv, dk], Distribution::Uniform(-1.0, 1.0), &device);
+    let q = Tensor::<B, 1>::random([dk], Distribution::Uniform(-1.0, 1.0), &device);
+    let k = Tensor::<B, 1>::random([dk], Distribution::Uniform(-1.0, 1.0), &device);
+    let v = Tensor::<B, 1>::random([dv], Distribution::Uniform(-1.0, 1.0), &device);
+    let beta = 0.4f32;
+    let (next, out) = gated_delta_step(state.clone(), q.clone(), k.clone(), v.clone(), 1.0, beta);
+    let k_col = k.clone().unsqueeze_dim::<2>(1).transpose();
+    let sk = state.clone().matmul(k.clone().unsqueeze_dim::<2>(1));
+    let want_next = state
+        .clone()
+        .sub(sk.matmul(k_col.clone()).mul_scalar(beta))
+        .add(
+            v.clone()
+                .unsqueeze_dim::<2>(1)
+                .matmul(k_col)
+                .mul_scalar(beta),
+        );
+    let want_out = want_next
+        .clone()
+        .matmul(q.clone().unsqueeze_dim::<2>(1))
+        .squeeze::<1>();
+    let alpha_gap = gap(&flat(next), &flat(want_next)).max(gap(
+        &flat(out.clone().unsqueeze_dim::<2>(0)),
+        &flat(want_out.unsqueeze_dim::<2>(0)),
+    ));
+
+    // 2. beta = 0 is pure decay, exactly.
+    let (decayed, _) = gated_delta_step(state.clone(), q.clone(), k.clone(), v.clone(), 0.6, 0.0);
+    let decay_gap = gap(&flat(decayed), &flat(state.clone().mul_scalar(0.6)));
+
+    // 3. From a zero state the first output is closed-form: o_1 = b v (k.q).
+    let qr = Tensor::<B, 3>::random([1, 3, dk], Distribution::Uniform(-1.0, 1.0), &device);
+    let kr = Tensor::<B, 3>::random([1, 3, dk], Distribution::Uniform(-1.0, 1.0), &device);
+    let vr = Tensor::<B, 3>::random([1, 3, dv], Distribution::Uniform(-1.0, 1.0), &device);
+    let (ro, _) = gated_delta_recurrent(
+        qr.clone(),
+        kr.clone(),
+        vr.clone(),
+        &[0.8, 0.3, 0.5],
+        &[0.6, 0.9, 0.2],
+        &device,
+    );
+    let q1: Vec<f32> = qr
+        .narrow(1, 0, 1)
+        .reshape([dk])
+        .into_data()
+        .convert::<f32>()
+        .iter()
+        .collect();
+    let k1: Vec<f32> = kr
+        .narrow(1, 0, 1)
+        .reshape([dk])
+        .into_data()
+        .convert::<f32>()
+        .iter()
+        .collect();
+    let v1: Vec<f32> = vr
+        .narrow(1, 0, 1)
+        .reshape([dv])
+        .into_data()
+        .convert::<f32>()
+        .iter()
+        .collect();
+    let dot: f32 = q1.iter().zip(&k1).map(|(a, b)| a * b).sum();
+    let want1: Vec<f32> = v1.iter().map(|x| 0.6 * x * dot).collect();
+    let got1: Vec<f32> = ro
+        .narrow(1, 0, 1)
+        .reshape([dv])
+        .into_data()
+        .convert::<f32>()
+        .iter()
+        .collect();
+    let first_gap = gap(&got1, &want1);
+
+    // 4. L2 rows are unit-norm.
+    let x = Tensor::<B, 3>::random([2, 4, 8], Distribution::Normal(0.0, 2.0), &device);
+    let y: Vec<f32> = l2norm_last_dim(x)
+        .into_data()
+        .convert::<f32>()
+        .iter()
+        .collect();
+    let mut norm_gap = 0.0f64;
+    for row in y.chunks_exact(8) {
+        let n: f64 = row.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+        norm_gap = norm_gap.max((n.sqrt() - 1.0).abs());
+    }
+
+    // 5. The short convolution is causal: changing only the last input
+    // leaves every earlier output bit-identical.
+    let xn: Vec<f32> = Tensor::<B, 3>::random([1, 7, 2], Distribution::Uniform(-1.0, 1.0), &device)
+        .into_data()
+        .convert::<f32>()
+        .iter()
+        .collect();
+    let mut yn = xn.clone();
+    yn[12] += 1.0;
+    yn[13] += 1.0;
+    let w: Vec<f32> = Tensor::<B, 2>::random([2, 4], Distribution::Uniform(-1.0, 1.0), &device)
+        .into_data()
+        .convert::<f32>()
+        .iter()
+        .collect();
+    let seq = |vals: &[f32]| Tensor::<B, 1>::from_floats(vals, &device).reshape([1, 7, 2]);
+    let taps = |vals: &[f32]| Tensor::<B, 1>::from_floats(vals, &device).reshape([2, 4]);
+    let o1: Vec<f32> = causal_depthwise_conv(seq(&xn), taps(&w))
+        .into_data()
+        .convert::<f32>()
+        .iter()
+        .collect();
+    let o2: Vec<f32> = causal_depthwise_conv(seq(&yn), taps(&w))
+        .into_data()
+        .convert::<f32>()
+        .iter()
+        .collect();
+    // First six positions (12 floats) must agree exactly; the last may differ.
+    let causal_gap = gap(&o1[..12], &o2[..12]);
+
+    // 6. The tensor-alpha step (gradients flow through alpha/beta) is the
+    // scalar step bit for bit: same operation order, broadcast [1]
+    // multiplies standing in for mul_scalar.
+    let alpha_host = 0.7f32;
+    let beta_host = 0.4f32;
+    let (next_t, out_t) = gated_delta_step_tensor(
+        state.clone(),
+        q.clone(),
+        k.clone(),
+        v.clone(),
+        Tensor::<B, 1>::from_floats([alpha_host], &device),
+        Tensor::<B, 1>::from_floats([beta_host], &device),
+    );
+    let (next_s, out_s) = gated_delta_step(
+        state.clone(),
+        q.clone(),
+        k.clone(),
+        v.clone(),
+        alpha_host,
+        beta_host,
+    );
+    let tensor_step_gap = gap(&flat(next_t), &flat(next_s)).max(gap(
+        &flat(out_t.unsqueeze_dim::<2>(0)),
+        &flat(out_s.unsqueeze_dim::<2>(0)),
+    ));
+
+    // 7. The batched tensor-alpha rollout (one (k, v) pair per row) matches
+    // the scalar rollout per row, bit for bit.
+    let rows = 2;
+    let tn = 3;
+    let q2 = Tensor::<B, 3>::random([rows, tn, dk], Distribution::Uniform(-1.0, 1.0), &device);
+    let k2 = Tensor::<B, 3>::random([rows, tn, dk], Distribution::Uniform(-1.0, 1.0), &device);
+    let v2 = Tensor::<B, 3>::random([rows, tn, dv], Distribution::Uniform(-1.0, 1.0), &device);
+    let a2 = Tensor::<B, 2>::from_floats([[0.8, 0.3, 0.5], [0.9, 0.2, 0.7]], &device);
+    let b2 = Tensor::<B, 2>::from_floats([[0.6, 0.9, 0.2], [0.4, 0.8, 0.1]], &device);
+    let (bo, bf) =
+        gated_delta_recurrent_batched(q2.clone(), k2.clone(), v2.clone(), a2, b2, &device);
+    let (so0, sf0) = gated_delta_recurrent(
+        q2.clone().narrow(0, 0, 1),
+        k2.clone().narrow(0, 0, 1),
+        v2.clone().narrow(0, 0, 1),
+        &[0.8, 0.3, 0.5],
+        &[0.6, 0.9, 0.2],
+        &device,
+    );
+    let (so1, sf1) = gated_delta_recurrent(
+        q2.narrow(0, 1, 1),
+        k2.narrow(0, 1, 1),
+        v2.narrow(0, 1, 1),
+        &[0.9, 0.2, 0.7],
+        &[0.4, 0.8, 0.1],
+        &device,
+    );
+    let want_o = Tensor::cat(vec![so0, so1], 0);
+    let want_f = Tensor::cat(vec![sf0, sf1], 0);
+    let batched_gap = gap(
+        &flat(bo.reshape([rows * tn, dv])),
+        &flat(want_o.reshape([rows * tn, dv])),
+    )
+    .max(gap(
+        &flat(bf.reshape([rows * dv, dk])),
+        &flat(want_f.reshape([rows * dv, dk])),
+    ));
+
+    vec![
+        cert(
+            "deltanet",
+            "alpha_one_is_pure_delta",
+            "With alpha = 1 the gated step is exactly the delta-rule Householder update S(I - b k k^T) + b v k^T, outputs included.",
+            alpha_gap,
+            1e-5,
+        ),
+        cert(
+            "deltanet",
+            "beta_zero_is_pure_decay",
+            "With beta = 0 the gated step is exactly alpha times the incoming state, whatever the vectors.",
+            decay_gap,
+            0.0,
+        ),
+        cert(
+            "deltanet",
+            "zero_state_first_output_closed_form",
+            "From a zero state the first output is exactly b v (k.q): the full step, state update and readout, in closed form.",
+            first_gap,
+            1e-5,
+        ),
+        cert(
+            "deltanet",
+            "l2norm_rows_are_unit",
+            "Query/key normalization leaves every row at unit L2 norm, so attention scores stay bounded.",
+            norm_gap,
+            1e-5,
+        ),
+        cert(
+            "deltanet",
+            "short_conv_is_causal",
+            "Changing only the last input leaves every earlier convolution output bit-identical: the future cannot leak backwards.",
+            causal_gap,
+            0.0,
+        ),
+        cert(
+            "deltanet",
+            "tensor_step_matches_scalar_step",
+            "The tensor-alpha gated step (alpha/beta as [1] tensors, so gradients flow through them) is the scalar step bit for bit: identical operation order with broadcast [1] multiplies in place of mul_scalar.",
+            tensor_step_gap,
+            0.0,
+        ),
+        cert(
+            "deltanet",
+            "batched_recurrent_matches_scalar_recurrent",
+            "The batched tensor-alpha recurrent rollout, one (k, v) pair per row, reproduces the scalar recurrent rollout per row bit for bit, outputs and final states.",
+            batched_gap,
+            0.0,
+        ),
     ]
+}
+
+// --------------------------------------------------------------- qwennet --
+
+/// Small Qwen architecture exercising both layer kinds (layer 3 of 5 is
+/// full attention); the same shape as the qwennet unit tests.
+fn qwennet_tiny_dims() -> crate::qwen::QwenArchDims {
+    crate::qwen::QwenArchDims {
+        num_layers: 5,
+        hidden_size: 64,
+        intermediate_size: 96,
+        vocab_size: 128,
+        num_q_heads: 4,
+        num_kv_heads: 2,
+        head_dim: 16,
+        linear_k_groups: 2,
+        linear_v_heads: 4,
+        linear_head_dim: 16,
+        conv_kernel: 4,
+        full_attention_interval: 4,
+        attn_output_gate: true,
+    }
+}
+
+fn qwennet_checks() -> anyhow::Result<Vec<Certificate>> {
+    use crate::qwennet::{QwenFullAttention, QwenRmsNorm, QwenTrunk, QwenTrunkConfig};
+    use burn::tensor::Int;
+
+    let device: <B as burn::tensor::backend::BackendTypes>::Device = Default::default();
+    let flat2 =
+        |t: Tensor<B, 2>| -> Vec<f32> { t.into_data().convert::<f32>().iter::<f32>().collect() };
+    let flat3 =
+        |t: Tensor<B, 3>| -> Vec<f32> { t.into_data().convert::<f32>().iter::<f32>().collect() };
+    let gap = |a: &[f32], b: &[f32]| -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| f64::from((x - y).abs()))
+            .fold(0.0, f64::max)
+    };
+
+    let dims = qwennet_tiny_dims();
+    let n = 6;
+
+    // 1. Full-attention KV-cache decode reproduces prefill at every position.
+    let attn = QwenFullAttention::<B>::new(&dims, 10_000_000.0, 1e-6, &device);
+    crate::tensor_ext::force_initialization(&attn);
+    let x = Tensor::<B, 3>::random(
+        [1, n, dims.hidden_size],
+        Distribution::Normal(0.0, 0.02),
+        &device,
+    );
+    let prefill = attn.forward(x.clone());
+    let mut state = crate::hybrid::LayerState::<B>::new();
+    let mut attn_gap = 0.0f64;
+    for t in 0..n {
+        let xt = x.clone().narrow(1, t, 1).reshape([1, dims.hidden_size]);
+        let out = attn.step(xt, &mut state);
+        attn_gap = attn_gap.max(gap(&flat2(out), &flat3(prefill.clone().narrow(1, t, 1))));
+    }
+
+    // 2. A mixed linear+full trunk decodes to its prefill logits.
+    let config = QwenTrunkConfig {
+        dims,
+        num_layers: None,
+        rope_base: 10_000_000.0,
+        eps: 1e-6,
+    };
+    let trunk = QwenTrunk::<B>::new(config, &device);
+    crate::tensor_ext::force_initialization(&trunk);
+    let tokens = Tensor::<B, 2, Int>::from_ints([[3, 1, 4, 1, 5, 9]], &device);
+    let logits = trunk.forward(tokens.clone());
+    let mut tstate = trunk.new_state(1, &device);
+    let mut trunk_gap = 0.0f64;
+    for t in 0..n {
+        let out = trunk.step(tokens.clone().narrow(1, t, 1), &mut tstate)?;
+        trunk_gap = trunk_gap.max(gap(&flat2(out), &flat3(logits.clone().narrow(1, t, 1))));
+    }
+
+    // 3. The zero-centered RMSNorm at zero weight is the identity on
+    // unit-RMS rows.
+    let norm = QwenRmsNorm::<B>::new(8, 1e-6, &device);
+    let unit =
+        Tensor::<B, 3>::from_floats([[[1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0]]], &device);
+    let norm_gap = gap(&flat3(norm.forward(unit.clone())), &flat3(unit));
+
+    Ok(vec![
+        cert(
+            "qwennet",
+            "full_attention_decodes_from_kv_cache_exactly",
+            "Token-by-token decode against the KV cache reproduces the prefill forward at every position bit for bit: identical projections, per-head QK norms, rotary angles at the absolute offset, masked softmax row and sigmoid output gate.",
+            attn_gap,
+            0.0,
+        ),
+        cert(
+            "qwennet",
+            "mixed_trunk_step_matches_prefill",
+            "A mixed linear-attention + full-attention trunk decodes token by token to exactly its prefill logits: every per-layer decode state is the prefill computation replayed one position at a time.",
+            trunk_gap,
+            0.0,
+        ),
+        cert(
+            "qwennet",
+            "zero_centered_norm_is_identity_at_zero_weight",
+            "QwenRmsNorm at its zeros-init weight applies only the RMS rescaling (the (1 + w) factor is exactly one), so unit-RMS rows pass through unchanged.",
+            norm_gap,
+            1e-6,
+        ),
+    ])
+}
+
+// ------------------------------------------------------------------- geom --
+
+/// Geometrical certificates. One `anyhow::Result`: a check that cannot be set
+/// up is a failing certificate, not a panic and not a silent pass.
+fn geom_checks() -> anyhow::Result<Vec<Certificate>> {
+    use crate::geometry::{
+        energy_grad_step, energy_value, geodesic_attention, lipschitz_step, GeomConfig,
+        GeometricReasoner, MetricField,
+    };
+    use crate::geomkernel::{
+        self, constraint_holds, construct, falsify, graph_from_points, saturate_rules, Segment, Q,
+    };
+    use burn::module::Param;
+    use burn::tensor::Distribution;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    let device: <B as burn::tensor::backend::BackendTypes>::Device = Default::default();
+    let mut out = Vec::new();
+
+    // -- kernel: exact rationals ------------------------------------------------
+    // 1/3 + 1/6 must be exactly 1/2 -- the identity a float kernel fails
+    let third = Q::new(1, 3)?;
+    let sixth = Q::new(1, 6)?;
+    let half = third.add(&sixth)?;
+    // Exactness is the *rational* check: the fraction must be literally 1/2
+    // (`num`/`den` untouched), and the float view of it must agree.
+    let rational_err = (half.to_f64() - 0.5).abs()
+        + (half.num - 1).unsigned_abs() as f64
+        + (half.den - 2).unsigned_abs() as f64;
+    out.push(cert(
+        "geom",
+        "kernel_rationals_are_exact_where_floats_are_not",
+        "1/3 + 1/6 equals exactly 1/2 in the kernel's rational arithmetic (in f32 the same expression is not 0.5).",
+        rational_err,
+        0.0,
+    ));
+
+    // -- kernel: exact intersection ---------------------------------------------
+    let points = vec![
+        crate::geomkernel::KPoint {
+            name: "A".into(),
+            x: crate::geomkernel::Frac { num: 0, den: 1 },
+            y: crate::geomkernel::Frac { num: 1, den: 3 },
+        },
+        crate::geomkernel::KPoint {
+            name: "B".into(),
+            x: crate::geomkernel::Frac { num: 1, den: 1 },
+            y: crate::geomkernel::Frac { num: 4, den: 3 },
+        },
+        crate::geomkernel::KPoint {
+            name: "C".into(),
+            x: crate::geomkernel::Frac { num: 2, den: 3 },
+            y: crate::geomkernel::Frac { num: 0, den: 1 },
+        },
+        crate::geomkernel::KPoint {
+            name: "D".into(),
+            x: crate::geomkernel::Frac { num: 2, den: 3 },
+            y: crate::geomkernel::Frac { num: 1, den: 1 },
+        },
+    ];
+    let graph = graph_from_points(points, vec![]);
+    let hit = construct(
+        &graph,
+        &geomkernel::Construction::Intersection {
+            first: Segment {
+                from: "A".into(),
+                to: "B".into(),
+            },
+            second: Segment {
+                from: "C".into(),
+                to: "D".into(),
+            },
+        },
+        "E",
+    )?;
+    let intersect_err = f64::from(
+        ((hit.x.num - 2).abs()
+            + (hit.x.den - 3).abs()
+            + (hit.y.num - 1).abs()
+            + (hit.y.den - 1).abs()) as f32,
+    );
+    out.push(cert(
+        "geom",
+        "kernel_intersection_is_exact",
+        "y = x + 1/3 meets x = 2/3 at exactly (2/3, 1): the coordinates come back as those exact fractions.",
+        intersect_err,
+        0.0,
+    ));
+
+    // -- kernel: non-degeneracy refusals ----------------------------------------
+    let points = vec![
+        crate::geomkernel::KPoint {
+            name: "A".into(),
+            x: crate::geomkernel::Frac::from_int(0),
+            y: crate::geomkernel::Frac::from_int(0),
+        },
+        crate::geomkernel::KPoint {
+            name: "B".into(),
+            x: crate::geomkernel::Frac::from_int(1),
+            y: crate::geomkernel::Frac::from_int(1),
+        },
+        crate::geomkernel::KPoint {
+            name: "C".into(),
+            x: crate::geomkernel::Frac::from_int(0),
+            y: crate::geomkernel::Frac::from_int(1),
+        },
+        crate::geomkernel::KPoint {
+            name: "D".into(),
+            x: crate::geomkernel::Frac::from_int(1),
+            y: crate::geomkernel::Frac::from_int(2),
+        },
+    ];
+    let graph = graph_from_points(points, vec![]);
+    let refused_parallel = construct(
+        &graph,
+        &geomkernel::Construction::Intersection {
+            first: Segment {
+                from: "A".into(),
+                to: "B".into(),
+            },
+            second: Segment {
+                from: "C".into(),
+                to: "D".into(),
+            },
+        },
+        "F",
+    )
+    .is_err();
+    let refused_coincident = construct(
+        &graph,
+        &geomkernel::Construction::Intersection {
+            first: Segment {
+                from: "A".into(),
+                to: "B".into(),
+            },
+            second: Segment {
+                from: "A".into(),
+                to: "B".into(),
+            },
+        },
+        "F",
+    )
+    .is_err();
+    out.push(cert(
+        "geom",
+        "kernel_refuses_degenerate_configurations",
+        "Parallel lines and coincident lines refuse to intersect: the kernel returns an error instead of a silent configuration.",
+        f64::from(!refused_parallel) + f64::from(!refused_coincident),
+        0.0,
+    ));
+
+    // -- kernel: rules fire with certificates and saturate ----------------------
+    let points = vec![
+        crate::geomkernel::KPoint {
+            name: "B".into(),
+            x: crate::geomkernel::Frac::from_int(0),
+            y: crate::geomkernel::Frac::from_int(0),
+        },
+        crate::geomkernel::KPoint {
+            name: "C".into(),
+            x: crate::geomkernel::Frac::from_int(4),
+            y: crate::geomkernel::Frac::from_int(2),
+        },
+        crate::geomkernel::KPoint {
+            name: "D".into(),
+            x: crate::geomkernel::Frac::from_int(2),
+            y: crate::geomkernel::Frac::from_int(1),
+        },
+    ];
+    let mut graph = graph_from_points(
+        points,
+        vec![geomkernel::Constraint::MidpointOf {
+            p: "D".into(),
+            a: "B".into(),
+            b: "C".into(),
+        }],
+    );
+    let added = saturate_rules(&mut graph, 8)?;
+    let derived = graph
+        .facts
+        .iter()
+        .filter(|f| matches!(f.provenance, crate::geomkernel::Provenance::Derived { .. }))
+        .count();
+    let second = saturate_rules(&mut graph, 8)?;
+    out.push(cert(
+        "geom",
+        "kernel_rules_derive_with_certificates_and_saturate",
+        "A midpoint given derives exactly the collinearity and length facts, each naming its rule, and saturation is a fixed point.",
+        f64::from((added != 2) as u8) + f64::from((derived != 2) as u8) + f64::from((second != 0) as u8),
+        0.0,
+    ));
+
+    // -- kernel: falsification ----------------------------------------------------
+    let claim = geomkernel::Constraint::EqualLength {
+        first: Segment {
+            from: "A".into(),
+            to: "B".into(),
+        },
+        second: Segment {
+            from: "A".into(),
+            to: "C".into(),
+        },
+    };
+    let mut rng = StdRng::seed_from_u64(4);
+    let rejected = matches!(
+        falsify(&mut rng, &[], &claim, 256, 6)?,
+        geomkernel::Verdict::Counterexample { .. }
+    );
+    // and a theorem survives every draw
+    let premises = vec![geomkernel::Constraint::MidpointOf {
+        p: "A".into(),
+        a: "B".into(),
+        b: "C".into(),
+    }];
+    let theorem = geomkernel::Constraint::Collinear {
+        a: "B".into(),
+        b: "A".into(),
+        c: "C".into(),
+    };
+    let survived = match falsify(&mut rng, &premises, &theorem, 128, 6)? {
+        geomkernel::Verdict::Unrefuted { satisfying, .. } => satisfying > 0,
+        _ => false,
+    };
+    out.push(cert(
+        "geom",
+        "kernel_falsification_rejects_and_survives_correctly",
+        "Randomized falsification finds a counterexample to an unconstrained length claim, while the midpoint theorem survives every premise-satisfying draw.",
+        f64::from(!rejected) + f64::from(!survived),
+        0.0,
+    ));
+
+    // -- model: the metric is PSD by construction ---------------------------------
+    let mut metric = MetricField::<B>::new(4, &device);
+    metric.lower = Param::from_tensor(Tensor::<B, 2>::random(
+        [4, 4],
+        Distribution::Normal(0.0, 1.0),
+        &device,
+    ));
+    metric.log_diag = Param::from_tensor(Tensor::<B, 1>::random(
+        [4],
+        Distribution::Normal(0.0, 1.0),
+        &device,
+    ));
+    let g = metric.metric();
+    let mut psd_err = 0.0f32;
+    for _ in 0..128 {
+        let v = Tensor::<B, 1>::random([4], Distribution::Normal(0.0, 1.0), &device);
+        let q = v
+            .clone()
+            .reshape([1, 4])
+            .matmul(g.clone())
+            .reshape([4])
+            .mul(v)
+            .sum()
+            .into_scalar();
+        psd_err = psd_err.max(-q);
+    }
+    out.push(cert(
+        "geom",
+        "metric_is_positive_definite_by_construction",
+        "G = L L^T with an exp-diagonal L has no negative quadratic form, for any parameter values the optimizer can reach.",
+        f64::from(psd_err),
+        1e-5,
+    ));
+
+    // -- model: geodesic attention rows are distributions -------------------------
+    let query = Tensor::<B, 3>::random([2, 5, 4], Distribution::Normal(0.0, 1.0), &device);
+    let keys = Tensor::<B, 3>::random([2, 7, 4], Distribution::Normal(0.0, 1.0), &device);
+    let weights = geodesic_attention(&g, query, keys, 1.0);
+    let row_err = weights.sum_dim(2).sub_scalar(1.0).abs().max().into_scalar();
+    out.push(cert(
+        "geom",
+        "geodesic_attention_rows_are_distributions",
+        "Inverse-distance attention weights sum to one over the attended set.",
+        f64::from(row_err),
+        1e-5,
+    ));
+
+    // -- model: the temperature is bounded on both sides ----------------------
+    // Extreme raw logits must map into [1e-3, 2·dim]: the floor keeps `-d²`
+    // off a zero divisor, the cap keeps runaway drift from flattening the
+    // attention into uniformity instead of learning geometry. At raw 0 the
+    // mapping is exactly softplus(0) + 1e-3, so every existing checkpoint
+    // (trained near there) is bit-identical under the cap.
+    use crate::geometry::{bounded_temperature, temperature_cap};
+    let dim = 8usize;
+    let cap = temperature_cap(dim);
+    let mut temp_err = 0.0f64;
+    for raw in [-50.0f32, -5.0, 0.0, 5.0, 50.0] {
+        let t = f64::from(bounded_temperature(raw, dim));
+        if !(1e-3..=f64::from(cap)).contains(&t) {
+            temp_err += 1.0;
+        }
+    }
+    let plain_softplus = (1.0f32 + 0.0f32.exp()).ln() + 1e-3;
+    temp_err += f64::from((bounded_temperature(0.0, dim) - plain_softplus).abs());
+    // A capped extreme stays finite (no inf/NaN through the mapping).
+    for raw in [-100.0f32, 100.0] {
+        if !bounded_temperature(raw, dim).is_finite() {
+            temp_err += 1.0;
+        }
+    }
+    out.push(cert(
+        "geom",
+        "attention_temperature_is_bounded",
+        "The geodesic-attention temperature maps any raw logit into [1e-3, 2·dim], stays finite at extremes, and reproduces softplus(0) + 1e-3 exactly at raw zero.",
+        temp_err,
+        0.0,
+    ));
+
+    // -- model: the certified relaxation ------------------------------------------
+    // a fresh identity metric: the closed-form fixed point holds for any G,
+    // but the *rate* is a function of the condition number, so the
+    // certificate's step budget needs the deterministic identity landscape
+    let g = MetricField::<B>::new(4, &device).metric();
+    let lambda = 0.5f32;
+    let slots = 6usize;
+    let eta = lipschitz_step(&g, lambda, slots);
+    let mut z = Tensor::<B, 3>::random([2, slots, 4], Distribution::Normal(0.0, 1.0), &device);
+    let c = Tensor::<B, 3>::random([2, slots, 4], Distribution::Normal(0.0, 1.0), &device);
+    let mut worst = 0.0f32;
+    let mut previous = energy_value(&g, &z, &c, lambda, slots);
+    for _ in 0..64 {
+        z = energy_grad_step(&g, &z, &c, lambda, slots, eta);
+        let current = energy_value(&g, &z, &c, lambda, slots);
+        worst = worst.max(current - previous);
+        previous = current;
+    }
+    out.push(cert(
+        "geom",
+        "energy_descent_is_monotone_under_the_certified_step",
+        "With the step size from the closed-form Lipschitz bound, the relaxation's energy never increases.",
+        f64::from(worst),
+        1e-4,
+    ));
+
+    // The exact fixed point of the identity-metric landscape. Solving
+    // `(I + 2*lambda*K) z - 2*lambda*S = c` with `S = sum_l z_l` per
+    // coordinate gives `A = (I + 2*lambda*K)I - 2*lambda*J`, and since
+    // `A - K*b = 1` the inverse collapses to `(c + 2*lambda*sum(c)) /
+    // (1 + 2*lambda*K)`. The `2*lambda` matches the gradient the step
+    // actually takes -- the same factor the monotone-descent certificate
+    // pins down.
+    let mut z = Tensor::<B, 3>::random([2, slots, 4], Distribution::Normal(0.0, 1.0), &device);
+    let z0 = z.clone();
+    let gap0 = z0.clone().sub(c.clone());
+    let initial = gap0.clone().mul(gap0).sum().sqrt().into_scalar();
+    for _ in 0..96 {
+        z = energy_grad_step(&g, &z, &c, lambda, slots, eta);
+    }
+    let fixed = c
+        .clone()
+        .add(c.clone().sum_dim(1).mul_scalar(2.0 * lambda))
+        .div_scalar(1.0 + 2.0 * lambda * slots as f32);
+    let gap = z.sub(fixed);
+    let residual = gap.clone().mul(gap).sum().sqrt().into_scalar();
+    out.push(cert(
+        "geom",
+        "relaxation_converges_to_the_exact_fixed_point",
+        "With an identity metric the fixed point is (c + 2*lambda*sum(c))/(1 + 2*lambda*K); 96 certified steps land within 1% of it.",
+        f64::from(residual / initial.max(1e-6)),
+        1e-2,
+    ));
+
+    // with repulsion off, the attractor is the context
+    let lambda_tiny = 0.0f32;
+    let eta_tiny = lipschitz_step(&g, lambda_tiny, slots);
+    let mut z = z0.clone();
+    for _ in 0..8 {
+        z = energy_grad_step(&g, &z, &c, lambda_tiny, slots, eta_tiny);
+    }
+    let gap_end = z.sub(c.clone());
+    let end = gap_end.clone().mul(gap_end).sum().sqrt().into_scalar();
+    out.push(cert(
+        "geom",
+        "with_repulsion_off_the_attractor_is_the_context",
+        "With the repulsion vanishing, eight certified steps drive every slot onto its context.",
+        f64::from(end / initial.max(1e-6)),
+        1e-4,
+    ));
+
+    // -- model: span identity -------------------------------------------------------
+    let config = GeomConfig::tiny();
+    let model = GeometricReasoner::<B>::new(&config, &device)?;
+    let scene: Vec<i64> = (0..config.scene_len - 1)
+        .map(|i| i64::from(b'A' + (i % 26) as u8))
+        .collect();
+    let tokens = Tensor::<B, 1, Int>::from_ints(scene.as_slice(), &device)
+        .reshape([1, config.scene_len - 1]);
+    let direct = model.forward(tokens.clone())?.logits;
+    let spanned = model.forward_span(tokens, 0..model.num_blocks())?.logits;
+    let span_err = (direct - spanned).abs().max().into_scalar();
+    out.push(cert(
+        "geom",
+        "block_span_covering_everything_is_the_full_path",
+        "A refinement span covering every block reproduces the full forward pass bit for bit.",
+        f64::from(span_err),
+        0.0,
+    ));
+
+    // -- model: the denoiser is its input at sigma zero ------------------------------
+    let scene_full: Vec<i64> = (0..config.scene_len)
+        .map(|i| i64::from(b'A' + (i % 26) as u8))
+        .collect();
+    let tokens_full = Tensor::<B, 1, Int>::from_ints(scene_full.as_slice(), &device)
+        .reshape([1, config.scene_len]);
+    let (z_star, _) = model.clean_state(tokens_full.clone())?;
+    let step = model.block_step(tokens_full, 0, 0.0, &z_star, 0.0)?;
+    let ident_err = step.x0.sub(z_star).abs().max().into_scalar();
+    out.push(cert(
+        "geom",
+        "denoiser_is_identity_at_sigma_zero",
+        "EDM preconditioning makes a block's x0 estimate its input at sigma zero: c_skip(0) = 1 and c_out(0) = 0.",
+        f64::from(ident_err),
+        1e-6,
+    ));
+
+    // -- model: the degenerate mixture is the dense head ------------------------------
+    let single = crate::geometry::GeomRouter::new(8, 12, 1, 1, 1, &device);
+    let query = Tensor::<B, 2>::random([3, 8], Distribution::Normal(0.0, 1.0), &device);
+    let (mixed, info) = single.forward(query.clone())?;
+    let own = single.expert_head(query, 0, 0);
+    let mix_err = (mixed - own).abs().max().into_scalar();
+    let gates_err = info
+        .balance
+        .total
+        .clone()
+        .detach()
+        .into_scalar()
+        .is_finite();
+    out.push(cert(
+        "geom",
+        "a_single_box_single_expert_mixture_is_that_expert",
+        "A one-box one-expert top-1 mixture returns exactly its selected expert head; the gates remain a distribution.",
+        f64::from(mix_err) + f64::from(!gates_err),
+        0.0,
+    ));
+
+    // -- model: the readout inherits the mosme invariants ------------------------------
+    // The readout routes through `mosme::HierarchicalRouter`, so disabling an
+    // expert masks its logit to -inf and `exp(-inf - max) == 0.0` gives its
+    // composed gate column exactly 0.0 -- the invariant
+    // `mosme`'s disabled-expert test pins at the router level. The gates of
+    // the *untouched boxes* are bit-identical (the mask never reaches them),
+    // and the composed gates still form a distribution: every row sums to 1.
+    // (The disabled expert's own box-mates are *not* bit-identical -- the
+    // softmax and the top-k renormalization redistribute its mass, which is
+    // the mask doing its job.)
+    let mut masked = crate::geometry::GeomRouter::new(8, 12, 2, 2, 2, &device);
+    let query = Tensor::<B, 2>::random([3, 8], Distribution::Normal(0.0, 1.0), &device);
+    let boxes_before = masked.router().route(query.clone()).composed_flat();
+    masked.router_mut().set_enabled(0, 1, false)?;
+    let after = masked.router().route(query).composed_flat();
+    let disabled_err = after.clone().narrow(1, 1, 1).abs().max().into_scalar();
+    let boxes_err = (after.clone().narrow(1, 2, 2) - boxes_before.narrow(1, 2, 2))
+        .abs()
+        .max()
+        .into_scalar();
+    let mass_err = (after.sum_dim(1) - 1.0).abs().max().into_scalar();
+    out.push(cert(
+        "geom",
+        "readout_inherits_mosme_invariants",
+        "Disabling one expert gives its composed gate column exactly 0.0, leaves the other boxes' gates bit-identical, and keeps every row of the composed gates summing to 1.",
+        f64::from(disabled_err) + f64::from(boxes_err) + f64::from(mass_err),
+        1e-6,
+    ));
+
+    // constraint_holds agrees with the graph facts on the sampled graph
+    let coords: Vec<(String, Q, Q)> = vec![
+        ("B".into(), Q::new(0, 1)?, Q::new(0, 1)?),
+        ("D".into(), Q::new(2, 1)?, Q::new(1, 1)?),
+        ("C".into(), Q::new(4, 1)?, Q::new(2, 1)?),
+    ];
+    let holds = constraint_holds(
+        &coords,
+        &geomkernel::Constraint::Collinear {
+            a: "B".into(),
+            b: "D".into(),
+            c: "C".into(),
+        },
+    )?;
+    out.push(cert(
+        "geom",
+        "constraint_evaluation_matches_the_scene_graph",
+        "The midpoint of (0,0) and (4,2) is exactly (2,1), and the kernel's predicate reads it as exactly collinear.",
+        f64::from(!holds),
+        0.0,
+    ));
+
+    // -- model: the readout gates are a distribution, not a scaled copy -----
+    // A hand-rolled box scatter once broadcast the top-k slice across all
+    // columns and summed, so every row added to `n_boxes` instead of 1
+    // (logits inflated, entropies negative, balance exploded, learning
+    // stalled). The readout now routes through `mosme::HierarchicalRouter`,
+    // whose scatter is certified; the scattered gates add to exactly one per
+    // row, the reported load sums to one and both entropies lie in [0, 1].
+    let (scene_tokens, scene_meta) = crate::geometry::generate_corpus(4, &["nearest"], 8, 3)?;
+    let mut readout_config = GeomConfig::tiny();
+    readout_config.answer_tokens = scene_meta.answer_tokens.clone();
+    let readout_model = GeometricReasoner::<B>::new(&readout_config, &device)?;
+    let flat: Vec<i64> = scene_tokens[..scene_meta.scene_len * 4]
+        .iter()
+        .map(|t| i64::from(*t))
+        .collect();
+    let readout_full =
+        burn::tensor::Tensor::<B, 1, burn::tensor::Int>::from_ints(flat.as_slice(), &device)
+            .reshape([4, scene_meta.scene_len]);
+    // The model reads scene_len - 1 tokens; the last of each scene is its
+    // answer, exactly as `answer_step` slices it.
+    let readout_tokens = readout_full.narrow(1, 0, scene_meta.scene_len - 1);
+    let readout_out = readout_model.forward(readout_tokens)?;
+    let (gates_err, entropy_err) = match &readout_out.routing {
+        Some(info) => {
+            let load_sum: f64 = info.box_load.iter().map(|v| f64::from(*v)).sum();
+            let mut err = 0.0f64;
+            for v in [info.load_entropy, info.token_entropy] {
+                if !(0.0..=1.0).contains(&f64::from(v)) {
+                    err += 1.0;
+                }
+            }
+            ((load_sum - 1.0).abs(), err)
+        }
+        None => (1.0, 0.0),
+    };
+    out.push(cert(
+        "geom",
+        "readout_gates_form_a_distribution",
+        "The MoSME readout's scattered box gates add to one per row in expectation, so the reported load sums to one and both routing entropies lie in [0, 1].",
+        gates_err + entropy_err,
+        1e-5,
+    ));
+
+    // -- data: similarity augmentation preserves the labels ----------------------
+    // Every kind's label is a similarity invariant (nearest/farthest by
+    // uniform distance scaling, inside/collinear by angle and containment,
+    // direction by translation + scale only -- its answer is an absolute
+    // compass bearing, so rotation would rotate the label). Grid rounding is
+    // the only label risk, and `augment_coords` rejects any transform whose
+    // rounded coordinates recompute to a different answer. The certificate
+    // builds scenes with the generator's own constructors, augments them,
+    // and re-derives every label from the transformed coordinates.
+    {
+        use crate::geometry::{
+            answer_for, augment_coords, collinear_triple, extreme_query, inside_scenes,
+            non_collinear_triple, GRID_MAX,
+        };
+        use rand::Rng as _;
+
+        let aug_kinds = ["nearest", "farthest", "direction", "inside", "collinear"];
+        let points = 6;
+        let mut rng = StdRng::seed_from_u64(41);
+        let (mut label_err, mut rot_err, mut sim_err) = (0.0f64, 0.0f64, 0.0f64);
+        for kind in aug_kinds {
+            for flip in 0..40 {
+                let mut coords: Vec<(i32, i32)> = Vec::with_capacity(points);
+                while coords.len() < points {
+                    let candidate = (
+                        rng.random_range(0..=GRID_MAX),
+                        rng.random_range(0..=GRID_MAX),
+                    );
+                    if !coords.contains(&candidate) {
+                        coords.push(candidate);
+                    }
+                }
+                let (refs, answer): (Vec<usize>, u8) = match kind {
+                    "nearest" => {
+                        let (r, idx) = extreme_query(&coords, &mut rng, false);
+                        (vec![r], b'A' + idx as u8)
+                    }
+                    "farthest" => {
+                        let (r, idx) = extreme_query(&coords, &mut rng, true);
+                        (vec![r], b'A' + idx as u8)
+                    }
+                    "direction" => (
+                        vec![0, 1],
+                        answer_for("direction", &coords, &[0, 1]).ok_or_else(|| {
+                            anyhow::anyhow!("direction answer for two distinct points")
+                        })?,
+                    ),
+                    "inside" => {
+                        let desired = flip % 2 == 0;
+                        match inside_scenes(&mut rng, desired, &coords[4..]) {
+                            Some([a, b, c, d]) => {
+                                coords[0] = a;
+                                coords[1] = b;
+                                coords[2] = c;
+                                coords[3] = d;
+                                (vec![0, 1, 2, 3], if desired { b'y' } else { b'n' })
+                            }
+                            None => continue,
+                        }
+                    }
+                    "collinear" => {
+                        let desired = flip % 2 == 0;
+                        let arranged = if desired {
+                            collinear_triple(&mut rng, &coords[3..])
+                        } else {
+                            non_collinear_triple(&mut rng, &coords[3..])
+                        };
+                        match arranged {
+                            Some([a, b, c]) => {
+                                coords[0] = a;
+                                coords[1] = b;
+                                coords[2] = c;
+                                (vec![0, 1, 2], if desired { b'y' } else { b'n' })
+                            }
+                            None => continue,
+                        }
+                    }
+                    // The kinds come from a fixed list this certificate chose,
+                    // so this arm is unreachable -- but a certificate must not
+                    // be able to abort the run that is checking the code, so it
+                    // records the defect instead.
+                    other => {
+                        label_err += 1.0;
+                        // The message is kept out of the residual on purpose: this
+                        // is a failed check, not a failed run, and the residual is
+                        // what the certificate reports. Constructed and dropped so
+                        // the reason is on record next to the code that hit it.
+                        drop(anyhow::anyhow!("unexpected kind '{other}' in augmentation"));
+                        continue;
+                    }
+                };
+                let Some((transformed, sim)) =
+                    augment_coords(kind, &coords, &refs, answer, &mut rng)
+                else {
+                    label_err += 1.0; // a label-preserving copy must be found
+                    continue;
+                };
+                if answer_for(kind, &transformed, &refs) != Some(answer) {
+                    label_err += 1.0;
+                }
+                if kind == "direction" && sim.theta != 0.0 {
+                    rot_err += 1.0;
+                }
+                // The transform really is a similarity: rounded distances
+                // track the uniformly scaled originals up to the rounding
+                // bound (each endpoint moves by at most sqrt(1/2), so a
+                // pairwise distance moves by at most sqrt(2)).
+                for i in 0..points {
+                    for j in (i + 1)..points {
+                        let d = (((coords[i].0 - coords[j].0).pow(2)
+                            + (coords[i].1 - coords[j].1).pow(2))
+                            as f64)
+                            .sqrt();
+                        let d_aug = (((transformed[i].0 - transformed[j].0).pow(2)
+                            + (transformed[i].1 - transformed[j].1).pow(2))
+                            as f64)
+                            .sqrt();
+                        let excess = (d_aug - sim.scale * d).abs() - 2f64.sqrt() - 1e-9;
+                        if excess > sim_err {
+                            sim_err = excess;
+                        }
+                    }
+                }
+            }
+        }
+        // ...and the written corpus round-trips: every emitted scene's stored
+        // answer is the label its own coordinates recompute, originals and
+        // augmented copies alike.
+        let (tokens, meta) =
+            crate::geometry::generate_corpus_weighted(6, &aug_kinds, None, 60, 5, 2)?;
+        let mut corpus_err = f64::from(u8::from(meta.augment != 2));
+        if meta.scenes <= 60 {
+            corpus_err += 1.0; // augmentation must actually emit copies
+        }
+        for scene in tokens.chunks(meta.scene_len) {
+            let n = usize::from((scene[1] - u16::from(b'0')) * 10 + (scene[2] - u16::from(b'0')));
+            let mut coords = Vec::with_capacity(n);
+            let mut at = 3;
+            for _ in 0..n {
+                let x = i32::from(
+                    (scene[at + 1] - u16::from(b'0')) * 10 + (scene[at + 2] - u16::from(b'0')),
+                );
+                let y = i32::from(
+                    (scene[at + 3] - u16::from(b'0')) * 10 + (scene[at + 4] - u16::from(b'0')),
+                );
+                coords.push((x, y));
+                at += 5;
+            }
+            let kind = match scene[at] as u8 {
+                b'n' => "nearest",
+                b'f' => "farthest",
+                b'd' => "direction",
+                b'i' => "inside",
+                b'c' => "collinear",
+                _ => {
+                    corpus_err += 1.0;
+                    continue;
+                }
+            };
+            let refs: Vec<usize> = (1..=4)
+                .filter_map(|k| {
+                    let t = scene[at + k] as u8;
+                    (t != b'_').then(|| usize::from(t - b'A'))
+                })
+                .collect();
+            let answer = scene[at + 6] as u8; // kind letter, 4 ref slots, '?', answer
+            match answer_for(kind, &coords, &refs) {
+                Some(recomputed) if recomputed == answer => {}
+                Some(_) => corpus_err += 1.0,
+                // A tied extremum keeps its generation-time fallback label.
+                None => {}
+            }
+        }
+        out.push(cert(
+            "geom",
+            "augmentation_preserves_labels",
+            "Random similarity transforms of random scenes keep every kind's recomputed label; direction scenes are translated and scaled, never rotated; and every scene in an augmented corpus stores the answer its own coordinates recompute.",
+            label_err + rot_err + sim_err + corpus_err,
+            1e-9,
+        ));
+    }
+
+    Ok(out)
 }
 
 // ------------------------------------------------------------ antipattern --
 
 fn antipattern_certificates() -> Vec<Certificate> {
     checks_or_failed("antipattern", antipattern_checks)
+}
+
+/// Certificates for the anti-cheat gate itself.
+///
+/// The reasoning is inverted from every other group. A numerical certificate
+/// says an implementation is right; these say the *gate* still has teeth, which
+/// is what makes a passing gate mean anything. A detector that silently stops
+/// matching is indistinguishable from a clean tree, so each pattern gets a
+/// positive detection certificate and the detector gets a negative one — a
+/// compliant candidate must stay clean, or the detector is matching too much
+/// and would train the model to add suppressions.
+fn cheat_checks() -> anyhow::Result<Vec<Certificate>> {
+    use crate::cheat::{scan, Candidate, CheatClass, Severity};
+    use std::path::PathBuf;
+
+    let mut certificates = Vec::new();
+
+    // Each case: (name, theorem, path, class, source, expected count,
+    // severity). The path is part of the case because the analyser is chosen
+    // by filename: manifest text dropped into a `.rs` file is Rust, not a
+    // manifest, and a certificate that did not respect that would be
+    // certifying the wrong code path.
+    let cases: &[(&str, &str, &str, CheatClass, &str, usize, Severity)] = &[
+        (
+            "detects_a_new_lint_suppression",
+            "A `#[allow]` attribute absent from the baseline is reported as suppression.",
+            "src/a.rs",
+            CheatClass::LintSuppression,
+            "#[allow(clippy::all)]\npub fn f() {}\n",
+            1,
+            Severity::Suppression,
+        ),
+        (
+            "detects_a_crate_level_suppression",
+            "A crate-level `#![allow]` silences the whole tree and is reported.",
+            "src/a.rs",
+            CheatClass::LintSuppression,
+            "#![allow(dead_code)]\npub fn f() {}\n",
+            1,
+            Severity::Suppression,
+        ),
+        (
+            "detects_a_whitespace_obfuscated_suppression",
+            "`#[ allow(..)]` is detected, so spacing inside the attribute buys nothing.",
+            "src/a.rs",
+            CheatClass::LintSuppression,
+            "#[ allow(clippy::all)]\npub fn f() {}\n",
+            1,
+            Severity::Suppression,
+        ),
+        (
+            "detects_an_ignored_test",
+            "An `#[ignore]`d test cannot fail the gate and is reported as evasion.",
+            "src/a.rs",
+            CheatClass::TestEvasion,
+            "#[test]\n#[ignore]\nfn t() {}\n",
+            1,
+            Severity::Evasion,
+        ),
+        (
+            "detects_a_vacuous_assertion",
+            "`assert!(true)` cannot fail and is reported as evasion.",
+            "src/a.rs",
+            CheatClass::TestEvasion,
+            "#[test]\nfn t() { assert!(true); }\n",
+            1,
+            Severity::Evasion,
+        ),
+        (
+            "detects_a_manifest_lint_cap",
+            "`--cap-lints` in the manifest caps every lint severity and is fraud.",
+            "Cargo.toml",
+            CheatClass::GateTampering,
+            "[build]\nrustflags = [\"--cap-lints\", \"allow\"]\n",
+            1,
+            Severity::Fraud,
+        ),
+        (
+            "detects_a_manifest_lint_table",
+            "A manifest `[lints]` table overrides the crate's own lint policy.",
+            "Cargo.toml",
+            CheatClass::GateTampering,
+            "[lints.clippy]\nall = \"allow\"\n",
+            1,
+            Severity::Fraud,
+        ),
+        (
+            "detects_a_loosened_clippy_threshold",
+            "A clippy threshold raised out of reach silences the lint it bounds.",
+            "clippy.toml",
+            CheatClass::GateTampering,
+            "too-many-arguments-threshold = 100000\n",
+            1,
+            Severity::Fraud,
+        ),
+        (
+            "detects_a_gate_that_swallows_its_status",
+            "`|| true` in the gate script swallows the exit status it reports.",
+            "audit-bad-patterns.sh",
+            CheatClass::GateTampering,
+            "grep -R pattern src || true\n",
+            1,
+            Severity::Fraud,
+        ),
+    ];
+
+    for (name, theorem, path, class, source, expected, severity) in cases {
+        let report = scan(&Candidate {
+            files: vec![(PathBuf::from(*path), (*source).to_string())],
+            deleted: Vec::new(),
+        });
+        let count = report.count(*class);
+        certificates.push(cert(
+            "cheat",
+            name,
+            theorem,
+            (count as f64 - *expected as f64).abs(),
+            0.0,
+        ));
+        let worst_ok = report.worst() == Some(*severity);
+        certificates.push(cert(
+            "cheat",
+            name,
+            "The finding carries the severity that matches its consequence.",
+            if worst_ok { 0.0 } else { 1.0 },
+            0.0,
+        ));
+    }
+
+    // Deleting the gate is only visible as an absence, so it is supplied
+    // explicitly. This is the highest-severity case and the reason the
+    // required-path list exists.
+    for (path, theorem) in [
+        (
+            "audit-bad-patterns.sh",
+            "Deleting the gate script is fraud.",
+        ),
+        (
+            "src/verify.rs",
+            "Deleting the certificate registry is fraud.",
+        ),
+        (
+            "Cargo.toml",
+            "Deleting the manifest that decides which tests run is fraud.",
+        ),
+    ] {
+        let report = scan(&Candidate {
+            files: Vec::new(),
+            deleted: vec![PathBuf::from(path)],
+        });
+        let fraud = report.worst() == Some(Severity::Fraud);
+        certificates.push(cert(
+            "cheat",
+            "detects_a_deleted_gate_file",
+            theorem,
+            if fraud { 0.0 } else { 1.0 },
+            0.0,
+        ));
+    }
+
+    // The negative half. Without these the detector could be matching
+    // everything, which reads as "always cheating" and would train a model to
+    // add suppressions in order to look compliant.
+    let negatives: &[(&str, &str, &str, CheatClass)] = &[
+        (
+            "comment_mentioning_allow",
+            "// do not add #[allow(clippy::all)]\npub fn f() {}\n",
+            "A suppression named inside a comment is data, not code.",
+            CheatClass::LintSuppression,
+        ),
+        (
+            "string_spelling_allow",
+            "pub const S: &str = \"#[allow(clippy::all)]\";\n",
+            "A suppression inside a string literal is data, not code.",
+            CheatClass::LintSuppression,
+        ),
+        (
+            "raw_string_spelling_allow",
+            "pub const S: &str = r#\"#[allow(clippy::all)]\"#;\n",
+            "A suppression inside a raw string is data, not code.",
+            CheatClass::LintSuppression,
+        ),
+        (
+            "block_comment_mentioning_allow",
+            "/* #[allow(clippy::all)] */\npub fn f() {}\n",
+            "A suppression inside a block comment is data, not code.",
+            CheatClass::LintSuppression,
+        ),
+        (
+            "matches_macro_assertion",
+            "#[test]\nfn t() { assert!(matches!(k, K::A)); }\n",
+            "`assert!(matches!(..))` compares; it is not vacuous.",
+            CheatClass::TestEvasion,
+        ),
+        (
+            "qualified_self_comparison",
+            "#[test]\nfn t() { assert_eq!(x.len(), self.len()); }\n",
+            "Comparing against a field is ordinary code.",
+            CheatClass::TestEvasion,
+        ),
+    ];
+    for (name, source, theorem, class) in negatives {
+        let report = scan(&Candidate {
+            files: vec![(PathBuf::from("src/a.rs"), (*source).to_string())],
+            deleted: Vec::new(),
+        });
+        let count = report.count(*class);
+        certificates.push(cert("cheat", name, theorem, count as f64, 0.0));
+    }
+
+    // The reward contract, stated as an identity: the score is 1 for a fully
+    // green run and 0 otherwise. There is no third value, which is why the
+    // type has no `Partial`.
+    let clean = scan(&Candidate {
+        files: vec![(
+            PathBuf::from("src/a.rs"),
+            "pub fn f() -> i32 { 1 }\n".to_string(),
+        )],
+        deleted: Vec::new(),
+    });
+    let green = crate::cheat::gate(&clean, true, true, true);
+    certificates.push(cert(
+        "cheat",
+        "score_is_one_for_a_fully_green_run",
+        "A clean candidate with every external gate green scores exactly 1.",
+        (green.score() - 1.0).abs(),
+        0.0,
+    ));
+
+    // One suppression among green tests must be worth nothing, not "mostly
+    // right". This is the certificate that makes partial credit impossible.
+    let cheated = scan(&Candidate {
+        files: vec![(
+            PathBuf::from("src/a.rs"),
+            "#[allow(clippy::all)]\npub fn f() {}\n".to_string(),
+        )],
+        deleted: Vec::new(),
+    });
+    let failed_gate = crate::cheat::gate(&cheated, true, true, true);
+    certificates.push(cert(
+        "cheat",
+        "score_is_zero_when_a_suppression_is_added",
+        "Adding a suppression to a green run scores 0, not partial credit.",
+        failed_gate.score(),
+        0.0,
+    ));
+
+    // Each external gate independently zeroes the score.
+    for (name, t, c, a, theorem) in [
+        (
+            "score_is_zero_when_tests_fail",
+            false,
+            true,
+            true,
+            "Failing tests score 0.",
+        ),
+        (
+            "score_is_zero_when_clippy_fails",
+            true,
+            false,
+            true,
+            "Failing clippy scores 0.",
+        ),
+        (
+            "score_is_zero_when_the_audit_fails",
+            true,
+            true,
+            false,
+            "A failing audit scores 0.",
+        ),
+    ] {
+        let g = crate::cheat::gate(&clean, t, c, a);
+        certificates.push(cert("cheat", name, theorem, g.score(), 0.0));
+    }
+
+    Ok(certificates)
+}
+
+fn cheat_certificates() -> Vec<Certificate> {
+    checks_or_failed("cheat", cheat_checks)
+}
+
+/// Certificates for the contamination gate.
+///
+/// Same inversion as the [`cheat`] group: these assert that the eval *rejects*
+/// what it should and admits what it should. An eval that admits everything
+/// reports a high yield and a meaningless score, so the false-positive
+/// direction needs pinning as much as the detection direction.
+fn codegen_eval_checks() -> anyhow::Result<Vec<Certificate>> {
+    use crate::codegen_eval::{
+        admit, decontaminate, normalise_tokens, split, CorpusIndex, Side, Task, TaskOutcome, NGRAM,
+        OVERLAP_THRESHOLD,
+    };
+    use crate::codegen_eval::{Scorecard, DEFAULT_EVAL_FRACTION};
+
+    // Distinct subjects, each long enough to form many 13-grams.
+    const SEARCH: &str = "implement a binary search over a sorted slice of integers \
+        and return the index of the target value or none when it is absent";
+    const CSV: &str = "parse a csv file with a header row and group every record \
+        by the categorical value that appears in its second column";
+    const MARINE: &str = "track the population of several coral reef species across \
+        a series of annual surveys and report the growth rate for each one";
+    const DIFF: &str = "integrate a first order differential equation numerically \
+        using an explicit euler step over a configurable number of intervals";
+
+    fn task(id: &str, prompt: &str, source: &str) -> Task {
+        Task {
+            id: id.into(),
+            prompt: prompt.into(),
+            target: format!("src/{id}.rs"),
+            tests: vec!["assert!(true)".into()],
+            source: source.into(),
+            language: "rust".into(),
+        }
+    }
+
+    let mut certificates = Vec::new();
+
+    // Identical text is caught, with the offending span reported so the flag
+    // is inspectable rather than merely asserted.
+    let index = CorpusIndex::build([("train", SEARCH)]);
+    let c = decontaminate(&index, SEARCH, "corpus");
+    certificates.push(cert(
+        "codegen_eval",
+        "a_task_present_in_the_corpus_is_contaminated",
+        "A task whose 13-grams all appear in the training corpus is flagged.",
+        if c.is_contaminated { 0.0 } else { 1.0 },
+        0.0,
+    ));
+    certificates.push(cert(
+        "codegen_eval",
+        "a_contamination_flag_names_the_shared_span",
+        "Every flag reports the n-gram that caused it.",
+        if c.example.is_some() { 0.0 } else { 1.0 },
+        0.0,
+    ));
+
+    // The false-positive direction. Without this the gate is unusable: an eval
+    // that rejects unrelated work measures nothing.
+    let c = decontaminate(&index, MARINE, "corpus");
+    certificates.push(cert(
+        "codegen_eval",
+        "an_unrelated_task_is_not_contaminated",
+        "A task sharing no 13-gram with the corpus scores below the threshold.",
+        if c.overlap < OVERLAP_THRESHOLD {
+            0.0
+        } else {
+            c.overlap
+        },
+        0.0,
+    ));
+
+    // Overlap is a fraction of the *task*, so corpus size cannot dilute a
+    // contaminated task into looking clean. The corpus here contains the task
+    // verbatim plus 400 unrelated rows: measured against the corpus fraction
+    // instead, the task's overlap would fall to ~1/401 and read as clean.
+    let mut rows: Vec<(String, String)> = vec![("seed".to_string(), SEARCH.to_string())];
+    rows.extend((0..400).map(|i| {
+        (
+            format!("row{i}"),
+            format!("unrelated training filler number {i} about widgets and cogs"),
+        )
+    }));
+    let borrowed: Vec<(&str, &str)> = rows.iter().map(|(l, t)| (l.as_str(), t.as_str())).collect();
+    let big_index = CorpusIndex::build(borrowed);
+    let c = decontaminate(&big_index, SEARCH, "401-row corpus");
+    certificates.push(cert(
+        "codegen_eval",
+        "a_large_corpus_cannot_launder_a_contaminated_task",
+        "A task present verbatim in a 401-row corpus still scores full overlap, because overlap is \
+         measured against the task rather than the corpus.",
+        c.overlap - 1.0,
+        0.0,
+    ));
+
+    // An uncheckable task (shorter than one n-gram) must not be scored clean.
+    // Scoring it clean is how a short task smuggles contamination through.
+    let c = decontaminate(&index, "sort", "corpus");
+    certificates.push(cert(
+        "codegen_eval",
+        "a_task_too_short_to_check_is_rejected",
+        "A task shorter than one n-gram is refused rather than assumed clean.",
+        if c.is_contaminated { 0.0 } else { 1.0 },
+        0.0,
+    ));
+
+    // Tests are part of the checked text: holding out a problem while training
+    // on its tests leaks the answer as surely as holding out nothing.
+    let test_text = "assert_eq!(binary_search(&[1, 2, 3, 5, 8, 13, 21], 13), Ok(5));";
+    let leak_index = CorpusIndex::build([("train", test_text)]);
+    let mut leaky = task("t", DIFF, "synthetic");
+    leaky.tests = vec![test_text.into()];
+    let report = admit(&[leaky], &leak_index);
+    certificates.push(cert(
+        "codegen_eval",
+        "a_task_whose_tests_leak_is_rejected",
+        "A task is rejected when its tests appear in the corpus even if its prompt is original.",
+        report.rejected.len() as f64,
+        0.0,
+    ));
+
+    // Known-contaminated provenance is surfaced even when the overlap is clean,
+    // because a task absent from the local corpus can still be in the teacher's
+    // weights.
+    let clean_index = CorpusIndex::build([("train", MARINE)]);
+    let mut tainted = task("t", CSV, "humaneval");
+    tainted.source = "humaneval".into();
+    let report = admit(&[tainted], &clean_index);
+    certificates.push(cert(
+        "codegen_eval",
+        "known_contaminated_provenance_is_surfaced",
+        "A task sourced from a benchmark known to be in pretraining data is reported at risk.",
+        report.at_risk.len() as f64 - 1.0,
+        0.0,
+    ));
+
+    // The split is a hash of the id, so inserting a task cannot reshuffle the
+    // split and silently invalidate every score recorded before the insertion.
+    let ids: Vec<String> = (0..500).map(|i| format!("task-{i}")).collect();
+    let before: Vec<Side> = ids
+        .iter()
+        .map(|i| split(i, DEFAULT_EVAL_FRACTION))
+        .collect();
+    let mut with_extra = vec!["task-new".to_string()];
+    with_extra.extend(ids.iter().cloned());
+    let after: Vec<Side> = with_extra
+        .iter()
+        .map(|i| split(i, DEFAULT_EVAL_FRACTION))
+        .collect();
+    certificates.push(cert(
+        "codegen_eval",
+        "the_split_is_unchanged_by_insertion",
+        "Adding one task leaves every other task on the same side.",
+        if before == after[1..] { 0.0 } else { 1.0 },
+        0.0,
+    ));
+    certificates.push(cert(
+        "codegen_eval",
+        "the_split_is_deterministic",
+        "The same id lands on the same side on every call.",
+        {
+            let first = split("task-42", DEFAULT_EVAL_FRACTION);
+            let same = (0..16).all(|_| split("task-42", DEFAULT_EVAL_FRACTION) == first);
+            if same {
+                0.0
+            } else {
+                1.0
+            }
+        },
+        0.0,
+    ));
+
+    // The split must actually populate both sides, and at the requested rate.
+    // A hash that put everything on one side would be stable and useless.
+    let n = 4000usize;
+    let eval_count = (0..n)
+        .filter(|i| split(&format!("t{i}"), DEFAULT_EVAL_FRACTION) == Side::Eval)
+        .count();
+    let frac = eval_count as f64 / n as f64;
+    certificates.push(cert(
+        "codegen_eval",
+        "the_split_hits_the_requested_fraction",
+        "The eval side holds the requested fraction of ids to within 0.03.",
+        (frac - DEFAULT_EVAL_FRACTION).abs() - 0.03,
+        0.0,
+    ));
+    certificates.push(cert(
+        "codegen_eval",
+        "both_sides_are_populated",
+        "Neither side is empty, so training and eval both have data.",
+        {
+            let train_count = n - eval_count;
+            if train_count > 0 && eval_count > 0 {
+                0.0
+            } else {
+                1.0
+            }
+        },
+        0.0,
+    ));
+
+    // Tokenisation is what the whole check rests on.
+    let folded = normalise_tokens("Convolution(A, B);");
+    certificates.push(cert(
+        "codegen_eval",
+        "tokenisation_folds_case_and_punctuation",
+        "Tokenisation is case-insensitive and splits on non-alphanumerics.",
+        if folded.first() == Some(&"convolution".to_string()) {
+            0.0
+        } else {
+            1.0
+        },
+        0.0,
+    ));
+    certificates.push(cert(
+        "codegen_eval",
+        "a_corpus_row_shorter_than_one_ngram_contributes_nothing",
+        "A training row shorter than one n-gram adds no grams, so it cannot silently inflate coverage.",
+        {
+            let tiny = CorpusIndex::build([("tiny", "too short")]);
+            tiny.gram_count() as f64
+        },
+        0.0,
+    ));
+    certificates.push(cert(
+        "codegen_eval",
+        "the_ngram_width_is_thirteen",
+        "The n-gram width is 13, the value the contamination literature settled on.",
+        (NGRAM as f64 - 13.0).abs(),
+        0.0,
+    ));
+
+    // Scoring is all-or-nothing, for the same reason as the cheat gate.
+    let s = Scorecard::new(vec![
+        TaskOutcome::new("a", true, true, true, true),
+        TaskOutcome::new("b", true, true, true, false),
+        TaskOutcome::new("c", false, true, true, true),
+        TaskOutcome::new("d", true, true, true, true),
+    ]);
+    certificates.push(cert(
+        "codegen_eval",
+        "pass_rate_counts_only_fully_clean_outcomes",
+        "Green tests bought with a suppression count as a failure, so 2 of 4 is a 0.5 pass rate.",
+        (s.pass_rate - 0.5).abs(),
+        0.0,
+    ));
+    let cheating = TaskOutcome::new("b", true, true, true, false);
+    certificates.push(cert(
+        "codegen_eval",
+        "a_cheating_outcome_scores_zero",
+        "An outcome that trips the cheat scan scores 0 despite green tests.",
+        cheating.score,
+        0.0,
+    ));
+    let clean_run = TaskOutcome::new("a", true, true, true, true);
+    certificates.push(cert(
+        "codegen_eval",
+        "a_fully_clean_outcome_scores_one",
+        "An outcome passing every gate scores exactly 1.",
+        (clean_run.score - 1.0).abs(),
+        0.0,
+    ));
+    let empty = Scorecard::new(Vec::new());
+    certificates.push(cert(
+        "codegen_eval",
+        "an_empty_scorecard_is_zero_not_a_pass",
+        "A scorecard with no scored tasks reports a 0 pass rate rather than passing vacuously.",
+        empty.pass_rate,
+        0.0,
+    ));
+
+    // The yield rate is what stops a low-yield set being reported as a strong
+    // result: 1 of 100 tasks scored is not a better eval than 90 of 100.
+    let report = admit(
+        &[
+            task("bad", SEARCH, "synthetic"),
+            task("good", MARINE, "synthetic"),
+        ],
+        &index,
+    );
+    certificates.push(cert(
+        "codegen_eval",
+        "the_yield_rate_reports_how_much_was_scorable",
+        "Half the set admitted yields a 0.5 yield rate.",
+        (report.yield_rate() - 0.5).abs(),
+        0.0,
+    ));
+
+    Ok(certificates)
+}
+
+fn codegen_eval_certificates() -> Vec<Certificate> {
+    checks_or_failed("codegen_eval", codegen_eval_checks)
 }
 
 fn antipattern_checks() -> anyhow::Result<Vec<Certificate>> {
@@ -2155,8 +4313,16 @@ fn antipattern_checks() -> anyhow::Result<Vec<Certificate>> {
         for start in (0..len).step_by(5) {
             from_stream.extend(streamed.window_labels(start, 5.min(len - start))?);
         }
-        let mismatches = from_memory.iter().zip(&expected).filter(|(a, b)| a != b).count()
-            + from_stream.iter().zip(&expected).filter(|(a, b)| a != b).count()
+        let mismatches = from_memory
+            .iter()
+            .zip(&expected)
+            .filter(|(a, b)| a != b)
+            .count()
+            + from_stream
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a != b)
+                .count()
             + usize::from(from_stream.len() != expected.len());
         let flagged: String = tokens
             .iter()
@@ -2171,8 +4337,17 @@ fn antipattern_checks() -> anyhow::Result<Vec<Certificate>> {
     // ------------------------------------------------------------------
     // With nothing flagged, the penalized objective must be the plain one to
     // the bit. Every labeled run takes this path on a clean batch.
-    let model = LanguageModel::<B>::new(&LmConfig { context: 32, ..LmConfig::tiny() }, &device);
-    let ids: Vec<i64> = text_tokens("except:\n    pass\n").iter().map(|t| i64::from(*t)).collect();
+    let model = LanguageModel::<B>::new(
+        &LmConfig {
+            context: 32,
+            ..LmConfig::tiny()
+        },
+        &device,
+    )?;
+    let ids: Vec<i64> = text_tokens("except:\n    pass\n")
+        .iter()
+        .map(|t| i64::from(*t))
+        .collect();
     let n = ids.len();
     let as_tensor = |v: &[i64]| Tensor::<B, 1, Int>::from_ints(v, &device).reshape([1, v.len()]);
     let (plain, _) = model.next_token_loss(as_tensor(&ids), 0..model.num_layers());
@@ -2211,7 +4386,11 @@ fn antipattern_checks() -> anyhow::Result<Vec<Certificate>> {
     .convert::<f32>()
     .iter::<f32>()
     .collect();
-    let ceiling = Unlikelihood { alpha: 1.0, epsilon: eps }.ceiling();
+    let ceiling = Unlikelihood {
+        alpha: 1.0,
+        epsilon: eps,
+    }
+    .ceiling();
     let mut endpoint_err = f64::from(term[0].abs())
         .max(f64::from((term[1] - 2f32.ln()).abs() / 2f32.ln()))
         .max(f64::from((term[2] - ceiling).abs() / ceiling));
@@ -2229,7 +4408,10 @@ fn antipattern_checks() -> anyhow::Result<Vec<Certificate>> {
     let labels = labeler.label(&sample_ids);
     let table = labeler.weight_table();
     let weights = label_weights::<B>(std::slice::from_ref(&labels), &table, &device);
-    let penalty = Unlikelihood { alpha: 1.5, epsilon: eps };
+    let penalty = Unlikelihood {
+        alpha: 1.5,
+        epsilon: eps,
+    };
     let sample_i64: Vec<i64> = sample_ids.iter().map(|t| i64::from(*t)).collect();
     let (loss, metrics) = model.next_token_loss_penalized(
         as_tensor(&sample_i64),
@@ -2243,7 +4425,11 @@ fn antipattern_checks() -> anyhow::Result<Vec<Certificate>> {
         .logits
         .narrow(1, 0, m - 1)
         .reshape([m - 1, model.vocab_size()]);
-    let lp: Vec<f32> = log_softmax(logits, 1).into_data().convert::<f32>().iter::<f32>().collect();
+    let lp: Vec<f32> = log_softmax(logits, 1)
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect();
     let vocab = model.vocab_size();
     let (mut likelihood, mut charge, mut negatives) = (0.0f64, 0.0f64, 0usize);
     for j in 0..m - 1 {
@@ -2277,12 +4463,19 @@ fn antipattern_checks() -> anyhow::Result<Vec<Certificate>> {
     // measurement: the plain step must *raise* p(bad).
     let ad_device = Default::default();
     let context = 2 * sample.len();
-    let ad_model = LanguageModel::<A>::new(&LmConfig { context, ..LmConfig::tiny() }, &ad_device);
+    let ad_model = LanguageModel::<A>::new(
+        &LmConfig {
+            context,
+            ..LmConfig::tiny()
+        },
+        &ad_device,
+    )?;
     let batch_text = sample.repeat(2);
     let batch_ids = text_tokens(&batch_text);
     let batch_labels = labeler.label(&batch_ids);
     let batch_i64: Vec<i64> = batch_ids.iter().map(|t| i64::from(*t)).collect();
-    let ad_tokens = || Tensor::<A, 1, Int>::from_ints(batch_i64.as_slice(), &ad_device).reshape([1, context]);
+    let ad_tokens =
+        || Tensor::<A, 1, Int>::from_ints(batch_i64.as_slice(), &ad_device).reshape([1, context]);
     let ad_weights = || label_weights::<A>(std::slice::from_ref(&batch_labels), &table, &ad_device);
     let span = 0..ad_model.num_layers();
     let bad_prob = |m: &LanguageModel<A>| {
@@ -2295,8 +4488,12 @@ fn antipattern_checks() -> anyhow::Result<Vec<Certificate>> {
     // Small enough that the first-order argument above holds, large enough
     // that the two steps land apart by more than rounding.
     let lr = 0.1;
-    let (loss, _) =
-        ad_model.next_token_loss_penalized(ad_tokens(), ad_weights(), Unlikelihood::new(1.0), span.clone());
+    let (loss, _) = ad_model.next_token_loss_penalized(
+        ad_tokens(),
+        ad_weights(),
+        Unlikelihood::new(1.0),
+        span.clone(),
+    );
     let grads = GradientsParams::from_grads(loss.backward(), &ad_model);
     let charged = SgdConfig::new().init().step(lr, ad_model.clone(), grads);
     let after_charged = bad_prob(&charged);
@@ -2373,7 +4570,6 @@ fn codequality_certificates() -> Vec<Certificate> {
         filter::WindowFilter, CodeAnalyzer, CompositeAnalyzer, Dimension, ExternalAnalyzer,
         Language, QualityRegularizer, QualityScore, StructuralAnalyzer,
     };
-    use burn::tensor::Tensor;
 
     // ------------------------------------------------------------------
     // The containment every "off by default" feature must satisfy: a
@@ -2383,16 +4579,8 @@ fn codequality_certificates() -> Vec<Certificate> {
     // a run, and the certificate is what catches that.
     let device = Default::default();
     let scores = vec![
-        QualityScore::from_dimensions(
-            Language::Rust,
-            vec![Dimension::new("synthetic", 0.7)],
-            10,
-        ),
-        QualityScore::from_dimensions(
-            Language::Rust,
-            vec![Dimension::new("synthetic", 0.3)],
-            10,
-        ),
+        QualityScore::from_dimensions(Language::Rust, vec![Dimension::new("synthetic", 0.7)], 10),
+        QualityScore::from_dimensions(Language::Rust, vec![Dimension::new("synthetic", 0.3)], 10),
     ];
     let (loss_off, scalar_off) =
         QualityRegularizer::off().loss::<burn::backend::NdArray<f32>>(&scores, &device);
@@ -2404,9 +4592,13 @@ fn codequality_certificates() -> Vec<Certificate> {
     // Drop policy at threshold 0.0 keeps every window. Both are the
     // exact identity on a batch of arbitrary scores.
     let (kept, ws) = WindowFilter::downweight(1.0, 1.0).decide(&scores);
-    let downweight_identity_err = f64::from(u8::from(kept.len() != scores.len() || ws.iter().any(|&w| w != 1.0)));
+    let downweight_identity_err = f64::from(u8::from(
+        kept.len() != scores.len() || ws.iter().any(|&w| w != 1.0),
+    ));
     let (kept2, ws2) = WindowFilter::drop_below(0.0).decide(&scores);
-    let drop_zero_err = f64::from(u8::from(kept2.len() != scores.len() || ws2.iter().any(|&w| w != 1.0)));
+    let drop_zero_err = f64::from(u8::from(
+        kept2.len() != scores.len() || ws2.iter().any(|&w| w != 1.0),
+    ));
 
     // ------------------------------------------------------------------
     // Pure function of the source. A regression that introduces hidden
@@ -2454,13 +4646,10 @@ fn codequality_certificates() -> Vec<Certificate> {
     // External analyzer without the feature flag is a no-op, and the
     // composite analyzer treats it that way: same source, same score.
     let ext_no_feature = ExternalAnalyzer::new("clippy", vec!["clippy".into()]);
-    let composite_with_ext = CompositeAnalyzer::<Identity>::new(
-        Language::Rust,
-        None,
-        None,
-        Some(ext_no_feature),
-    );
-    let composite_without_ext = CompositeAnalyzer::<Identity>::new(Language::Rust, None, None, None);
+    let composite_with_ext =
+        CompositeAnalyzer::<Identity>::new(Language::Rust, None, None, Some(ext_no_feature));
+    let composite_without_ext =
+        CompositeAnalyzer::<Identity>::new(Language::Rust, None, None, None);
     let ext_no_op_err = f64::from(u8::from(
         composite_with_ext.analyze("fn main() {}") != composite_without_ext.analyze("fn main() {}"),
     ));
@@ -2488,8 +4677,6 @@ fn codequality_certificates() -> Vec<Certificate> {
     let max_w = ws.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let bounds_err = f64::from(u8::from(min_w < 0.2 - 1e-6 || max_w > 0.8 + 1e-6))
         + f64::from(u8::from(ws.len() != varied.len()));
-
-    let _ = Tensor::<B, 1>::zeros([1], &device);
 
     vec![
         cert(
@@ -2565,7 +4752,12 @@ fn accuracy_certificates() -> Vec<Certificate> {
         .convert::<f32>()
         .iter::<f32>()
         .collect();
-    let reference: Vec<f32> = cond.clone().into_data().convert::<f32>().iter::<f32>().collect();
+    let reference: Vec<f32> = cond
+        .clone()
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect();
     let guidance_identity = identity
         .iter()
         .zip(&reference)
@@ -2592,7 +4784,12 @@ fn accuracy_certificates() -> Vec<Certificate> {
             .convert::<f32>()
             .iter::<f32>()
             .collect();
-        let u: Vec<f32> = uncond.clone().into_data().convert::<f32>().iter::<f32>().collect();
+        let u: Vec<f32> = uncond
+            .clone()
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
         for ((g, c), u) in got.iter().zip(&reference).zip(&u) {
             let (c, u) = (f64::from(*c), f64::from(*u));
             let want = u + scale * (c - u);
@@ -2631,11 +4828,7 @@ fn accuracy_certificates() -> Vec<Certificate> {
             .convert::<i64>()
             .iter()
             .collect();
-        let differing = moved
-            .iter()
-            .zip(&baseline)
-            .filter(|(a, b)| a != b)
-            .count();
+        let differing = moved.iter().zip(&baseline).filter(|(a, b)| a != b).count();
         argmax_drift = argmax_drift.max(differing as f64);
     }
 
@@ -2646,7 +4839,12 @@ fn accuracy_certificates() -> Vec<Certificate> {
         .convert::<f32>()
         .iter::<f32>()
         .collect();
-    let raw_bits: Vec<f32> = raw.clone().into_data().convert::<f32>().iter::<f32>().collect();
+    let raw_bits: Vec<f32> = raw
+        .clone()
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect();
     let norm_identity = untouched
         .iter()
         .zip(&raw_bits)
@@ -2667,7 +4865,11 @@ fn accuracy_certificates() -> Vec<Certificate> {
         })
         .collect();
     let mut simplex_err: f64 = 0.0;
-    for kind in [Ensemble::ProbabilityMean, Ensemble::LogitMean, Ensemble::MajorityVote] {
+    for kind in [
+        Ensemble::ProbabilityMean,
+        Ensemble::LogitMean,
+        Ensemble::MajorityVote,
+    ] {
         let combined = kind.combine(&members);
         for s in combined
             .clone()
@@ -2740,7 +4942,10 @@ fn accuracy_certificates() -> Vec<Certificate> {
             }
         }
         // The most accurate point's accuracy must be attained on the frontier.
-        let best = raw_points.iter().map(|(_, a)| *a).fold(f64::NEG_INFINITY, f64::max);
+        let best = raw_points
+            .iter()
+            .map(|(_, a)| *a)
+            .fold(f64::NEG_INFINITY, f64::max);
         if !frontier.iter().any(|p| p.accuracy == best) {
             curve_violation = 1.0;
         }
@@ -2828,10 +5033,10 @@ fn optim_certificates() -> Vec<Certificate> {
     // f64 numbers and passed while the implementation threw k-1 of every k
     // gradients away -- a formula is not an implementation, and a certificate
     // that never touches the code path cannot tell the difference.
-    use burn::nn::{Linear, LinearConfig};
-    use burn::tensor::backend::AutodiffBackend;
-    use burn::optim::GradientsParams;
     use crate::train::DefaultTrainBackend as A;
+    use burn::nn::{Linear, LinearConfig};
+    use burn::optim::GradientsParams;
+    use burn::tensor::backend::AutodiffBackend;
 
     let ad_device = Default::default();
     <A as burn::tensor::backend::Backend>::seed(&ad_device, 4242);
@@ -2843,11 +5048,8 @@ fn optim_certificates() -> Vec<Certificate> {
     let mut accumulation_err: f64 = 0.0;
     for k in [1usize, 2, 4] {
         let rows = k * micro;
-        let inputs = Tensor::<A, 2>::random(
-            [rows, 6],
-            Distribution::Uniform(-1.0, 1.0),
-            &ad_device,
-        );
+        let inputs =
+            Tensor::<A, 2>::random([rows, 6], Distribution::Uniform(-1.0, 1.0), &ad_device);
 
         // One k-times-larger batch: the reference.
         let single = layer.forward(inputs.clone()).powf_scalar(2.0).mean();
@@ -2860,7 +5062,11 @@ fn optim_certificates() -> Vec<Certificate> {
         let mut summed = None;
         for i in 0..k {
             let chunk = inputs.clone().narrow(0, i * micro, micro);
-            let loss = layer.forward(chunk).powf_scalar(2.0).mean().mul_scalar(scale);
+            let loss = layer
+                .forward(chunk)
+                .powf_scalar(2.0)
+                .mean()
+                .mul_scalar(scale);
             let grads = GradientsParams::from_grads(loss.backward(), &layer);
             summed = accumulator.fold(grads, &layer).into_gradients();
         }
@@ -2871,12 +5077,10 @@ fn optim_certificates() -> Vec<Certificate> {
 
         // Compare parameter by parameter.
         let weight_id = layer.weight.id;
-        for (a, b) in [
-            (
-                summed.get::<<A as AutodiffBackend>::InnerBackend, 2>(weight_id),
-                reference.get::<<A as AutodiffBackend>::InnerBackend, 2>(weight_id),
-            ),
-        ] {
+        for (a, b) in [(
+            summed.get::<<A as AutodiffBackend>::InnerBackend, 2>(weight_id),
+            reference.get::<<A as AutodiffBackend>::InnerBackend, 2>(weight_id),
+        )] {
             match (a, b) {
                 (Some(a), Some(b)) => {
                     let diff: f32 = (a - b).abs().max().into_scalar();
@@ -2920,8 +5124,9 @@ fn optim_certificates() -> Vec<Certificate> {
     // correction entirely pass this certificate: the inline copy stayed
     // correct while the implementation did not.
     let ema_device: <A2 as burn::tensor::backend::BackendTypes>::Device = Default::default();
-    let probe: burn::nn::Linear<A2> =
-        burn::nn::LinearConfig::new(2, 2).with_bias(false).init(&ema_device);
+    let probe: burn::nn::Linear<A2> = burn::nn::LinearConfig::new(2, 2)
+        .with_bias(false)
+        .init(&ema_device);
 
     let mut convexity_err: f64 = 0.0;
     let mut interval_err: f64 = 0.0;
@@ -2961,9 +5166,22 @@ fn optim_certificates() -> Vec<Certificate> {
     let mut decay_violation: f64 = 0.0;
     let schedules = [
         LrSchedule::Constant { lr: 1e-3 },
-        LrSchedule::WarmupConstant { peak: 1e-3, warmup_steps: 50 },
-        LrSchedule::WarmupCosine { peak: 1e-3, min_lr: 1e-5, warmup_steps: 50, total_steps: 500 },
-        LrSchedule::WarmupCosine { peak: 3e-4, min_lr: 0.0, warmup_steps: 0, total_steps: 200 },
+        LrSchedule::WarmupConstant {
+            peak: 1e-3,
+            warmup_steps: 50,
+        },
+        LrSchedule::WarmupCosine {
+            peak: 1e-3,
+            min_lr: 1e-5,
+            warmup_steps: 50,
+            total_steps: 500,
+        },
+        LrSchedule::WarmupCosine {
+            peak: 3e-4,
+            min_lr: 0.0,
+            warmup_steps: 0,
+            total_steps: 200,
+        },
     ];
     for schedule in &schedules {
         let peak = schedule.peak();
@@ -3006,8 +5224,8 @@ fn optim_certificates() -> Vec<Certificate> {
             let gap = objective(l_star) - objective(l_star + delta);
             optimum_err = optimum_err.max(gap.max(0.0));
         }
-        optimum_err =
-            optimum_err.max((objective(l_star) - UncertaintyWeighting::value_at_optimum(raw)).abs());
+        optimum_err = optimum_err
+            .max((objective(l_star) - UncertaintyWeighting::value_at_optimum(raw)).abs());
     }
 
     // ...and `apply` must implement that objective, not merely agree with the
@@ -3209,7 +5427,11 @@ fn planner_certificates() -> Vec<Certificate> {
     for max_evaluations in [1usize, 2, 3, 5, 7, 11, 16, 64] {
         for max_depth in [0usize, 1, 3, 5] {
             for beam_width in [1usize, 2, 4] {
-                let budget = Budget { max_evaluations, max_depth, beam_width };
+                let budget = Budget {
+                    max_evaluations,
+                    max_depth,
+                    beam_width,
+                };
                 let mut work = 0usize;
                 let plan = Beam::new(budget).search(|_p: &Path<u32>, remaining: usize| {
                     // A model-calling expand consults its allowance first; the
@@ -3271,14 +5493,21 @@ fn planner_certificates() -> Vec<Certificate> {
     // prediction error.
     let mut commit_mismatch: f64 = 0.0;
     for max_depth in [0usize, 1, 2, 4] {
-        let plan = Beam::new(Budget { max_evaluations: 1024, max_depth, beam_width: 3 })
-            .search(|path: &Path<usize>, _r: usize| {
-                if path.depth() > max_depth {
-                    return Vec::new();
-                }
-                (0..3).map(|i| (i, next_f64())).collect::<Vec<_>>()
-            });
-        match (plan.commit(), plan.best.as_ref().and_then(|p| p.steps.first())) {
+        let plan = Beam::new(Budget {
+            max_evaluations: 1024,
+            max_depth,
+            beam_width: 3,
+        })
+        .search(|path: &Path<usize>, _r: usize| {
+            if path.depth() > max_depth {
+                return Vec::new();
+            }
+            (0..3).map(|i| (i, next_f64())).collect::<Vec<_>>()
+        });
+        match (
+            plan.commit(),
+            plan.best.as_ref().and_then(|p| p.steps.first()),
+        ) {
             (Some(a), Some(b)) if a == b => {}
             (None, None) => {}
             _ => commit_mismatch = 1.0,
@@ -3315,18 +5544,26 @@ fn planner_certificates() -> Vec<Certificate> {
     // costs. Here `b` is worse immediately and better overall; a planner that
     // compared a depth-1 path against a depth-2 path on raw score would take
     // `a` and never notice.
-    let lookahead_plan = Beam::new(Budget { max_evaluations: 64, max_depth: 1, beam_width: 4 })
-        .search(|path: &Path<char>, _r: usize| match path.steps.as_slice() {
-            [] => vec![('a', -0.1), ('b', -0.5)],
-            ['a'] => vec![('x', -6.0)],
-            ['b'] => vec![('y', -0.2)],
-            _ => Vec::new(),
-        });
+    let lookahead_plan = Beam::new(Budget {
+        max_evaluations: 64,
+        max_depth: 1,
+        beam_width: 4,
+    })
+    .search(|path: &Path<char>, _r: usize| match path.steps.as_slice() {
+        [] => vec![('a', -0.1), ('b', -0.5)],
+        ['a'] => vec![('x', -6.0)],
+        ['b'] => vec![('y', -0.2)],
+        _ => Vec::new(),
+    });
     let myopia = f64::from(lookahead_plan.commit() != Some(&'b'));
 
     // The same statement on the language side, through the real decoder.
     let decoder_plan = LookaheadDecoder::new(
-        Budget { max_evaluations: 64, max_depth: 1, beam_width: 4 },
+        Budget {
+            max_evaluations: 64,
+            max_depth: 1,
+            beam_width: 4,
+        },
         2,
     )
     .plan(&[65], |context: &[u16]| match context.len() {
@@ -3344,12 +5581,18 @@ fn planner_certificates() -> Vec<Certificate> {
     for beam_width in [1usize, 2, 3] {
         for max_depth in [0usize, 1, 2] {
             let candidates = 4usize;
-            let budget = Budget { max_evaluations: 4096, max_depth, beam_width };
+            let budget = Budget {
+                max_evaluations: 4096,
+                max_depth,
+                beam_width,
+            };
             let plan = Beam::new(budget).search(|path: &Path<u32>, _r: usize| {
                 if path.depth() > max_depth {
                     return Vec::new();
                 }
-                (0..candidates as u32).map(|i| (i, f64::from(i))).collect::<Vec<_>>()
+                (0..candidates as u32)
+                    .map(|i| (i, f64::from(i)))
+                    .collect::<Vec<_>>()
             });
             worst_case_violation = worst_case_violation
                 .max((plan.evaluations as f64 - budget.worst_case(candidates) as f64).max(0.0));
@@ -3430,7 +5673,9 @@ fn experiment_checks() -> anyhow::Result<Vec<Certificate>> {
     let var = sample.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (sample.len() - 1) as f64;
     let half = t_quantile_975(sample.len() - 1) * var.sqrt() / (sample.len() as f64).sqrt();
     let (lo, hi) = summary.ci95();
-    let mut interval_err = (summary.ci95_half_width - half).abs().max((summary.mean - mean).abs());
+    let mut interval_err = (summary.ci95_half_width - half)
+        .abs()
+        .max((summary.mean - mean).abs());
     if !(lo <= summary.mean && summary.mean <= hi) {
         interval_err = 1.0;
     }
@@ -3508,13 +5753,13 @@ fn multisource_certificates() -> Vec<Certificate> {
 
 fn multisource_checks() -> anyhow::Result<Vec<Certificate>> {
     use crate::corpus::TokenCorpus;
-    use crate::train::DefaultTrainBackend as A;
-    use burn::optim::{GradientsParams, Optimizer, SgdConfig};
     use crate::distill::{soft_target_kl, soft_target_kl_probs, teacher_mixture};
-    use crate::lm::{Distillation, ExtraNegatives, LanguageModel, LmConfig};
+    use crate::lm::{Distillation, ExtraNegatives, LanguageModel, LmConfig, LmExtras};
     use crate::merge::{flatten, merge_into, ParamSnapshot};
     use crate::mix::{CorpusMix, MixMode, MixWeights};
+    use crate::train::DefaultTrainBackend as A;
     use burn::nn::LinearConfig;
+    use burn::optim::{GradientsParams, Optimizer, SgdConfig};
     use rand::SeedableRng;
 
     let device = Default::default();
@@ -3539,7 +5784,9 @@ fn multisource_checks() -> anyhow::Result<Vec<Certificate>> {
         }
         for (i, slice) in slices.iter().enumerate() {
             let ideal = weights.get(i) * batch as f64;
-            composite_err = composite_err.max(((*slice as f64) - ideal).abs() - 1.0).max(0.0);
+            composite_err = composite_err
+                .max(((*slice as f64) - ideal).abs() - 1.0)
+                .max(0.0);
         }
     }
 
@@ -3549,7 +5796,10 @@ fn multisource_checks() -> anyhow::Result<Vec<Certificate>> {
     std::fs::create_dir_all(&scratch).with_context(|| format!("create {}", scratch.display()))?;
     let corpus_path = scratch.join("mix.bin");
     let single_err = (|| -> anyhow::Result<f64> {
-        TokenCorpus::write(&corpus_path, &(0..300).map(|i| (i % 250) as u16).collect::<Vec<_>>())?;
+        TokenCorpus::write(
+            &corpus_path,
+            &(0..300).map(|i| (i % 250) as u16).collect::<Vec<_>>(),
+        )?;
         let mut plain = TokenCorpus::in_memory(&corpus_path)?;
         let mut a = rand_chacha::ChaCha12Rng::seed_from_u64(5);
         let expected = plain.sample_batch(3, 8, &mut a)?;
@@ -3557,20 +5807,31 @@ fn multisource_checks() -> anyhow::Result<Vec<Certificate>> {
         let mut mix = CorpusMix::single(&mut mixed)?;
         let mut b = rand_chacha::ChaCha12Rng::seed_from_u64(5);
         let (got, rows, origin) = mix.sample(3, 8, &mut b)?;
-        Ok(f64::from(u8::from(got != expected || rows.is_some() || origin.counts != vec![3])))
+        Ok(f64::from(u8::from(
+            got != expected || rows.is_some() || origin.counts != vec![3],
+        )))
     })()
     .unwrap_or_else(|err| failed("multisource", &err));
     let composite_mix_err = (|| -> anyhow::Result<f64> {
         let mut x = TokenCorpus::in_memory(&corpus_path)?;
         let mut y = TokenCorpus::in_memory(&corpus_path)?;
-        let mut mix = CorpusMix::new(vec![&mut x, &mut y], MixWeights::new(&[3.0, 1.0])?, MixMode::Composite)?;
+        let mut mix = CorpusMix::new(
+            vec![&mut x, &mut y],
+            MixWeights::new(&[3.0, 1.0])?,
+            MixMode::Composite,
+        )?;
         let mut r = rand_chacha::ChaCha12Rng::seed_from_u64(6);
         let (got, _, origin) = mix.sample(8, 4, &mut r)?;
-        Ok(f64::from(u8::from(got.len() != 8 || origin.counts != vec![6, 2])))
+        Ok(f64::from(u8::from(
+            got.len() != 8 || origin.counts != vec![6, 2],
+        )))
     })()
     .unwrap_or_else(|err| failed("multisource", &err));
     if let Err(err) = std::fs::remove_dir_all(&scratch) {
-        eprintln!("verify: could not remove scratch {}: {err}", scratch.display());
+        eprintln!(
+            "verify: could not remove scratch {}: {err}",
+            scratch.display()
+        );
     }
 
     // ------------------------------------------------------------------
@@ -3580,24 +5841,36 @@ fn multisource_checks() -> anyhow::Result<Vec<Certificate>> {
     // rounding of `log(softmax)` against `log_softmax`.
     let logits = Tensor::<B, 2>::random([5, 7], Distribution::Uniform(-3.0, 3.0), &device);
     let student = Tensor::<B, 2>::random([5, 7], Distribution::Uniform(-3.0, 3.0), &device);
-    let bits = |t: Tensor<B, 2>| -> Vec<u32> { t.into_data().convert::<f32>().iter::<f32>().map(f32::to_bits).collect() };
+    let bits = |t: Tensor<B, 2>| -> Vec<u32> {
+        t.into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .map(f32::to_bits)
+            .collect()
+    };
     let softened = bits(softmax(logits.clone().div_scalar(2.0), 1));
-    let one = bits(teacher_mixture(&[(logits.clone(), 0.7)], 2.0));
-    let twins = teacher_mixture(&[(logits.clone(), 1.0), (logits.clone(), 3.0)], 2.0);
+    let one = bits(teacher_mixture(&[(logits.clone(), 0.7)], 2.0)?);
+    let twins = teacher_mixture(&[(logits.clone(), 1.0), (logits.clone(), 3.0)], 2.0)?;
     let mut mixture_identity_err = f64::from(u8::from(one != softened));
     let twin_rows: Vec<f32> = twins.into_data().convert::<f32>().iter::<f32>().collect();
-    let soft_rows: Vec<f32> = softmax(logits.clone().div_scalar(2.0), 1).into_data().convert::<f32>().iter::<f32>().collect();
+    let soft_rows: Vec<f32> = softmax(logits.clone().div_scalar(2.0), 1)
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect();
     for (a, b) in twin_rows.iter().zip(&soft_rows) {
         mixture_identity_err = mixture_identity_err.max(f64::from((a - b).abs()));
     }
     let mut distribution_err = 0.0f64;
     let other = Tensor::<B, 2>::random([5, 7], Distribution::Uniform(-3.0, 3.0), &device);
-    let mixed = teacher_mixture(&[(logits.clone(), 0.3), (other, 0.7)], 1.5);
+    let mixed = teacher_mixture(&[(logits.clone(), 0.3), (other, 0.7)], 1.5)?;
     for row in mixed.sum_dim(1).into_data().convert::<f32>().iter::<f32>() {
         distribution_err = distribution_err.max(f64::from((row - 1.0).abs()));
     }
     let kl_logits = f64::from(soft_target_kl(logits.clone(), student.clone(), 2.0).into_scalar());
-    let kl_probs = f64::from(soft_target_kl_probs(softmax(logits.div_scalar(2.0), 1), student, 2.0).into_scalar());
+    let kl_probs = f64::from(
+        soft_target_kl_probs(softmax(logits.div_scalar(2.0), 1), student, 2.0).into_scalar(),
+    );
     let kl_agreement_err = (kl_logits - kl_probs).abs() / kl_logits.abs().max(1.0);
 
     // ------------------------------------------------------------------
@@ -3605,8 +5878,20 @@ fn multisource_checks() -> anyhow::Result<Vec<Certificate>> {
     // proposed and the objective is the plain loss to the bit; where a
     // proposal is charged it is never the corpus target; and a step with the
     // charge ends with the proposals less probable than a plain step does.
-    let model = LanguageModel::<B>::new(&LmConfig { context: 16, ..LmConfig::tiny() }, &device);
-    let negative = LanguageModel::<B>::new(&LmConfig { context: 16, ..LmConfig::tiny() }, &device);
+    let model = LanguageModel::<B>::new(
+        &LmConfig {
+            context: 16,
+            ..LmConfig::tiny()
+        },
+        &device,
+    )?;
+    let negative = LanguageModel::<B>::new(
+        &LmConfig {
+            context: 16,
+            ..LmConfig::tiny()
+        },
+        &device,
+    )?;
     let ids: Vec<i64> = (0..16).map(|i| 65 + (i * 7 % 26) as i64).collect();
     let tokens = Tensor::<B, 1, Int>::from_ints(ids.as_slice(), &device).reshape([1, 16]);
     let span = 0..model.num_layers();
@@ -3614,18 +5899,29 @@ fn multisource_checks() -> anyhow::Result<Vec<Certificate>> {
     let (proposed, weights_none) = negative.negative_proposals(tokens.clone(), 2.0);
     let silent = model.next_token_step_full(
         tokens.clone(),
-        None,
-        Some(ExtraNegatives { tokens: proposed, weights: weights_none, alpha: 1.0, epsilon: 1e-6 }),
-        None,
+        LmExtras {
+            extra: Some(ExtraNegatives {
+                tokens: proposed,
+                weights: weights_none,
+                alpha: 1.0,
+                epsilon: 1e-6,
+            }),
+            ..LmExtras::plain()
+        },
         span.clone(),
     );
-    let mut negative_identity_err =
-        f64::from(u8::from(plain.into_scalar().to_bits() != silent.loss.into_scalar().to_bits()));
+    let mut negative_identity_err = f64::from(u8::from(
+        plain.into_scalar().to_bits() != silent.loss.into_scalar().to_bits(),
+    ));
     if silent.metrics.negative_teacher_tokens != 0 {
         negative_identity_err = 1.0;
     }
     let (proposed, weights) = negative.negative_proposals(tokens.clone(), 0.0);
-    let proposed_host: Vec<i64> = proposed.into_data().convert::<i64>().iter::<i64>().collect();
+    let proposed_host: Vec<i64> = proposed
+        .into_data()
+        .convert::<i64>()
+        .iter::<i64>()
+        .collect();
     let weights_host: Vec<f32> = weights.into_data().convert::<f32>().iter::<f32>().collect();
     let mut contradiction_err = 0.0f64;
     for (j, w) in weights_host.iter().enumerate() {
@@ -3639,8 +5935,20 @@ fn multisource_checks() -> anyhow::Result<Vec<Certificate>> {
 
     // The comparative step, on the autodiff backend.
     let ad_device = Default::default();
-    let ad_model = LanguageModel::<A>::new(&LmConfig { context: 16, ..LmConfig::tiny() }, &ad_device);
-    let ad_negative = LanguageModel::<A>::new(&LmConfig { context: 16, ..LmConfig::tiny() }, &ad_device);
+    let ad_model = LanguageModel::<A>::new(
+        &LmConfig {
+            context: 16,
+            ..LmConfig::tiny()
+        },
+        &ad_device,
+    )?;
+    let ad_negative = LanguageModel::<A>::new(
+        &LmConfig {
+            context: 16,
+            ..LmConfig::tiny()
+        },
+        &ad_device,
+    )?;
     let ad_tokens = || Tensor::<A, 1, Int>::from_ints(ids.as_slice(), &ad_device).reshape([1, 16]);
     let (ad_proposed, ad_weights) = ad_negative.negative_proposals(ad_tokens(), 0.0);
     let extra = || ExtraNegatives {
@@ -3650,15 +5958,32 @@ fn multisource_checks() -> anyhow::Result<Vec<Certificate>> {
         epsilon: 1e-6,
     };
     let prob_of_proposals = |m: &LanguageModel<A>| {
-        m.next_token_step_full(ad_tokens(), None, Some(ExtraNegatives { alpha: 0.0, ..extra() }), None, span.clone())
-            .metrics
-            .negative_teacher_prob
+        m.next_token_step_full(
+            ad_tokens(),
+            LmExtras {
+                extra: Some(ExtraNegatives {
+                    alpha: 0.0,
+                    ..extra()
+                }),
+                ..LmExtras::plain()
+            },
+            span.clone(),
+        )
+        .metrics
+        .negative_teacher_prob
     };
     let lr = 0.1;
-    let charged_step = ad_model.next_token_step_full(ad_tokens(), None, Some(extra()), None, span.clone());
+    let charged_step = ad_model.next_token_step_full(
+        ad_tokens(),
+        LmExtras {
+            extra: Some(extra()),
+            ..LmExtras::plain()
+        },
+        span.clone(),
+    );
     let grads = GradientsParams::from_grads(charged_step.loss.backward(), &ad_model);
     let charged = SgdConfig::new().init().step(lr, ad_model.clone(), grads);
-    let plain_step = ad_model.next_token_step_full(ad_tokens(), None, None, None, span.clone());
+    let plain_step = ad_model.next_token_step_full(ad_tokens(), LmExtras::plain(), span.clone());
     let grads = GradientsParams::from_grads(plain_step.loss.backward(), &ad_model);
     let rewarded = SgdConfig::new().init().step(lr, ad_model, grads);
     let (after_charged, after_plain) = (prob_of_proposals(&charged), prob_of_proposals(&rewarded));
@@ -3670,9 +5995,14 @@ fn multisource_checks() -> anyhow::Result<Vec<Certificate>> {
     let self_distill = model
         .next_token_step_full(
             tokens,
-            None,
-            None,
-            Some(Distillation { teachers: &[(&model, 1.0)], temperature: 2.0, weight: 1.0 }),
+            LmExtras {
+                distill: Some(Distillation {
+                    teachers: &[(&model, 1.0)],
+                    temperature: 2.0,
+                    weight: 1.0,
+                }),
+                ..LmExtras::plain()
+            },
             span,
         )
         .metrics
@@ -3685,9 +6015,11 @@ fn multisource_checks() -> anyhow::Result<Vec<Certificate>> {
     let b_lin = LinearConfig::new(4, 3).init::<B>(&device);
     let fa = flatten::<B, _>(&a);
     let fb = flatten::<B, _>(&b_lin);
-    let same = merge_into::<B, _>(a.clone(), &[ParamSnapshot::of::<B, _>(&a)], &[1.0, 1.0]).context("merge")?;
+    let same = merge_into::<B, _>(a.clone(), &[ParamSnapshot::of::<B, _>(&a)], &[1.0, 1.0])
+        .context("merge")?;
     let mut merge_identity_err = f64::from(u8::from(flatten::<B, _>(&same) != fa));
-    let half = merge_into::<B, _>(a, &[ParamSnapshot::of::<B, _>(&b_lin)], &[1.0, 3.0]).context("merge")?;
+    let half = merge_into::<B, _>(a, &[ParamSnapshot::of::<B, _>(&b_lin)], &[1.0, 3.0])
+        .context("merge")?;
     let mut merge_linear_err = 0.0f64;
     for ((m, x), y) in flatten::<B, _>(&half).iter().zip(&fa).zip(&fb) {
         merge_linear_err = merge_linear_err.max(f64::from((m - (0.25 * x + 0.75 * y)).abs()));
@@ -3791,7 +6123,9 @@ fn policy_certificates() -> Vec<Certificate> {
 }
 
 fn policy_checks() -> anyhow::Result<Vec<Certificate>> {
-    use crate::policy::{gated_generate, hex, hmac_sha256, starter, Approval, Decision, Grant, Key, Policy};
+    use crate::policy::{
+        gated_generate, hex, hmac_sha256, starter, Approval, Decision, Grant, Key, Policy,
+    };
 
     // ------------------------------------------------------------------
     // The primitive every grant rests on: HMAC-SHA256 against RFC 4231.
@@ -3818,16 +6152,31 @@ fn policy_checks() -> anyhow::Result<Vec<Certificate>> {
     let grant = Grant::issue(&key, approval).context("grant")?;
     let mut grant_err = f64::from(u8::from(grant.verify(&key, &policy, 150).is_err()));
     let reasons = [
-        grant.verify(&other, &policy, 150).err().map(|e| e.to_string().contains("signed by key")),
-        grant.verify(&key, &policy, 250).err().map(|e| e.to_string().contains("expired")),
+        grant
+            .verify(&other, &policy, 150)
+            .err()
+            .map(|e| e.to_string().contains("signed by key")),
+        grant
+            .verify(&key, &policy, 250)
+            .err()
+            .map(|e| e.to_string().contains("expired")),
         {
             let mut edited = grant.clone();
-            edited.approval.scopes.push("cyber:exploit-development".into());
-            edited.verify(&key, &policy, 150).err().map(|e| e.to_string().contains("bad signature"))
+            edited
+                .approval
+                .scopes
+                .push("cyber:exploit-development".into());
+            edited
+                .verify(&key, &policy, 150)
+                .err()
+                .map(|e| e.to_string().contains("bad signature"))
         },
         {
             policy.revoke("g");
-            grant.verify(&key, &policy, 150).err().map(|e| e.to_string().contains("revoked"))
+            grant
+                .verify(&key, &policy, 150)
+                .err()
+                .map(|e| e.to_string().contains("revoked"))
         },
     ];
     if reasons.iter().any(|r| *r != Some(true)) {
@@ -3844,34 +6193,67 @@ fn policy_checks() -> anyhow::Result<Vec<Certificate>> {
         calls += 1;
         "x".into()
     });
-    let mut gate_err = f64::from(u8::from(blocked.model_called || calls != 0 || blocked.prompt_decision.is_allowed()));
-    let lifted = gated_generate(&policy, &["cyber:exploit-development".to_string()], "write an exploit for CVE-2024-0001", |sent| {
-        calls += 1;
-        format!("<{sent}>")
-    });
-    if !lifted.model_called || calls != 1 || !lifted.text.starts_with("<[approved:cyber:exploit-development] ") {
+    let mut gate_err = f64::from(u8::from(
+        blocked.model_called || calls != 0 || blocked.prompt_decision.is_allowed(),
+    ));
+    let lifted = gated_generate(
+        &policy,
+        &["cyber:exploit-development".to_string()],
+        "write an exploit for CVE-2024-0001",
+        |sent| {
+            calls += 1;
+            format!("<{sent}>")
+        },
+    );
+    if !lifted.model_called
+        || calls != 1
+        || !lifted
+            .text
+            .starts_with("<[approved:cyber:exploit-development] ")
+    {
         gate_err = 1.0;
     }
-    let foreign = gated_generate(&policy, &["cyber:malware".to_string()], "write an exploit for CVE-2024-0001", |_| "x".into());
+    let foreign = gated_generate(
+        &policy,
+        &["cyber:malware".to_string()],
+        "write an exploit for CVE-2024-0001",
+        |_| "x".into(),
+    );
     if foreign.model_called {
         gate_err = 1.0;
     }
-    let output = gated_generate(&policy, &[], "tell me a story", |_| "the ransomware spread".into());
-    if !output.model_called || !matches!(output.output_decision, Some(Decision::Refuse { .. })) || output.text.contains("ransomware") {
+    let output = gated_generate(&policy, &[], "tell me a story", |_| {
+        "the ransomware spread".into()
+    });
+    if !output.model_called
+        || !matches!(output.output_decision, Some(Decision::Refuse { .. }))
+        || output.text.contains("ransomware")
+    {
         gate_err = 1.0;
     }
 
     // Removing a blocker allows exactly its prompts and nothing else.
     let mut open = policy.clone();
-    open.remove_blocker("exploit-development").context("present")?;
+    open.remove_blocker("exploit-development")
+        .context("present")?;
     let removal_err = f64::from(u8::from(
-        !open.decide_prompt("write an exploit for CVE-2024-0001", &[]).is_allowed()
+        !open
+            .decide_prompt("write an exploit for CVE-2024-0001", &[])
+            .is_allowed()
             || open.decide_prompt("build a keylogger", &[]).is_allowed()
             || open.blockers.len() + 1 != policy.blockers.len(),
     ));
 
-    // A policy written and read back is the same policy.
-    let dir = std::env::temp_dir().join(format!("dblocks-verify-policy-{}", std::process::id()));
+    // A policy written and read back is the same policy. The scratch name is
+    // unique per call, not just per process: `run_all` is invoked by more than
+    // one test in this process, and a shared `policy.json` had them truncating
+    // each other's file mid-write (the read saw zero bytes).
+    static SCRATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "dblocks-verify-policy-{}-{}",
+        std::process::id(),
+        SCRATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let path = dir.join("policy.json");
     let roundtrip_err = match policy.write(&path).and_then(|_| Policy::read(&path)) {
@@ -3926,17 +6308,29 @@ fn ablation_certificates() -> Vec<Certificate> {
 }
 
 fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
-    use crate::ablation::{best as best_direction, extract, orthogonalize, projection_penalty, residual_projection, Direction};
+    use crate::ablation::{
+        best as best_direction, extract, orthogonalize, projection_penalty, residual_projection,
+        Direction,
+    };
     use crate::checkpoint::canonical_hash_hex;
     use crate::dblock::NegativeLabels;
-    use crate::heretic::{apply, best, interpolate, mean_kl, search, HereticParams, Kernel, RefusalDetector, SearchConfig};
-    use crate::lm::{DirectionPenalty, LanguageModel, LmConfig};
+    use crate::heretic::{
+        apply, best, interpolate, mean_kl, search, HereticParams, Kernel, RefusalDetector,
+        SearchConfig,
+    };
+    use crate::lm::{DirectionPenalty, LanguageModel, LmConfig, LmExtras};
     use crate::train::DefaultTrainBackend as A;
     use burn::optim::{GradientsParams, Optimizer, SgdConfig};
     use burn::tensor::activation::softmax;
 
     let device = Default::default();
-    let model = LanguageModel::<B>::new(&LmConfig { context: 16, ..LmConfig::tiny() }, &device);
+    let model = LanguageModel::<B>::new(
+        &LmConfig {
+            context: 16,
+            ..LmConfig::tiny()
+        },
+        &device,
+    )?;
     let h = model.hidden_size();
     let layers = model.num_layers();
     let eps = f64::from(f32::EPSILON);
@@ -3952,7 +6346,10 @@ fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
         ids
     };
     let residuals = |lasts: &[u8]| -> Vec<Vec<Vec<f32>>> {
-        lasts.iter().map(|l| model.residuals_at_last_position(&prompt(*l), &device)).collect()
+        lasts
+            .iter()
+            .map(|l| model.residuals_at_last_position(&prompt(*l), &device))
+            .collect()
     };
     let (target, baseline) = (residuals(b"abcde"), residuals(b"vwxyz"));
     let directions: Vec<Direction> = (0..layers)
@@ -3962,12 +6359,24 @@ fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
             extract(l, &t, &b)
         })
         .collect();
-    let chosen = best_direction(&directions).cloned().context("a direction")?;
+    let chosen = best_direction(&directions)
+        .cloned()
+        .context("a direction")?;
     let separation_err = f64::from(u8::from(
         chosen.separation.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
-            || chosen.target_mean_projection.partial_cmp(&chosen.baseline_mean_projection) != Some(std::cmp::Ordering::Greater),
+            || chosen
+                .target_mean_projection
+                .partial_cmp(&chosen.baseline_mean_projection)
+                != Some(std::cmp::Ordering::Greater),
     ));
-    let norm_err = (chosen.vector.iter().map(|x| f64::from(*x) * f64::from(*x)).sum::<f64>().sqrt() - 1.0).abs();
+    let norm_err = (chosen
+        .vector
+        .iter()
+        .map(|x| f64::from(*x) * f64::from(*x))
+        .sum::<f64>()
+        .sqrt()
+        - 1.0)
+        .abs();
 
     // ------------------------------------------------------------------
     // Weight-space ablation on the real model, adaLN gates included: after
@@ -3997,7 +6406,9 @@ fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
     };
     let (once, _) = orthogonalize::<B, _>(model.clone(), &axis, Some(gates.clone()));
     let (twice, _) = orthogonalize::<B, _>(once.clone(), &axis, Some(gates.clone()));
-    let idempotent_err = f64::from(u8::from(canonical_hash_hex::<B, _>(&once) != canonical_hash_hex::<B, _>(&twice)));
+    let idempotent_err = f64::from(u8::from(
+        canonical_hash_hex::<B, _>(&once) != canonical_hash_hex::<B, _>(&twice),
+    ));
 
     // ------------------------------------------------------------------
     // Inference-time ablation: with the direction projected out after the
@@ -4014,7 +6425,15 @@ fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
         .fold(1.0f64, f64::max);
     let inference_err = states
         .iter()
-        .map(|s| f64::from(s.clone().matmul(d_tensor.clone().reshape([1, h, 1])).abs().max().into_scalar()))
+        .map(|s| {
+            f64::from(
+                s.clone()
+                    .matmul(d_tensor.clone().reshape([1, h, 1]))
+                    .abs()
+                    .max()
+                    .into_scalar(),
+            )
+        })
         .fold(0.0f64, f64::max);
     let inference_tolerance = 4.0 * h as f64 * eps * largest_state;
 
@@ -4024,23 +6443,31 @@ fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
     // penalized layer's states projecting less onto the direction than a
     // plain step does.
     let span = 0..layers;
-    let plain = model.next_token_step_full(tokens(), None, None, None, span.clone());
+    let plain = model.next_token_step_full(tokens(), LmExtras::plain(), span.clone());
     let silent = model.next_token_step_directed(
         tokens(),
-        None,
-        None,
-        None,
-        Some(DirectionPenalty { direction: &d_tensor, layer: chosen.layer, weight: 0.0 }),
+        LmExtras::with_direction(DirectionPenalty {
+            direction: &d_tensor,
+            layer: chosen.layer,
+            weight: 0.0,
+        }),
         span.clone(),
     );
-    let mut zero_weight_err =
-        f64::from(u8::from(plain.loss.into_scalar().to_bits() != silent.loss.into_scalar().to_bits()));
+    let mut zero_weight_err = f64::from(u8::from(
+        plain.loss.into_scalar().to_bits() != silent.loss.into_scalar().to_bits(),
+    ));
     if silent.metrics.direction_projection != 0.0 {
         zero_weight_err = 1.0;
     }
 
     let ad_device = Default::default();
-    let ad_model = LanguageModel::<A>::new(&LmConfig { context: 16, ..LmConfig::tiny() }, &ad_device);
+    let ad_model = LanguageModel::<A>::new(
+        &LmConfig {
+            context: 16,
+            ..LmConfig::tiny()
+        },
+        &ad_device,
+    )?;
     let ad_tokens = || Tensor::<A, 1, Int>::from_ints(ids.as_slice(), &ad_device).reshape([1, 16]);
     // The penalized direction: the mean state of the last layer, so the
     // projection starts large.
@@ -4053,7 +6480,12 @@ fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
         .convert::<f32>()
         .iter::<f32>()
         .collect();
-    let norm = mean_state.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
+    let norm = mean_state
+        .iter()
+        .map(|x| x * x)
+        .sum::<f32>()
+        .sqrt()
+        .max(1e-12);
     let unit: Vec<f32> = mean_state.iter().map(|x| x / norm).collect();
     let ad_direction = Tensor::<A, 1>::from_floats(unit.as_slice(), &ad_device);
     let projection_of = |m: &LanguageModel<A>| -> f32 {
@@ -4066,15 +6498,16 @@ fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
     let lr = 0.01;
     let penalized_step = ad_model.next_token_step_directed(
         ad_tokens(),
-        None,
-        None,
-        None,
-        Some(DirectionPenalty { direction: &ad_direction, layer: last, weight: 1.0 }),
+        LmExtras::with_direction(DirectionPenalty {
+            direction: &ad_direction,
+            layer: last,
+            weight: 1.0,
+        }),
         span.clone(),
     );
     let grads = GradientsParams::from_grads(penalized_step.loss.backward(), &ad_model);
     let penalized = SgdConfig::new().init().step(lr, ad_model.clone(), grads);
-    let plain_step = ad_model.next_token_step_full(ad_tokens(), None, None, None, span.clone());
+    let plain_step = ad_model.next_token_step_full(ad_tokens(), LmExtras::plain(), span.clone());
     let grads = GradientsParams::from_grads(plain_step.loss.backward(), &ad_model);
     let unpenalized = SgdConfig::new().init().step(lr, ad_model, grads);
     let (after_penalized, after_plain) = (projection_of(&penalized), projection_of(&unpenalized));
@@ -4089,9 +6522,13 @@ fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
     // step ends with the labels less probable than a rewarded step does --
     // measured on the clean latent, where no noise is drawn.
     let cfg = ViTDiTConfig::tiny(10);
-    let block_cfg = DblockConfig { num_blocks: 1, ..DblockConfig::default() };
-    let classifier = DblockClassifier::<A>::new(&cfg, &block_cfg, &ad_device);
-    let pixels = Tensor::<A, 4>::random([4, 3, 32, 32], Distribution::Uniform(-1.0, 1.0), &ad_device);
+    let block_cfg = DblockConfig {
+        num_blocks: 1,
+        ..DblockConfig::default()
+    };
+    let classifier = DblockClassifier::<A>::new(&cfg, &block_cfg, &ad_device)?;
+    let pixels =
+        Tensor::<A, 4>::random([4, 3, 32, 32], Distribution::Uniform(-1.0, 1.0), &ad_device);
     let labels = Tensor::<A, 1, Int>::from_ints([0i64, 1, 2, 3], &ad_device);
     let sigmas = [0.05f64; 4];
     let negatives = |alpha: f32| NegativeLabels::<A> {
@@ -4099,22 +6536,40 @@ fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
         alpha,
         epsilon: 1e-6,
     };
-    let free = classifier.training_step_negative(pixels.clone(), labels.clone(), &sigmas, 0, None, negatives(0.0));
+    let free = classifier.training_step_negative(
+        pixels.clone(),
+        labels.clone(),
+        &sigmas,
+        0,
+        None,
+        negatives(0.0),
+    );
     let mut free_err = f64::from(free.metrics.ce_loss.abs());
     if free.metrics.negative_samples != 4 {
         free_err = 1.0;
     }
-    let charged = classifier.training_step_negative(pixels.clone(), labels.clone(), &sigmas, 0, None, negatives(1.0));
+    let charged = classifier.training_step_negative(
+        pixels.clone(),
+        labels.clone(),
+        &sigmas,
+        0,
+        None,
+        negatives(1.0),
+    );
     let bound_err = (f64::from(charged.metrics.ce_loss) + (1e-6f64).ln()).max(0.0);
 
     let label_prob = |m: &DblockClassifier<A>| -> f32 {
         let clean = m.model().normalized_label_embeds(labels.clone());
         let probs = softmax(m.denoise(pixels.clone(), clean, &sigmas, Some(0)), 1);
-        probs.gather(1, labels.clone().unsqueeze_dim::<2>(1)).mean().into_scalar()
+        probs
+            .gather(1, labels.clone().unsqueeze_dim::<2>(1))
+            .mean()
+            .into_scalar()
     };
     let grads = GradientsParams::from_grads(charged.loss.backward(), &classifier);
     let charged_model = SgdConfig::new().init().step(lr, classifier.clone(), grads);
-    let rewarded_step = classifier.training_step_on(pixels.clone(), labels.clone(), &sigmas, 0, None);
+    let rewarded_step =
+        classifier.training_step_on(pixels.clone(), labels.clone(), &sigmas, 0, None);
     let grads = GradientsParams::from_grads(rewarded_step.loss.backward(), &classifier);
     let rewarded_model = SgdConfig::new().init().step(lr, classifier, grads);
     let (p_charged, p_rewarded) = (label_prob(&charged_model), label_prob(&rewarded_model));
@@ -4126,8 +6581,17 @@ fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
     // ------------------------------------------------------------------
     // Heretic (roadmap 31.6): the trapezoid kernel, identity parameters,
     // direction interpolation, the search's best, the refusal detector.
-    let kernel = Kernel { max_weight: 1.0, max_weight_position: 3.0, min_weight: 0.2, min_weight_distance: 2.0 };
-    let mut kernel_err = f64::from((kernel.weight(3) - 1.0).abs() + (kernel.weight(0) - 0.2).abs() + (kernel.weight(6) - 0.2).abs());
+    let kernel = Kernel {
+        max_weight: 1.0,
+        max_weight_position: 3.0,
+        min_weight: 0.2,
+        min_weight_distance: 2.0,
+    };
+    let mut kernel_err = f64::from(
+        (kernel.weight(3) - 1.0).abs()
+            + (kernel.weight(0) - 0.2).abs()
+            + (kernel.weight(6) - 0.2).abs(),
+    );
     kernel_err += f64::from((kernel.weight(4) - 0.6).abs());
     for layer in 0..8 {
         let w = kernel.weight(layer);
@@ -4136,9 +6600,17 @@ fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
         }
     }
 
-    let (untouched, touched_by_identity) =
-        apply::<B, _>(model.clone(), &directions, &HereticParams::identity(), Some(&gates)).context("identity")?;
-    let logits = model.forward(tokens()).logits.reshape([16, model.vocab_size()]);
+    let (untouched, touched_by_identity) = apply::<B, _>(
+        model.clone(),
+        &directions,
+        &HereticParams::identity(),
+        Some(&gates),
+    )
+    .context("identity")?;
+    let logits = model
+        .forward(tokens())
+        .logits
+        .reshape([16, model.vocab_size()]);
     let self_kl = f64::from(mean_kl(logits.clone(), logits));
     let mut identity_err = self_kl + touched_by_identity as f64;
     if canonical_hash_hex::<B, _>(&untouched) != canonical_hash_hex::<B, _>(&model) {
@@ -4149,7 +6621,8 @@ fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
     let interpolation_err = f64::from(u8::from(at_one != directions[1].vector));
 
     let trials = search(&SearchConfig::new(9, layers), |params| {
-        let refusals = f64::from(params.attention.kernel.max_weight - params.mlp.kernel.min_weight).abs();
+        let refusals =
+            f64::from(params.attention.kernel.max_weight - params.mlp.kernel.min_weight).abs();
         let kl = f64::from(params.attention.direction_index).abs() * 0.01;
         Ok((refusals, kl, 1))
     })
@@ -4159,7 +6632,8 @@ fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
 
     let detector = RefusalDetector::default();
     let detector_err = f64::from(u8::from(
-        !detector.is_refusal("I cannot help with that request.") || detector.is_refusal("Sure, here is the code you asked for."),
+        !detector.is_refusal("I cannot help with that request.")
+            || detector.is_refusal("Sure, here is the code you asked for."),
     ));
 
     Ok(vec![
@@ -4264,14 +6738,17 @@ fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
     ])
 }
 
-fn model_certificates() -> Vec<Certificate> {
+fn model_checks() -> anyhow::Result<Vec<Certificate>> {
     let device = Default::default();
     let cfg = ViTDiTConfig::tiny(10);
     let model = DblockClassifier::<B>::new(
         &cfg,
-        &DblockConfig { num_blocks: 2, ..DblockConfig::default() },
+        &DblockConfig {
+            num_blocks: 2,
+            ..DblockConfig::default()
+        },
         &device,
-    );
+    )?;
 
     let pixels = Tensor::<B, 4>::random([4, 3, 32, 32], Distribution::Uniform(-1.0, 1.0), &device);
     let z = Tensor::<B, 2>::random([4, 32], Distribution::Normal(0.0, 1.0), &device);
@@ -4300,7 +6777,7 @@ fn model_certificates() -> Vec<Certificate> {
         0.0,
     ));
 
-    certificates
+    Ok(certificates)
 }
 
 /// Certificates that hold for *any* model, trained or not, and can therefore
@@ -4470,17 +6947,32 @@ fn autodiff_checks() -> anyhow::Result<Vec<Certificate>> {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_all_certificates_hold() {
         let report = run_all();
-        assert!(
-            report.passed(),
-            "verification failed:\n{}",
-            report.render()
-        );
+        assert!(report.passed(), "verification failed:\n{}", report.render());
     }
 
     #[test]
@@ -4498,8 +6990,12 @@ mod tests {
                 "accuracy",
                 "antipattern",
                 "autodiff",
+                "cheat",
+                "codegen_eval",
                 "codequality",
+                "deltanet",
                 "experiment",
+                "geom",
                 "hybrid",
                 "lm",
                 "loopgraph",
@@ -4513,6 +7009,7 @@ mod tests {
                 "precision",
                 "preconditioning",
                 "quantize",
+                "qwennet",
                 "schedule",
                 "solver",
                 "stats",

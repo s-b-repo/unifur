@@ -17,7 +17,7 @@ the one the issue states: an optimization hypothesis does not become a fact
 without a measurement.
 
 > **In this repository.** Certificates: `src/verify.rs` (`dblocks verify`,
-> 21 groups). Measurements: the `Status` paragraphs of `TODO.md`. Harnesses:
+> 26 groups). Measurements: the `Status` paragraphs of `TODO.md`. Harnesses:
 > `dblocks sweep`, `dblocks bench --json`, `dblocks audit propagation`,
 > `dblocks lm bench`, `dblocks experiment compare`.
 
@@ -70,6 +70,10 @@ without a measurement.
 | The policy gate refuses a blocked prompt before any forward pass; grants are unforgeable without the key (HMAC-SHA256 per RFC 4231), expire and can be revoked; removing a blocker allows exactly its prompts | VERIFIED | `policy` group (Phase 30) |
 | Direction ablation removes every residual writer's component along the (gate-scaled) direction, is idempotent on an axis, and inference-time projection leaves no component at any layer; the direction penalty at weight 0 is the plain loss and a penalized step lowers the projection relative to a plain step; image negatives at charge 0 cost nothing, are bounded by `−ln ε`, and a charged step lowers the label probability relative to a rewarded one | VERIFIED | `ablation` group (Phase 31) |
 | Heretic's kernel is a trapezoid, its identity parameters change no bit, an integer direction index is that layer's direction, the reported best is the lowest-scoring trial, the detector matches its phrases | VERIFIED | `ablation` group (Phase 31.6) |
+| The learned metric `G = L Lᵀ` is positive definite by construction for any parameters; geodesic attention rows are distributions; the Lipschitz step never increases the relaxation energy | VERIFIED | `geom` group (Phase 33) |
+| The exact rational kernel computes `1/3 + 1/6 = 1/2` exactly, intersects segments exactly, refuses degenerate figures, derives facts with their rule certificate to a fixed point, and falsification both rejects a false claim and survives a true one | VERIFIED | `geom` group |
+| Attractor relaxation beats a matched-depth transformer on real geometric questions | REJECTED at this scale | `geombaseline.rs` (`dblocks geom baseline` / `geom eval --baseline`): at 8192 scenes, 3000 steps, equal optimizer and held-out split on an RTX 3060, the matched transformer (4 layers, 233k params) reached **0.312** held-out against the reasoner's **0.292** (243k params). A larger budget could move this; the harness is the rerun |
+| The depth scaling curve flattens past convergence | VERIFIED (this setting) | `geom eval --refine-sweep` on the same weights: 0.297 / 0.292 / 0.300 / 0.289 at depths 1–4; agree-with-depth-1 drops to ~0.29 at depth 2, so depth changes *which* scenes are right without changing how many |
 | A trained refusal holds under adversarial prompting | UNKNOWN | needs a real model and an evaluation set; `dblocks lm refusal-corpus` + `lm train` build it, the gate holds regardless |
 | An all-dense attention schedule is the Phase 19 trunk bit for bit; a window or retrieval set covering the sequence is dense attention bit for bit | VERIFIED | `hybrid` group (Phase 25) |
 | Linear attention's recurrent state equals its masked matrix form; every attention mode decodes from its state exactly as it recomputes, under every position kind | VERIFIED | `hybrid` group |
@@ -90,6 +94,7 @@ without a measurement.
 | Balance-weight annealing changes anything at 400 steps | REJECTED (no effect observed) | `TODO.md` Phase 23 |
 | Negative supervision drives a labeled idiom >20× down while the clean tokens still learn | VERIFIED (tiny model) | `integration_negative_supervision_unlearns_error_swallowing`, `TODO.md` Phase 24 |
 | Plain training *learns* `except: pass` | VERIFIED | same |
+| Stratification + similarity augmentation improve geom generalization | REJECTED at 3000 steps | own-corpus 0.3457 (inflated by augmented copies in the split) vs 0.2949 cross-eval on the uniform corpus ≈ uniform-trained 0.2920; `docs/Geometric-Reasoning.md` Measured |
 | Loss-free bias balancing / global-batch load on the 400-step MoSME run | see `TODO.md` Phase 23 status | measured with `dblocks train`; entropies reported |
 
 ## Quality claims (all GPU-blocked)

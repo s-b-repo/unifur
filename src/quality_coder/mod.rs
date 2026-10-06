@@ -97,7 +97,11 @@ pub struct Task {
 impl Task {
     /// Construct a task with no defects and no test command. Useful
     /// for the synthetic fixture generator.
-    pub fn identity(language: crate::codequality::Language, path: impl Into<String>, source: impl Into<String>) -> Self {
+    pub fn identity(
+        language: crate::codequality::Language,
+        path: impl Into<String>,
+        source: impl Into<String>,
+    ) -> Self {
         Self {
             language,
             path: path.into(),
@@ -134,13 +138,19 @@ pub struct Patch {
 impl Patch {
     /// Empty patch with a refusal reason.
     pub fn refuse(reason: impl Into<String>) -> Self {
-        Self { diff: String::new(), refusal_reason: Some(reason.into()) }
+        Self {
+            diff: String::new(),
+            refusal_reason: Some(reason.into()),
+        }
     }
 
     /// Empty patch with no reason. Equivalent to "do nothing" —
     /// useful as a sentinel value.
     pub fn empty() -> Self {
-        Self { diff: String::new(), refusal_reason: None }
+        Self {
+            diff: String::new(),
+            refusal_reason: None,
+        }
     }
 
     /// Whether this is a refusal. The eval harness treats refusals
@@ -198,7 +208,11 @@ impl Prompt {
                     d.span.0,
                     d.span.1,
                     d.severity,
-                    if d.explanation.is_empty() { "(no explanation)" } else { d.explanation.as_str() }
+                    if d.explanation.is_empty() {
+                        "(no explanation)"
+                    } else {
+                        d.explanation.as_str()
+                    }
                 ));
             }
         }
@@ -211,17 +225,43 @@ impl Prompt {
              defect is intentional behavior the user should not silently undo,\n\
              output an empty diff and a one-line refusal reason.\n",
         );
-        Prompt { version: Self::CURRENT_VERSION, text }
+        Prompt {
+            version: Self::CURRENT_VERSION,
+            text,
+        }
     }
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use crate::codequality::Language;
 
     fn sample_task() -> Task {
-        let mut task = Task::identity(Language::Python, "src/foo.py", "def f():\n    try:\n        x = 1/0\n    except: pass\n");
+        let mut task = Task::identity(
+            Language::Python,
+            "src/foo.py",
+            "def f():\n    try:\n        x = 1/0\n    except: pass\n",
+        );
         task.defects.push(Defect {
             category: "error-swallowing".into(),
             span: (30, 50),
@@ -290,7 +330,10 @@ mod tests {
 
     #[test]
     fn test_patch_with_diff_is_not_a_refusal() {
-        let p = Patch { diff: "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n".into(), refusal_reason: None };
+        let p = Patch {
+            diff: "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n".into(),
+            refusal_reason: None,
+        };
         assert!(!p.is_refusal());
     }
 

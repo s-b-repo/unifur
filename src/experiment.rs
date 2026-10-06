@@ -25,7 +25,7 @@ use crate::checkpoint::BuildInfo;
 mod nan_null {
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(value: &f64, s: S) -> Result<S::Ok, S::Error> {
+    pub(super) fn serialize<S: Serializer>(value: &f64, s: S) -> Result<S::Ok, S::Error> {
         if value.is_finite() {
             s.serialize_f64(*value)
         } else {
@@ -33,7 +33,7 @@ mod nan_null {
         }
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
         Ok(Option::<f64>::deserialize(d)?.unwrap_or(f64::NAN))
     }
 }
@@ -67,7 +67,11 @@ impl Environment {
             .and_then(|text| {
                 text.lines()
                     .find(|l| l.starts_with("PRETTY_NAME="))
-                    .map(|l| l.trim_start_matches("PRETTY_NAME=").trim_matches('"').to_string())
+                    .map(|l| {
+                        l.trim_start_matches("PRETTY_NAME=")
+                            .trim_matches('"')
+                            .to_string()
+                    })
             })
             .unwrap_or_else(|| std::env::consts::OS.to_string());
         Self {
@@ -126,7 +130,11 @@ impl Summary {
         } else {
             f64::NAN
         };
-        let ci95_half_width = if n >= 2 { t_quantile_975(n - 1) * std / (n as f64).sqrt() } else { f64::NAN };
+        let ci95_half_width = if n >= 2 {
+            t_quantile_975(n - 1) * std / (n as f64).sqrt()
+        } else {
+            f64::NAN
+        };
         Some(Self {
             n,
             mean,
@@ -140,7 +148,10 @@ impl Summary {
 
     /// `(low, high)` of the 95% interval.
     pub fn ci95(&self) -> (f64, f64) {
-        (self.mean - self.ci95_half_width, self.mean + self.ci95_half_width)
+        (
+            self.mean - self.ci95_half_width,
+            self.mean + self.ci95_half_width,
+        )
     }
 
     /// Whether the two intervals overlap. Not a significance test -- a
@@ -215,7 +226,12 @@ pub struct Record {
 }
 
 impl Record {
-    pub fn new(name: impl Into<String>, unit: impl Into<String>, config: serde_json::Value, seeds: Vec<u64>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        unit: impl Into<String>,
+        config: serde_json::Value,
+        seeds: Vec<u64>,
+    ) -> Self {
         Self {
             name: name.into(),
             unit: unit.into(),
@@ -236,7 +252,11 @@ impl Record {
 
     /// The non-warm-up values, in order.
     pub fn measured(&self) -> Vec<f64> {
-        self.trials.iter().filter(|t| !t.warmup).map(|t| t.value).collect()
+        self.trials
+            .iter()
+            .filter(|t| !t.warmup)
+            .map(|t| t.value)
+            .collect()
     }
 
     pub fn with_extra(mut self, extra: serde_json::Value) -> Self {
@@ -255,7 +275,8 @@ impl RunLog {
     pub fn append(path: &Path, record: &Record) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create {}", parent.display()))?;
             }
         }
         let mut file = std::fs::OpenOptions::new()
@@ -272,11 +293,15 @@ impl RunLog {
     /// Every record in the file, in order. Blank lines are skipped; a
     /// malformed line is an error naming its number.
     pub fn read(path: &Path) -> anyhow::Result<Vec<Record>> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         text.lines()
             .enumerate()
             .filter(|(_, l)| !l.trim().is_empty())
-            .map(|(i, l)| serde_json::from_str(l).with_context(|| format!("{}:{}: malformed record", path.display(), i + 1)))
+            .map(|(i, l)| {
+                serde_json::from_str(l)
+                    .with_context(|| format!("{}:{}: malformed record", path.display(), i + 1))
+            })
             .collect()
     }
 }
@@ -343,13 +368,35 @@ pub fn render_comparison(rows: &[ComparisonRow]) -> String {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_summary_statistics_by_hand() {
         let s = Summary::of(&[1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
-        assert_eq!((s.n, s.mean, s.median, s.min, s.max), (5, 3.0, 3.0, 1.0, 5.0));
+        assert_eq!(
+            (s.n, s.mean, s.median, s.min, s.max),
+            (5, 3.0, 3.0, 1.0, 5.0)
+        );
         assert!((s.std - 2.5f64.sqrt()).abs() < 1e-12);
         assert!((s.ci95_half_width - 2.7764 * 2.5f64.sqrt() / 5f64.sqrt()).abs() < 1e-12);
         let single = Summary::of(&[7.0]).unwrap();
@@ -388,10 +435,22 @@ mod tests {
         b.push(2.0, false);
         RunLog::append(&path, &b).unwrap();
         let after = std::fs::read(&path).unwrap();
-        assert!(after.starts_with(&before), "earlier bytes must be untouched");
+        assert!(
+            after.starts_with(&before),
+            "earlier bytes must be untouched"
+        );
         let records = RunLog::read(&path).unwrap();
-        assert_eq!(records.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(), ["a", "b"]);
-        let rows = compare(&records[..1], &[Record { name: "a".into(), ..records[1].clone() }]);
+        assert_eq!(
+            records.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        let rows = compare(
+            &records[..1],
+            &[Record {
+                name: "a".into(),
+                ..records[1].clone()
+            }],
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ratio, 2.0);
         assert!(render_comparison(&rows).contains("b/a"));

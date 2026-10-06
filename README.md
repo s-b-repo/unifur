@@ -44,7 +44,7 @@ with an accurate "In this repository" block naming the module, types and flags
 that implement it.
 
 ```bash
-# Build and run the quality gate: 130 numerical certificates, non-zero exit on
+# Build and run the quality gate: 167 numerical certificates, non-zero exit on
 # any failure.
 cargo build --release
 ./target/release/dblocks verify
@@ -1156,6 +1156,7 @@ table below is generated from it; "blocked" items are all in that table.
 | 29. Multi-Source Training | 5 / 0 / 0 | Done. |
 | 30. Cyber Policy -- Blockers, Refusals and Approvals | 4 / 0 / 0 | Done as a mechanism. |
 | 31. Direction Ablation and Negative Training for Every Model | 6 / 0 / 0 | Done as a mechanism, end to end on a tiny model (the integration test extracts a direction from a trained model, ablates it, trains with the ... |
+| 33. Geometric Reasoning over a Learned Riemannian Geometry | 11 / 0 / 0 | Done as a mechanism: the certificates cover the geometry and the exact kernel, not the quality of a trained reasoner (that is a GPU-scale measurement). |
 
 The original phase-by-phase design checklist that used to live here is
 superseded by that file.

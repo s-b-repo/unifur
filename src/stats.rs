@@ -28,7 +28,11 @@ pub fn erf(x: f64) -> f64 {
     if ax >= SERIES_CROSSOVER {
         // Past the crossover the series would lose digits to cancellation;
         // the continued fraction in `erfc` does not.
-        return if x >= 0.0 { 1.0 - erfc(ax) } else { erfc(ax) - 1.0 };
+        return if x >= 0.0 {
+            1.0 - erfc(ax)
+        } else {
+            erfc(ax) - 1.0
+        };
     }
     // Maclaurin series: erf(x) = 2/sqrt(pi) * sum_{n>=0} (-1)^n x^(2n+1) / (n! (2n+1))
     let xx = x * x;
@@ -169,6 +173,25 @@ pub fn norm_ppf(p: f64) -> f64 {
 const SQRT_2PI: f64 = 2.5066282746310002; // sqrt(2 pi)
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
@@ -207,7 +230,11 @@ mod tests {
         // scipy.stats.norm.cdf(-3.0) = 0.0013498980316301035
         assert_relative_eq!(norm_cdf(-3.0), 0.0013498980316301035, max_relative = 1e-11);
         // scipy.stats.norm.cdf(-4.6517) = 1.6460488695804655e-06 (sigma_max endpoint)
-        assert_relative_eq!(norm_cdf(-4.6517), 1.6460488695804655e-06, max_relative = 1e-9);
+        assert_relative_eq!(
+            norm_cdf(-4.6517),
+            1.6460488695804655e-06,
+            max_relative = 1e-9
+        );
     }
 
     #[test]

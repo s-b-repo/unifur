@@ -89,7 +89,9 @@ impl<B: Backend> RoutingState<B> {
         assert!(size > 0, "a routing state needs a positive size");
         Self {
             norm: LayerNormConfig::new(hidden_size).init(device),
-            update: LinearConfig::new(hidden_size + size, size).with_bias(true).init(device),
+            update: LinearConfig::new(hidden_size + size, size)
+                .with_bias(true)
+                .init(device),
             size,
         }
     }
@@ -119,8 +121,17 @@ pub fn token_stability<B: Backend>(top1: &Tensor<B, 2, Int>, batch: usize, seq_l
     if seq_len < 2 || batch == 0 {
         return 1.0;
     }
-    let ids: Vec<i64> = top1.clone().into_data().convert::<i64>().iter::<i64>().collect();
-    assert_eq!(ids.len(), batch * seq_len, "top1 must cover batch x seq_len positions");
+    let ids: Vec<i64> = top1
+        .clone()
+        .into_data()
+        .convert::<i64>()
+        .iter::<i64>()
+        .collect();
+    assert_eq!(
+        ids.len(),
+        batch * seq_len,
+        "top1 must cover batch x seq_len positions"
+    );
     let mut same = 0usize;
     let mut pairs = 0usize;
     for b in 0..batch {
@@ -148,10 +159,33 @@ pub fn layer_agreement(a: &[i64], b: &[i64], width_a: usize, width_b: usize) -> 
 
 /// Top-1 indices `[T, 1]` to a host vector.
 pub fn top1_to_host<B: Backend>(top1: &Tensor<B, 2, Int>) -> Vec<i64> {
-    top1.clone().into_data().convert::<i64>().iter::<i64>().collect()
+    top1.clone()
+        .into_data()
+        .convert::<i64>()
+        .iter::<i64>()
+        .collect()
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use burn::backend::NdArray;
@@ -185,13 +219,24 @@ mod tests {
         // Two sequences of four: [0,0,0,0] is perfectly stable, [0,1,0,1] never.
         let top1 = ids(&[0, 0, 0, 0, 0, 1, 0, 1]);
         assert!((token_stability(&top1, 2, 4) - 0.5).abs() < 1e-6);
-        assert_eq!(token_stability(&ids(&[0, 1]), 2, 1), 1.0, "length-1 sequences are trivially stable");
+        assert_eq!(
+            token_stability(&ids(&[0, 1]), 2, 1),
+            1.0,
+            "length-1 sequences are trivially stable"
+        );
         // A boundary between sequences is not a pair: [..,0] then [1,..] must not count.
         let boundary = ids(&[0, 0, 1, 1]);
         assert_eq!(token_stability(&boundary, 2, 2), 1.0);
 
-        assert_eq!(layer_agreement(&[0, 1, 2], &[0, 1, 0], 3, 3), Some(2.0 / 3.0));
-        assert_eq!(layer_agreement(&[0, 1], &[0, 1], 2, 3), None, "different widths are incomparable");
+        assert_eq!(
+            layer_agreement(&[0, 1, 2], &[0, 1, 0], 3, 3),
+            Some(2.0 / 3.0)
+        );
+        assert_eq!(
+            layer_agreement(&[0, 1], &[0, 1], 2, 3),
+            None,
+            "different widths are incomparable"
+        );
         assert_eq!(layer_agreement(&[], &[], 2, 2), None);
         assert_eq!(top1_to_host(&ids(&[3, 1])), vec![3, 1]);
         assert_eq!(RouterKind::Value.name(), "value");

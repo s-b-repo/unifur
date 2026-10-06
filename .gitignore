@@ -62,3 +62,13 @@ Thumbs.db
 
 # Burn checkpoints (also covered by checkpoints/ above)
 *.mpk
+
+# Generated corpora. Reproducible from the `dblocks geom data` line in
+# docs/Geometric-Reasoning.md -- same flags, same seed, same bytes -- so a
+# 2.5 MB binary that anyone can rebuild has no business in the history.
+# The hand-written `.json` sidecars next to them are a different matter: a few
+# hundred bytes each, they are inputs a reader needs to see, and `!geom*/*.json`
+# below re-admits exactly those.
+/geom/corpus.bin
+/geom-hard/corpus.bin
+!geom*/geom-meta.json

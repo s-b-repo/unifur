@@ -30,13 +30,13 @@
 //! checkpoint would stop loading. They are owned by the training loop instead,
 //! and a run that does not enable them pays nothing — not even a record field.
 
-use serde::{Deserialize, Serialize};
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
     tensor::{backend::Backend, Tensor},
 };
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 
 use crate::stats::{norm_cdf, norm_ppf};
 
@@ -62,7 +62,9 @@ impl<B: Backend<FloatElem = f32>> LogVarianceHead<B> {
     /// merely enabling the feature. The same zero-init argument the DiT blocks
     /// and the LoRA adapters use, for the same reason.
     pub fn new(hidden_size: usize, frequency_embedding_size: usize, device: &B::Device) -> Self {
-        let linear_2 = LinearConfig::new(hidden_size, 1).with_bias(true).init(device);
+        let linear_2 = LinearConfig::new(hidden_size, 1)
+            .with_bias(true)
+            .init(device);
         let zeroed = Linear {
             weight: burn::module::Param::from_tensor(linear_2.weight.val().zeros_like()),
             bias: linear_2
@@ -154,15 +156,24 @@ impl Default for UncertaintyWeighting {
 impl UncertaintyWeighting {
     /// The exact identity: the loss is returned untouched.
     pub fn off() -> Self {
-        Self { strength: 0.0, clamp: 8.0 }
+        Self {
+            strength: 0.0,
+            clamp: 8.0,
+        }
     }
 
     pub fn full() -> Self {
-        Self { strength: 1.0, clamp: 8.0 }
+        Self {
+            strength: 1.0,
+            clamp: 8.0,
+        }
     }
 
     pub fn new(strength: f64) -> Self {
-        Self { strength: strength.clamp(0.0, 1.0), clamp: 8.0 }
+        Self {
+            strength: strength.clamp(0.0, 1.0),
+            clamp: 8.0,
+        }
     }
 
     pub fn with_clamp(mut self, clamp: f64) -> Self {
@@ -425,6 +436,25 @@ fn pick<R: Rng>(rng: &mut R, weights: &[f64]) -> usize {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use burn::backend::NdArray;
@@ -529,7 +559,11 @@ mod tests {
         // multiply a loss by e^20 and destroy the run in one step.
         let raw = tensor(&[1.0, 1.0]);
         let wild = tensor(&[-500.0, 500.0]);
-        let out = values(UncertaintyWeighting::full().with_clamp(4.0).apply(raw, wild));
+        let out = values(
+            UncertaintyWeighting::full()
+                .with_clamp(4.0)
+                .apply(raw, wild),
+        );
         for v in &out {
             assert!(v.is_finite(), "clamping must keep the loss finite: {v}");
         }
@@ -547,13 +581,19 @@ mod tests {
         let q = sampler.proposal();
         assert_eq!(q.len(), 8);
         for value in &q {
-            assert!((value - 0.125).abs() < 1e-15, "cold proposal must be uniform");
+            assert!(
+                (value - 0.125).abs() < 1e-15,
+                "cold proposal must be uniform"
+            );
         }
 
         let mut rng = StdRng::seed_from_u64(3);
         for (sigma, weight) in sampler.sample(&mut rng, 0.05, 0.95, -1.2, 1.2, 32) {
             assert!(sigma.is_finite() && sigma > 0.0);
-            assert!((weight - 1.0).abs() < 1e-12, "weight must be exactly 1, got {weight}");
+            assert!(
+                (weight - 1.0).abs() < 1e-12,
+                "weight must be exactly 1, got {weight}"
+            );
         }
         assert!((sampler.max_weight() - 1.0).abs() < 1e-12);
     }
@@ -571,7 +611,10 @@ mod tests {
         let prior = sampler.prior();
 
         let total: f64 = q.iter().sum();
-        assert!((total - 1.0).abs() < 1e-12, "proposal must be a distribution");
+        assert!(
+            (total - 1.0).abs() < 1e-12,
+            "proposal must be a distribution"
+        );
 
         let expectation: f64 = q.iter().map(|qb| qb * (prior / qb)).sum();
         assert!(
@@ -671,7 +714,10 @@ mod tests {
             assert!(bin < 5);
             seen[bin] += 1;
         }
-        assert!(seen.iter().all(|c| *c > 0), "a uniform proposal must reach every bin: {seen:?}");
+        assert!(
+            seen.iter().all(|c| *c > 0),
+            "a uniform proposal must reach every bin: {seen:?}"
+        );
     }
 
     #[test]
@@ -707,7 +753,10 @@ mod tests {
             .apply(per_sample, head.forward(sigmas))
             .mean();
         let grads = GradientsParams::from_grads(loss.backward(), &head);
-        assert!(!grads.is_empty(), "the log-variance head must receive gradients");
+        assert!(
+            !grads.is_empty(),
+            "the log-variance head must receive gradients"
+        );
     }
 
     #[test]
@@ -721,6 +770,12 @@ mod tests {
 
         type AB = Autodiff<NdArray<f32>>;
         let device = Default::default();
+        // The backend's random stream is process-wide, so the head's
+        // initialization -- and with it how far the optimizer has to travel,
+        // and whether 4000 steps is enough -- depends on whatever other tests
+        // drew first. Seeding fixes the starting point, which is what turns
+        // this from "usually converges" into a reproducible check.
+        <AB as burn::tensor::backend::Backend>::seed(&device, 20_240_917);
         let mut head = LogVarianceHead::<AB>::new(32, 32, &device);
         // A short second-moment memory. The objective's gradient is
         // `1 - L exp(-l)`: from an initialization with `l` well below `ln L`

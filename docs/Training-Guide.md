@@ -334,6 +334,38 @@ backend's, so a seeded DDIM trajectory replays exactly.
 
 ---
 
+## Field notes: diffusion labs (what ports, what does not)
+
+- **Absorbing diffusion for text, never uniform** (D3PM, Austin et al.:
+  uniform schedules waste capacity on text). The byte LM path has no MASK
+  token and no masked-diffusion objective yet — that is the prerequisite
+  project, not a flag.
+- **Weight by surprisal, not uniform time** (DiffusionBERT spindle beat
+  `(T-t+1)⁻¹` 77.5 vs 125 PPL): the sigma-importance sampler
+  (`--importance-bins`) is this idea on the continuous side; keep it on for
+  text-adjacent data.
+- **Train the denoiser target, normalize per noise level** (EDM/EDM2): the
+  `F`-target with unit weight plus `--uncertainty` per-sigma normalization
+  is already the loop's shape; the EDM2 follow-up (post-hoc power-EMA
+  snapshots instead of one fixed decay) is not built.
+- **Masked-CE only, `t ~ U`, semi-AR blocks** (MDLM/LLaDA/BD3-LM recipe:
+  loss on masked tokens, block-diffusion sampling, low-confidence remask
+  with top-k margin re-scored on current context). Applies the day the MASK
+  objective lands; the block machinery (`L' = 4–8`) already matches BD3.
+- **One trunk, two losses** (Transfusion/Show-o: causal AR head +
+  diffusion head, separate masks, summed losses) is the shape a future
+  AR+denoise byte trunk takes — not built.
+- **Inference: Heun for quality, DPM++2M for budgets, annealed guidance
+  with thresholding** (high-order solvers without data-prediction +
+  multistep + thresholding fail under large guidance; high CFG
+  oversaturates). Already the sampler set; annealed `--guidance` is not.
+- **Data beats denoiser size** (Imagen: frozen T5-XXL + fused dense
+  captions; hard negatives fix attribute binding): recaption code comments
+  densely and mine swapped-attribute blocks rather than adding depth.
+- **Watch diversity vs steps** (SEDD follow-up: entropy *falls* with steps
+  under FP bugs): if samples get more stereotyped with more steps, check
+  precision before blaming the schedule.
+
 ## See also
 
 - [Quality Gate](Quality-Gate.md) — what is verified and why

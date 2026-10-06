@@ -112,15 +112,23 @@ impl AttentionMode {
             "dense" | "d" | "full" => Self::Dense,
             "linear" | "l" | "recurrent" => Self::Linear,
             "learned" | "m" | "mixed" => Self::Learned,
-            "sliding" | "s" | "window" => Self::Sliding { window: default_window },
-            "retrieval" | "r" | "sparse" => Self::Retrieval { top_k: default_top_k },
+            "sliding" | "s" | "window" => Self::Sliding {
+                window: default_window,
+            },
+            "retrieval" | "r" | "sparse" => Self::Retrieval {
+                top_k: default_top_k,
+            },
             _ => {
                 if let Some(rest) = lower.strip_prefix("sliding") {
-                    let window: usize = rest.parse().map_err(|_| anyhow::anyhow!("bad sliding window in '{t}'"))?;
+                    let window: usize = rest
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("bad sliding window in '{t}'"))?;
                     anyhow::ensure!(window >= 1, "a sliding window must be at least 1");
                     Self::Sliding { window }
                 } else if let Some(rest) = lower.strip_prefix("retrieval") {
-                    let top_k: usize = rest.parse().map_err(|_| anyhow::anyhow!("bad retrieval top-k in '{t}'"))?;
+                    let top_k: usize = rest
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("bad retrieval top-k in '{t}'"))?;
                     anyhow::ensure!(top_k >= 1, "retrieval must read at least 1 key");
                     Self::Retrieval { top_k }
                 } else {
@@ -140,16 +148,29 @@ pub struct AttentionSchedule {
 impl AttentionSchedule {
     /// Every layer dense: the pre-Phase-25 trunk.
     pub fn dense(num_layers: usize) -> Self {
-        Self { modes: vec![AttentionMode::Dense; num_layers] }
+        Self {
+            modes: vec![AttentionMode::Dense; num_layers],
+        }
     }
 
     /// `cheap` layers of `filler` for every `expensive` layer of `precise`,
     /// the precise one last in each group (so the trunk ends on a precise
     /// layer whenever the ratio divides the depth).
-    pub fn ratio(num_layers: usize, cheap: usize, filler: AttentionMode, precise: AttentionMode) -> Self {
+    pub fn ratio(
+        num_layers: usize,
+        cheap: usize,
+        filler: AttentionMode,
+        precise: AttentionMode,
+    ) -> Self {
         let group = cheap + 1;
         let modes = (0..num_layers)
-            .map(|i| if i % group == group - 1 { precise } else { filler })
+            .map(|i| {
+                if i % group == group - 1 {
+                    precise
+                } else {
+                    filler
+                }
+            })
             .collect();
         Self { modes }
     }
@@ -164,16 +185,27 @@ impl AttentionSchedule {
     ///   `linear,linear,dense,linear`;
     /// - a letter pattern such as `LLLD`, repeated to cover the depth
     ///   (`D` dense, `L` linear, `M` learned, `S` sliding, `R` retrieval).
-    pub fn parse(text: &str, num_layers: usize, default_window: usize, default_top_k: usize) -> anyhow::Result<Self> {
+    pub fn parse(
+        text: &str,
+        num_layers: usize,
+        default_window: usize,
+        default_top_k: usize,
+    ) -> anyhow::Result<Self> {
         let t = text.trim();
         anyhow::ensure!(num_layers > 0, "a schedule needs at least one layer");
         if t.is_empty() {
             return Ok(Self::dense(num_layers));
         }
         if let Some((cheap, rest)) = t.split_once(':') {
-            let cheap: usize = cheap.trim().parse().map_err(|_| anyhow::anyhow!("bad ratio '{t}'"))?;
+            let cheap: usize = cheap
+                .trim()
+                .parse()
+                .map_err(|_| anyhow::anyhow!("bad ratio '{t}'"))?;
             let (one, filler) = match rest.split_once('@') {
-                Some((one, mode)) => (one, AttentionMode::parse(mode, default_window, default_top_k)?),
+                Some((one, mode)) => (
+                    one,
+                    AttentionMode::parse(mode, default_window, default_top_k)?,
+                ),
                 None => (rest, AttentionMode::Linear),
             };
             anyhow::ensure!(one.trim() == "1", "a ratio is written <cheap>:1, got '{t}'");
@@ -193,7 +225,9 @@ impl AttentionSchedule {
         }
         if let Ok(mode) = AttentionMode::parse(t, default_window, default_top_k) {
             if t.len() > 1 {
-                return Ok(Self { modes: vec![mode; num_layers] });
+                return Ok(Self {
+                    modes: vec![mode; num_layers],
+                });
             }
         }
         // A letter pattern, repeated across the depth.
@@ -201,7 +235,11 @@ impl AttentionSchedule {
             .chars()
             .map(|c| AttentionMode::parse(&c.to_string(), default_window, default_top_k))
             .collect::<anyhow::Result<_>>()?;
-        Ok(Self { modes: (0..num_layers).map(|i| pattern[i % pattern.len()]).collect() })
+        Ok(Self {
+            modes: (0..num_layers)
+                .map(|i| pattern[i % pattern.len()])
+                .collect(),
+        })
     }
 
     pub fn num_layers(&self) -> usize {
@@ -209,7 +247,10 @@ impl AttentionSchedule {
     }
 
     pub fn mode(&self, layer: usize) -> AttentionMode {
-        self.modes.get(layer).copied().unwrap_or(AttentionMode::Dense)
+        self.modes
+            .get(layer)
+            .copied()
+            .unwrap_or(AttentionMode::Dense)
     }
 
     pub fn is_all_dense(&self) -> bool {
@@ -231,7 +272,11 @@ impl AttentionSchedule {
                 None => counts.push((c, 1)),
             }
         }
-        counts.iter().map(|(c, n)| format!("{n}{c}")).collect::<Vec<_>>().join(" ")
+        counts
+            .iter()
+            .map(|(c, n)| format!("{n}{c}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -257,7 +302,9 @@ impl PositionKind {
             "learned" | "table" | "absolute" => Self::Learned,
             "rotary" | "rope" => Self::Rotary,
             "none" | "nope" => Self::None,
-            other => anyhow::bail!("unknown position kind '{other}' (expected learned|rotary|none)"),
+            other => {
+                anyhow::bail!("unknown position kind '{other}' (expected learned|rotary|none)")
+            }
         })
     }
 
@@ -304,11 +351,21 @@ pub fn attention_mask<B: Backend>(
 
 /// Multiplicative `0/1` causal mask `[1, 1, m, total]` with the same geometry
 /// as [`attention_mask`] and no window: what linear attention multiplies by.
-pub fn causal_keep_mask<B: Backend>(m: usize, total: usize, query_offset: usize, key_offset: usize, device: &B::Device) -> Tensor<B, 4> {
+pub fn causal_keep_mask<B: Backend>(
+    m: usize,
+    total: usize,
+    query_offset: usize,
+    key_offset: usize,
+    device: &B::Device,
+) -> Tensor<B, 4> {
     let mut values = Vec::with_capacity(m * total);
     for query in 0..m {
         for key in 0..total {
-            values.push(if key_offset + key <= query_offset + query { 1.0f32 } else { 0.0 });
+            values.push(if key_offset + key <= query_offset + query {
+                1.0f32
+            } else {
+                0.0
+            });
         }
     }
     Tensor::<B, 1>::from_floats(values.as_slice(), device).reshape([1, 1, m, total])
@@ -326,7 +383,12 @@ pub fn keep_top_k<B: Backend>(scores: Tensor<B, 4>, top_k: usize) -> Tensor<B, 4
     let (_, idx) = scores.clone().topk_with_indices(top_k, 3); // [b, h, m, k]
     let device = scores.device();
     let ones = Tensor::<B, 4>::ones([b, h, m, top_k], &device);
-    let keep = Tensor::<B, 4>::zeros([b, h, m, total], &device).scatter(3, idx, ones, burn::tensor::IndexingUpdateOp::Add);
+    let keep = Tensor::<B, 4>::zeros([b, h, m, total], &device).scatter(
+        3,
+        idx,
+        ones,
+        burn::tensor::IndexingUpdateOp::Add,
+    );
     let dropped: Tensor<B, 4, Bool> = keep.equal_elem(0.0);
     scores.mask_fill(dropped, f32::NEG_INFINITY)
 }
@@ -396,8 +458,17 @@ pub fn linear_attention<B: Backend>(
 /// Rotary tables `(cos, sin)` for `n` positions starting at `offset`, each
 /// `[1, 1, n, dim]` with the half-dimension frequencies duplicated so they
 /// broadcast against `[b, heads, n, dim]`. `dim` must be even.
-pub fn rotary_tables<B: Backend>(offset: usize, n: usize, dim: usize, base: f64, device: &B::Device) -> (Tensor<B, 4>, Tensor<B, 4>) {
-    assert!(dim % 2 == 0, "rotary positions need an even head dimension, got {dim}");
+pub fn rotary_tables<B: Backend>(
+    offset: usize,
+    n: usize,
+    dim: usize,
+    base: f64,
+    device: &B::Device,
+) -> (Tensor<B, 4>, Tensor<B, 4>) {
+    assert!(
+        dim % 2 == 0,
+        "rotary positions need an even head dimension, got {dim}"
+    );
     let half = dim / 2;
     let mut cos = Vec::with_capacity(n * dim);
     let mut sin = Vec::with_capacity(n * dim);
@@ -436,6 +507,53 @@ pub fn apply_rotary<B: Backend>(x: Tensor<B, 4>, offset: usize, base: f64) -> Te
     x * cos + rotated * sin
 }
 
+/// How many head-dim columns the rotary embedding covers for `fraction` in
+/// `(0, 1]`: rounded down to an even number, at least 2. Qwen3-Next style
+/// partial rotary (e.g. the first 25% of dims) extrapolates to longer
+/// sequences; `1.0` is the full rotation this crate always applied.
+pub fn rotary_dim_for(fraction: f64, head_dim: usize) -> usize {
+    if fraction >= 1.0 {
+        return head_dim - head_dim % 2;
+    }
+    let want = ((head_dim as f64 * fraction.clamp(0.0, 1.0)) as usize).max(2);
+    (want - want % 2).min(head_dim - head_dim % 2)
+}
+
+/// Apply the rotary embedding to the first `rotary_dim` columns of `x` and
+/// pass the rest through untouched. With `rotary_dim == dim` this is
+/// [`apply_rotary`] bit for bit (it delegates); with less, the rotated prefix
+/// keeps the distance-dependence the certificates check while the suffix
+/// carries unrotated content, which is what lets a model trained at one
+/// length decode far past it.
+pub fn apply_rotary_partial<B: Backend>(
+    x: Tensor<B, 4>,
+    offset: usize,
+    base: f64,
+    rotary_dim: usize,
+) -> Tensor<B, 4> {
+    let [_, _, n, dim] = x.dims();
+    assert!(
+        rotary_dim <= dim && rotary_dim % 2 == 0,
+        "rotary cover {rotary_dim} must be an even number of columns of {dim}"
+    );
+    if rotary_dim == dim {
+        return apply_rotary(x, offset, base);
+    }
+    let device = x.device();
+    // Frequencies over the rotated width, not the full head: the angles are
+    // what a `rotary_dim`-wide head would use, exactly as partial-RoPE models
+    // (Qwen3-Next: RoPE on the first 25% of dims) define them.
+    let (cos, sin) = rotary_tables::<B>(offset, n, rotary_dim, base, &device);
+    let rot = x.clone().narrow(3, 0, rotary_dim);
+    let half = rotary_dim / 2;
+    let x1 = rot.clone().narrow(3, 0, half);
+    let x2 = rot.clone().narrow(3, half, half);
+    let rotated = Tensor::cat(vec![x2.neg(), x1], 3);
+    let done = rot * cos + rotated * sin;
+    let rest = x.narrow(3, rotary_dim, dim - rotary_dim);
+    Tensor::cat(vec![done, rest], 3)
+}
+
 /// The rotary base every layer uses.
 pub const ROTARY_BASE: f64 = 10_000.0;
 
@@ -461,7 +579,13 @@ pub struct LayerState<B: Backend> {
 
 impl<B: Backend> Default for LayerState<B> {
     fn default() -> Self {
-        Self { keys: None, values: None, first_key_position: 0, linear: None, positions: 0 }
+        Self {
+            keys: None,
+            values: None,
+            first_key_position: 0,
+            linear: None,
+            positions: 0,
+        }
     }
 }
 
@@ -484,11 +608,23 @@ impl<B: Backend> LayerState<B> {
         *self = Self::default();
     }
 
-    /// Append new keys and values, then keep only the last `keep` positions
-    /// when a window is given.
-    pub fn push_kv(&mut self, k_new: Tensor<B, 4>, v_new: Tensor<B, 4>, keep: Option<usize>) {
+    /// Append new keys and values, keep only the last `keep` positions when a
+    /// window is given, and hand back what is now held.
+    ///
+    /// The return value is why there is no separate "read the cache" call that
+    /// can fail: a caller that has just pushed cannot be reading an empty cache,
+    /// so the pair it needs is the pair this stored.
+    pub fn push_kv(
+        &mut self,
+        k_new: Tensor<B, 4>,
+        v_new: Tensor<B, 4>,
+        keep: Option<usize>,
+    ) -> (Tensor<B, 4>, Tensor<B, 4>) {
         let (k, v) = match (self.keys.take(), self.values.take()) {
-            (Some(pk), Some(pv)) => (Tensor::cat(vec![pk, k_new], 2), Tensor::cat(vec![pv, v_new], 2)),
+            (Some(pk), Some(pv)) => (
+                Tensor::cat(vec![pk, k_new], 2),
+                Tensor::cat(vec![pv, v_new], 2),
+            ),
             _ => (k_new, v_new),
         };
         let total = k.dims()[2];
@@ -500,16 +636,20 @@ impl<B: Backend> LayerState<B> {
             }
             _ => (k, v),
         };
-        self.keys = Some(k);
-        self.values = Some(v);
+        self.keys = Some(k.clone());
+        self.values = Some(v.clone());
+        (k, v)
     }
 
-    /// The held keys and values; panics when there are none.
-    pub fn kv(&self) -> (Tensor<B, 4>, Tensor<B, 4>) {
-        (
-            self.keys.clone().expect("keys were pushed before being read"),
-            self.values.clone().expect("values were pushed before being read"),
-        )
+    /// The held keys and values, if any.
+    ///
+    /// `None` on a state that has never been pushed to, which is what
+    /// [`Self::is_empty`] reports.
+    pub fn kv(&self) -> Option<(Tensor<B, 4>, Tensor<B, 4>)> {
+        match (self.keys.clone(), self.values.clone()) {
+            (Some(k), Some(v)) => Some((k, v)),
+            _ => None,
+        }
     }
 
     /// Keep only the newest `keep` positions, forgetting the rest and
@@ -531,10 +671,9 @@ impl<B: Backend> LayerState<B> {
     pub fn resident_floats(&self) -> usize {
         let kv = self.keys.as_ref().map_or(0, |k| k.shape().num_elements())
             + self.values.as_ref().map_or(0, |v| v.shape().num_elements());
-        let lin = self
-            .linear
-            .as_ref()
-            .map_or(0, |l| l.s.shape().num_elements() + l.z.shape().num_elements());
+        let lin = self.linear.as_ref().map_or(0, |l| {
+            l.s.shape().num_elements() + l.z.shape().num_elements()
+        });
         kv + lin
     }
 }
@@ -558,11 +697,34 @@ pub fn additive_from_keep<B: Backend>(keep: Tensor<B, 4, Bool>) -> Tensor<B, 4> 
 }
 
 /// Int helper: absolute positions `offset..offset + n` as a rank-1 tensor.
-pub fn positions_tensor<B: Backend>(offset: usize, n: usize, device: &B::Device) -> Tensor<B, 1, Int> {
+pub fn positions_tensor<B: Backend>(
+    offset: usize,
+    n: usize,
+    device: &B::Device,
+) -> Tensor<B, 1, Int> {
     Tensor::<B, 1, Int>::arange(offset as i64..(offset + n) as i64, device)
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use burn::backend::NdArray;
@@ -578,9 +740,20 @@ mod tests {
     fn test_schedule_parsing_covers_every_form() {
         let d = AttentionSchedule::parse("", 4, 8, 4).unwrap();
         assert!(d.is_all_dense());
-        assert_eq!(AttentionSchedule::parse("dense", 3, 8, 4).unwrap().pattern(), "DDD");
-        assert_eq!(AttentionSchedule::parse("3:1", 8, 8, 4).unwrap().pattern(), "LLLDLLLD");
-        assert_eq!(AttentionSchedule::parse("1:1", 4, 8, 4).unwrap().pattern(), "LDLD");
+        assert_eq!(
+            AttentionSchedule::parse("dense", 3, 8, 4)
+                .unwrap()
+                .pattern(),
+            "DDD"
+        );
+        assert_eq!(
+            AttentionSchedule::parse("3:1", 8, 8, 4).unwrap().pattern(),
+            "LLLDLLLD"
+        );
+        assert_eq!(
+            AttentionSchedule::parse("1:1", 4, 8, 4).unwrap().pattern(),
+            "LDLD"
+        );
         let s = AttentionSchedule::parse("2:1@sliding16", 6, 8, 4).unwrap();
         assert_eq!(s.pattern(), "SSDSSD");
         assert_eq!(s.mode(0), AttentionMode::Sliding { window: 16 });
@@ -588,8 +761,14 @@ mod tests {
         assert_eq!(list.modes[1], AttentionMode::Retrieval { top_k: 3 });
         assert_eq!(list.pattern(), "LRDM");
         assert_eq!(list.summary(), "1L 1R 1D 1M");
-        assert_eq!(AttentionSchedule::parse("LLD", 5, 8, 4).unwrap().pattern(), "LLDLL");
-        assert!(AttentionSchedule::parse("linear,dense", 3, 8, 4).is_err(), "wrong length");
+        assert_eq!(
+            AttentionSchedule::parse("LLD", 5, 8, 4).unwrap().pattern(),
+            "LLDLL"
+        );
+        assert!(
+            AttentionSchedule::parse("linear,dense", 3, 8, 4).is_err(),
+            "wrong length"
+        );
         assert!(AttentionSchedule::parse("2:2", 4, 8, 4).is_err());
         assert!(AttentionSchedule::parse("sliding0", 4, 8, 4).is_err());
         assert!(AttentionMode::parse("hyper", 8, 4).is_err());
@@ -601,7 +780,10 @@ mod tests {
     #[test]
     fn test_position_kind_parses_and_reports_bounds() {
         assert_eq!(PositionKind::parse("rope").unwrap(), PositionKind::Rotary);
-        assert_eq!(PositionKind::parse("learned").unwrap(), PositionKind::Learned);
+        assert_eq!(
+            PositionKind::parse("learned").unwrap(),
+            PositionKind::Learned
+        );
         assert_eq!(PositionKind::parse("nope").unwrap(), PositionKind::None);
         assert!(PositionKind::parse("alibi").is_err());
         assert!(PositionKind::Learned.is_bounded() && !PositionKind::Rotary.is_bounded());
@@ -614,14 +796,23 @@ mod tests {
         let m = to_vec(attention_mask::<B>(2, 5, 3, 0, Some(2), &device));
         let visible: Vec<bool> = m.iter().map(|v| *v == 0.0).collect();
         // query 3 sees keys 2, 3; query 4 sees keys 3, 4.
-        assert_eq!(visible, vec![false, false, true, true, false, false, false, false, true, true]);
+        assert_eq!(
+            visible,
+            vec![false, false, true, true, false, false, false, false, true, true]
+        );
         // No window: plain causal with an offset.
         let c = to_vec(attention_mask::<B>(2, 5, 3, 0, None, &device));
         let visible: Vec<bool> = c.iter().map(|v| *v == 0.0).collect();
-        assert_eq!(visible, vec![true, true, true, true, false, true, true, true, true, true]);
+        assert_eq!(
+            visible,
+            vec![true, true, true, true, false, true, true, true, true, true]
+        );
         // Keys that start later than 0 (a truncated sliding cache).
         let t = to_vec(attention_mask::<B>(1, 2, 5, 4, Some(2), &device));
-        assert_eq!(t.iter().map(|v| *v == 0.0).collect::<Vec<_>>(), vec![true, true]);
+        assert_eq!(
+            t.iter().map(|v| *v == 0.0).collect::<Vec<_>>(),
+            vec![true, true]
+        );
         let keep = to_vec(causal_keep_mask::<B>(2, 2, 0, 0, &device));
         assert_eq!(keep, vec![1.0, 0.0, 1.0, 1.0]);
     }
@@ -664,8 +855,16 @@ mod tests {
         // matrix product over the whole sequence.
         let device = Default::default();
         let (b, h, n, d) = (2usize, 2usize, 7usize, 4usize);
-        let q = feature_map(Tensor::<B, 4>::random([b, h, n, d], Distribution::Uniform(-1.0, 1.0), &device));
-        let k = feature_map(Tensor::<B, 4>::random([b, h, n, d], Distribution::Uniform(-1.0, 1.0), &device));
+        let q = feature_map(Tensor::<B, 4>::random(
+            [b, h, n, d],
+            Distribution::Uniform(-1.0, 1.0),
+            &device,
+        ));
+        let k = feature_map(Tensor::<B, 4>::random(
+            [b, h, n, d],
+            Distribution::Uniform(-1.0, 1.0),
+            &device,
+        ));
         let v = Tensor::<B, 4>::random([b, h, n, d], Distribution::Uniform(-1.0, 1.0), &device);
         let (full, _) = linear_attention(q.clone(), k.clone(), v.clone(), None, 1e-6);
         let full = to_vec(full);
@@ -692,7 +891,10 @@ mod tests {
             let produced = to_vec(Tensor::cat(outputs, 2));
             assert_eq!(produced.len(), full.len());
             for (i, (a, c)) in produced.iter().zip(&full).enumerate() {
-                assert!((a - c).abs() <= 1e-5 * c.abs().max(1.0), "element {i}: {a} vs {c}");
+                assert!(
+                    (a - c).abs() <= 1e-5 * c.abs().max(1.0),
+                    "element {i}: {a} vs {c}"
+                );
             }
         }
     }
@@ -701,16 +903,30 @@ mod tests {
     fn test_linear_attention_cannot_see_the_future() {
         let device = Default::default();
         let (n, d) = (6usize, 4usize);
-        let q = feature_map(Tensor::<B, 4>::random([1, 1, n, d], Distribution::Uniform(-1.0, 1.0), &device));
-        let k = feature_map(Tensor::<B, 4>::random([1, 1, n, d], Distribution::Uniform(-1.0, 1.0), &device));
+        let q = feature_map(Tensor::<B, 4>::random(
+            [1, 1, n, d],
+            Distribution::Uniform(-1.0, 1.0),
+            &device,
+        ));
+        let k = feature_map(Tensor::<B, 4>::random(
+            [1, 1, n, d],
+            Distribution::Uniform(-1.0, 1.0),
+            &device,
+        ));
         let v = Tensor::<B, 4>::random([1, 1, n, d], Distribution::Uniform(-1.0, 1.0), &device);
         let (reference, _) = linear_attention(q.clone(), k.clone(), v.clone(), None, 1e-6);
         let tail = v.clone().narrow(2, n - 1, 1) + 10.0;
         let perturbed_v = Tensor::cat(vec![v.narrow(2, 0, n - 1), tail], 2);
         let (changed, _) = linear_attention(q, k, perturbed_v, None, 1e-6);
-        let prefix = (reference.clone().narrow(2, 0, n - 1) - changed.clone().narrow(2, 0, n - 1)).abs().max().into_scalar();
+        let prefix = (reference.clone().narrow(2, 0, n - 1) - changed.clone().narrow(2, 0, n - 1))
+            .abs()
+            .max()
+            .into_scalar();
         assert_eq!(prefix, 0.0, "a later value leaked backwards");
-        let last = (reference.narrow(2, n - 1, 1) - changed.narrow(2, n - 1, 1)).abs().max().into_scalar();
+        let last = (reference.narrow(2, n - 1, 1) - changed.narrow(2, n - 1, 1))
+            .abs()
+            .max()
+            .into_scalar();
         assert!(last > 1e-4);
     }
 
@@ -728,11 +944,20 @@ mod tests {
         let base = score(7, 3);
         for shift in [0usize, 1, 10, 100] {
             let shifted = score(7 + shift, 3 + shift);
-            assert!((shifted - base).abs() < 1e-4, "shift {shift}: {shifted} vs {base}");
+            assert!(
+                (shifted - base).abs() < 1e-4,
+                "shift {shift}: {shifted} vs {base}"
+            );
         }
-        assert!((score(3, 7) - base).abs() > 1e-4 || dim < 2, "direction of the distance must matter");
+        assert!(
+            (score(3, 7) - base).abs() > 1e-4 || dim < 2,
+            "direction of the distance must matter"
+        );
         let norm_before: f32 = q.clone().powf_scalar(2.0).sum().into_scalar();
-        let norm_after: f32 = apply_rotary(q, 13, ROTARY_BASE).powf_scalar(2.0).sum().into_scalar();
+        let norm_after: f32 = apply_rotary(q, 13, ROTARY_BASE)
+            .powf_scalar(2.0)
+            .sum()
+            .into_scalar();
         assert!((norm_before - norm_after).abs() < 1e-5);
         // Position 0 is the identity rotation.
         let x = Tensor::<B, 4>::random([1, 2, 3, dim], Distribution::Uniform(-1.0, 1.0), &device);
@@ -756,10 +981,15 @@ mod tests {
         assert!(state.resident_floats() == 8);
         state.clear();
         assert!(state.is_empty() && state.first_key_position == 0);
-        assert_eq!(keys_read_per_query(AttentionMode::Sliding { window: 4 }, 10), 4);
-        assert_eq!(keys_read_per_query(AttentionMode::Retrieval { top_k: 3 }, 2), 2);
+        assert_eq!(
+            keys_read_per_query(AttentionMode::Sliding { window: 4 }, 10),
+            4
+        );
+        assert_eq!(
+            keys_read_per_query(AttentionMode::Retrieval { top_k: 3 }, 2),
+            2
+        );
         assert_eq!(keys_read_per_query(AttentionMode::Linear, 100), 0);
         assert_eq!(keys_read_per_query(AttentionMode::Dense, 100), 100);
     }
 }
-

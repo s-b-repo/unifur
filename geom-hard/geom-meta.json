@@ -1,0 +1,39 @@
+{
+  "scene_len": 40,
+  "points": 6,
+  "kinds": [
+    "nearest",
+    "farthest",
+    "direction",
+    "inside",
+    "collinear"
+  ],
+  "answer_tokens": [
+    48,
+    49,
+    50,
+    51,
+    52,
+    53,
+    54,
+    55,
+    65,
+    66,
+    67,
+    68,
+    69,
+    70,
+    110,
+    121
+  ],
+  "scenes": 24576,
+  "seed": 7,
+  "kind_counts": [
+    3156,
+    3147,
+    6312,
+    5964,
+    5997
+  ],
+  "augment": 2
+}

@@ -31,9 +31,23 @@ Advanced performance features for DiffusionBlocks++.
 > the syscall count, and the label scan walks the file in 4 MiB chunks rather
 > than one header read per record.
 >
-> Native `io_uring` submission would need an external crate and is deliberately
-> not vendored: the measurable win it targets is what run coalescing already
-> delivers.
+> **This is no longer the whole story.** Native `io_uring` submission *is*
+> vendored now, behind the off-by-default `peregrine-uring` feature: see
+> `src/peregrine.rs` and
+> [Parallel I/O & Block Execution](Parallel-IO-and-Block-Execution.md). The
+> original reasoning — that coalescing already captures the win — was half
+> right and is worth revisiting. Coalescing reduces the *number* of reads; a
+> ring reduces the *syscalls per read*, and a streaming dataset that is not in
+> the page cache is bound by both. What the ring adds on top is **striping**:
+> splitting one region across every replica of a file, which is a different
+> effect entirely and worth ~2.7x on the measured fixture.
+>
+> The measurement also contradicted the enthusiasm: on that fixture the ring
+> batches four reads per `io_uring_enter` as advertised, but is *not* the
+> fastest path, because saving three `enter` calls out of a 32 MiB transfer is
+> noise beside the memory traffic. The numbers and their limits are in
+> `peregrine`'s module docs rather than a claim, and `dblocks io` reproduces
+> them on your own storage.
 >
 > **Profiling** — `src/profile.rs`. Named scopes with exact (not estimated)
 > percentiles, ranked by total time. Percentiles rather than means alone,

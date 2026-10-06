@@ -63,7 +63,10 @@ impl Default for InferenceConfig {
 impl InferenceConfig {
     fn to_multi_block(&self) -> MultiBlockConfig {
         MultiBlockConfig {
-            strategy: Gated { inner: self.strategy, gate: self.gates.clone() },
+            strategy: Gated {
+                inner: self.strategy,
+                gate: self.gates.clone(),
+            },
             solver: self.solver,
             num_steps: self.num_steps,
             precision: self.precision,
@@ -104,7 +107,9 @@ impl Predictions {
                 let probs = softmax_row(row);
                 let mut ranked: Vec<(usize, f32)> = probs.into_iter().enumerate().collect();
                 ranked.sort_by(|a, b| {
-                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.0.cmp(&b.0))
                 });
                 ranked.truncate(k.min(row.len()));
                 ranked
@@ -135,7 +140,9 @@ fn softmax_row(row: &[f32]) -> Vec<f32> {
     }
     let exps: Vec<f32> = row.iter().map(|v| (v - max).exp()).collect();
     let sum: f32 = exps.iter().sum();
-    exps.into_iter().map(|e| e / sum.max(f32::MIN_POSITIVE)).collect()
+    exps.into_iter()
+        .map(|e| e / sum.max(f32::MIN_POSITIVE))
+        .collect()
 }
 
 /// A model plus its inference policy.
@@ -220,7 +227,12 @@ impl<B: Backend<FloatElem = f32>> InferenceEngine<B> {
             offset += take;
         }
 
-        Predictions { logits: logits_out, labels, confidence, stats }
+        Predictions {
+            logits: logits_out,
+            labels,
+            confidence,
+            stats,
+        }
     }
 }
 
@@ -237,6 +249,25 @@ fn merge_stats(acc: &mut SamplingStats, batch: SamplingStats) {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use crate::{dblock::DblockConfig, vit::ViTDiTConfig};
@@ -251,17 +282,29 @@ mod tests {
         <B as Backend>::seed(&device, 7);
         let model = DblockClassifier::<B>::new(
             &ViTDiTConfig::tiny(10),
-            &DblockConfig { num_blocks: 2, ..DblockConfig::default() },
+            &DblockConfig {
+                num_blocks: 2,
+                ..DblockConfig::default()
+            },
             &device,
-        );
+        )
+        .unwrap();
         InferenceEngine::new(
             model,
-            InferenceConfig { batch_size, num_steps: Some(3), ..InferenceConfig::default() },
+            InferenceConfig {
+                batch_size,
+                num_steps: Some(3),
+                ..InferenceConfig::default()
+            },
         )
     }
 
     fn inputs(n: usize) -> Tensor<B, 4> {
-        Tensor::<B, 4>::random([n, 3, 32, 32], Distribution::Uniform(-0.5, 0.5), &Default::default())
+        Tensor::<B, 4>::random(
+            [n, 3, 32, 32],
+            Distribution::Uniform(-0.5, 0.5),
+            &Default::default(),
+        )
     }
 
     #[test]
@@ -306,8 +349,14 @@ mod tests {
             stats: SamplingStats::default(),
         };
         let top = preds.top_k(3);
-        assert_eq!(top[0].iter().map(|(i, _)| *i).collect::<Vec<_>>(), vec![1, 2, 0]);
-        assert!(top[0].windows(2).all(|w| w[0].1 >= w[1].1), "must be descending");
+        assert_eq!(
+            top[0].iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![1, 2, 0]
+        );
+        assert!(
+            top[0].windows(2).all(|w| w[0].1 >= w[1].1),
+            "must be descending"
+        );
 
         // The probabilities are a genuine softmax of the full row, so the
         // whole row sums to one even though only k entries are returned.
@@ -350,7 +399,10 @@ mod tests {
         let preds = e.classify(inputs(5), &mut StdRng::seed_from_u64(4));
         for block in 0..preds.stats.ledger.num_blocks() {
             let rate = preds.stats.ledger.rejection_rate(block);
-            assert!((0.0..=1.0).contains(&rate), "block {block} rate {rate} out of range");
+            assert!(
+                (0.0..=1.0).contains(&rate),
+                "block {block} rate {rate} out of range"
+            );
             assert!(
                 preds.stats.ledger.rejected(block) <= preds.stats.ledger.evaluated(block),
                 "more rejections than evaluations in block {block}"

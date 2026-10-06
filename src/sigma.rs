@@ -61,14 +61,21 @@ pub fn block_sigmas(num_blocks: usize) -> Vec<f64> {
 pub fn block_window(bounds: &[f64], block_idx: usize) -> (f64, f64) {
     let n = bounds.len() - 1;
     assert!(n >= 1, "bounds must contain num_blocks + 1 entries");
-    assert!(block_idx < n, "block_idx {block_idx} out of range ({n} blocks)");
+    assert!(
+        block_idx < n,
+        "block_idx {block_idx} out of range ({n} blocks)"
+    );
     (bounds[n - block_idx - 1], bounds[n - block_idx])
 }
 
 /// Sigma shared by blocks `b` and `b + 1` (their common window edge).
 pub fn shared_boundary_sigma(bounds: &[f64], block_idx: usize) -> f64 {
     let n = bounds.len() - 1;
-    assert!(block_idx + 1 < n, "blocks {block_idx} and {} do not both exist", block_idx + 1);
+    assert!(
+        block_idx + 1 < n,
+        "blocks {block_idx} and {} do not both exist",
+        block_idx + 1
+    );
     bounds[n - block_idx - 1]
 }
 
@@ -105,11 +112,12 @@ pub fn discrete_sigmas_dblock(
     let cdf_max = norm_cdf((sigma_max.ln() - p_mean) / p_std);
     let mut sigmas: Vec<f64> = (0..num_steps)
         .map(|i| {
-            let p = cdf_min + if num_steps > 1 {
-                (cdf_max - cdf_min) * (i as f64 / (num_steps - 1) as f64)
-            } else {
-                0.0
-            };
+            let p = cdf_min
+                + if num_steps > 1 {
+                    (cdf_max - cdf_min) * (i as f64 / (num_steps - 1) as f64)
+                } else {
+                    0.0
+                };
             (p_mean + p_std * norm_ppf(p)).exp()
         })
         .collect();
@@ -247,6 +255,25 @@ pub fn edm_loss_weight(sigma: f64, sigma_data: f64) -> f64 {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
@@ -312,7 +339,11 @@ mod tests {
         // stays clamped there after the gamma extension.
         let (lo0, hi0) = sampler.extended_window(0);
         assert_relative_eq!(hi0, SIGMA_MAX, max_relative = 1e-9);
-        assert!(lo0 < bounds[2], "gamma must widen downwards: {lo0} vs {}", bounds[2]);
+        assert!(
+            lo0 < bounds[2],
+            "gamma must widen downwards: {lo0} vs {}",
+            bounds[2]
+        );
 
         // The last block is the cleanest and clamps at the global min.
         let (lo_last, hi_last) = sampler.extended_window(2);
@@ -396,13 +427,17 @@ mod tests {
     fn test_loss_weight() {
         // At sigma == sigma_data the weight is 2/sigma_data^2.
         assert_relative_eq!(edm_loss_weight(0.5, 0.5), 8.0, epsilon = 1e-9);
-        assert_relative_eq!(edm_loss_weight(80.0, 0.5), (80.0f64.powi(2) + 0.25) / 1600.0, epsilon = 1e-12);
+        assert_relative_eq!(
+            edm_loss_weight(80.0, 0.5),
+            (80.0f64.powi(2) + 0.25) / 1600.0,
+            epsilon = 1e-12
+        );
     }
 
     #[test]
     fn test_estimate_target_layer_mapping() {
         let bounds = block_sigmas(3); // ~[0.002, 0.180, 0.505, 80]
-        // Highest-noise sigma -> block 0.
+                                      // Highest-noise sigma -> block 0.
         assert_eq!(estimate_target_layer(&bounds, &[70.0]), 0);
         // Lowest-noise sigma -> last block.
         assert_eq!(estimate_target_layer(&bounds, &[0.003]), 2);

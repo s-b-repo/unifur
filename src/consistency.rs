@@ -24,9 +24,9 @@
 //! small.
 
 use crate::dblock::DblockClassifier;
-use serde::{Deserialize, Serialize};
-use burn::tensor::{Int, Tensor, backend::Backend};
+use burn::tensor::{backend::Backend, Int, Tensor};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 
 /// Weight schedule for combining consistency terms with the main loss.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -34,7 +34,11 @@ pub enum ConsistencySchedule {
     /// Constant weight (no ramp).
     Constant { weight: f64 },
     /// Linear ramp from `start` to `end` over `total_steps`.
-    Linear { start: f64, end: f64, total_steps: usize },
+    Linear {
+        start: f64,
+        end: f64,
+        total_steps: usize,
+    },
     /// Cosine ramp 0 -> 1 over `total_steps` (smooth warmup).
     Cosine { total_steps: usize },
 }
@@ -49,7 +53,11 @@ impl ConsistencySchedule {
     pub fn weight_at(&self, step: usize) -> f64 {
         match *self {
             Self::Constant { weight } => weight,
-            Self::Linear { start, end, total_steps } => {
+            Self::Linear {
+                start,
+                end,
+                total_steps,
+            } => {
                 let t = ((step as f64) / (total_steps.max(2) - 1) as f64).min(1.0);
                 start + (end - start) * t
             }
@@ -86,13 +94,23 @@ impl Default for ConsistencyWeights {
 impl ConsistencyWeights {
     /// Only the boundary term (cheapest configuration).
     pub fn boundary_only() -> Self {
-        Self { boundary: 1.0, self_consistency: 0.0, trajectory: 0.0, cross_fork: 0.0 }
+        Self {
+            boundary: 1.0,
+            self_consistency: 0.0,
+            trajectory: 0.0,
+            cross_fork: 0.0,
+        }
     }
 
     /// Every term disabled: `consistency_step` reduces exactly to
     /// [`crate::dblock::DblockClassifier::training_step`].
     pub fn none() -> Self {
-        Self { boundary: 0.0, self_consistency: 0.0, trajectory: 0.0, cross_fork: 0.0 }
+        Self {
+            boundary: 0.0,
+            self_consistency: 0.0,
+            trajectory: 0.0,
+            cross_fork: 0.0,
+        }
     }
 }
 
@@ -150,17 +168,22 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         let block_idx = rng.random_range(0..self.num_blocks());
         let sigmas = self.sampler(config.gamma).sample(rng, block_idx, b);
 
-        let eps =
-            Tensor::<B, 2>::random(z.dims(), Distribution::Normal(0.0, 1.0), &device);
+        let eps = Tensor::<B, 2>::random(z.dims(), Distribution::Normal(0.0, 1.0), &device);
         let s_t = Tensor::<B, 1>::from_floats(
-            sigmas.iter().map(|&v| v as f32).collect::<Vec<_>>().as_slice(),
+            sigmas
+                .iter()
+                .map(|&v| v as f32)
+                .collect::<Vec<_>>()
+                .as_slice(),
             &device,
         );
         let zt = z.clone() + eps * s_t.unsqueeze_dim::<2>(1);
 
         let logits = self.denoise(pixel_values.clone(), zt.clone(), &sigmas, Some(block_idx));
         let log_probs = log_softmax(logits, 1);
-        let nll = -log_probs.gather(1, labels.unsqueeze_dim::<2>(1)).squeeze_dim::<1>(1);
+        let nll = -log_probs
+            .gather(1, labels.unsqueeze_dim::<2>(1))
+            .squeeze_dim::<1>(1);
         let ce_loss = nll.clone().mean();
 
         let weights: Vec<f32> = sigmas
@@ -192,8 +215,12 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             let eps_b = Tensor::<B, 2>::random(z.dims(), Distribution::Normal(0.0, 1.0), &device);
             let zt_b = z.clone() + eps_b * shared;
             let lo = self.x0_estimate(pixel_values, &zt_b, shared, Some(self.layer_range(lo_blk)));
-            let hi =
-                self.x0_estimate(pixel_values, &zt_b, shared, Some(self.layer_range(lo_blk + 1)));
+            let hi = self.x0_estimate(
+                pixel_values,
+                &zt_b,
+                shared,
+                Some(self.layer_range(lo_blk + 1)),
+            );
             let l = mse(&lo, &hi);
             m_boundary = l.clone().into_scalar();
             loss = loss + l.mul_scalar((config.weights.boundary * lambda) as f32);
@@ -233,8 +260,7 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             // latent reached by integration and one by construction.
             let end_sigma = bounds[1];
             let last = self.layer_range(n_blocks - 1);
-            let target =
-                self.x0_estimate(pixel_values, &z_roll, end_sigma, Some(last.clone()));
+            let target = self.x0_estimate(pixel_values, &z_roll, end_sigma, Some(last.clone()));
             let z_direct = z.clone()
                 + Tensor::<B, 2>::random(z.dims(), Distribution::Normal(0.0, 1.0), &device)
                     * end_sigma;
@@ -306,6 +332,25 @@ fn mse<B: Backend>(a: &Tensor<B, 2>, b: &Tensor<B, 2>) -> Tensor<B, 1> {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
 
@@ -318,7 +363,11 @@ mod tests {
 
     #[test]
     fn test_linear_ramp_endpoints() {
-        let s = ConsistencySchedule::Linear { start: 0.0, end: 1.0, total_steps: 10 };
+        let s = ConsistencySchedule::Linear {
+            start: 0.0,
+            end: 1.0,
+            total_steps: 10,
+        };
         assert!((s.weight_at(0)).abs() < 1e-12);
         assert!((s.weight_at(10) - 1.0).abs() < 1e-12);
         assert!((s.weight_at(5) - 5.0 / 9.0).abs() < 1e-12);

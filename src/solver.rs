@@ -45,9 +45,9 @@
 //!   in `lambda` to machine precision at any step size. That exactness is
 //!   asserted as a certificate rather than assumed (see [`crate::verify`]).
 
-use serde::{Deserialize, Serialize};
-use burn::tensor::{Tensor, backend::Backend};
+use burn::tensor::{backend::Backend, Tensor};
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 
 /// Available ODE solvers.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
@@ -56,7 +56,9 @@ pub enum SolverKind {
     Euler,
     Heun,
     /// `eta` controls ancestral noise (0 = deterministic = Euler).
-    Ddim { eta: f64 },
+    Ddim {
+        eta: f64,
+    },
     DpmPlusPlus2M,
     /// Third-order linear multistep (roadmap 4.5).
     ///
@@ -81,7 +83,9 @@ impl SolverKind {
             "ddim" => Ok(Self::Ddim { eta: 1.0 }),
             "dpmpp2m" => Ok(Self::DpmPlusPlus2M),
             "dpmpp3m" => Ok(Self::DpmPlusPlus3M),
-            other => anyhow::bail!("unknown solver '{other}' (expected euler|heun|ddim|dpmpp2m|dpmpp3m)"),
+            other => {
+                anyhow::bail!("unknown solver '{other}' (expected euler|heun|ddim|dpmpp2m|dpmpp3m)")
+            }
         }
     }
 
@@ -158,7 +162,10 @@ pub struct SolverState<B: Backend> {
 
 impl<B: Backend> SolverState<B> {
     pub fn new(kind: SolverKind) -> Self {
-        Self { kind, history: Vec::with_capacity(2) }
+        Self {
+            kind,
+            history: Vec::with_capacity(2),
+        }
     }
 
     pub fn kind(&self) -> SolverKind {
@@ -238,7 +245,13 @@ impl<B: Backend> SolverState<B> {
     /// Published DPM-Solver++(2M) update (Lu et al., 2022):
     /// `z+ = e^-h z + (1 - e^-h) D~` with the extrapolated
     /// `D~ = (1 + 1/2r) D_i - (1/2r) D_{i-1}`.
-    fn step_dpmpp_2m(&self, s: f64, s_next: f64, z: Tensor<B, 2>, x0: &Tensor<B, 2>) -> Tensor<B, 2> {
+    fn step_dpmpp_2m(
+        &self,
+        s: f64,
+        s_next: f64,
+        z: Tensor<B, 2>,
+        x0: &Tensor<B, 2>,
+    ) -> Tensor<B, 2> {
         // lambda = -log sigma; strictly increasing along the descending schedule.
         let (t, t_next) = (-s.ln(), -s_next.ln());
         let h = t_next - t;
@@ -258,7 +271,13 @@ impl<B: Backend> SolverState<B> {
 
     /// Third-order multistep: quadratic (in lambda) extrapolation of the last
     /// three x0 predictions, integrated against the exact exponential kernel.
-    fn step_dpmpp_3m(&self, s: f64, s_next: f64, z: Tensor<B, 2>, x0: &Tensor<B, 2>) -> Tensor<B, 2> {
+    fn step_dpmpp_3m(
+        &self,
+        s: f64,
+        s_next: f64,
+        z: Tensor<B, 2>,
+        x0: &Tensor<B, 2>,
+    ) -> Tensor<B, 2> {
         let (t, t_next) = (-s.ln(), -s_next.ln());
         let h = t_next - t;
         let e = (-h).exp();
@@ -422,6 +441,25 @@ pub fn quadratic_interp_weights(g0: f64, g1: f64) -> [f64; 4] {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use burn::backend::NdArray;
@@ -483,9 +521,7 @@ mod tests {
         let z_end = integrate(
             Tensor::<B, 2>::full([b, dim], z0 as f32, &device),
             grid,
-            |sigma, _z| {
-                Tensor::<B, 2>::full([b, dim], x0_of_lambda(-sigma.ln()) as f32, &device)
-            },
+            |sigma, _z| Tensor::<B, 2>::full([b, dim], x0_of_lambda(-sigma.ln()) as f32, &device),
             kind,
             &mut rng,
         );
@@ -560,7 +596,11 @@ mod tests {
             integrate(
                 z,
                 &[1.0, 2.0],
-                |_, _: &Tensor<B, 2>| unimplemented!(),
+                // Never reached: an ascending schedule is rejected before the
+                // oracle is called, which is what the assertion below checks. If
+                // that ever changed, this closure would panic -- which is the
+                // outcome the test wants to see.
+                |_, _: &Tensor<B, 2>| panic!("an ascending schedule reached the oracle"),
                 SolverKind::Euler,
                 &mut rng,
             )
@@ -573,7 +613,11 @@ mod tests {
         // Deterministic solvers must all track the closed-form solution.
         for kind in SolverKind::deterministic() {
             let err = constant_oracle_error(kind);
-            assert!(err < 1e-4, "{} drifted off the closed form: {err}", kind.name());
+            assert!(
+                err < 1e-4,
+                "{} drifted off the closed form: {err}",
+                kind.name()
+            );
         }
     }
 
@@ -615,7 +659,11 @@ mod tests {
             .collect()
         };
         assert_ne!(run(1), run(2), "eta > 0 should introduce stochasticity");
-        assert_eq!(run(1), run(1), "the same seed must replay the same trajectory");
+        assert_eq!(
+            run(1),
+            run(1),
+            "the same seed must replay the same trajectory"
+        );
     }
 
     #[test]
@@ -679,9 +727,16 @@ mod tests {
         let quadratic = |lam: f64| 0.05 * lam * lam + 0.3 * lam - 0.7;
         let (hi, lo) = (SCHEDULE[0], SCHEDULE[SCHEDULE.len() - 1]);
 
-        let err_8 = oracle_error(SolverKind::DpmPlusPlus3M, &uniform_lambda_grid(hi, lo, 8), quadratic);
-        let err_16 =
-            oracle_error(SolverKind::DpmPlusPlus3M, &uniform_lambda_grid(hi, lo, 16), quadratic);
+        let err_8 = oracle_error(
+            SolverKind::DpmPlusPlus3M,
+            &uniform_lambda_grid(hi, lo, 8),
+            quadratic,
+        );
+        let err_16 = oracle_error(
+            SolverKind::DpmPlusPlus3M,
+            &uniform_lambda_grid(hi, lo, 16),
+            quadratic,
+        );
 
         assert!(err_8 < 1e-4, "3M residual at 8 steps too large: {err_8:e}");
         assert!(
@@ -698,7 +753,10 @@ mod tests {
         let grid = uniform_lambda_grid(SCHEDULE[0], SCHEDULE[SCHEDULE.len() - 1], 4);
         let affine = |lam: f64| 0.3 * lam - 0.7;
         let err_2m = oracle_error(SolverKind::DpmPlusPlus2M, &grid, affine);
-        assert!(err_2m > 1e-4, "2M unexpectedly exact on affine x0: {err_2m:e}");
+        assert!(
+            err_2m > 1e-4,
+            "2M unexpectedly exact on affine x0: {err_2m:e}"
+        );
     }
 
     #[test]
@@ -761,7 +819,13 @@ mod tests {
         let err_2m = oracle_error(SolverKind::DpmPlusPlus2M, &grid, oracle);
         let err_3m = oracle_error(SolverKind::DpmPlusPlus3M, &grid, oracle);
 
-        assert!(err_2m < err_euler, "2M ({err_2m:e}) should beat Euler ({err_euler:e})");
-        assert!(err_3m < err_2m, "3M ({err_3m:e}) should beat 2M ({err_2m:e})");
+        assert!(
+            err_2m < err_euler,
+            "2M ({err_2m:e}) should beat Euler ({err_euler:e})"
+        );
+        assert!(
+            err_3m < err_2m,
+            "3M ({err_3m:e}) should beat 2M ({err_2m:e})"
+        );
     }
 }

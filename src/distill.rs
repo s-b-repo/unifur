@@ -23,11 +23,7 @@
 //! quantized copy of a model ([`crate::quantize::quantize_module`]) act as its
 //! own student (7.6, "QLoRA students") without any extra plumbing.
 
-use crate::{
-    dblock::DblockClassifier,
-    multi_block::euler_step,
-    solver::SolverKind,
-};
+use crate::{dblock::DblockClassifier, multi_block::euler_step, solver::SolverKind};
 use burn::tensor::{
     activation::{log_softmax, softmax},
     backend::Backend,
@@ -173,7 +169,12 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             for _ in 0..substeps {
                 let next = sigma * ratio;
                 let x0 = teacher
-                    .x0_estimate(pixel_values, &z_teacher, sigma, Some(teacher.span_for(sigma)))
+                    .x0_estimate(
+                        pixel_values,
+                        &z_teacher,
+                        sigma,
+                        Some(teacher.span_for(sigma)),
+                    )
                     .detach();
                 let mut predictor = |sig: f64, zz: &Tensor<B, 2>| {
                     teacher
@@ -206,8 +207,7 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
                 let teacher_logits = teacher
                     .denoise(pixel_values.clone(), zt.clone(), &sigmas, None)
                     .detach();
-                let kl =
-                    soft_target_kl(teacher_logits, student_logits.clone(), config.temperature);
+                let kl = soft_target_kl(teacher_logits, student_logits.clone(), config.temperature);
                 m_kl = kl.clone().into_scalar();
                 loss = Some(accumulate(loss, kl.mul_scalar(config.kl_weight as f32)));
             }
@@ -219,7 +219,10 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
                     .squeeze_dim::<1>(1)
                     .mean();
                 m_ce = ce.clone().into_scalar();
-                loss = Some(accumulate(loss, ce.mul_scalar(config.hard_label_weight as f32)));
+                loss = Some(accumulate(
+                    loss,
+                    ce.mul_scalar(config.hard_label_weight as f32),
+                ));
             }
         }
 
@@ -247,13 +250,19 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         labels: Tensor<B, 1, Int>,
         config: &DistillConfig,
         rng: &mut R,
-    ) -> (Tensor<B, 1>, DistillMetrics) {
-        assert!(!teachers.is_empty(), "distillation needs at least one teacher");
+    ) -> anyhow::Result<(Tensor<B, 1>, DistillMetrics)> {
+        anyhow::ensure!(
+            !teachers.is_empty(),
+            "distillation needs at least one teacher"
+        );
         if teachers.len() == 1 {
-            return self.distill_step(teachers[0].0, pixel_values, labels, config, rng);
+            return Ok(self.distill_step(teachers[0].0, pixel_values, labels, config, rng));
         }
         let total: f64 = teachers.iter().map(|(_, w)| w).sum();
-        assert!(total > 0.0 && teachers.iter().all(|(_, w)| *w >= 0.0), "teacher weights must be non-negative");
+        anyhow::ensure!(
+            total > 0.0 && teachers.iter().all(|(_, w)| *w >= 0.0),
+            "teacher weights must be non-negative and sum to more than zero, not {total}"
+        );
         for (teacher, _) in teachers {
             assert_eq!(
                 self.model().label_embedding_weight().dims(),
@@ -287,14 +296,21 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
                 for _ in 0..substeps {
                     let next = sigma * ratio;
                     let x0 = teacher
-                        .x0_estimate(pixel_values, &z_teacher, sigma, Some(teacher.span_for(sigma)))
+                        .x0_estimate(
+                            pixel_values,
+                            &z_teacher,
+                            sigma,
+                            Some(teacher.span_for(sigma)),
+                        )
                         .detach();
                     let mut predictor = |sig: f64, zz: &Tensor<B, 2>| {
                         teacher
                             .x0_estimate(pixel_values, zz, sig, Some(teacher.span_for(sig)))
                             .detach()
                     };
-                    z_teacher = solver.step(sigma, next, z_teacher, &x0, &mut predictor, &mut local_rng).detach();
+                    z_teacher = solver
+                        .step(sigma, next, z_teacher, &x0, &mut predictor, &mut local_rng)
+                        .detach();
                     sigma = next;
                 }
                 let term = z_teacher.mul_scalar((w / total) as f32);
@@ -303,8 +319,16 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
                     Some(acc) => acc + term,
                 });
             }
-            let z_teacher = target.expect("at least one teacher");
-            let x0_student = self.x0_estimate(pixel_values, &zt, sigma_hi, Some(student_span.clone()));
+            // Non-empty: `teachers` was checked above and the loop ran at
+            // least once.
+            let z_teacher = target.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the latent-weight loop ran over no teachers despite being given {}",
+                    teachers.len()
+                )
+            })?;
+            let x0_student =
+                self.x0_estimate(pixel_values, &zt, sigma_hi, Some(student_span.clone()));
             let z_student = euler_step(sigma_hi, sigma_lo, &zt, &x0_student);
             let l = (z_student - z_teacher).powf_scalar(2.0).mean();
             m_latent = l.clone().into_scalar();
@@ -313,24 +337,37 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
 
         if config.kl_weight > 0.0 || config.hard_label_weight > 0.0 {
             let sigmas = vec![sigma_hi; b];
-            let student_logits = self.denoise(pixel_values.clone(), zt.clone(), &sigmas, Some(block_idx));
+            let student_logits =
+                self.denoise(pixel_values.clone(), zt.clone(), &sigmas, Some(block_idx));
             if config.kl_weight > 0.0 {
                 let teacher_logits: Vec<(Tensor<B, 2>, f64)> = teachers
                     .iter()
                     .map(|(teacher, w)| {
-                        (teacher.denoise(pixel_values.clone(), zt.clone(), &sigmas, None).detach(), *w)
+                        (
+                            teacher
+                                .denoise(pixel_values.clone(), zt.clone(), &sigmas, None)
+                                .detach(),
+                            *w,
+                        )
                     })
                     .collect();
-                let log_mixture = log_teacher_mixture(&teacher_logits, config.temperature);
-                let kl = soft_target_kl_log(log_mixture, student_logits.clone(), config.temperature);
+                let log_mixture = log_teacher_mixture(&teacher_logits, config.temperature)?;
+                let kl =
+                    soft_target_kl_log(log_mixture, student_logits.clone(), config.temperature);
                 m_kl = kl.clone().into_scalar();
                 loss = Some(accumulate(loss, kl.mul_scalar(config.kl_weight as f32)));
             }
             if config.hard_label_weight > 0.0 {
                 let log_probs = log_softmax(student_logits, 1);
-                let ce = -log_probs.gather(1, labels.unsqueeze_dim::<2>(1)).squeeze_dim::<1>(1).mean();
+                let ce = -log_probs
+                    .gather(1, labels.unsqueeze_dim::<2>(1))
+                    .squeeze_dim::<1>(1)
+                    .mean();
                 m_ce = ce.clone().into_scalar();
-                loss = Some(accumulate(loss, ce.mul_scalar(config.hard_label_weight as f32)));
+                loss = Some(accumulate(
+                    loss,
+                    ce.mul_scalar(config.hard_label_weight as f32),
+                ));
             }
         }
 
@@ -343,7 +380,7 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             block_idx,
             steps_saved: substeps - 1,
         };
-        (loss, metrics)
+        Ok((loss, metrics))
     }
 
     /// Layer span the model itself would pick for `sigma` (the teacher's own
@@ -371,21 +408,34 @@ pub fn soft_target_kl_probs<B: Backend<FloatElem = f32>>(
 /// The mixture `sum_i w_i softmax(logits_i / T)` of several teachers'
 /// distributions, weights normalized to sum to 1. A distribution by
 /// construction: a convex combination of distributions.
+///
+/// An empty teacher list is an error rather than a zero distribution: a
+/// mixture over nothing has no mean, and returning zeros would silently train a
+/// student against a target that is uniformly zero everywhere.
 pub fn teacher_mixture<B: Backend<FloatElem = f32>>(
     teacher_logits: &[(Tensor<B, 2>, f64)],
     temperature: f64,
-) -> Tensor<B, 2> {
+) -> anyhow::Result<Tensor<B, 2>> {
+    anyhow::ensure!(
+        !teacher_logits.is_empty(),
+        "a teacher mixture needs at least one teacher"
+    );
     let t = temperature.max(1e-6) as f32;
     let total: f64 = teacher_logits.iter().map(|(_, w)| w).sum();
-    let mut acc: Option<Tensor<B, 2>> = None;
-    for (logits, w) in teacher_logits {
-        let term = softmax(logits.clone().div_scalar(t), 1).mul_scalar((w / total) as f32);
-        acc = Some(match acc {
-            None => term,
-            Some(a) => a + term,
-        });
+    anyhow::ensure!(
+        total > 0.0,
+        "teacher weights sum to {total}, which is not a mixture"
+    );
+    // Seeded from the first teacher rather than accumulated through an `Option`,
+    // so the summation order -- and therefore the bit pattern -- does not depend
+    // on a fold that starts from nothing.
+    let (first_logits, first_w) = &teacher_logits[0];
+    let mut acc =
+        softmax(first_logits.clone().div_scalar(t), 1).mul_scalar((*first_w / total) as f32);
+    for (logits, w) in &teacher_logits[1..] {
+        acc = acc + softmax(logits.clone().div_scalar(t), 1).mul_scalar((*w / total) as f32);
     }
-    acc.expect("at least one teacher")
+    Ok(acc)
 }
 
 /// `log(sum_i w_i softmax(l_i / T))` computed in the log domain (roadmap
@@ -397,7 +447,29 @@ pub fn teacher_mixture<B: Backend<FloatElem = f32>>(
 pub fn log_teacher_mixture<B: Backend<FloatElem = f32>>(
     teacher_logits: &[(Tensor<B, 2>, f64)],
     temperature: f64,
+) -> anyhow::Result<Tensor<B, 2>> {
+    anyhow::ensure!(
+        !teacher_logits.is_empty(),
+        "a teacher mixture needs at least one teacher"
+    );
+    Ok(log_teacher_mixture_nonempty(teacher_logits, temperature))
+}
+
+/// [`log_teacher_mixture`] for a caller that has *already* established the list
+/// is non-empty -- one that matched it out of a guard, for instance. Panics on
+/// an empty list rather than returning an error, because there is no error to
+/// report to anyone: the caller decided the case could not arise, and this is
+/// the assertion that the decision held.
+pub(crate) fn log_teacher_mixture_nonempty<B: Backend<FloatElem = f32>>(
+    teacher_logits: &[(Tensor<B, 2>, f64)],
+    temperature: f64,
 ) -> Tensor<B, 2> {
+    assert!(
+        !teacher_logits.is_empty() && teacher_logits.iter().map(|(_, w)| w).sum::<f64>() > 0.0,
+        "log_teacher_mixture_nonempty called with {} teachers and weights summing to {}",
+        teacher_logits.len(),
+        teacher_logits.iter().map(|(_, w)| w).sum::<f64>()
+    );
     let t = temperature.max(1e-6) as f32;
     let total: f64 = teacher_logits.iter().map(|(_, w)| w).sum();
     let terms: Vec<Tensor<B, 3>> = teacher_logits
@@ -405,7 +477,9 @@ pub fn log_teacher_mixture<B: Backend<FloatElem = f32>>(
         .map(|(logits, w)| {
             let [n, v] = logits.dims();
             let log_w = ((w / total).max(0.0)).ln() as f32; // -inf for a zero weight: exp(-inf) = 0 below
-            log_softmax(logits.clone().div_scalar(t), 1).add_scalar(log_w).reshape([1, n, v])
+            log_softmax(logits.clone().div_scalar(t), 1)
+                .add_scalar(log_w)
+                .reshape([1, n, v])
         })
         .collect();
     let stacked = Tensor::cat(terms, 0); // [k, n, v]
@@ -427,7 +501,10 @@ pub fn soft_target_kl_log<B: Backend<FloatElem = f32>>(
 ) -> Tensor<B, 1> {
     let t = temperature.max(1e-6) as f32;
     let log_q = log_softmax(student_logits.div_scalar(t), 1);
-    (log_p.clone().exp() * (log_p - log_q)).sum_dim(1).mean().mul_scalar(t * t)
+    (log_p.clone().exp() * (log_p - log_q))
+        .sum_dim(1)
+        .mean()
+        .mul_scalar(t * t)
 }
 
 fn accumulate<B: Backend>(acc: Option<Tensor<B, 1>>, term: Tensor<B, 1>) -> Tensor<B, 1> {
@@ -438,13 +515,28 @@ fn accumulate<B: Backend>(acc: Option<Tensor<B, 1>>, term: Tensor<B, 1>) -> Tens
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
-    use crate::{
-        dblock::DblockConfig,
-        train::DefaultTrainBackend,
-        vit::ViTDiTConfig,
-    };
+    use crate::{dblock::DblockConfig, train::DefaultTrainBackend, vit::ViTDiTConfig};
     use burn::backend::NdArray;
     use rand::{rngs::StdRng, SeedableRng};
 
@@ -459,22 +551,21 @@ mod tests {
         // Gibbs' inequality: KL(p || q) >= 0 with equality iff p == q. If this
         // ever fails the distillation objective has a sign or reduction bug.
         let device = Default::default();
-        let logits = Tensor::<B, 1>::from_floats(
-            [2.0f32, -1.0, 0.5, 3.0, 0.0, -2.0].as_slice(),
-            &device,
-        )
-        .reshape([2, 3]);
+        let logits =
+            Tensor::<B, 1>::from_floats([2.0f32, -1.0, 0.5, 3.0, 0.0, -2.0].as_slice(), &device)
+                .reshape([2, 3]);
 
         let same = soft_target_kl(logits.clone(), logits.clone(), 1.0).into_scalar();
         assert!(same.abs() < 1e-6, "KL(p||p) must vanish, got {same}");
 
-        let other = Tensor::<B, 1>::from_floats(
-            [0.0f32, 0.0, 0.0, 1.0, -1.0, 2.0].as_slice(),
-            &device,
-        )
-        .reshape([2, 3]);
+        let other =
+            Tensor::<B, 1>::from_floats([0.0f32, 0.0, 0.0, 1.0, -1.0, 2.0].as_slice(), &device)
+                .reshape([2, 3]);
         let kl = soft_target_kl(logits, other, 1.0).into_scalar();
-        assert!(kl > 0.0, "KL between different distributions must be positive: {kl}");
+        assert!(
+            kl > 0.0,
+            "KL between different distributions must be positive: {kl}"
+        );
     }
 
     #[test]
@@ -484,8 +575,10 @@ mod tests {
         // finite non-zero limit, whereas the unscaled KL would fall off like
         // 1/T^2.
         let device = Default::default();
-        let a = Tensor::<B, 1>::from_floats([2.0f32, -1.0, 0.5].as_slice(), &device).reshape([1, 3]);
-        let b = Tensor::<B, 1>::from_floats([0.0f32, 1.0, -0.5].as_slice(), &device).reshape([1, 3]);
+        let a =
+            Tensor::<B, 1>::from_floats([2.0f32, -1.0, 0.5].as_slice(), &device).reshape([1, 3]);
+        let b =
+            Tensor::<B, 1>::from_floats([0.0f32, 1.0, -0.5].as_slice(), &device).reshape([1, 3]);
 
         let k4 = soft_target_kl(a.clone(), b.clone(), 4.0).into_scalar();
         let k8 = soft_target_kl(a.clone(), b.clone(), 8.0).into_scalar();
@@ -494,7 +587,10 @@ mod tests {
         assert!(k4 > 0.0 && k8 > 0.0 && k16 > 0.0);
         // Successive doublings must converge, not decay by 4x each time.
         let drift = (k16 - k8).abs() / k8;
-        assert!(drift < 0.05, "scaled KL should stabilize with T, drift = {drift}");
+        assert!(
+            drift < 0.05,
+            "scaled KL should stabilize with T, drift = {drift}"
+        );
     }
 
     #[test]
@@ -505,9 +601,13 @@ mod tests {
         let device = Default::default();
         let model = DblockClassifier::<B>::new(
             &tiny_config(),
-            &DblockConfig { num_blocks: 2, ..DblockConfig::default() },
+            &DblockConfig {
+                num_blocks: 2,
+                ..DblockConfig::default()
+            },
             &device,
-        );
+        )
+        .unwrap();
         let pixels = Tensor::<B, 4>::zeros([2, 3, 32, 32], &device);
         let labels = Tensor::<B, 1, Int>::from_ints([1i64, 4].as_slice(), &device);
 
@@ -520,7 +620,11 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(11);
         let (_, metrics) = model.distill_step(&model, &pixels, labels, &config, &mut rng);
 
-        assert!(metrics.kl.abs() < 1e-5, "self-distillation KL must vanish: {}", metrics.kl);
+        assert!(
+            metrics.kl.abs() < 1e-5,
+            "self-distillation KL must vanish: {}",
+            metrics.kl
+        );
         assert!(
             metrics.latent_mse.abs() < 1e-6,
             "one teacher substep must equal the student's single step: {}",
@@ -537,9 +641,13 @@ mod tests {
         let device = Default::default();
         let model = DblockClassifier::<B>::new(
             &tiny_config(),
-            &DblockConfig { num_blocks: 2, ..DblockConfig::default() },
+            &DblockConfig {
+                num_blocks: 2,
+                ..DblockConfig::default()
+            },
             &device,
-        );
+        )
+        .unwrap();
         let pixels = Tensor::<B, 4>::ones([2, 3, 32, 32], &device);
         let labels = Tensor::<B, 1, Int>::from_ints([1i64, 4].as_slice(), &device);
 
@@ -550,7 +658,10 @@ mod tests {
         };
         let mut rng = StdRng::seed_from_u64(3);
         let (_, metrics) = model.distill_step(&model, &pixels, labels, &config, &mut rng);
-        assert!(metrics.latent_mse > 0.0, "4 teacher substeps should not match 1 student step");
+        assert!(
+            metrics.latent_mse > 0.0,
+            "4 teacher substeps should not match 1 student step"
+        );
         assert_eq!(metrics.steps_saved, 3);
     }
 
@@ -562,14 +673,22 @@ mod tests {
         let device = Default::default();
         let teacher = DblockClassifier::<A>::new(
             &tiny_config(),
-            &DblockConfig { num_blocks: 2, ..DblockConfig::default() },
+            &DblockConfig {
+                num_blocks: 2,
+                ..DblockConfig::default()
+            },
             &device,
-        );
+        )
+        .unwrap();
         let student = DblockClassifier::<A>::new(
             &tiny_config(),
-            &DblockConfig { num_blocks: 2, ..DblockConfig::default() },
+            &DblockConfig {
+                num_blocks: 2,
+                ..DblockConfig::default()
+            },
             &device,
-        );
+        )
+        .unwrap();
         let pixels =
             Tensor::<A, 4>::random([2, 3, 32, 32], Distribution::Uniform(-0.5, 0.5), &device);
         let labels = Tensor::<A, 1, Int>::from_ints([0i64, 7].as_slice(), &device);
@@ -588,7 +707,10 @@ mod tests {
         // The teacher is detached, so collecting gradients against it must
         // yield nothing to update; the student must receive some.
         let student_grads = GradientsParams::from_grads(grads, &student);
-        assert!(!student_grads.is_empty(), "the student must receive gradients");
+        assert!(
+            !student_grads.is_empty(),
+            "the student must receive gradients"
+        );
 
         // Re-run to get a fresh graph, then check the teacher side.
         let mut rng = StdRng::seed_from_u64(5);
@@ -600,6 +722,9 @@ mod tests {
             &mut rng,
         );
         let teacher_grads = GradientsParams::from_grads(loss.backward(), &teacher);
-        assert!(teacher_grads.is_empty(), "no gradient may reach the frozen teacher");
+        assert!(
+            teacher_grads.is_empty(),
+            "no gradient may reach the frozen teacher"
+        );
     }
 }

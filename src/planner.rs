@@ -42,7 +42,11 @@ pub struct Budget {
 
 impl Default for Budget {
     fn default() -> Self {
-        Self { max_evaluations: 64, max_depth: 2, beam_width: 4 }
+        Self {
+            max_evaluations: 64,
+            max_depth: 2,
+            beam_width: 4,
+        }
     }
 }
 
@@ -50,7 +54,11 @@ impl Budget {
     /// No lookahead: score the immediate candidates and commit. Reduces to the
     /// greedy policy the crate already had.
     pub fn greedy() -> Self {
-        Self { max_evaluations: usize::MAX, max_depth: 0, beam_width: 1 }
+        Self {
+            max_evaluations: usize::MAX,
+            max_depth: 0,
+            beam_width: 1,
+        }
     }
 
     pub fn with_depth(mut self, depth: usize) -> Self {
@@ -125,13 +133,19 @@ pub struct Path<T> {
 
 impl<T: Clone> Path<T> {
     pub fn root() -> Self {
-        Self { steps: Vec::new(), score: 0.0 }
+        Self {
+            steps: Vec::new(),
+            score: 0.0,
+        }
     }
 
     pub fn extended(&self, step: T, delta: f64) -> Self {
         let mut steps = self.steps.clone();
         steps.push(step);
-        Self { steps, score: self.score + delta }
+        Self {
+            steps,
+            score: self.score + delta,
+        }
     }
 
     /// The step this path commits to, i.e. its first.
@@ -351,7 +365,10 @@ impl Default for TrajectoryPlanner {
 
 impl TrajectoryPlanner {
     pub fn new(budget: Budget) -> Self {
-        Self { budget, ..Self::default() }
+        Self {
+            budget,
+            ..Self::default()
+        }
     }
 
     pub fn with_ratios(mut self, ratios: Vec<f64>) -> Self {
@@ -431,7 +448,13 @@ impl TrajectoryPlanner {
                         continue;
                     };
                     let adjusted = value - self.cost_per_block * *width as f64;
-                    options.push((TrajectoryStep { sigma: next, width: *width }, adjusted));
+                    options.push((
+                        TrajectoryStep {
+                            sigma: next,
+                            width: *width,
+                        },
+                        adjusted,
+                    ));
                 }
             }
             options
@@ -466,13 +489,21 @@ pub struct LookaheadDecoder {
 
 impl Default for LookaheadDecoder {
     fn default() -> Self {
-        Self { budget: Budget::default(), top_k: 4, length_penalty: 0.0 }
+        Self {
+            budget: Budget::default(),
+            top_k: 4,
+            length_penalty: 0.0,
+        }
     }
 }
 
 impl LookaheadDecoder {
     pub fn new(budget: Budget, top_k: usize) -> Self {
-        Self { budget, top_k: top_k.max(1), length_penalty: 0.0 }
+        Self {
+            budget,
+            top_k: top_k.max(1),
+            length_penalty: 0.0,
+        }
     }
 
     pub fn with_length_penalty(mut self, penalty: f64) -> Self {
@@ -514,6 +545,25 @@ impl LookaheadDecoder {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
 
@@ -572,10 +622,18 @@ mod tests {
         };
 
         let greedy = Beam::new(Budget::greedy()).search(expand);
-        assert_eq!(greedy.commit(), Some(&1), "greedy takes the locally best step");
+        assert_eq!(
+            greedy.commit(),
+            Some(&1),
+            "greedy takes the locally best step"
+        );
 
-        let looked = Beam::new(Budget { max_evaluations: 64, max_depth: 1, beam_width: 4 })
-            .search(expand);
+        let looked = Beam::new(Budget {
+            max_evaluations: 64,
+            max_depth: 1,
+            beam_width: 4,
+        })
+        .search(expand);
         assert_eq!(
             looked.commit(),
             Some(&2),
@@ -613,11 +671,19 @@ mod tests {
 
     #[test]
     fn test_worst_case_is_reported_honestly() {
-        let b = Budget { max_evaluations: 1000, max_depth: 2, beam_width: 3 };
+        let b = Budget {
+            max_evaluations: 1000,
+            max_depth: 2,
+            beam_width: 3,
+        };
         // 3 paths x 4 candidates x 3 levels.
         assert_eq!(b.worst_case(4), 36);
         // ...and it never claims more than the hard cap.
-        let capped = Budget { max_evaluations: 10, max_depth: 5, beam_width: 5 };
+        let capped = Budget {
+            max_evaluations: 10,
+            max_depth: 5,
+            beam_width: 5,
+        };
         assert_eq!(capped.worst_case(10), 10);
     }
 
@@ -625,13 +691,21 @@ mod tests {
     fn test_trajectory_planner_descends_toward_sigma_min() {
         // Every planned step must reduce sigma and never undershoot the floor,
         // or the "trajectory" is not one.
-        let planner = TrajectoryPlanner::new(Budget { max_evaluations: 200, max_depth: 2, beam_width: 3 });
+        let planner = TrajectoryPlanner::new(Budget {
+            max_evaluations: 200,
+            max_depth: 2,
+            beam_width: 3,
+        });
         let plan = planner.plan(80.0, 0.002, |sigma, _width| -sigma);
 
         let path = plan.best.as_ref().expect("a plan should exist");
         let mut previous = 80.0;
         for step in &path.steps {
-            assert!(step.sigma < previous, "sigma must decrease: {} !< {previous}", step.sigma);
+            assert!(
+                step.sigma < previous,
+                "sigma must decrease: {} !< {previous}",
+                step.sigma
+            );
             assert!(step.sigma >= 0.002, "must not undershoot sigma_min");
             previous = step.sigma;
         }
@@ -656,7 +730,11 @@ mod tests {
             .with_widths(vec![1, 4])
             .with_cost_per_block(0.1);
         let plan = planner.plan(1.0, 0.002, |_sigma, _width| 1.0);
-        assert_eq!(plan.commit().map(|s| s.width), Some(1), "cheaper span should win");
+        assert_eq!(
+            plan.commit().map(|s| s.width),
+            Some(1),
+            "cheaper span should win"
+        );
 
         // ...and a quality function that genuinely favours width overrides it.
         let planner = planner.with_cost_per_block(0.001);
@@ -669,7 +747,11 @@ mod tests {
         // The language-side counterpart: token 1 is likelier now, but leads
         // into a continuation the model itself considers unlikely.
         let decoder = LookaheadDecoder::new(
-            Budget { max_evaluations: 64, max_depth: 1, beam_width: 4 },
+            Budget {
+                max_evaluations: 64,
+                max_depth: 1,
+                beam_width: 4,
+            },
             2,
         );
         let plan = decoder.plan(&[65], |context: &[u16]| match context.len() {
@@ -685,10 +767,13 @@ mod tests {
         );
 
         // Greedy, by contrast, takes the locally likelier token.
-        let greedy = LookaheadDecoder::new(Budget::greedy(), 2)
-            .plan(&[65], |c: &[u16]| {
-                if c.len() == 1 { vec![(1, -0.1), (2, -0.5)] } else { Vec::new() }
-            });
+        let greedy = LookaheadDecoder::new(Budget::greedy(), 2).plan(&[65], |c: &[u16]| {
+            if c.len() == 1 {
+                vec![(1, -0.1), (2, -0.5)]
+            } else {
+                Vec::new()
+            }
+        });
         assert_eq!(greedy.commit().map(|s| s.token), Some(1));
     }
 
@@ -698,9 +783,7 @@ mod tests {
         // keeps the branching factor bounded independently of vocabulary size.
         let decoder = LookaheadDecoder::new(Budget::greedy(), 2);
         let mut seen = Vec::new();
-        let plan = decoder.plan(&[0], |_| {
-            vec![(1, -0.1), (2, -0.2), (3, -0.3), (4, -9.0)]
-        });
+        let plan = decoder.plan(&[0], |_| vec![(1, -0.1), (2, -0.2), (3, -0.3), (4, -9.0)]);
         if let Some(path) = &plan.best {
             seen.extend(path.steps.iter().map(|s| s.token));
         }
@@ -712,7 +795,11 @@ mod tests {
     fn test_only_the_first_step_is_committed() {
         // Lookahead informs the choice, but the rest of the path is a
         // hypothesis to be re-planned once its consequences are observed.
-        let beam = Beam::new(Budget { max_evaluations: 64, max_depth: 3, beam_width: 2 });
+        let beam = Beam::new(Budget {
+            max_evaluations: 64,
+            max_depth: 3,
+            beam_width: 2,
+        });
         let plan = beam.search(|path: &Path<u32>, _budget: usize| {
             if path.depth() >= 3 {
                 return Vec::new();
@@ -728,15 +815,21 @@ mod tests {
         // Reaching the goal in fewer steps is a success, not a truncation. If
         // completed paths were dropped from the frontier, the planner would
         // systematically prefer whichever branch happens to keep going.
-        let beam = Beam::new(Budget { max_evaluations: 64, max_depth: 3, beam_width: 4 });
-        let plan = beam.search(|path: &Path<u32>, _budget: usize| match path.steps.as_slice() {
-            [] => vec![(1, 10.0), (2, 1.0)],
-            // `1` is done immediately with a score nothing else can reach...
-            [1] => Vec::new(),
-            // ...while `2` keeps accumulating small gains.
-            [2, ..] if path.depth() < 3 => vec![(2, 1.0)],
-            _ => Vec::new(),
+        let beam = Beam::new(Budget {
+            max_evaluations: 64,
+            max_depth: 3,
+            beam_width: 4,
         });
+        let plan = beam.search(
+            |path: &Path<u32>, _budget: usize| match path.steps.as_slice() {
+                [] => vec![(1, 10.0), (2, 1.0)],
+                // `1` is done immediately with a score nothing else can reach...
+                [1] => Vec::new(),
+                // ...while `2` keeps accumulating small gains.
+                [2, ..] if path.depth() < 3 => vec![(2, 1.0)],
+                _ => Vec::new(),
+            },
+        );
         assert_eq!(plan.commit(), Some(&1), "the completed path should win");
         assert_eq!(plan.depth(), 1);
     }
@@ -750,13 +843,19 @@ mod tests {
         // Level 0 costs 2 evaluations and settles on `1`. Level 1 would offer
         // `2` a large gain, but the budget stops after seeing only `1`'s
         // continuation -- which must not be mistaken for the best of level 1.
-        let beam = Beam::new(Budget { max_evaluations: 3, max_depth: 2, beam_width: 4 });
-        let plan = beam.search(|path: &Path<u32>, _budget: usize| match path.steps.as_slice() {
-            [] => vec![(1, 1.0), (2, 0.9)],
-            [1] => vec![(11, -50.0)],
-            [2] => vec![(22, 100.0)],
-            _ => Vec::new(),
+        let beam = Beam::new(Budget {
+            max_evaluations: 3,
+            max_depth: 2,
+            beam_width: 4,
         });
+        let plan = beam.search(
+            |path: &Path<u32>, _budget: usize| match path.steps.as_slice() {
+                [] => vec![(1, 1.0), (2, 0.9)],
+                [1] => vec![(11, -50.0)],
+                [2] => vec![(22, 100.0)],
+                _ => Vec::new(),
+            },
+        );
         assert!(plan.budget_exhausted, "the budget should have bitten");
         assert_eq!(plan.evaluations, 3);
         assert_eq!(plan.commit(), Some(&1), "fall back to the settled level");
@@ -768,7 +867,11 @@ mod tests {
         // Degenerate budget: no level ever completes. Returning nothing would
         // leave the caller with no move at all, so the best of what was seen is
         // used -- the one case where a partial level is allowed to decide.
-        let beam = Beam::new(Budget { max_evaluations: 1, max_depth: 5, beam_width: 4 });
+        let beam = Beam::new(Budget {
+            max_evaluations: 1,
+            max_depth: 5,
+            beam_width: 4,
+        });
         let plan = beam.search(|_: &Path<u32>, _budget: usize| vec![(7, 1.0), (8, 2.0)]);
         assert!(plan.budget_exhausted);
         assert_eq!(plan.evaluations, 1);
@@ -780,7 +883,11 @@ mod tests {
         // Without truncation the frontier grows as candidates^depth. The width
         // is what keeps lookahead affordable, so it must actually bind.
         let width = 2usize;
-        let beam = Beam::new(Budget { max_evaluations: usize::MAX, max_depth: 3, beam_width: width });
+        let beam = Beam::new(Budget {
+            max_evaluations: usize::MAX,
+            max_depth: 3,
+            beam_width: width,
+        });
         let mut widest = 0usize;
         let mut level_calls = 0usize;
         beam.search(|path: &Path<u32>, _budget: usize| {
@@ -790,7 +897,10 @@ mod tests {
             widest = widest.max(level_calls);
             (0..5).map(|i| (i, i as f64)).collect::<Vec<_>>()
         });
-        assert_eq!(widest, width, "at most `beam_width` paths are expanded per level");
+        assert_eq!(
+            widest, width,
+            "at most `beam_width` paths are expanded per level"
+        );
     }
 
     #[test]
@@ -805,8 +915,12 @@ mod tests {
             vec![(3, 0.2), (5, 0.7), (9, 0.4)]
         };
         let greedy = Beam::new(Budget::greedy()).search(expand);
-        let beam_one = Beam::new(Budget { max_evaluations: usize::MAX, max_depth: 0, beam_width: 1 })
-            .search(expand);
+        let beam_one = Beam::new(Budget {
+            max_evaluations: usize::MAX,
+            max_depth: 0,
+            beam_width: 1,
+        })
+        .search(expand);
         assert_eq!(greedy.commit(), beam_one.commit());
         assert_eq!(greedy.score(), beam_one.score());
     }
@@ -816,7 +930,11 @@ mod tests {
         // Truncating options after the fact bounds the bookkeeping, not the
         // compute. An expand that runs a model must be able to stop *before*
         // spending, so the allowance it is handed has to be accurate.
-        let beam = Beam::new(Budget { max_evaluations: 5, max_depth: 3, beam_width: 2 });
+        let beam = Beam::new(Budget {
+            max_evaluations: 5,
+            max_depth: 3,
+            beam_width: 2,
+        });
         let mut allowances = Vec::new();
         let mut work = 0usize;
         let plan = beam.search(|_path: &Path<u32>, remaining: usize| {
@@ -849,7 +967,11 @@ mod tests {
         let plan = planner.plan_with(1.0, 0.002, |_path, _sigma, width, _left| {
             offered.push(width);
             // Refuse the width that would otherwise win.
-            if width == 3 { None } else { Some(width as f64) }
+            if width == 3 {
+                None
+            } else {
+                Some(width as f64)
+            }
         });
         assert_eq!(offered, vec![1, 2, 3], "every candidate is still offered");
         assert_eq!(
@@ -864,9 +986,13 @@ mod tests {
     fn test_trajectory_rollout_sees_its_own_prefix() {
         // Depth is only useful if a rollout can locate the state a hypothesized
         // path leads to. The prefix handed to the scorer is that address.
-        let planner = TrajectoryPlanner::new(Budget { max_evaluations: 64, max_depth: 2, beam_width: 1 })
-            .with_ratios(vec![0.5])
-            .with_widths(vec![1]);
+        let planner = TrajectoryPlanner::new(Budget {
+            max_evaluations: 64,
+            max_depth: 2,
+            beam_width: 1,
+        })
+        .with_ratios(vec![0.5])
+        .with_widths(vec![1]);
         let mut depths = Vec::new();
         planner.plan_with(1.0, 0.1, |path, sigma, _w, _left| {
             depths.push((path.depth(), sigma));
@@ -876,6 +1002,9 @@ mod tests {
         assert_eq!(depths[0].0, 0);
         assert_eq!(depths[1].0, 1);
         assert_eq!(depths[2].0, 2);
-        assert!((depths[1].1 - 0.25).abs() < 1e-12, "the prefix determines the sigma reached");
+        assert!(
+            (depths[1].1 - 0.25).abs() < 1e-12,
+            "the prefix determines the sigma reached"
+        );
     }
 }

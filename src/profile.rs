@@ -69,7 +69,13 @@ impl ScopeStats {
     pub fn ci95_half_width(&self) -> Duration {
         let values: Vec<f64> = self.samples.iter().map(|&s| s as f64).collect();
         crate::experiment::Summary::of(&values)
-            .map(|s| if s.ci95_half_width.is_nan() { 0.0 } else { s.ci95_half_width })
+            .map(|s| {
+                if s.ci95_half_width.is_nan() {
+                    0.0
+                } else {
+                    s.ci95_half_width
+                }
+            })
             .map_or(Duration::ZERO, |ns| Duration::from_nanos(ns as u64))
     }
 
@@ -192,6 +198,25 @@ pub fn format_duration(d: Duration) -> String {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
 
@@ -282,7 +307,10 @@ mod tests {
 
         let rendered = p.render();
         let slow_line = rendered.lines().nth(2).unwrap();
-        assert!(slow_line.starts_with("slow"), "slowest scope must come first");
+        assert!(
+            slow_line.starts_with("slow"),
+            "slowest scope must come first"
+        );
         assert!(rendered.contains('%'));
 
         p.clear();

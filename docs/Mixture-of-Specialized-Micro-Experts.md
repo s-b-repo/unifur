@@ -277,6 +277,35 @@ one.
 
 ---
 
+## Sizing boxes from other labs' numbers
+
+Industry consensus for small MoE, mapped to boxes:
+
+- **Fine-grained beats few-large.** Granularity studies (100+ runs, 129M–3.7B)
+  put the sweet spot at expert width `FFN/4`–`FFN/8` sub-1B; OLMoE (1.3B
+  active) runs 64 experts top-8; Qwen3 segments `moe_inter = dense_inter/8`
+  (128 top-8); Kimi K2 pushes sparsity 48 (384 top-8+1). Start boxes at
+  16–32 tiny experts, top-3/4 — not 8 large ones.
+- **Shared expert: yes-but-one.** DeepSeekMoE, Kimi K2, GLM-4.5, Hunyuan and
+  MiniMax M2 all carry exactly one shared expert; OLMoE is the outlier (none
+  at 1B, arguing it kills routing combos). One shared + routed rest is the
+  safe default; zero shared is the experiment.
+- **Balance globally, decay the pressure.** Qwen's global-batch study: sync
+  the load fraction across the batch (micro-batch balancing kills
+  single-domain specialization — the failure this crate refuses for MoSME in
+  `TODO.md` 23.4). DeepSeek V3's schedule (bias-rate 1e-3, then 0) and
+  `--balance-schedule anneal` are the same lesson: balance early, specialize
+  late. Watch the `load H` / `token H` columns, not just the loss.
+- **Aux loss small or zero.** V3 keeps `1e-4` seq-aux + z-loss `1e-3`
+  (ST-MoE's value); large balance weights degrade the LM loss directly.
+- **Upcycle, don't start sparse.** Komatsuzaki et al.: train dense, copy each
+  MLP into N experts, then specialize — beats from-scratch sparse below ~120%
+  extra budget. Cheapest path to a first MoSME readout: dense warmup, then
+  `extended_with` new experts (a bit-exact identity until enabled).
+- **RL later: sequence-level, never token-clip on MoE.** Qwen's GSPO paper is
+  explicit that token-level GRPO collapses high-sparsity MoE routing; use
+  sequence ratios when that phase comes.
+
 ## What is not built yet
 
 - **Selective freezing** (18.12) — specialist and router training modes.

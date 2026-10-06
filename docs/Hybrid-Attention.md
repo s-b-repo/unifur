@@ -143,6 +143,42 @@ a CPU backend every mode is executed densely and wall-clock measures the
 backend, not the architecture. The quality-per-active-FLOP axis of the
 roadmap is read from these counts.
 
+## Qwen-style trunk knobs (all default-off, all certified)
+
+Portable pieces of the current open frontier (Qwen3-Next, Kimi Linear,
+GLM-4.5), each an exact identity when off:
+
+| Flag | Meaning | Off state |
+|---|---|---|
+| `--kv-heads k` | Grouped-query attention: `k` KV heads per layer | Full MHA, bit for bit (`gqa_with_full_heads_is_dense…`) |
+| `--rotary-fraction f` | Rotary cover as a fraction of the head dim (Qwen3-Next uses 0.25, GLM-4.5 uses 0.5) | Full rotation, bit for bit |
+| `--gated-attention` | Merged heads scaled by `1 + tanh(g(x))`, zero-init gate | Ungated trunk to 1e-6 (measured 0.0) |
+| `--norm rmsnorm` | RMSNorm instead of LayerNorm on trunk layers + final norm | LayerNorm, checkpoints unchanged |
+| `--mtp-steps k --mtp-weight w` | Multi-token prediction: auxiliary CE on `k` future offsets (GLM uses λ 0.3 → 0.1) | Plain next-token loss, bit for bit |
+
+Two findings from those labs are already this crate's defaults: the `3:1`
+linear:dense schedule is their measured-best hybrid ratio (Kimi Linear §7.2:
+7:1 collapses on val, 1:1 only costs more), and `--bias-balance-rate` is
+DeepSeek's loss-free balancing. Two of their postmortems are now runtime
+behavior: retrieval on a CPU backend prints a warning (it computes every
+score, so wall-clock measures the backend, not the architecture), and the
+readout-gate scatter that once broadcast rows to sum `n` instead of 1 is
+pinned by `geom/readout_gates_form_a_distribution`.
+
+Training levers ported from the image loop to `lm train` (roadmap Phase 20):
+`--lr-schedule cosine|warmup`, `--accumulate k` (averaged, clip applies to
+the sum), `--clip-norm`, `--ema-decay` (bias-corrected shadow returned for
+evaluation and saved beside the checkpoint for resume). `geom train` gains
+`--accumulate` and `--ema-decay` the same way. With every lever off, both
+loops are numerically what they were.
+
+Every `lm train` log line also carries `maxlogit`: the largest causally-valid
+attention score over the trunk on a truncated probe sample (Kimi K2's
+early-warning metric — loss and grad-norm miss logit blowup until it spikes
+the run; past 100 with `--qk-norm` off is blowup territory and the line says
+so). Linear layers keep no scores and report nothing. Logged to JSONL as
+`max_logit` beside the loss.
+
 ## What is and is not claimed
 
 Certified (the `hybrid` group): an all-dense schedule is the Phase 19 trunk
@@ -151,12 +187,46 @@ attention bit for bit; the linear recurrence equals the masked form; rotary
 scores depend only on distance; every mode decodes from its state exactly
 as it recomputes; rotary decoding continues past the table; the routing
 state is bounded, carries history and costs nothing when off; the locality
-diagnostics read as specified.
+diagnostics read as specified; partial rotary is full rotary at fraction one
+and leaves the suffix; GQA with full heads is dense and narrow KV shrinks
+the decode state; gated attention is identity at init; QK-normalized trunks
+decode exactly and move the output; every causal mode reads its past (a
+mask deaf to everything would still decode exactly, so only perturbation
+sees it); RMSNorm starts at unit RMS; MTP at weight zero is the plain loss.
 
-Not claimed: that any schedule, position kind or routing state improves
-quality per FLOP. `dblocks lm bench --axis attention | positions | routing`
-is the harness; the numbers it produces on a CPU in a few steps say what
-the mechanisms cost, not what they buy.
+Not claimed: that any schedule, position kind, routing state, GQA factor,
+gate, norm or MTP setting improves quality per FLOP.
+`dblocks lm bench --axis attention | positions | routing` is the harness;
+the numbers it produces on a CPU in a few steps say what the mechanisms
+cost, not what they buy. The labs' numbers (Kimi 3:1, GLM 0.5-RoPE) are
+their measurements on their scale, cited as priors, not transferred facts.
+
+## Field notes from other labs (what ports, what does not)
+
+- **QK-Norm** (`--qk-norm`): Qwen3 (`use_qk_norm`), GLM-4.5 (large variant),
+  LLaMA-4 Scout (QK-RMSNorm, no affine) all normalize queries/keys; Kimi K2's
+  postmortem is attention logits past 100 with soft-cap/QK-Norm alone judged
+  inadequate next to their MuonClip rescale. Under AdamW (this crate's
+  optimizer) QK-Norm is the standard stabilizer: scores bounded by the head
+  dim whatever the projections learn. Not yet here: max-logit-per-layer
+  logging (K2's actual early-warning metric) — the next cheap addition.
+- **Keep a dense layer first.** DeepSeekMoE, OLMoE, Kimi K2 and GLM all keep
+  layer 0 (or the first blocks) dense: balance converges slowest there. The
+  default `--moe-every 2` / `--mosme-every 2` already leaves layer 0 dense
+  (`applies_to` fires on odd indices); setting either to 1 opts out
+  deliberately.
+- **NoPE/partial-RoPE must be consistent.** Kimi Linear ships NoPE everywhere
+  because RoPE-on-dense plus nothing-on-linear over-emphasized short range;
+  GLM uses partial RoPE (0.5) on all layers. Here rotary applies inside every
+  mode (including linear) when enabled, so there is no mixed regime to fall
+  into; `--rotary-fraction` covers the Qwen3-Next (0.25) and GLM (0.5) points.
+- **No linear/SWA for long-range reasoning.** MiniMax M2 abandoned its
+  lightning/SWA hybrid after 100B–1T ablations: matched short-context scores,
+  collapsed past 32k retrieval/multi-hop. Sliding and retrieval stay opt-in
+  here for exactly this reason; the default is dense.
+- **More heads can help reasoning without helping loss** (GLM-4.5: 96 heads
+  on 5120 dim, no train-loss gain, consistent MMLU/BBH gain). Do not prune
+  `--num-heads` on loss alone.
 
 See also: [Language Modeling](Language-Modeling.md) ·
 [MoE Routing](MoE-Routing.md) · [Configuration](Configuration.md) ·

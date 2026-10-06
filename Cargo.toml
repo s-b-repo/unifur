@@ -2,6 +2,11 @@
 name = "diffusionblocks"
 version = "0.1.0"
 edition = "2021"
+# The floor this crate claims to build on. `rust-toolchain.toml` pins 1.96 for
+# development; the two are different numbers on purpose and CI keeps them honest
+# with a job that compiles the whole tree at exactly this version. Raise this
+# when a dependency or a language feature moves the floor -- and let that job
+# fail first, so the bump is a decision rather than a surprise.
 rust-version = "1.85"
 license = "Apache-2.0"
 description = "Block-wise neural network training via diffusion interpretation (DiffusionBlocks++ in Rust)"
@@ -25,8 +30,20 @@ burn = { version = "0.21", default-features = false, features = ["ndarray", "std
 # so simd/multi-threads must be enabled here explicitly. multi-threads turns on
 # rayon for elementwise/reduction ops and threaded GEMM (matrixmultiply).
 burn-ndarray = { version = "0.21", features = ["multi-threads"] }
+wgpu-types = { version = "29", optional = true }
 clap = { version = "4", features = ["derive"] }
+# Already compiled transitively (via idna): exact \p{L}/\p{M}/\p{N} classes
+# for the BPE splitter through CodePointMapData<GeneralCategory> with baked
+# data. Hand tables would risk silent divergence from HF regex semantics.
+icu_properties = "2"
 serde = { version = "1", features = ["derive"] }
+# Real io_uring, used by the `peregrine` I/O engine for batched, submitted
+# reads. It is optional and default-off: the engine falls back to positional
+# `pread` when the ring cannot be created, so a kernel without io_uring (or a
+# sandbox that blocks the syscall) loses throughput, never correctness. The
+# default-on `peregrine-uring` feature turns the fast path on for machines that
+# have it.
+io-uring = { version = "0.7", optional = true }
 # Already present transitively via burn; promoting it to a direct dependency
 # costs no new crate. The expert index must be *parsed*, not just emitted, and
 # a hand-rolled reader for a nested tagged document is pure liability.
@@ -39,11 +56,20 @@ rand = "0.9"
 # uninterrupted run would have (roadmap Phase 28).
 rand_chacha = { version = "0.9", features = ["serde"] }
 sha2 = "0.10"
+# Already compiled transitively: NFC/NFD/NFKC/NFKD normalizers for
+# tokenizer.json files that declare them (Qwen declares NFC). Tables are
+# infeasible to hand-carry std-only; this is the standard data crate.
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 approx = "0.5"
 
 [features]
+wgpu = ["burn/wgpu", "dep:wgpu-types"]
+# Enables the io_uring submission path in the `peregrine` I/O engine. Without
+# it the engine uses positional `pread` on a mirror-striped plan, which is the
+# same reads with more syscalls.
+peregrine-uring = ["dep:io-uring"]
 # Enables shelling out to clippy/ruff/eslint from the code-quality module.
 # Disabled by default: the rest of the pipeline works identically with or
 # without it, so users without those tools installed pay no cost.
@@ -56,3 +82,91 @@ codegen-units = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# ---------------------------------------------------------------------------
+# Machine-enforced quality rules.
+#
+# These are `deny`, not `warn`, and not conventions in a document: a violation
+# fails the build. `cargo clippy --all-targets -- -D warnings` in CI turns any
+# *other* warning into a failure too, so a new lint cannot be introduced quietly.
+#
+# The rule is about *production* code. `unwrap` in a test is how a test says
+# "this must have worked", and rewriting 1200 of those into `?` would make the
+# tests worse, not better. So the unwrap family is denied here and re-granted
+# inside `#[cfg(test)]` modules -- see the "Testing exemptions" section of
+# `src/lib.rs`, which explains the scoping. Test-only crates (`tests/*.rs`) and
+# the examples carry their own file-level grant for the same reason.
+#
+# `assert!` is deliberately absent from this list. It asserts an invariant the
+# caller already established, and there is no error channel at the point it
+# fires. What is denied is reaching for a value that might be absent.
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+unreachable_pub = "deny"
+non_ascii_idents = "deny"
+# A deprecated/renamed lint is a silent hole: naming one that no longer exists
+# is a warning, not an error, so it would stop being enforced without anyone
+# noticing. Make it an error.
+renamed_and_removed_lints = "deny"
+
+[lints.clippy]
+# --- panicking escape hatches ---------------------------------------------
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+# `x.unwrap()` after `x.ok_or_else(..)?` is dead code that says so.
+unnecessary_unwrap = "deny"
+
+# --- errors that disappear instead of being reported ---------------------
+# `let _ = f();` and `if let Ok(v) = f() { ... }` are how a failure becomes
+# silence. A result that is genuinely not needed has to say so out loud.
+#
+# `let_underscore_must_use` is the part that always fires: any `#[must_use]`
+# value bound to `_`. It is a rustc lint, so it covers `Result`, `Option`,
+# `#[must_use]` functions and `#[must_use]` types alike -- including every
+# fallible call in the crate, which is the point. (An earlier draft also named
+# `clippy::match_result_ok` here; it is a *style* lint that suggests
+# `unwrap_or_default`, which would be worse than the `if let` it replaces, so it
+# is deliberately absent.)
+let_underscore_must_use = "deny"
+# A `match` whose arms are all `_` or all literals: the scrutinee is being
+# re-examined for no reason, and in the `Result` case it usually means an arm
+# that was meant to handle the error.
+redundant_pattern_matching = "deny"
+
+# --- process-level escapes -------------------------------------------------
+# A library that calls `std::process::exit` cannot be tested and cannot be
+# embedded in another binary. `dblocks` returns `Result` from `main` instead, so
+# nothing in the tree needs this.
+exit = "deny"
+# `dbg!` is a leftover-debugger print. It is the only printing construct denied:
+# `println!` is not, because progress reporting from a training loop is this
+# crate's intended interface to whoever launched it (`docs/Training-Guide.md`
+# documents reading the curve off stdout). `dbg!` has no such purpose -- it
+# prints an expression's source text and a value, which is a debugging artifact
+# and never a report.
+dbg_macro = "deny"
+
+# --- suppression -----------------------------------------------------------
+# `clippy::allow_attributes` is deliberately *not* in this table. It would flag
+# the scoped test grants that every `#[cfg(test)]` module legitimately needs, and
+# a rule that forces you to exempt your own exemptions is a rule you turn off.
+#
+# What replaces it is `audit-bad-patterns.sh --section C`, which fails on any
+# `#[allow]` outside a `#[cfg(test)]` module and on the blanket forms
+# (`#[allow(clippy::all)]`, `#[allow(unused)]`, `#![allow(...)]` at file scope).
+# That catches the blanket suppression this lint was aimed at, without making the
+# legitimate case impossible to write.
+
+# --- misc hygiene ----------------------------------------------------------
+# `use foo::*;` makes it impossible to see what a file depends on.
+wildcard_imports = "deny"
+# `mem::forget` leaks whatever it is handed.
+mem_forget = "deny"
+# `#[derive(Default)]` then field-by-field assignment is how a field gets
+# forgotten; `..Default::default()` in a struct literal is the same thing done
+# correctly, and clippy tells the difference.
+field_reassign_with_default = "deny"

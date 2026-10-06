@@ -40,13 +40,18 @@ fn or_unknown(what: &str, value: Result<String, String>) -> String {
 }
 
 fn burn_version() -> Result<String, String> {
-    let lock = std::fs::read_to_string("Cargo.lock").map_err(|err| format!("read Cargo.lock: {err}"))?;
+    let lock =
+        std::fs::read_to_string("Cargo.lock").map_err(|err| format!("read Cargo.lock: {err}"))?;
     let mut lines = lock.lines();
     while let Some(line) = lines.next() {
         if line.trim() == "name = \"burn\"" {
             return lines
                 .next()
-                .and_then(|v| v.trim().strip_prefix("version = \"").map(|v| v.trim_end_matches('"').to_string()))
+                .and_then(|v| {
+                    v.trim()
+                        .strip_prefix("version = \"")
+                        .map(|v| v.trim_end_matches('"').to_string())
+                })
                 .ok_or_else(|| "the burn entry in Cargo.lock has no version line".to_string());
         }
     }
@@ -65,7 +70,11 @@ fn main() {
             false
         }
     };
-    let revision = if revision != "unknown" && dirty { format!("{revision}-dirty") } else { revision };
+    let revision = if revision != "unknown" && dirty {
+        format!("{revision}-dirty")
+    } else {
+        revision
+    };
     println!("cargo:rustc-env=DBLOCKS_GIT_REVISION={revision}");
 
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
@@ -78,7 +87,11 @@ fn main() {
     println!("cargo:rerun-if-changed=Cargo.lock");
     // In a linked worktree `.git` is a file pointing at the real git dir.
     let git_dir = match std::fs::read_to_string(".git") {
-        Ok(pointer) => pointer.trim().strip_prefix("gitdir: ").map(str::to_string).unwrap_or_else(|| ".git".into()),
+        Ok(pointer) => pointer
+            .trim()
+            .strip_prefix("gitdir: ")
+            .map(str::to_string)
+            .unwrap_or_else(|| ".git".into()),
         Err(_) => ".git".into(),
     };
     println!("cargo:rerun-if-changed={git_dir}/HEAD");

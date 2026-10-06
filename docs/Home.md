@@ -28,7 +28,7 @@ Two documents are authoritative about what is and is not implemented:
 
 ```bash
 cargo build --release
-./target/release/dblocks verify        # 130 certificates, non-zero exit on failure
+./target/release/dblocks verify        # 169 certificates, non-zero exit on failure
 ./target/release/dblocks train --steps 200
 ./target/release/dblocks sample --planned --plan-depth 2   # plan the trajectory
 ./target/release/dblocks lm generate --lookahead 2         # plan the tokens
@@ -62,6 +62,8 @@ cargo build --release
 - [Cyber Policy](Cyber-Policy.md) — blockers, refusals and signed approvals gating a model's capabilities
 - [Direction Ablation](Direction-Ablation.md) — find a behaviour direction, remove it from the weights, or penalize it while training
 - [Next-Step Planning](Next-Step-Planning.md) — beam search over trajectories and tokens
+- [Geometric Reasoning](Geometric-Reasoning.md) — a dual-stream reasoner over a learned Riemannian metric, geodesic attention, certified attractor relaxation, block diffusion, and the exact rational kernel beside it
+- [Geometric Reasoning Flaws](Geometric-Reasoning-Flaws.md) — every known flaw of the reasoner, its status, and the artifact that covers it
 - [Accuracy Improvements](Accuracy-Improvements.md) — guidance, normalization, ensembling, compute scaling
 
 ### Capacity and compression
@@ -77,6 +79,7 @@ cargo build --release
 - [Claims](Claims.md) — every claim classified VERIFIED / PLAUSIBLE / REJECTED / UNKNOWN, with the harness that settles each
 - [Architecture](Architecture.md) — ViT-DiT backbone and block partitioning
 - [Precision & I/O](Precision-IO.md) — mixed precision, streaming reads, profiling
+- [Parallel I/O & Block Execution](Parallel-IO-and-Block-Execution.md) — mirror-striped io_uring reads, and the sync/mt/par block execution selector
 - [Quality Coder](Quality-Coder.md) — design document for the agentic code refiner (scaffolding only)
 - [Model Parallelism](Model-Parallelism.md) — why block-wise training is not model parallelism, and what is
 - [FAQ](FAQ.md)

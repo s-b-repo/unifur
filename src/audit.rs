@@ -63,7 +63,14 @@ impl PropagationReport {
     pub fn render(&self) -> String {
         let mut out = format!(
             "{:<6} {:>10} {:>10} {:>11} {:>10} {:>12} {:>12} {:>14}\n",
-            "block", "sigma hi", "sigma lo", "local loss", "local ce", "boundary", "sensitivity", "amplification"
+            "block",
+            "sigma hi",
+            "sigma lo",
+            "local loss",
+            "local ce",
+            "boundary",
+            "sensitivity",
+            "amplification"
         );
         out.push_str(&"-".repeat(92));
         out.push('\n');
@@ -75,7 +82,8 @@ impl PropagationReport {
                 b.sigma_lo,
                 b.local_loss,
                 b.local_ce,
-                b.boundary_mismatch.map_or("-".to_string(), |v| format!("{v:.4e}")),
+                b.boundary_mismatch
+                    .map_or("-".to_string(), |v| format!("{v:.4e}")),
                 b.sensitivity,
                 b.downstream_amplification
             ));
@@ -103,7 +111,8 @@ pub fn sensitivity_proxy<B: Backend<FloatElem = f32>>(
     z: &Tensor<B, 2>,
     epsilon: f64,
 ) -> f32 {
-    let eps = Tensor::<B, 2>::random(z.dims(), Distribution::Normal(0.0, 1.0), &z.device()).mul_scalar(epsilon as f32);
+    let eps = Tensor::<B, 2>::random(z.dims(), Distribution::Normal(0.0, 1.0), &z.device())
+        .mul_scalar(epsilon as f32);
     let base = f(z.clone());
     let moved = f(z.clone() + eps.clone());
     let num: f32 = (moved - base).powf_scalar(2.0).sum().sqrt().into_scalar();
@@ -149,7 +158,8 @@ pub fn propagation<B: Backend<FloatElem = f32>>(
 
     let hidden = model.model().label_embedding_weight().dims()[1];
     let sigma_max = order[0].1;
-    let mut z = Tensor::<B, 2>::random([batch, hidden], Distribution::Normal(0.0, 1.0), &device).mul_scalar(sigma_max as f32);
+    let mut z = Tensor::<B, 2>::random([batch, hidden], Distribution::Normal(0.0, 1.0), &device)
+        .mul_scalar(sigma_max as f32);
 
     let mut rows = Vec::with_capacity(num_blocks);
     let mut sensitivities = Vec::with_capacity(num_blocks);
@@ -158,7 +168,13 @@ pub fn propagation<B: Backend<FloatElem = f32>>(
 
         // Local objective at the window's geometric midpoint.
         let mid = (hi.ln() * 0.5 + lo.ln() * 0.5).exp();
-        let parts = model.training_step_on(pixel_values.clone(), labels.clone(), &vec![mid; batch], block, None);
+        let parts = model.training_step_on(
+            pixel_values.clone(),
+            labels.clone(),
+            &vec![mid; batch],
+            block,
+            None,
+        );
 
         // The block map and its sensitivity at the chain's current latent.
         let sensitivity = sensitivity_proxy(
@@ -172,8 +188,17 @@ pub fn propagation<B: Backend<FloatElem = f32>>(
         // Boundary: both blocks asked for x0 at the sigma they share.
         let boundary_mismatch = order.get(i + 1).map(|&(next_block, _, _)| {
             let mine = model.x0_estimate(pixel_values, &next_z, lo, Some(span.clone()));
-            let theirs = model.x0_estimate(pixel_values, &next_z, lo, Some(model.layer_range(next_block)));
-            (mine - theirs).powf_scalar(2.0).sum_dim(1).mean().into_scalar()
+            let theirs = model.x0_estimate(
+                pixel_values,
+                &next_z,
+                lo,
+                Some(model.layer_range(next_block)),
+            );
+            (mine - theirs)
+                .powf_scalar(2.0)
+                .sum_dim(1)
+                .mean()
+                .into_scalar()
         });
 
         rows.push(BlockReport {
@@ -200,10 +225,35 @@ pub fn propagation<B: Backend<FloatElem = f32>>(
         .mean()
         .into_scalar();
 
-    PropagationReport { blocks: rows, end_to_end_ce, end_to_end_accuracy, batch_size: batch, epsilon }
+    PropagationReport {
+        blocks: rows,
+        end_to_end_ce,
+        end_to_end_accuracy,
+        batch_size: batch,
+        epsilon,
+    }
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use burn::backend::NdArray;

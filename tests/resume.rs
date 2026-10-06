@@ -7,7 +7,27 @@
 //! and the draws it governs. Cargo runs each integration test binary as its
 //! own process, and the lock below keeps these two tests from overlapping each
 //! other, so this file is the one place the guarantee can be asserted.
-
+//!
+//! This entire file is a test binary: every function here exists to be called
+//! by `cargo test`, and a test says "this must have worked" with `unwrap`. The
+//! grant below is file-scoped for that reason -- see the "Testing exemptions"
+//! section of `src/lib.rs` for why it is written here rather than at the crate
+//! root.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 use burn::backend::{Autodiff, NdArray};
 use burn::tensor::backend::BackendTypes;
 
@@ -17,7 +37,9 @@ type Device = <B as BackendTypes>::Device;
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn serial() -> std::sync::MutexGuard<'static, ()> {
-    SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn scratch(name: &str) -> std::path::PathBuf {
@@ -76,7 +98,12 @@ fn integration_resume_is_bit_identical_for_the_image_trainer() {
         ..base.clone()
     };
     let (model_a, summary_a) = train(&full).unwrap();
-    assert_eq!(summary_a.periodic_checkpoints.len(), 1, "{:?}", summary_a.periodic_checkpoints);
+    assert_eq!(
+        summary_a.periodic_checkpoints.len(),
+        1,
+        "{:?}",
+        summary_a.periodic_checkpoints
+    );
     let (at, halfway) = summary_a.periodic_checkpoints[0].clone();
     assert_eq!(at, 3);
     let final_a = summary_a.checkpoint.clone().expect("final checkpoint");
@@ -94,7 +121,11 @@ fn integration_resume_is_bit_identical_for_the_image_trainer() {
     let final_b = summary_b.checkpoint.clone().expect("final checkpoint");
     // Content-addressed names embed the canonical parameter hash: identical
     // live weights mean identical file names.
-    assert_eq!(final_a.file_name(), final_b.file_name(), "live weights differ after resume");
+    assert_eq!(
+        final_a.file_name(),
+        final_b.file_name(),
+        "live weights differ after resume"
+    );
     // `train` returns the EMA shadow when EMA is on; it must match too.
     assert_eq!(
         canonical_hash_hex::<B, _>(&model_a),
@@ -105,7 +136,10 @@ fn integration_resume_is_bit_identical_for_the_image_trainer() {
     let losses_b = logged_losses(&dir_b.join("log.jsonl"));
     let tail_a: Vec<_> = losses_a.iter().filter(|(s, _)| *s >= 3).collect();
     let tail_b: Vec<_> = losses_b.iter().collect();
-    assert_eq!(tail_a, tail_b, "logged losses after the resume point differ");
+    assert_eq!(
+        tail_a, tail_b,
+        "logged losses after the resume point differ"
+    );
 
     // Corruption is refused by name, not loaded.
     let optimizer_file = TrainState::dir_for(&halfway).join("optimizer.mpk");
@@ -113,17 +147,45 @@ fn integration_resume_is_bit_identical_for_the_image_trainer() {
     let mid = bytes.len() / 2;
     bytes[mid] ^= 0xff;
     std::fs::write(&optimizer_file, bytes).unwrap();
-    let err = train(&TrainConfig { steps: 4, ..resumed.clone() }).unwrap_err().to_string();
+    let err = train(&TrainConfig {
+        steps: 4,
+        ..resumed.clone()
+    })
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("corrupted"), "unhelpful error: {err}");
 
     // A different dataset is refused before any step runs.
     std::fs::remove_dir_all(TrainState::dir_for(&halfway)).unwrap();
-    let (model_c, summary_c) = train(&TrainConfig { steps: 4, ..resumed.clone() }).unwrap();
-    assert_eq!(summary_c.resumed_from_step, 0, "without a state directory only the weights load");
+    let (model_c, summary_c) = train(&TrainConfig {
+        steps: 4,
+        ..resumed.clone()
+    })
+    .unwrap();
+    assert_eq!(
+        summary_c.resumed_from_step, 0,
+        "without a state directory only the weights load"
+    );
     drop(model_c);
-    let (_, summary_d) = train(&TrainConfig { steps: 4, resume: Some(final_a.clone()), num_labels: 10, ..base.clone() }).unwrap();
-    assert_eq!(summary_d.resumed_from_step, 6, "resuming a finished run continues from its last step");
-    let err = train(&TrainConfig { steps: 8, resume: Some(final_a), num_labels: 7, ..base }).unwrap_err().to_string();
+    let (_, summary_d) = train(&TrainConfig {
+        steps: 4,
+        resume: Some(final_a.clone()),
+        num_labels: 10,
+        ..base.clone()
+    })
+    .unwrap();
+    assert_eq!(
+        summary_d.resumed_from_step, 6,
+        "resuming a finished run continues from its last step"
+    );
+    let err = train(&TrainConfig {
+        steps: 8,
+        resume: Some(final_a),
+        num_labels: 7,
+        ..base
+    })
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("refusing to resume"), "unhelpful error: {err}");
 }
 
@@ -137,7 +199,11 @@ fn integration_resume_is_bit_identical_for_the_lm_trainer() {
 
     let dir = scratch("lm-resume");
     let source = dir.join("text.txt");
-    std::fs::write(&source, "all work and no play makes jack a dull boy. ".repeat(30)).unwrap();
+    std::fs::write(
+        &source,
+        "all work and no play makes jack a dull boy. ".repeat(30),
+    )
+    .unwrap();
     let corpus_path = dir.join("text.bin");
     TokenCorpus::tokenize_file(&source, &corpus_path).unwrap();
     let mut corpus = TokenCorpus::in_memory(&corpus_path).unwrap();
@@ -145,22 +211,47 @@ fn integration_resume_is_bit_identical_for_the_lm_trainer() {
     let device: Device = Default::default();
     let config = LmConfig::tiny();
     <B as burn::tensor::backend::Backend>::seed(&device, 3);
-    let init = LanguageModel::<B>::new(&config, &device);
+    let init = LanguageModel::<B>::new(&config, &device).unwrap();
 
-    let base = LmTrainConfig { steps: 6, batch_size: 2, log_every: 0, model_config: Some(config.clone()), ..Default::default() };
-    let full = LmTrainConfig { out_dir: Some(dir.join("a")), checkpoint_every: 3, ..base.clone() };
+    let base = LmTrainConfig {
+        steps: 6,
+        batch_size: 2,
+        log_every: 0,
+        model_config: Some(config.clone()),
+        ..Default::default()
+    };
+    let full = LmTrainConfig {
+        out_dir: Some(dir.join("a")),
+        checkpoint_every: 3,
+        ..base.clone()
+    };
     let (model_a, report_a) = train_lm(init.clone(), &mut corpus, &full, &device).unwrap();
     let (_, halfway) = report_a.periodic_checkpoints[0].clone();
 
     // Resume into a *fresh* model: the weights come from the file.
     <B as burn::tensor::backend::Backend>::seed(&device, 99);
-    let fresh = LanguageModel::<B>::new(&config, &device);
-    let resumed = LmTrainConfig { out_dir: Some(dir.join("b")), resume: Some(halfway), ..base };
+    let fresh = LanguageModel::<B>::new(&config, &device).unwrap();
+    let resumed = LmTrainConfig {
+        out_dir: Some(dir.join("b")),
+        resume: Some(halfway),
+        ..base
+    };
     let (model_b, report_b) = train_lm(fresh, &mut corpus, &resumed, &device).unwrap();
     assert_eq!(report_b.resumed_from_step, 3);
     assert_eq!(report_a.steps_taken, report_b.steps_taken);
-    assert_eq!(report_a.last_loss.to_bits(), report_b.last_loss.to_bits(), "{} vs {}", report_a.last_loss, report_b.last_loss);
-    assert_eq!(canonical_hash_hex::<B, _>(&model_a), canonical_hash_hex::<B, _>(&model_b));
-    assert_eq!(report_a.checkpoint.unwrap().file_name(), report_b.checkpoint.unwrap().file_name());
+    assert_eq!(
+        report_a.last_loss.to_bits(),
+        report_b.last_loss.to_bits(),
+        "{} vs {}",
+        report_a.last_loss,
+        report_b.last_loss
+    );
+    assert_eq!(
+        canonical_hash_hex::<B, _>(&model_a),
+        canonical_hash_hex::<B, _>(&model_b)
+    );
+    assert_eq!(
+        report_a.checkpoint.unwrap().file_name(),
+        report_b.checkpoint.unwrap().file_name()
+    );
 }
-

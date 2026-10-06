@@ -34,9 +34,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::Patch;
 use super::dataset::Source;
-use crate::codequality::{CodeAnalyzer, CompositeAnalyzer, ExternalAnalyzer, Language, QualityScore, StructuralAnalyzer};
+use super::Patch;
+use crate::codequality::{
+    CodeAnalyzer, CompositeAnalyzer, ExternalAnalyzer, Language, QualityScore, StructuralAnalyzer,
+};
 
 /// One evaluation metric.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -100,7 +102,11 @@ impl EvalReport {
             self.lint_clean_rate,
             self.test_preserved,
             self.composite,
-            if self.meets_v1_targets() { "v1-target" } else { "below-target" },
+            if self.meets_v1_targets() {
+                "v1-target"
+            } else {
+                "below-target"
+            },
         )
     }
 }
@@ -173,7 +179,11 @@ impl EvalHarness {
         examples: &[super::dataset::Example],
         predictions: &[Patch],
     ) -> (EvalReport, Vec<ScoreRow>) {
-        assert_eq!(examples.len(), predictions.len(), "examples and predictions must align");
+        assert_eq!(
+            examples.len(),
+            predictions.len(),
+            "examples and predictions must align"
+        );
         let mut rows = Vec::with_capacity(examples.len());
         let mut applied = 0usize;
         let mut improved = 0usize;
@@ -197,7 +207,9 @@ impl EvalHarness {
             };
             applied += 1;
 
-            let original = self.analyzer.analyze(&extract_source_from_prompt(&example.prompt.text));
+            let original = self
+                .analyzer
+                .analyze(&extract_source_from_prompt(&example.prompt.text));
             let patched_score = self.analyzer.analyze(&patched);
             let improves = patched_score.overall > original.overall
                 && !regressed_below_threshold(&original, &patched_score);
@@ -279,7 +291,10 @@ pub fn apply_unified_diff(prompt: &str, patch: &Patch) -> Option<String> {
     }
     // Whole-file rewrite marker from the dataset adapter: bypass the
     // diff parser and use the payload directly.
-    if let Some(payload) = patch.diff.strip_prefix("# quality-coder: whole-file-rewrite\n") {
+    if let Some(payload) = patch
+        .diff
+        .strip_prefix("# quality-coder: whole-file-rewrite\n")
+    {
         return Some(payload.to_string());
     }
     apply_unified_diff_inner(&extract_source_from_prompt(prompt), &patch.diff)
@@ -389,18 +404,27 @@ fn parse_hunks(diff: &str) -> Option<Vec<Hunk>> {
                 return None;
             }
             let old_part = parts[0].trim_start_matches('-');
-            let old_start: usize = old_part
-                .split(',')
-                .next()
-                .and_then(|s| s.parse().ok())?;
-            current = Some(Hunk { old_start, lines: Vec::new() });
+            let old_start: usize = old_part.split(',').next().and_then(|s| s.parse().ok())?;
+            current = Some(Hunk {
+                old_start,
+                lines: Vec::new(),
+            });
         } else if let Some(h) = current.as_mut() {
             if let Some(content) = line.strip_prefix(' ') {
-                h.lines.push(DiffLine { kind: LineKind::Context, content: content.to_string() + "\n" });
+                h.lines.push(DiffLine {
+                    kind: LineKind::Context,
+                    content: content.to_string() + "\n",
+                });
             } else if let Some(content) = line.strip_prefix('+') {
-                h.lines.push(DiffLine { kind: LineKind::Add, content: content.to_string() });
+                h.lines.push(DiffLine {
+                    kind: LineKind::Add,
+                    content: content.to_string(),
+                });
             } else if let Some(content) = line.strip_prefix('-') {
-                h.lines.push(DiffLine { kind: LineKind::Remove, content: content.to_string() + "\n" });
+                h.lines.push(DiffLine {
+                    kind: LineKind::Remove,
+                    content: content.to_string() + "\n",
+                });
             }
         }
     }
@@ -418,8 +442,12 @@ fn parse_hunks(diff: &str) -> Option<Vec<Hunk>> {
 /// stable — see [`super::Task::prompt`] — so a substring search is
 /// sufficient.
 fn extract_source_from_prompt(prompt: &str) -> String {
-    let start = prompt.find("Source:\n```\n").map(|i| i + "Source:\n```\n".len());
-    let Some(start) = start else { return String::new() };
+    let start = prompt
+        .find("Source:\n```\n")
+        .map(|i| i + "Source:\n```\n".len());
+    let Some(start) = start else {
+        return String::new();
+    };
     let rest = &prompt[start..];
     let end = rest.find("\n```\n\nOutput").unwrap_or(rest.len());
     rest[..end].to_string()
@@ -460,7 +488,11 @@ fn touches_lines_outside_defect(patch: &Patch, prompt: &str) -> bool {
                 continue;
             }
             let old_part = parts[0].trim_start_matches('-');
-            let old_start: usize = old_part.split(',').next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let old_start: usize = old_part
+                .split(',')
+                .next()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
             // A hunk that starts past 2x the source line count is
             // almost certainly touching lines that were never in the
             // file — a sign the patch deleted the original and
@@ -474,6 +506,25 @@ fn touches_lines_outside_defect(patch: &Patch, prompt: &str) -> bool {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use crate::codequality::Language;
@@ -505,7 +556,14 @@ mod tests {
         let task = sample_task(source);
         let prompt = task.prompt();
         let patch_text = "--- a/src/foo.py\n+++ b/src/foo.py\n@@ -1 +1 @@\n-def f():\n-    return 1\n+def f():\n+    return 2\n";
-        let patched = apply_unified_diff(&prompt.text, &Patch { diff: patch_text.into(), refusal_reason: None }).unwrap();
+        let patched = apply_unified_diff(
+            &prompt.text,
+            &Patch {
+                diff: patch_text.into(),
+                refusal_reason: None,
+            },
+        )
+        .unwrap();
         assert_eq!(patched, "def f():\n    return 2\n");
     }
 
@@ -515,7 +573,14 @@ mod tests {
         let task = sample_task(source);
         let prompt = task.prompt();
         let patch_text = "this is not a diff";
-        assert!(apply_unified_diff(&prompt.text, &Patch { diff: patch_text.into(), refusal_reason: None }).is_none());
+        assert!(apply_unified_diff(
+            &prompt.text,
+            &Patch {
+                diff: patch_text.into(),
+                refusal_reason: None
+            }
+        )
+        .is_none());
     }
 
     #[test]
@@ -530,7 +595,13 @@ mod tests {
         let patch_text = "--- a/src/foo.py\n+++ b/src/foo.py\n@@ -1,2 +1,2 @@\n-def f():\n-    return 999\n+def f():\n+    return 2\n";
         let extracted = extract_source_from_prompt(&prompt.text);
         eprintln!("extracted: {extracted:?}");
-        let result = apply_unified_diff(&prompt.text, &Patch { diff: patch_text.into(), refusal_reason: None });
+        let result = apply_unified_diff(
+            &prompt.text,
+            &Patch {
+                diff: patch_text.into(),
+                refusal_reason: None,
+            },
+        );
         eprintln!("result: {result:?}");
         assert!(result.is_none());
     }
@@ -541,7 +612,14 @@ mod tests {
         let task = sample_task(source);
         let prompt = task.prompt();
         let rewritten = "# quality-coder: whole-file-rewrite\ndef f():\n    return 2\n";
-        let patched = apply_unified_diff(&prompt.text, &Patch { diff: rewritten.into(), refusal_reason: None }).unwrap();
+        let patched = apply_unified_diff(
+            &prompt.text,
+            &Patch {
+                diff: rewritten.into(),
+                refusal_reason: None,
+            },
+        )
+        .unwrap();
         assert_eq!(patched, "def f():\n    return 2\n");
     }
 
@@ -566,10 +644,20 @@ mod tests {
             source: Source::SweBench,
             id: "t1".into(),
             prompt,
-            target: Patch { diff: good_patch.into(), refusal_reason: None },
+            target: Patch {
+                diff: good_patch.into(),
+                refusal_reason: None,
+            },
         };
         let harness = EvalHarness::new().expect("built-in rules");
-        let (report, rows) = harness.score(Source::SweBench, std::slice::from_ref(&example), &[Patch { diff: good_patch.into(), refusal_reason: None }]);
+        let (report, rows) = harness.score(
+            Source::SweBench,
+            std::slice::from_ref(&example),
+            &[Patch {
+                diff: good_patch.into(),
+                refusal_reason: None,
+            }],
+        );
         assert_eq!(report.evaluated, 1);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].applied);
@@ -663,7 +751,10 @@ mod tests {
         let prompt = task.prompt();
         let bad_patch = "--- a/x\n+++ b/x\n@@ -1000 +1 @@\n-old\n+new\n";
         assert!(touches_lines_outside_defect(
-            &Patch { diff: bad_patch.into(), refusal_reason: None },
+            &Patch {
+                diff: bad_patch.into(),
+                refusal_reason: None
+            },
             &prompt.text,
         ));
     }

@@ -52,6 +52,25 @@ pub fn open(
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use crate::data::TrainDataset;
@@ -101,7 +120,8 @@ mod tests {
             &mut ds,
             &mut StdRng::seed_from_u64(1),
             &Default::default(),
-        ).expect("batch");
+        )
+        .expect("batch");
         assert_eq!(batch.pixel_values.dims(), [2, 3, 32, 32]);
         assert_eq!(batch.labels.dims(), [2]);
 
@@ -123,7 +143,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cifar-missing-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let err = open(&dir, false, 1, false).unwrap_err().to_string();
-        assert!(err.contains("test.bin"), "error should name the missing file: {err}");
+        assert!(
+            err.contains("test.bin"),
+            "error should name the missing file: {err}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

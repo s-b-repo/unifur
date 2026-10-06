@@ -17,12 +17,12 @@
 //! changing semantics -- `test_top_one_matches_selected_expert_exactly`
 //! is what would catch a regression.
 
+use burn::tensor::ElementConversion;
 use burn::{
     module::{Module, Param},
     nn::{Linear, LinearConfig},
     tensor::{activation::softmax, backend::Backend, Int, Tensor},
 };
-use burn::tensor::ElementConversion;
 use serde::{Deserialize, Serialize};
 
 /// Router + expert-pool configuration.
@@ -249,7 +249,10 @@ impl<B: Backend> TopKRouter<B> {
     /// in [`crate::mosme`] rests on.
     pub fn weight_dims(&self) -> anyhow::Result<[usize; 2]> {
         let dims = self.linear.weight.dims();
-        anyhow::ensure!(dims.len() == 2, "router weight must be rank 2, got {dims:?}");
+        anyhow::ensure!(
+            dims.len() == 2,
+            "router weight must be rank 2, got {dims:?}"
+        );
         Ok([dims[0], dims[1]])
     }
 
@@ -276,7 +279,10 @@ impl<B: Backend> TopKRouter<B> {
             .init(&weight.device());
         linear.weight = Param::from_tensor(weight);
         linear.bias = bias.map(|b| Param::from_tensor(b.detach()));
-        Self { linear, balance_bias: None }
+        Self {
+            linear,
+            balance_bias: None,
+        }
     }
 }
 
@@ -487,7 +493,11 @@ impl<B: Backend> LayerRouting<B> {
     /// Record the `batch x seq_len` layout of the routed tokens, so adjacent
     /// positions can be compared within a sequence (roadmap 25.6).
     pub fn with_sequence(mut self, batch: usize, seq_len: usize) -> Self {
-        assert_eq!(batch * seq_len, self.tokens, "layout must cover every routed token");
+        assert_eq!(
+            batch * seq_len,
+            self.tokens,
+            "layout must cover every routed token"
+        );
         self.batch = batch;
         self.seq_len = seq_len;
         self
@@ -501,7 +511,13 @@ impl<B: Backend> LayerRouting<B> {
 
     /// Sync to the host and normalize.
     pub fn to_host(&self) -> RoutingStats {
-        let load: Vec<f32> = self.load.clone().into_data().convert::<f32>().iter::<f32>().collect();
+        let load: Vec<f32> = self
+            .load
+            .clone()
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
         let entropy: f32 = self.entropy.clone().into_scalar().elem::<f32>();
         let mut stats = RoutingStats::from_load(load, entropy, self.tokens);
         stats.stability = crate::routing::token_stability(&self.top1, self.batch, self.seq_len);
@@ -557,8 +573,16 @@ impl RoutingStats {
     pub fn from_load(load: Vec<f32>, token_entropy_nats: f32, tokens: usize) -> Self {
         let e = load.len();
         let norm = if e > 1 { (e as f32).ln() } else { 1.0 };
-        let load_entropy = if e > 1 { normalized_entropy(&load) } else { 1.0 };
-        let token_entropy = if e > 1 { (token_entropy_nats / norm).clamp(0.0, 1.0) } else { 1.0 };
+        let load_entropy = if e > 1 {
+            normalized_entropy(&load)
+        } else {
+            1.0
+        };
+        let token_entropy = if e > 1 {
+            (token_entropy_nats / norm).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         Self {
             load,
             load_entropy,
@@ -594,12 +618,20 @@ impl RoutingStats {
     }
 
     pub fn min_load(&self) -> f32 {
-        self.load.iter().copied().fold(f32::INFINITY, f32::min).min(1.0)
+        self.load
+            .iter()
+            .copied()
+            .fold(f32::INFINITY, f32::min)
+            .min(1.0)
     }
 
     /// Fold another measurement of the **same** layer in, weighted by tokens.
     pub fn merge(&mut self, other: &RoutingStats) {
-        assert_eq!(self.load.len(), other.load.len(), "cannot merge stats over different expert counts");
+        assert_eq!(
+            self.load.len(),
+            other.load.len(),
+            "cannot merge stats over different expert counts"
+        );
         let total = (self.tokens + other.tokens).max(1) as f32;
         let (a, b) = (self.tokens as f32 / total, other.tokens as f32 / total);
         for (x, y) in self.load.iter_mut().zip(&other.load) {
@@ -782,6 +814,13 @@ impl<B: Backend> MoELayer<B> {
         self.state_size
     }
 
+    /// The empty state, for a router that keeps none. Width zero costs nothing
+    /// and cannot be mistaken for a real state, whose width is this router's
+    /// `state_size` -- the width check in the router is what rejects a mismatch.
+    pub fn no_state(&self, device: &B::Device) -> Tensor<B, 3> {
+        Tensor::<B, 3>::zeros([1, 1, 0], device)
+    }
+
     /// Declare the routing-state width of a layer assembled from parts.
     pub fn with_state_size(mut self, size: usize) -> Self {
         self.state_size = size;
@@ -840,7 +879,8 @@ impl<B: Backend> MoELayer<B> {
     /// Exposed so callers (and tests) can reproduce the routing decision
     /// without re-deriving how the condition and token features are combined.
     pub fn router_logits(&self, x: &Tensor<B, 3>, routing_cond: &Tensor<B, 2>) -> Tensor<B, 2> {
-        self.router_logits_with(x, routing_cond, None)
+        let no_state = self.no_state(&x.device());
+        self.router_logits_with(x, routing_cond, &no_state)
     }
 
     /// [`Self::router_logits`] with the per-token routing state `[b, n, s]`
@@ -851,7 +891,7 @@ impl<B: Backend> MoELayer<B> {
         &self,
         x: &Tensor<B, 3>,
         routing_cond: &Tensor<B, 2>,
-        state: Option<&Tensor<B, 3>>,
+        state: &Tensor<B, 3>,
     ) -> Tensor<B, 2> {
         let [b, n, h] = x.dims();
         let t = b * n;
@@ -865,13 +905,24 @@ impl<B: Backend> MoELayer<B> {
         if self.route_on_tokens {
             parts.push(x.clone().reshape([t, h]));
         }
-        if self.state_size > 0 {
-            let state = state.expect("this router was built with a routing state and needs one to route");
-            let s = state.dims()[2];
-            assert_eq!(s, self.state_size, "routing state width {s} does not match the router's {}", self.state_size);
+        // A state of width zero is how "this router keeps no state" is spelled:
+        // there is no `Option` to be wrong about, and the width check below is
+        // what guarantees the caller passed the state this router was built for.
+        let s = state.dims()[2];
+        assert_eq!(
+            s, self.state_size,
+            "routing state width {s} does not match the router's {}",
+            self.state_size
+        );
+        if s > 0 {
             parts.push(state.clone().reshape([t, s]));
         }
-        let input = if parts.len() == 1 { parts.pop().expect("one part") } else { Tensor::cat(parts, 1) };
+        // `parts` holds at least the condition, so it is never empty, and a
+        // single part is passed through rather than concatenated with itself.
+        let input = match parts.len() {
+            1 => parts.swap_remove(0),
+            _ => Tensor::cat(parts, 1),
+        };
         self.router.linear.forward(input)
     }
 
@@ -880,12 +931,9 @@ impl<B: Backend> MoELayer<B> {
     /// * `x`: token features `[b, n, h]`.
     /// * `routing_cond`: per-example condition `[b, cond_size]`; concatenate a
     ///   sigma embedding beforehand for noise-aware routing.
-    pub fn forward(
-        &self,
-        x: Tensor<B, 3>,
-        routing_cond: Tensor<B, 2>,
-    ) -> MoEOutput<B> {
-        self.forward_with_state(x, routing_cond, None)
+    pub fn forward(&self, x: Tensor<B, 3>, routing_cond: Tensor<B, 2>) -> MoEOutput<B> {
+        let forward_state = self.no_state(&x.device());
+        self.forward_with_state(x, routing_cond, &forward_state)
     }
 
     /// [`Self::forward`] with the routing state of roadmap 25.4.
@@ -893,7 +941,7 @@ impl<B: Backend> MoELayer<B> {
         &self,
         x: Tensor<B, 3>,
         routing_cond: Tensor<B, 2>,
-        state: Option<&Tensor<B, 3>>,
+        state: &Tensor<B, 3>,
     ) -> MoEOutput<B> {
         let device = x.device();
         let [b, n, _h] = x.dims();
@@ -929,11 +977,36 @@ impl<B: Backend> MoELayer<B> {
         let balance_loss = balance.clone() + z_loss.clone().mul_scalar(self.z_level as f32);
         let routing = layer_routing(&probs, &top1, self.num_experts).with_sequence(b, n);
 
-        MoEOutput { output: out.reshape([b, n, h_size]), balance_loss, balance, z_loss, routing }
+        MoEOutput {
+            output: out.reshape([b, n, h_size]),
+            balance_loss,
+            balance,
+            z_loss,
+            routing,
+        }
     }
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use burn::backend::NdArray;
@@ -945,7 +1018,11 @@ mod tests {
     fn test_routing_stats_merge_is_token_weighted_and_entropies_normalize() {
         assert_eq!(normalized_entropy(&[0.5, 0.5]), 1.0);
         assert_eq!(normalized_entropy(&[1.0, 0.0]), 0.0);
-        assert_eq!(normalized_entropy(&[1.0]), 1.0, "one expert has nothing to balance");
+        assert_eq!(
+            normalized_entropy(&[1.0]),
+            1.0,
+            "one expert has nothing to balance"
+        );
 
         let mut a = RoutingStats::from_load(vec![1.0, 0.0], 0.0, 2);
         let b = RoutingStats::from_load(vec![0.0, 1.0], 2f32.ln(), 6);
@@ -954,8 +1031,15 @@ mod tests {
         a.merge(&b);
         assert_eq!(a.tokens, 8);
         assert!((a.load[0] - 0.25).abs() < 1e-6 && (a.load[1] - 0.75).abs() < 1e-6);
-        assert!((a.token_entropy - 0.75).abs() < 1e-6, "6 of 8 tokens hedged");
-        assert!(a.load_entropy > 0.8 && a.load_entropy < 0.82, "{}", a.load_entropy);
+        assert!(
+            (a.token_entropy - 0.75).abs() < 1e-6,
+            "6 of 8 tokens hedged"
+        );
+        assert!(
+            a.load_entropy > 0.8 && a.load_entropy < 0.82,
+            "{}",
+            a.load_entropy
+        );
 
         let (lh, th, min, max) = RoutingStats::summarize(&[a.clone(), b.clone()]);
         assert!((lh - (a.load_entropy + b.load_entropy) / 2.0).abs() < 1e-6);
@@ -971,21 +1055,51 @@ mod tests {
         let mut router = TopKRouter::<B>::new(3, 2, &device);
         assert!(!router.has_balance_bias());
         router.nudge_balance_bias(&[1.0, 0.0], 1.0);
-        assert!(router.balance_bias().is_none(), "a nudge without a bias is a no-op");
+        assert!(
+            router.balance_bias().is_none(),
+            "a nudge without a bias is a no-op"
+        );
         router.ensure_balance_bias();
-        let zeros: Vec<f32> = router.balance_bias().unwrap().into_data().convert::<f32>().iter::<f32>().collect();
+        let zeros: Vec<f32> = router
+            .balance_bias()
+            .unwrap()
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
         assert_eq!(zeros, vec![0.0, 0.0]);
         router.ensure_balance_bias();
         router.nudge_balance_bias(&[0.9, 0.1], 0.5);
-        let moved: Vec<f32> = router.balance_bias().unwrap().into_data().convert::<f32>().iter::<f32>().collect();
+        let moved: Vec<f32> = router
+            .balance_bias()
+            .unwrap()
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
         assert_eq!(moved, vec![-0.5, 0.5]);
         // Widening keeps the old entries and starts the new one at zero.
         let wider = TopKRouter::from_parts(
-            Tensor::cat(vec![router.weight(), Tensor::<B, 2>::zeros([3, 1], &device)], 1),
-            router.bias().map(|b| Tensor::cat(vec![b, Tensor::<B, 1>::zeros([1], &device)], 0)),
+            Tensor::cat(
+                vec![router.weight(), Tensor::<B, 2>::zeros([3, 1], &device)],
+                1,
+            ),
+            router
+                .bias()
+                .map(|b| Tensor::cat(vec![b, Tensor::<B, 1>::zeros([1], &device)], 0)),
         )
-        .with_balance_bias(router.balance_bias().map(|b| Tensor::cat(vec![b, Tensor::<B, 2>::zeros([1, 1], &device)], 1)));
-        let grown: Vec<f32> = wider.balance_bias().unwrap().into_data().convert::<f32>().iter::<f32>().collect();
+        .with_balance_bias(
+            router
+                .balance_bias()
+                .map(|b| Tensor::cat(vec![b, Tensor::<B, 2>::zeros([1, 1], &device)], 1)),
+        );
+        let grown: Vec<f32> = wider
+            .balance_bias()
+            .unwrap()
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
         assert_eq!(grown, vec![-0.5, 0.5, 0.0]);
     }
 
@@ -1027,8 +1141,16 @@ mod tests {
         let device = Default::default();
         let layer = MoELayer::<B>::new(&tiny_config(1, 3), &device);
 
-        let x = Tensor::<B, 3>::random([2, 3, 8], burn::tensor::Distribution::Uniform(-1.0, 1.0), &device);
-        let cond = Tensor::<B, 2>::random([2, 4], burn::tensor::Distribution::Uniform(-1.0, 1.0), &device);
+        let x = Tensor::<B, 3>::random(
+            [2, 3, 8],
+            burn::tensor::Distribution::Uniform(-1.0, 1.0),
+            &device,
+        );
+        let cond = Tensor::<B, 2>::random(
+            [2, 4],
+            burn::tensor::Distribution::Uniform(-1.0, 1.0),
+            &device,
+        );
         let out = layer.forward(x.clone(), cond.clone());
 
         // Recompute the router decision by hand.
@@ -1041,7 +1163,11 @@ mod tests {
         // Verify each row equals the output of its selected expert.
         let xf = x.reshape([t, 8]);
         let mut expected: Vec<f32> = Vec::with_capacity(t * 8);
-        let flat_rows = xf.into_data().convert::<f32>().iter::<f32>().collect::<Vec<_>>();
+        let flat_rows = xf
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect::<Vec<_>>();
         for (row, &e) in chosen.iter().enumerate() {
             let expert = &layer.experts[e as usize];
             let row_t = Tensor::<B, 1>::from_floats(
@@ -1049,13 +1175,20 @@ mod tests {
                 &device,
             )
             .reshape([1, 8]);
-            let y = expert.fc_out.forward(crate::tensor_ext::exact_gelu(
-                expert.fc_in.forward(row_t).unsqueeze_dim::<3>(1),
-            ).squeeze_dim::<2>(1));
+            let y = expert.fc_out.forward(
+                crate::tensor_ext::exact_gelu(expert.fc_in.forward(row_t).unsqueeze_dim::<3>(1))
+                    .squeeze_dim::<2>(1),
+            );
             expected.extend(y.into_data().convert::<f32>().iter::<f32>());
         }
 
-        let got = out.output.reshape([t, 8]).into_data().convert::<f32>().iter::<f32>().collect::<Vec<_>>();
+        let got = out
+            .output
+            .reshape([t, 8])
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect::<Vec<_>>();
         for (g, e) in got.iter().zip(&expected) {
             assert!((g - e).abs() < 1e-5, "top-1 routing mismatch: {g} vs {e}");
         }
@@ -1091,14 +1224,14 @@ mod tests {
         // few seeds so the assertion does not hinge on one initialization.
         let diverged = (0..8).any(|seed| {
             <B as burn::tensor::backend::Backend>::seed(&device, seed);
-            let layer = MoELayer::<B>::new(
-                &tiny_config(1, 4).with_token_routing(true),
-                &device,
-            );
+            let layer = MoELayer::<B>::new(&tiny_config(1, 4).with_token_routing(true), &device);
             let got = ids(&layer);
             got.windows(2).any(|w| w[0] != w[1])
         });
-        assert!(diverged, "token-conditioned routing never produced per-token variety");
+        assert!(
+            diverged,
+            "token-conditioned routing never produced per-token variety"
+        );
     }
 
     #[test]
@@ -1128,7 +1261,10 @@ mod tests {
                 .iter::<f32>()
                 .collect();
             for s in total {
-                assert!((s - 1.0).abs() < 1e-5, "gates sum to {s}, not 1 (k={top_k})");
+                assert!(
+                    (s - 1.0).abs() < 1e-5,
+                    "gates sum to {s}, not 1 (k={top_k})"
+                );
             }
         }
     }
@@ -1189,12 +1325,18 @@ mod tests {
         // Both extremes are attained exactly.
         let uniform = vec![1.0 / e as f64; e];
         let at_uniform = e as f64 * uniform.iter().map(|x| x * x).sum::<f64>();
-        assert!((at_uniform - 1.0).abs() < 1e-12, "uniform routing must give exactly 1");
+        assert!(
+            (at_uniform - 1.0).abs() < 1e-12,
+            "uniform routing must give exactly 1"
+        );
 
         let mut collapsed = vec![0.0; e];
         collapsed[0] = 1.0;
         let at_collapse = e as f64 * collapsed.iter().map(|x| x * x).sum::<f64>();
-        assert!((at_collapse - e as f64).abs() < 1e-12, "collapse must give exactly E");
+        assert!(
+            (at_collapse - e as f64).abs() < 1e-12,
+            "collapse must give exactly E"
+        );
 
         // And the random sweep really explored the interior.
         assert!(min_diagonal < 1.5 && max_seen > 1.2, "sweep was too narrow");
@@ -1247,7 +1389,10 @@ mod tests {
                 let shifted = Tensor::<B, 2>::full([3, e], at_optimum + offset, &device);
                 let z: f32 = router_z_loss(&shifted).into_scalar();
                 assert!(z > 0.0, "E={e} offset={offset}: expected > 0, got {z}");
-                assert!((z - offset * offset).abs() < 1e-4, "z should be offset^2, got {z}");
+                assert!(
+                    (z - offset * offset).abs() < 1e-4,
+                    "z should be offset^2, got {z}"
+                );
             }
         }
     }
@@ -1264,7 +1409,10 @@ mod tests {
         assert!((z - 40000.0).abs() < 100.0, "expected ~200^2, got {z}");
 
         // Naive: exp(200) is +inf in f32.
-        assert!(!(200.0f32).exp().is_finite(), "the naive form really does overflow");
+        assert!(
+            !(200.0f32).exp().is_finite(),
+            "the naive form really does overflow"
+        );
     }
 
     #[test]
@@ -1276,15 +1424,26 @@ mod tests {
         let base = row(&[1.0, 2.0, 0.5]);
         let shifted = base.clone() + 50.0;
 
-        let p0: Vec<f32> = softmax(base.clone(), 1).into_data().convert::<f32>().iter::<f32>().collect();
-        let p1: Vec<f32> = softmax(shifted.clone(), 1).into_data().convert::<f32>().iter::<f32>().collect();
+        let p0: Vec<f32> = softmax(base.clone(), 1)
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
+        let p1: Vec<f32> = softmax(shifted.clone(), 1)
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
         for (a, b) in p0.iter().zip(&p1) {
             assert!((a - b).abs() < 1e-6, "the softmax must be shift-invariant");
         }
 
         let z0: f32 = router_z_loss(&base).into_scalar();
         let z1: f32 = router_z_loss(&shifted).into_scalar();
-        assert!(z1 > z0 * 100.0, "the z-loss must see the shift: {z0} vs {z1}");
+        assert!(
+            z1 > z0 * 100.0,
+            "the z-loss must see the shift: {z0} vs {z1}"
+        );
     }
 
     #[test]

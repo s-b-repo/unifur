@@ -1,0 +1,148 @@
+# The quality gate.
+#
+# Every job here runs a target from the `Makefile`, and `make gate` is defined as
+# the same sequence. That is the whole design: there is no CI-only check that is
+# easier to satisfy than the local one, so "it passed on my machine" and "it
+# passed here" cannot drift apart.
+#
+# The one thing CI does that a laptop does not is check the *declared* minimum
+# Rust version. `Cargo.toml` says `rust-version = "1.85"` while
+# `rust-toolchain.toml` pins 1.96 for development; if the two disagree, either the
+# declared MSRV is a lie or the pin is unnecessary, and the `msrv` job below is
+# what turns that from an argument into a build failure.
+
+name: gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Not on `workflow_dispatch` alone: the expensive jobs are cached per commit,
+  # so a second push to a branch is cheap.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The release profile sets `codegen-units = 1`, so a debug build and a test
+  # build do not share artefacts. Letting cargo keep its own cache is faster.
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  # --------------------------------------------------------------------------
+  # The fast gate: the checks that run on every push and take seconds.
+  # --------------------------------------------------------------------------
+  lint:
+    name: fmt, clippy, audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustc --version && cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: make fmt-check
+
+      # `-D warnings` rather than relying on the `[lints]` table alone: the table
+      # denies the rules this repository chose, and this flag means a *new* rule
+      # from a newer toolchain also fails, instead of appearing as a warning in a
+      # log nobody reads.
+      - name: Clippy (warnings are errors)
+        run: make lint-strict
+
+      # Every optional feature, not just the default set. `wgpu` and
+      # `peregrine-uring` are each behind a `cfg`, so the default build never
+      # type-checks the code inside them.
+      - name: Clippy with all features
+        run: make all-features
+
+      # What clippy cannot see: suppressions, secrets, injected commands.
+      - name: Pattern audit
+        run: make audit
+
+      - name: Documentation builds warning-free
+        run: make doc
+
+  # --------------------------------------------------------------------------
+  # Tests. Split from lint so a formatting fix does not re-run a 6-minute suite.
+  # --------------------------------------------------------------------------
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+
+      # `make test` passes `--test-threads=$(TEST_THREADS)`, defaulting to 1. That
+      # is not slowness: Burn's backend RNG is a process-wide global, so two tests
+      # drawing from it concurrently makes a seeded run unreproducible.
+      # `tests/resume.rs` asserts bit-identical resume and can only do so because
+      # the binary is serialized.
+      - name: Unit and integration tests
+        run: make test
+
+      # The numerical certificate suite, through the shipped binary rather than
+      # through `cargo test`. The binary is what users run, so it is what gets
+      # checked -- and it catches a build that compiles but does not link the
+      # certificate runner at all.
+      - name: Certificate suite (release binary)
+        run: make verify
+
+  # --------------------------------------------------------------------------
+  # The declared minimum supported version. Cheap, and the only check that
+  # notices when a new dependency or a new language feature raises the floor
+  # without anyone updating `rust-version`.
+  # --------------------------------------------------------------------------
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+
+      - name: Build at the declared MSRV
+        run: cargo check --all-targets --locked
+
+      # The `[lints]` table can name a lint a 1.85 clippy does not have, which
+      # the compiler reports as an unknown-lint *warning*. `-D warnings` turns
+      # that into a failure here rather than in a developer's face six months
+      # later.
+      - name: The lint table is valid at the MSRV
+        run: cargo clippy --all-targets -- -D warnings
+
+  # --------------------------------------------------------------------------
+  # MSRV is a claim; this is the check that the dependency tree can actually
+  # produce that claim. `Cargo.lock` is committed, so `--locked` is what stops a
+  # resolver that wants a newer crate from quietly moving the floor.
+  # --------------------------------------------------------------------------
+  deps:
+    name: dependencies are current and audited
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain || rustup toolchain install
+
+      # `-D warnings` catches the unused-dependency lint this tree would
+      # otherwise trip on any Cargo version that enables it by default.
+      - name: Advisory database for known-vulnerable crates
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: No duplicate dependency versions
+        run: cargo tree --duplicates
+
+      # Not a failure: a report of what is stale, so the upgrade is a decision
+      # someone makes on purpose rather than an accident of a `cargo update`.
+      - name: Outdated dependencies (informational)
+        run: |
+          cargo install cargo-outdated --locked
+          cargo outdated || true

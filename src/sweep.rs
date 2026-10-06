@@ -33,14 +33,28 @@ impl Grid {
     /// values by `,`.
     pub fn parse(spec: &str) -> anyhow::Result<Self> {
         let mut axes = Vec::new();
-        for item in spec.split(|c: char| c.is_whitespace() || c == ';').filter(|s| !s.is_empty()) {
+        for item in spec
+            .split(|c: char| c.is_whitespace() || c == ';')
+            .filter(|s| !s.is_empty())
+        {
             let (key, values) = item
                 .split_once('=')
                 .with_context(|| format!("grid axis {item:?} is not key=v1,v2"))?;
-            let values: Vec<String> = values.split(',').filter(|v| !v.is_empty()).map(str::to_string).collect();
+            let values: Vec<String> = values
+                .split(',')
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .collect();
             anyhow::ensure!(!values.is_empty(), "grid axis {key:?} has no values");
-            anyhow::ensure!(SUPPORTED.contains(&key), "unknown grid key {key:?}; supported: {}", SUPPORTED.join(", "));
-            axes.push(Axis { key: key.to_string(), values });
+            anyhow::ensure!(
+                SUPPORTED.contains(&key),
+                "unknown grid key {key:?}; supported: {}",
+                SUPPORTED.join(", ")
+            );
+            axes.push(Axis {
+                key: key.to_string(),
+                values,
+            });
         }
         anyhow::ensure!(!axes.is_empty(), "an empty grid sweeps nothing");
         Ok(Self { axes })
@@ -66,15 +80,38 @@ impl Grid {
 
 /// Keys [`apply`] understands.
 pub const SUPPORTED: [&str; 20] = [
-    "lr", "steps", "batch_size", "num_blocks", "gamma", "weight_decay", "accumulate", "clip_norm",
-    "ema_decay", "uncertainty", "importance_bins", "normalize_block_loss", "objective", "consistency",
-    "lr_schedule", "moe_experts", "moe_top_k", "balance_scope", "bias_balance_rate", "negatives",
+    "lr",
+    "steps",
+    "batch_size",
+    "num_blocks",
+    "gamma",
+    "weight_decay",
+    "accumulate",
+    "clip_norm",
+    "ema_decay",
+    "uncertainty",
+    "importance_bins",
+    "normalize_block_loss",
+    "objective",
+    "consistency",
+    "lr_schedule",
+    "moe_experts",
+    "moe_top_k",
+    "balance_scope",
+    "bias_balance_rate",
+    "negatives",
 ];
 
 /// Set one flag on a configuration.
 pub fn apply(config: &mut TrainConfig, key: &str, value: &str) -> anyhow::Result<()> {
-    let num = |v: &str| -> anyhow::Result<f64> { v.parse::<f64>().with_context(|| format!("{key}={value}: not a number")) };
-    let int = |v: &str| -> anyhow::Result<usize> { v.parse::<usize>().with_context(|| format!("{key}={value}: not an integer")) };
+    let num = |v: &str| -> anyhow::Result<f64> {
+        v.parse::<f64>()
+            .with_context(|| format!("{key}={value}: not a number"))
+    };
+    let int = |v: &str| -> anyhow::Result<usize> {
+        v.parse::<usize>()
+            .with_context(|| format!("{key}={value}: not an integer"))
+    };
     match key {
         "lr" => config.lr = num(value)?,
         "steps" => config.steps = int(value)?,
@@ -93,7 +130,9 @@ pub fn apply(config: &mut TrainConfig, key: &str, value: &str) -> anyhow::Result
         }
         "uncertainty" => config.uncertainty = num(value)?,
         "importance_bins" => config.importance_bins = int(value)?,
-        "normalize_block_loss" => config.normalize_block_loss = matches!(value, "1" | "true" | "yes"),
+        "normalize_block_loss" => {
+            config.normalize_block_loss = matches!(value, "1" | "true" | "yes")
+        }
         "objective" => config.objective = Objective::parse(value)?,
         "consistency" => {
             let weight = num(value)?;
@@ -107,7 +146,9 @@ pub fn apply(config: &mut TrainConfig, key: &str, value: &str) -> anyhow::Result
                 Objective::Dblock
             };
         }
-        "lr_schedule" => config.lr_schedule = crate::schedule::LrSchedule::parse(value, config.lr, config.steps)?,
+        "lr_schedule" => {
+            config.lr_schedule = crate::schedule::LrSchedule::parse(value, config.lr, config.steps)?
+        }
         "moe_experts" => {
             let mut moe = config.moe.unwrap_or_default();
             moe.num_experts = int(value)?;
@@ -141,7 +182,11 @@ pub fn cell_name(cell: &[(String, String)]) -> String {
 ///
 /// The learning-rate schedule is re-derived after the overrides so a swept
 /// `lr` or `steps` reaches it. Every per-seed outcome is kept in `extra`.
-pub fn run_cell(base: &TrainConfig, cell: &[(String, String)], seeds: &[u64]) -> anyhow::Result<Record> {
+pub fn run_cell(
+    base: &TrainConfig,
+    cell: &[(String, String)],
+    seeds: &[u64],
+) -> anyhow::Result<Record> {
     let mut config = base.clone();
     for (key, value) in cell {
         apply(&mut config, key, value)?;
@@ -154,7 +199,10 @@ pub fn run_cell(base: &TrainConfig, cell: &[(String, String)], seeds: &[u64]) ->
     let mut record = Record::new(cell_name(cell), "loss", config_json, seeds.to_vec());
     let mut per_seed = Vec::with_capacity(seeds.len());
     for &seed in seeds {
-        let run = TrainConfig { seed, ..config.clone() };
+        let run = TrainConfig {
+            seed,
+            ..config.clone()
+        };
         let (_, summary) = train(&run)?;
         let per_block: Vec<f32> = (0..summary.health.num_blocks())
             .map(|b| summary.health.block(b).map_or(0.0, |h| h.mean_loss()))
@@ -177,7 +225,12 @@ pub fn run_cell(base: &TrainConfig, cell: &[(String, String)], seeds: &[u64]) ->
 
 /// Run every cell and append each record to `log` as soon as it exists, so
 /// a sweep interrupted halfway still leaves its finished cells on disk.
-pub fn run_grid(base: &TrainConfig, grid: &Grid, seeds: &[u64], log: Option<&Path>) -> anyhow::Result<Vec<Record>> {
+pub fn run_grid(
+    base: &TrainConfig,
+    grid: &Grid,
+    seeds: &[u64],
+    log: Option<&Path>,
+) -> anyhow::Result<Vec<Record>> {
     let mut records = Vec::new();
     for cell in grid.cells() {
         let record = run_cell(base, &cell, seeds)?;
@@ -191,7 +244,10 @@ pub fn run_grid(base: &TrainConfig, grid: &Grid, seeds: &[u64], log: Option<&Pat
 
 /// A table of a sweep's records.
 pub fn render(records: &[Record]) -> String {
-    let mut out = format!("{:<48} {:>5} {:>12} {:>12} {:>12}\n", "cell", "seeds", "mean loss", "±ci95", "median");
+    let mut out = format!(
+        "{:<48} {:>5} {:>12} {:>12} {:>12}\n",
+        "cell", "seeds", "mean loss", "±ci95", "median"
+    );
     out.push_str(&"-".repeat(94));
     out.push('\n');
     for r in records {
@@ -201,16 +257,42 @@ pub fn render(records: &[Record]) -> String {
                 r.name,
                 s.n,
                 s.mean,
-                if s.ci95_half_width.is_nan() { 0.0 } else { s.ci95_half_width },
+                if s.ci95_half_width.is_nan() {
+                    0.0
+                } else {
+                    s.ci95_half_width
+                },
                 s.median
             )),
-            None => out.push_str(&format!("{:<48} {:>5} {:>12} {:>12} {:>12}\n", r.name, 0, "-", "-", "-")),
+            None => out.push_str(&format!(
+                "{:<48} {:>5} {:>12} {:>12} {:>12}\n",
+                r.name, 0, "-", "-", "-"
+            )),
         }
     }
     out
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
 
@@ -220,8 +302,14 @@ mod tests {
         assert_eq!(grid.axes.len(), 3);
         let cells = grid.cells();
         assert_eq!(cells.len(), 4);
-        assert_eq!(cell_name(&cells[0]), "sweep/lr=1e-4,num_blocks=2,consistency=0");
-        assert_eq!(cell_name(&cells[3]), "sweep/lr=3e-4,num_blocks=3,consistency=0");
+        assert_eq!(
+            cell_name(&cells[0]),
+            "sweep/lr=1e-4,num_blocks=2,consistency=0"
+        );
+        assert_eq!(
+            cell_name(&cells[3]),
+            "sweep/lr=3e-4,num_blocks=3,consistency=0"
+        );
         assert!(Grid::parse("lr=").is_err());
         assert!(Grid::parse("bogus=1").is_err());
         assert!(Grid::parse("").is_err());

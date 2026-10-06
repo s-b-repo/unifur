@@ -24,7 +24,9 @@ impl ParamSnapshot {
     pub fn of<B: Backend<FloatElem = f32>, M: Module<B>>(module: &M) -> Self {
         let mut visitor = Collector { values: Vec::new() };
         module.visit(&mut visitor);
-        Self { values: visitor.values }
+        Self {
+            values: visitor.values,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -70,7 +72,10 @@ impl<B: Backend<FloatElem = f32>> ModuleMapper<B> for Averager<B> {
         let mut acc = base.clone().mul_scalar(self.weights[0]);
         for (k, other) in self.others.iter().enumerate() {
             let Some(data) = other.values.get(idx) else {
-                self.error = Some(anyhow::anyhow!("checkpoint {} has fewer parameters than the template", k + 1));
+                self.error = Some(anyhow::anyhow!(
+                    "checkpoint {} has fewer parameters than the template",
+                    k + 1
+                ));
                 return param;
             };
             if base.shape() != data.shape.clone() {
@@ -82,7 +87,8 @@ impl<B: Backend<FloatElem = f32>> ModuleMapper<B> for Averager<B> {
                 ));
                 return param;
             }
-            acc = acc + Tensor::<B, D>::from_data(data.clone(), &device).mul_scalar(self.weights[k + 1]);
+            acc = acc
+                + Tensor::<B, D>::from_data(data.clone(), &device).mul_scalar(self.weights[k + 1]);
         }
         // `map` keeps the parameter id; the merged module can then load into
         // and be loaded from records exactly as the template could.
@@ -98,8 +104,16 @@ pub fn merge_into<B: Backend<FloatElem = f32>, M: Module<B>>(
     others: &[ParamSnapshot],
     weights: &[f64],
 ) -> anyhow::Result<M> {
-    anyhow::ensure!(weights.len() == others.len() + 1, "{} weight(s) for {} checkpoint(s)", weights.len(), others.len() + 1);
-    anyhow::ensure!(weights.iter().all(|w| w.is_finite() && *w > 0.0), "merge weights must be positive: {weights:?}");
+    anyhow::ensure!(
+        weights.len() == others.len() + 1,
+        "{} weight(s) for {} checkpoint(s)",
+        weights.len(),
+        others.len() + 1
+    );
+    anyhow::ensure!(
+        weights.iter().all(|w| w.is_finite() && *w > 0.0),
+        "merge weights must be positive: {weights:?}"
+    );
     let total: f64 = weights.iter().sum();
     let expected = ParamSnapshot::of::<B, M>(&base).len();
     for (k, other) in others.iter().enumerate() {
@@ -121,7 +135,11 @@ pub fn merge_into<B: Backend<FloatElem = f32>, M: Module<B>>(
     if let Some(err) = mapper.error {
         return Err(err);
     }
-    anyhow::ensure!(mapper.cursor == expected, "visited {} of {expected} parameters", mapper.cursor);
+    anyhow::ensure!(
+        mapper.cursor == expected,
+        "visited {} of {expected} parameters",
+        mapper.cursor
+    );
     Ok(merged)
 }
 
@@ -163,11 +181,35 @@ pub fn flatten<B: Backend<FloatElem = f32>, M: Module<B>>(module: &M) -> Vec<f32
     ParamSnapshot::of::<B, M>(module)
         .values
         .iter()
-        .flat_map(|d| d.clone().convert::<f32>().iter::<f32>().collect::<Vec<f32>>())
+        .flat_map(|d| {
+            d.clone()
+                .convert::<f32>()
+                .iter::<f32>()
+                .collect::<Vec<f32>>()
+        })
         .collect()
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use burn::backend::NdArray;
@@ -184,18 +226,32 @@ mod tests {
         let fb = flatten::<B, _>(&b);
         assert_ne!(fa, fb, "two inits differ");
 
-        let same = merge_into::<B, _>(a.clone(), &[ParamSnapshot::of::<B, _>(&a)], &[1.0, 1.0]).unwrap();
-        assert_eq!(flatten::<B, _>(&same), fa, "merging a checkpoint with itself is the identity, bitwise");
+        let same =
+            merge_into::<B, _>(a.clone(), &[ParamSnapshot::of::<B, _>(&a)], &[1.0, 1.0]).unwrap();
+        assert_eq!(
+            flatten::<B, _>(&same),
+            fa,
+            "merging a checkpoint with itself is the identity, bitwise"
+        );
 
-        let half = merge_into::<B, _>(a.clone(), &[ParamSnapshot::of::<B, _>(&b)], &[1.0, 1.0]).unwrap();
+        let half =
+            merge_into::<B, _>(a.clone(), &[ParamSnapshot::of::<B, _>(&b)], &[1.0, 1.0]).unwrap();
         for ((m, x), y) in flatten::<B, _>(&half).iter().zip(&fa).zip(&fb) {
-            assert!((m - 0.5 * (x + y)).abs() <= 1e-6 * (x.abs() + y.abs() + 1.0), "{m} vs {}", 0.5 * (x + y));
+            assert!(
+                (m - 0.5 * (x + y)).abs() <= 1e-6 * (x.abs() + y.abs() + 1.0),
+                "{m} vs {}",
+                0.5 * (x + y)
+            );
         }
-        let skewed = merge_into::<B, _>(a.clone(), &[ParamSnapshot::of::<B, _>(&b)], &[3.0, 1.0]).unwrap();
+        let skewed =
+            merge_into::<B, _>(a.clone(), &[ParamSnapshot::of::<B, _>(&b)], &[3.0, 1.0]).unwrap();
         for ((m, x), y) in flatten::<B, _>(&skewed).iter().zip(&fa).zip(&fb) {
             assert!((m - (0.75 * x + 0.25 * y)).abs() <= 1e-6 * (x.abs() + y.abs() + 1.0));
         }
-        assert!(merge_into::<B, _>(a.clone(), &[], &[1.0, 1.0]).is_err(), "weight count must match");
+        assert!(
+            merge_into::<B, _>(a.clone(), &[], &[1.0, 1.0]).is_err(),
+            "weight count must match"
+        );
         assert!(merge_into::<B, _>(a, &[ParamSnapshot::of::<B, _>(&b)], &[1.0, -1.0]).is_err());
     }
 }

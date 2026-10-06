@@ -41,50 +41,165 @@ impl LayerCost {
 
 /// The four projections of an attention layer plus its score/value work for
 /// `positions` visible keys, per token.
-pub fn attention_cost(mode: AttentionMode, hidden: usize, heads: usize, positions: usize) -> LayerCost {
-    let head_dim = hidden / heads.max(1);
-    let projections = 4 * hidden * hidden + 4 * hidden; // q, k, v, out with biases
-    let proj_flops = 2.0 * (4 * hidden * hidden) as f64;
+pub fn attention_cost(
+    mode: AttentionMode,
+    hidden: usize,
+    heads: usize,
+    positions: usize,
+) -> LayerCost {
+    attention_cost_full(mode, hidden, heads, heads, false, positions)
+}
+
+/// [`attention_cost`] with grouped-query attention and the gated-attention
+/// output gate counted: keys and values use `kv_heads` heads (the decode
+/// state they occupy is `2 * positions * kv_dim`, which is where GQA saves),
+/// and a gated layer adds one `[hidden, hidden]` projection plus bias.
+///
+/// With `kv_heads == heads` and `gated == false` this is [`attention_cost`]
+/// bit for bit in every integer field and exactly in FLOPs.
+pub fn attention_cost_full(
+    mode: AttentionMode,
+    hidden: usize,
+    heads: usize,
+    kv_heads: usize,
+    gated: bool,
+    positions: usize,
+) -> LayerCost {
+    let heads = heads.max(1);
+    let kv_heads = kv_heads.max(1).min(heads);
+    let head_dim = hidden / heads;
+    let kv_dim = kv_heads * head_dim;
+    // q and out stay full width; k and v narrow to the KV heads.
+    let projections = 2 * hidden * hidden + 2 * hidden * kv_dim + 4 * hidden;
+    let proj_flops = 2.0 * (2 * hidden * hidden + 2 * hidden * kv_dim) as f64;
+    // The output gate: one more [hidden, hidden] map plus its tanh/scale.
+    let (gate_params, gate_flops) = if gated {
+        (
+            hidden * hidden + hidden,
+            2.0 * (hidden * hidden) as f64 + 2.0 * hidden as f64,
+        )
+    } else {
+        (0, 0.0)
+    };
     let (mix_flops, keys_read, state_floats) = match mode {
-        AttentionMode::Dense => (4.0 * positions as f64 * hidden as f64, positions, 2 * positions * hidden),
+        AttentionMode::Dense => (
+            4.0 * positions as f64 * hidden as f64,
+            positions,
+            2 * positions * kv_dim,
+        ),
         AttentionMode::Sliding { window } => {
             let w = window.min(positions);
-            (4.0 * w as f64 * hidden as f64, w, 2 * window.saturating_sub(1) * hidden)
+            (
+                4.0 * w as f64 * hidden as f64,
+                w,
+                2 * window.saturating_sub(1) * kv_dim,
+            )
         }
         AttentionMode::Retrieval { top_k } => {
             let k = top_k.min(positions);
             // Every score is computed; only the chosen values are read.
-            (2.0 * positions as f64 * hidden as f64 + 2.0 * k as f64 * hidden as f64, k, 2 * positions * hidden)
+            (
+                2.0 * positions as f64 * hidden as f64 + 2.0 * k as f64 * hidden as f64,
+                k,
+                2 * positions * kv_dim,
+            )
         }
         AttentionMode::Linear => {
-            // phi(q) S: [d] x [d, d] per head, plus the state update phi(k) v^T.
+            // Keys and values are repeated to the query heads before the
+            // feature map, so the recurrent state stays per query head.
             let per_head = 2.0 * (head_dim * head_dim) as f64 * 2.0;
-            (per_head * heads as f64, 0, heads * (head_dim * head_dim + head_dim))
+            (
+                per_head * heads as f64,
+                0,
+                heads * (head_dim * head_dim + head_dim),
+            )
         }
         AttentionMode::Learned => {
-            let dense = attention_cost(AttentionMode::Dense, hidden, heads, positions);
-            let linear = attention_cost(AttentionMode::Linear, hidden, heads, positions);
+            let dense = attention_cost_full(
+                AttentionMode::Dense,
+                hidden,
+                heads,
+                kv_heads,
+                false,
+                positions,
+            );
+            let linear = attention_cost_full(
+                AttentionMode::Linear,
+                hidden,
+                heads,
+                kv_heads,
+                false,
+                positions,
+            );
             return LayerCost {
-                active_params: projections + 2,
-                flops: proj_flops + (dense.flops - proj_flops) + (linear.flops - proj_flops),
+                active_params: projections + gate_params + 2,
+                flops: proj_flops
+                    + gate_flops
+                    + (dense.flops - proj_flops)
+                    + (linear.flops - proj_flops),
                 keys_read: dense.keys_read,
                 state_floats: dense.state_floats + linear.state_floats,
             };
         }
     };
-    LayerCost { active_params: projections, flops: proj_flops + mix_flops, keys_read, state_floats }
+    LayerCost {
+        active_params: projections + gate_params,
+        flops: proj_flops + gate_flops + mix_flops,
+        keys_read,
+        state_floats,
+    }
+}
+
+/// QK-Norm (Qwen3/GLM-4.5/LLaMA-4): per-head RMSNorm on queries and keys.
+/// One shared scale per head-dim on each side: `2 * head_dim` parameters,
+/// ~5 FLOPs per element per side (square, mean, rsqrt, normalize, scale).
+pub fn qk_norm_cost(hidden: usize, heads: usize) -> LayerCost {
+    let heads = heads.max(1);
+    let head_dim = hidden / heads;
+    let params = 2 * head_dim;
+    let flops = 2.0 * 5.0 * hidden as f64;
+    LayerCost {
+        active_params: params,
+        flops,
+        keys_read: 0,
+        state_floats: 0,
+    }
 }
 
 /// A dense two-layer MLP, per token.
 pub fn dense_mlp_cost(hidden: usize, intermediate: usize) -> LayerCost {
     let params = 2 * hidden * intermediate + hidden + intermediate;
-    LayerCost { active_params: params, flops: 2.0 * (2 * hidden * intermediate) as f64, keys_read: 0, state_floats: 0 }
+    LayerCost {
+        active_params: params,
+        flops: 2.0 * (2 * hidden * intermediate) as f64,
+        keys_read: 0,
+        state_floats: 0,
+    }
+}
+
+pub fn dense_ffn_cost(hidden: usize, intermediate: usize, kind: crate::vit::FfnKind) -> LayerCost {
+    match kind {
+        crate::vit::FfnKind::Gelu => dense_mlp_cost(hidden, intermediate),
+        crate::vit::FfnKind::SwiGlu => LayerCost {
+            active_params: 3 * hidden * intermediate + 2 * intermediate + hidden,
+            flops: 6.0 * (hidden * intermediate) as f64,
+            keys_read: 0,
+            state_floats: 0,
+        },
+    }
 }
 
 /// A routed expert layer, per token: the router (optionally through a latent
 /// projection) plus `top_k` expert MLPs. The unselected experts are resident
 /// but not active, which is the whole point of the count.
-pub fn moe_cost(hidden: usize, intermediate: usize, experts: usize, top_k: usize, router_in: usize, latent: Option<usize>) -> LayerCost {
+pub fn moe_cost(
+    hidden: usize,
+    intermediate: usize,
+    experts: usize,
+    top_k: usize,
+    router_in: usize,
+    latent: Option<usize>,
+) -> LayerCost {
     let router_params = match latent {
         Some(l) => router_in * l + l * experts + experts,
         None => router_in * experts + experts,
@@ -103,7 +218,14 @@ pub fn moe_cost(hidden: usize, intermediate: usize, experts: usize, top_k: usize
 /// Value experts over a shared base (Phase 26): the router plus `top_k`
 /// rank-`rank` deltas, per token. The base value projection is already in
 /// [`attention_cost`].
-pub fn value_experts_cost(hidden: usize, rank: usize, experts: usize, top_k: usize, router_in: usize, latent: Option<usize>) -> LayerCost {
+pub fn value_experts_cost(
+    hidden: usize,
+    rank: usize,
+    experts: usize,
+    top_k: usize,
+    router_in: usize,
+    latent: Option<usize>,
+) -> LayerCost {
     let router_params = match latent {
         Some(l) => router_in * l + l * experts + experts,
         None => router_in * experts + experts,
@@ -126,7 +248,9 @@ pub struct TrunkCost {
 
 impl TrunkCost {
     pub fn total(&self) -> LayerCost {
-        self.layers.iter().fold(LayerCost::default(), |acc, l| acc.plus(*l))
+        self.layers
+            .iter()
+            .fold(LayerCost::default(), |acc, l| acc.plus(*l))
     }
 
     /// Cost of executing only `span` of the layers.
@@ -175,8 +299,44 @@ impl ComputeLedger {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_dense_ffn_cost_formulas() {
+        use crate::vit::FfnKind;
+        let gelu = dense_ffn_cost(8, 16, FfnKind::Gelu);
+        assert_eq!(gelu, dense_mlp_cost(8, 16));
+        assert_eq!(gelu.active_params, 280);
+        assert_eq!(gelu.flops, 512.0);
+        let swiglu = dense_ffn_cost(8, 16, FfnKind::SwiGlu);
+        assert_eq!(swiglu.active_params, 424);
+        assert_eq!(swiglu.flops, 768.0);
+        assert_eq!(swiglu.keys_read, 0);
+        assert_eq!(swiglu.state_floats, 0);
+        let expert = moe_cost(8, 16, 4, 1, 12, None);
+        assert_eq!(expert.active_params, 12 * 4 + 4 + gelu.active_params);
+        assert_eq!(expert.flops, 2.0 * 12.0 * 4.0 + gelu.flops);
+    }
 
     #[test]
     fn test_attention_costs_are_hand_checkable() {
@@ -195,7 +355,10 @@ mod tests {
         assert_eq!(linear.keys_read, 0);
         assert_eq!(linear.state_floats, 2 * (16 + 4));
         // Linear attention's cost does not grow with the sequence.
-        assert_eq!(linear.flops, attention_cost(AttentionMode::Linear, h, 2, 10_000).flops);
+        assert_eq!(
+            linear.flops,
+            attention_cost(AttentionMode::Linear, h, 2, 10_000).flops
+        );
         let learned = attention_cost(AttentionMode::Learned, h, 2, 10);
         assert!(learned.flops > dense.flops);
     }
@@ -205,14 +368,29 @@ mod tests {
         let one = moe_cost(8, 16, 4, 1, 12, None);
         let two = moe_cost(8, 16, 4, 2, 12, None);
         let eight = moe_cost(8, 16, 8, 1, 12, None);
-        assert_eq!(two.active_params - one.active_params, dense_mlp_cost(8, 16).active_params);
-        assert_eq!(eight.active_params - one.active_params, 4 * 12 + 4, "only the router widens");
+        assert_eq!(
+            two.active_params - one.active_params,
+            dense_mlp_cost(8, 16).active_params
+        );
+        assert_eq!(
+            eight.active_params - one.active_params,
+            4 * 12 + 4,
+            "only the router widens"
+        );
         let latent = moe_cost(8, 16, 4, 1, 12, Some(2));
-        assert!(latent.active_params < one.active_params, "a latent router is cheaper than a full one");
+        assert!(
+            latent.active_params < one.active_params,
+            "a latent router is cheaper than a full one"
+        );
         let v = value_experts_cost(8, 2, 4, 2, 12, None);
         assert_eq!(v.active_params, 12 * 4 + 4 + 2 * (2 * 8 * 2));
-        let trunk = TrunkCost { layers: vec![one, two] };
-        assert_eq!(trunk.total().active_params, one.active_params + two.active_params);
+        let trunk = TrunkCost {
+            layers: vec![one, two],
+        };
+        assert_eq!(
+            trunk.total().active_params,
+            one.active_params + two.active_params
+        );
         assert_eq!(trunk.span(1..2).active_params, two.active_params);
         assert_eq!(trunk.span(0..9).flops, trunk.total().flops);
     }

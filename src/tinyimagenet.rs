@@ -51,13 +51,44 @@ pub fn open(
 ) -> anyhow::Result<RawImageDataset> {
     let path = data_dir.join(if train { "train.bin" } else { "val.bin" });
     if streaming {
-        RawImageDataset::streaming(&path, FORMAT, batch_size, TINY_IMAGENET_MEAN, TINY_IMAGENET_STD)
+        RawImageDataset::streaming(
+            &path,
+            FORMAT,
+            batch_size,
+            TINY_IMAGENET_MEAN,
+            TINY_IMAGENET_STD,
+        )
     } else {
-        RawImageDataset::in_memory(&path, FORMAT, batch_size, TINY_IMAGENET_MEAN, TINY_IMAGENET_STD)
+        RawImageDataset::in_memory(
+            &path,
+            FORMAT,
+            batch_size,
+            TINY_IMAGENET_MEAN,
+            TINY_IMAGENET_STD,
+        )
     }
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use crate::data::TrainDataset;
@@ -85,7 +116,10 @@ mod tests {
     fn test_layout_constants() {
         assert_eq!(RECORD_BYTES, 2 + 3 * 64 * 64);
         assert_eq!(NUM_CLASSES, 200);
-        assert!(CONVERTER.contains("transpose(2, 0, 1)"), "converter must emit CHW");
+        assert!(
+            CONVERTER.contains("transpose(2, 0, 1)"),
+            "converter must emit CHW"
+        );
     }
 
     #[test]
@@ -114,14 +148,18 @@ mod tests {
         std::fs::write(&offset, &rec).unwrap();
         let split = read_split(&offset).unwrap();
         assert_eq!(split.labels, vec![5]);
-        assert!(split.record(0).iter().all(|&b| b == 9), "header leaked into the pixels");
+        assert!(
+            split.record(0).iter().all(|&b| b == 9),
+            "header leaked into the pixels"
+        );
 
         let mut ds = open(&dir, true, 4, true).unwrap();
         let batch = <RawImageDataset as TrainDataset<B>>::next_batch(
             &mut ds,
             &mut StdRng::seed_from_u64(2),
             &Default::default(),
-        ).expect("batch");
+        )
+        .expect("batch");
         assert_eq!(batch.pixel_values.dims(), [4, 3, 64, 64]);
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -132,7 +170,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("tin-val-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let err = open(&dir, false, 1, false).unwrap_err().to_string();
-        assert!(err.contains("val.bin"), "validation split is val.bin: {err}");
+        assert!(
+            err.contains("val.bin"),
+            "validation split is val.bin: {err}"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

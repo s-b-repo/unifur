@@ -22,7 +22,7 @@ use anyhow::Context;
 use burn::{
     module::{Module, ModuleVisitor, Param, Parameter},
     record::{FileRecorder, FullPrecisionSettings, NamedMpkFileRecorder, Record, Recorder},
-    tensor::{BasicOps, Bool, Int, Tensor, TensorKind, backend::Backend},
+    tensor::{backend::Backend, BasicOps, Bool, Int, Tensor, TensorKind},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -98,6 +98,60 @@ where
         .map_err(|err| anyhow::anyhow!("load {}: {err}", path.display()))
 }
 
+/// Load several checkpoints into several modules, in a chosen execution mode.
+///
+/// Loading is the one part of a run that is embarrassingly parallel and
+/// embarrassingly slow: each file is read and deserialized on its own, with no
+/// shared state, and a sweep or an ensemble touches dozens of them. The
+/// [`crate::blockexec::BlockExecMode`] selector decides whether that happens
+/// one at a time, one thread per file, or on the persistent pool.
+///
+/// The mode is a performance decision only. Results come back in the order the
+/// modules were given, and a failed load is an error naming its index, so a
+/// caller cannot accidentally pair a model with the wrong weights because a
+/// faster one finished first.
+pub fn load_all<B, M>(
+    modules: Vec<M>,
+    paths: &[PathBuf],
+    device: &B::Device,
+    mode: crate::blockexec::BlockExecMode,
+) -> anyhow::Result<Vec<M>>
+where
+    B: Backend,
+    M: Module<B> + Send + Sync + 'static,
+    B::Device: Send + Sync,
+{
+    anyhow::ensure!(
+        !modules.is_empty(),
+        "load_all needs at least one module to load into"
+    );
+    anyhow::ensure!(
+        modules.len() == paths.len(),
+        "load_all got {} modules for {} paths: pairing them by index is the whole \
+         contract, and a length mismatch would pair a model with the wrong weights",
+        modules.len(),
+        paths.len()
+    );
+
+    let count = modules.len();
+    let device = device.clone();
+    let paths = paths.to_vec();
+    // `modules` is consumed by the closure, which must be `'static` because a
+    // pooled job outlives the call that queued it.
+    let modules = std::sync::Arc::new(std::sync::Mutex::new(modules.into_iter()));
+    mode.map(count, move |index| {
+        let mut slot = modules
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the module queue was poisoned by a failed load"))?;
+        let module = slot
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("ran out of modules at index {index}"))?;
+        let path = &paths[index];
+        load(module, path, &device)
+            .with_context(|| format!("load checkpoint {index} from {}", path.display()))
+    })
+}
+
 /// Most recently modified checkpoint in `dir` whose name starts with `stem`.
 ///
 /// Content-addressed names carry no ordering of their own -- that is the point
@@ -157,7 +211,9 @@ impl ContentHasher {
     fn hash_param<B: Backend, K: TensorKind<B> + BasicOps<B>, const D: usize>(
         &mut self,
         param: &Param<Tensor<B, D, K>>,
-    ) where Tensor<B, D, K>: Parameter {
+    ) where
+        Tensor<B, D, K>: Parameter,
+    {
         let tensor = param.val();
         let shape = format!("{:?}", tensor.shape());
         let data = tensor.to_data();
@@ -206,7 +262,9 @@ pub fn file_sha256_hex(path: &Path) -> anyhow::Result<String> {
     let mut sha = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];
     loop {
-        let n = file.read(&mut buf).with_context(|| format!("read {}", path.display()))?;
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("read {}", path.display()))?;
         if n == 0 {
             break;
         }
@@ -239,11 +297,22 @@ pub struct BuildInfo {
 impl BuildInfo {
     pub fn current() -> Self {
         Self {
-            git_revision: option_env!("DBLOCKS_GIT_REVISION").unwrap_or("unknown").to_string(),
+            git_revision: option_env!("DBLOCKS_GIT_REVISION")
+                .unwrap_or("unknown")
+                .to_string(),
             crate_version: env!("CARGO_PKG_VERSION").to_string(),
-            burn_version: option_env!("DBLOCKS_BURN_VERSION").unwrap_or("unknown").to_string(),
-            rustc_version: option_env!("DBLOCKS_RUSTC_VERSION").unwrap_or("unknown").to_string(),
-            profile: if cfg!(debug_assertions) { "debug" } else { "release" }.to_string(),
+            burn_version: option_env!("DBLOCKS_BURN_VERSION")
+                .unwrap_or("unknown")
+                .to_string(),
+            rustc_version: option_env!("DBLOCKS_RUSTC_VERSION")
+                .unwrap_or("unknown")
+                .to_string(),
+            profile: if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+            .to_string(),
         }
     }
 }
@@ -266,7 +335,13 @@ pub struct DatasetIdentity {
 impl DatasetIdentity {
     /// Data generated in-process from a seed: nothing on disk to hash.
     pub fn synthetic(description: impl Into<String>) -> Self {
-        Self { description: description.into(), path: None, files: 0, bytes: 0, sha256: None }
+        Self {
+            description: description.into(),
+            path: None,
+            files: 0,
+            bytes: 0,
+            sha256: None,
+        }
     }
 
     /// A file or a directory of files.
@@ -284,7 +359,9 @@ impl DatasetIdentity {
         let mut sha = Sha256::new();
         let mut bytes = 0u64;
         for file in &files {
-            let len = fs::metadata(file).with_context(|| format!("stat {}", file.display()))?.len();
+            let len = fs::metadata(file)
+                .with_context(|| format!("stat {}", file.display()))?
+                .len();
             let name = file
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -292,7 +369,8 @@ impl DatasetIdentity {
             sha.update(name.as_bytes());
             sha.update([0u8]);
             sha.update(len.to_le_bytes());
-            let mut handle = fs::File::open(file).with_context(|| format!("open {}", file.display()))?;
+            let mut handle =
+                fs::File::open(file).with_context(|| format!("open {}", file.display()))?;
             let mut buf = vec![0u8; 1 << 20];
             loop {
                 let n = handle.read(&mut buf)?;
@@ -314,7 +392,9 @@ impl DatasetIdentity {
 
     /// Same data: same description, byte count and hash.
     pub fn matches(&self, other: &Self) -> bool {
-        self.description == other.description && self.bytes == other.bytes && self.sha256 == other.sha256
+        self.description == other.description
+            && self.bytes == other.bytes
+            && self.sha256 == other.sha256
     }
 }
 
@@ -331,7 +411,9 @@ pub fn describe_datasets(list: &[DatasetIdentity]) -> String {
                 "{} ({} bytes, {})",
                 d.description,
                 d.bytes,
-                d.sha256.as_deref().map_or("no hash".to_string(), |h| h[..12.min(h.len())].to_string())
+                d.sha256
+                    .as_deref()
+                    .map_or("no hash".to_string(), |h| h[..12.min(h.len())].to_string())
             )
         })
         .collect::<Vec<_>>()
@@ -430,7 +512,8 @@ impl TrainState {
         let tmp = dir.join(format!(".state.{}.tmp", std::process::id()));
         let text = serde_json::to_string_pretty(self).context("serialize training state")?;
         fs::write(&tmp, format!("{text}\n")).with_context(|| format!("write {}", tmp.display()))?;
-        fs::rename(&tmp, &path).with_context(|| format!("move {} to {}", tmp.display(), path.display()))?;
+        fs::rename(&tmp, &path)
+            .with_context(|| format!("move {} to {}", tmp.display(), path.display()))?;
         Ok(path)
     }
 
@@ -470,7 +553,14 @@ impl TrainState {
     /// Keys of `config` whose values differ from `other`, ignoring the keys
     /// that legitimately change between a run and its continuation.
     pub fn config_differences(&self, other: &serde_json::Value) -> Vec<String> {
-        const VOLATILE: [&str; 6] = ["resume", "steps", "out_dir", "checkpoint_every", "log_file", "log_path"];
+        const VOLATILE: [&str; 6] = [
+            "resume",
+            "steps",
+            "out_dir",
+            "checkpoint_every",
+            "log_file",
+            "log_path",
+        ];
         let (Some(a), Some(b)) = (self.config.as_object(), other.as_object()) else {
             return vec!["config is not an object".into()];
         };
@@ -498,7 +588,11 @@ pub fn resolve(dir: &Path, recorded: &str) -> PathBuf {
 
 /// Save any Burn record (a module's, an optimizer's) under `dir/<name>.mpk`
 /// and return its entry for the state file.
-pub fn save_record<B: Backend, R: Record<B>>(record: R, dir: &Path, name: &str) -> anyhow::Result<StateFile> {
+pub fn save_record<B: Backend, R: Record<B>>(
+    record: R,
+    dir: &Path,
+    name: &str,
+) -> anyhow::Result<StateFile> {
     fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let recorder = MpkRecorder::new();
     let ext = <MpkRecorder as FileRecorder<B>>::file_extension();
@@ -512,11 +606,18 @@ pub fn save_record<B: Backend, R: Record<B>>(record: R, dir: &Path, name: &str) 
     let final_path = dir.join(format!("{name}.{ext}"));
     fs::rename(&tmp, &final_path)
         .with_context(|| format!("move {} to {}", tmp.display(), final_path.display()))?;
-    Ok(StateFile { path: format!("{name}.{ext}"), sha256: file_sha256_hex(&final_path)? })
+    Ok(StateFile {
+        path: format!("{name}.{ext}"),
+        sha256: file_sha256_hex(&final_path)?,
+    })
 }
 
 /// Load a record saved by [`save_record`].
-pub fn load_record<B: Backend, R: Record<B>>(dir: &Path, file: &StateFile, device: &B::Device) -> anyhow::Result<R> {
+pub fn load_record<B: Backend, R: Record<B>>(
+    dir: &Path,
+    file: &StateFile,
+    device: &B::Device,
+) -> anyhow::Result<R> {
     let path = resolve(dir, &file.path);
     <MpkRecorder as Recorder<B>>::load(&MpkRecorder::new(), path.clone(), device)
         .map_err(|err| anyhow::anyhow!("load {}: {err}", path.display()))
@@ -524,7 +625,10 @@ pub fn load_record<B: Backend, R: Record<B>>(dir: &Path, file: &StateFile, devic
 
 /// The entry for an already-written model file.
 pub fn model_entry(model_path: &Path) -> anyhow::Result<StateFile> {
-    Ok(StateFile { path: model_path.display().to_string(), sha256: file_sha256_hex(model_path)? })
+    Ok(StateFile {
+        path: model_path.display().to_string(),
+        sha256: file_sha256_hex(model_path)?,
+    })
 }
 
 /// Seconds since the Unix epoch, for the record.
@@ -536,13 +640,32 @@ pub fn unix_now() -> u64 {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use crate::dblock::{DblockClassifier, DblockConfig};
     use crate::vit::ViTDiTConfig;
     use burn::backend::NdArray;
-    use burn::tensor::Tensor;
     use burn::tensor::backend::BackendTypes;
+    use burn::tensor::Tensor;
 
     type B = NdArray<f32>;
     type Device = <B as BackendTypes>::Device;
@@ -560,6 +683,7 @@ mod tests {
             },
             device,
         )
+        .unwrap()
     }
 
     fn probe_logits(model: &DblockClassifier<B>, device: &Device) -> Tensor<B, 2> {
@@ -574,6 +698,113 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("dblocks-test-{}-{tag}-{nanos}", std::process::id()))
+    }
+
+    /// Every execution mode loads the same checkpoints into the same modules,
+    /// in the same order. This is the property that makes the mode a
+    /// performance decision: a load that came back permuted would pair a model
+    /// with the wrong weights, and nothing downstream would notice.
+    #[test]
+    fn load_all_is_order_preserving_in_every_mode() {
+        use crate::blockexec::BlockExecMode;
+        let device = Default::default();
+        let dir = scratch_dir("load-all");
+
+        // Three distinct checkpoints, so a permutation would be visible.
+        let mut paths = Vec::new();
+        for i in 0..3 {
+            let sub = dir.join(format!("m{i}"));
+            let model = tiny_model(&device);
+            paths.push(save_content_addressed(model, &sub, "ckpt").expect("save"));
+        }
+
+        // Reference: load them one at a time and record each model's output.
+        let mut reference = Vec::new();
+        for path in &paths {
+            let loaded = load(tiny_model(&device), path, &device).expect("serial load");
+            reference.push(
+                probe_logits(&loaded, &device)
+                    .to_data()
+                    .to_vec::<f32>()
+                    .unwrap(),
+            );
+        }
+
+        for mode in [
+            BlockExecMode::Sync,
+            BlockExecMode::MultiThread,
+            BlockExecMode::Parallel,
+        ] {
+            let modules: Vec<DblockClassifier<B>> = (0..3).map(|_| tiny_model(&device)).collect();
+            let loaded = load_all(modules, &paths, &device, mode)
+                .unwrap_or_else(|e| panic!("{} load_all failed: {e:#}", mode.as_str()));
+            assert_eq!(
+                loaded.len(),
+                3,
+                "{} returned the wrong count",
+                mode.as_str()
+            );
+            for (i, model) in loaded.iter().enumerate() {
+                let got = probe_logits(model, &device)
+                    .to_data()
+                    .to_vec::<f32>()
+                    .unwrap();
+                assert_eq!(
+                    got,
+                    reference[i],
+                    "{} paired checkpoint {i} with the wrong module",
+                    mode.as_str()
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A module/path count mismatch is refused rather than paired by index.
+    /// Silently truncating to the shorter list would load some models and leave
+    /// the rest at their random initialization.
+    #[test]
+    fn load_all_refuses_a_module_path_mismatch() {
+        use crate::blockexec::BlockExecMode;
+        let device = Default::default();
+        let modules: Vec<DblockClassifier<B>> = (0..3).map(|_| tiny_model(&device)).collect();
+        let paths = vec![PathBuf::from("a"), PathBuf::from("b")];
+        let err = load_all(modules, &paths, &device, BlockExecMode::Sync)
+            .expect_err("a mismatch must be refused");
+        let text = format!("{err}");
+        assert!(text.contains("3 modules for 2 paths"), "unhelpful: {text}");
+    }
+
+    /// An empty batch is refused, and so is a missing file -- naming the index,
+    /// because "load failed" without an index is unactionable in a sweep over
+    /// dozens of checkpoints.
+    #[test]
+    fn load_all_reports_a_missing_file_by_index() {
+        use crate::blockexec::BlockExecMode;
+        let device = Default::default();
+        let err = load_all(
+            Vec::<DblockClassifier<B>>::new(),
+            &[],
+            &device,
+            BlockExecMode::Sync,
+        )
+        .expect_err("an empty batch must be refused");
+        assert!(
+            format!("{err}").contains("at least one module"),
+            "unhelpful: {err}"
+        );
+
+        let dir = scratch_dir("load-all-missing");
+        let modules: Vec<DblockClassifier<B>> = (0..2).map(|_| tiny_model(&device)).collect();
+        let paths = vec![dir.join("nope-0"), dir.join("nope-1")];
+        let err = load_all(modules, &paths, &device, BlockExecMode::Parallel)
+            .expect_err("a missing file must be refused");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("load checkpoint 0") || text.contains("load checkpoint 1"),
+            "the error does not name an index: {text}"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -596,7 +827,9 @@ mod tests {
 
         // Filename shape: dblocks-<16 hex>.mpk
         assert!(name1.starts_with("dblocks-"), "{name1}");
-        let hash_part = name1.trim_start_matches("dblocks-").trim_end_matches(".mpk");
+        let hash_part = name1
+            .trim_start_matches("dblocks-")
+            .trim_end_matches(".mpk");
         assert_eq!(hash_part.len(), HASH_LEN, "{name1}");
         assert!(hash_part.chars().all(|c| c.is_ascii_hexdigit()), "{name1}");
 
@@ -612,9 +845,16 @@ mod tests {
 
         // Perturb one parameter so contents differ.
         let mut rec = tiny_model(&device).into_record();
-        let w = rec.model.vit.embeddings.label_embeddings.weight.val().set_require_grad(false) + 1.0;
-        rec.model.vit.embeddings.label_embeddings.weight =
-            burn::module::Param::from_tensor(w);
+        let w = rec
+            .model
+            .vit
+            .embeddings
+            .label_embeddings
+            .weight
+            .val()
+            .set_require_grad(false)
+            + 1.0;
+        rec.model.vit.embeddings.label_embeddings.weight = burn::module::Param::from_tensor(w);
         let b = tiny_model(&device).load_record(rec);
 
         let pa = save_content_addressed(a, &dir, "dblocks").unwrap();
@@ -628,7 +868,10 @@ mod tests {
     fn test_latest_in_dir_picks_the_newest_matching_file() {
         let dir = scratch_dir("latest");
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(latest_in_dir(&dir, "dblocks").unwrap().is_none(), "empty dir");
+        assert!(
+            latest_in_dir(&dir, "dblocks").unwrap().is_none(),
+            "empty dir"
+        );
 
         std::fs::write(dir.join("dblocks-aaaa.mpk"), b"a").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -642,7 +885,9 @@ mod tests {
 
         // A directory that does not exist is "no checkpoint", not an error:
         // a first run has nothing to resume from.
-        assert!(latest_in_dir(&dir.join("missing"), "dblocks").unwrap().is_none());
+        assert!(latest_in_dir(&dir.join("missing"), "dblocks")
+            .unwrap()
+            .is_none());
 
         fs::remove_dir_all(&dir).unwrap();
     }

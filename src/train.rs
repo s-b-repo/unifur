@@ -8,13 +8,11 @@
 //! checkpointing, resume) is shared, so a new objective cannot accidentally
 //! come with a subtly different training procedure.
 
-use serde::{Deserialize, Serialize};
 use anyhow::Context;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 use crate::{
-    reweight::{LogVarianceHead, SigmaImportanceSampler, UncertaintyWeighting},
-    schedule::BalanceSchedule,
     consistency::ConsistencyConfig,
     data::{Batch, SyntheticDataset, TrainDataset},
     dblock::{DblockClassifier, DblockConfig},
@@ -24,6 +22,8 @@ use crate::{
         TrainingHealth, TrainingPhase,
     },
     rawdata::RawImageDataset,
+    reweight::{LogVarianceHead, SigmaImportanceSampler, UncertaintyWeighting},
+    schedule::BalanceSchedule,
     schedule::{BalanceScope, Ema, GlobalLoad, GradientAccumulator, LossScales, LrSchedule},
     vit::ViTDiTConfig,
 };
@@ -33,7 +33,9 @@ use crate::{
 };
 use burn::{
     backend::{
-        autodiff::checkpoint::strategy::{BalancedCheckpointing, CheckpointStrategy, NoCheckpointing},
+        autodiff::checkpoint::strategy::{
+            BalancedCheckpointing, CheckpointStrategy, NoCheckpointing,
+        },
         Autodiff, NdArray,
     },
     module::Module,
@@ -57,19 +59,28 @@ use crate::mix::{BatchOrigin, CorpusMix, MixMode, MixWeights, SourceStats};
 pub fn step_seed(seed: u64, step: usize) -> u64 {
     // splitmix64 over the pair: cheap, and every bit of the step reaches
     // every bit of the seed.
-    let mut z = seed ^ (step as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = seed
+        ^ (step as u64)
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
 }
 
 type TrainBackend<C> = Autodiff<NdArray<f32>, C>;
-type ModelOptim<C> =
-    burn::optim::adaptor::OptimizerAdaptor<burn::optim::AdamW, DblockClassifier<TrainBackend<C>>, TrainBackend<C>>;
+type ModelOptim<C> = burn::optim::adaptor::OptimizerAdaptor<
+    burn::optim::AdamW,
+    DblockClassifier<TrainBackend<C>>,
+    TrainBackend<C>,
+>;
 type Teachers<C> = Vec<(DblockClassifier<TrainBackend<C>>, f64)>;
 type TeacherRefs<'a, C> = Vec<(&'a DblockClassifier<TrainBackend<C>>, f64)>;
-type HeadOptim<C> =
-    burn::optim::adaptor::OptimizerAdaptor<burn::optim::AdamW, LogVarianceHead<TrainBackend<C>>, TrainBackend<C>>;
+type HeadOptim<C> = burn::optim::adaptor::OptimizerAdaptor<
+    burn::optim::AdamW,
+    LogVarianceHead<TrainBackend<C>>,
+    TrainBackend<C>,
+>;
 
 /// Autodiff-enabled ndarray backend used for CPU training.
 pub type DefaultTrainBackend = Autodiff<NdArray<f32>>;
@@ -315,7 +326,9 @@ impl Default for TrainConfig {
 impl TrainConfig {
     /// Every source, primary first.
     pub fn all_datasets(&self) -> Vec<&DatasetChoice> {
-        std::iter::once(&self.dataset).chain(self.extra_datasets.iter()).collect()
+        std::iter::once(&self.dataset)
+            .chain(self.extra_datasets.iter())
+            .collect()
     }
 
     /// Normalized weights over [`Self::all_datasets`].
@@ -324,7 +337,11 @@ impl TrainConfig {
         if self.dataset_weights.is_empty() {
             Ok(MixWeights::uniform(n))
         } else {
-            anyhow::ensure!(self.dataset_weights.len() == n, "{} dataset weight(s) for {n} source(s)", self.dataset_weights.len());
+            anyhow::ensure!(
+                self.dataset_weights.len() == n,
+                "{} dataset weight(s) for {n} source(s)",
+                self.dataset_weights.len()
+            );
             MixWeights::new(&self.dataset_weights)
         }
     }
@@ -430,9 +447,7 @@ where
 }
 
 /// The loop itself.
-pub fn train_generic<C>(
-    config: &TrainConfig,
-) -> anyhow::Result<TrainOutcome<C>>
+pub fn train_generic<C>(config: &TrainConfig) -> anyhow::Result<TrainOutcome<C>>
 where
     C: CheckpointStrategy,
 {
@@ -448,7 +463,7 @@ where
 
     let hidden_size = vit_config.hidden_size;
     let mut model =
-        DblockClassifier::<Autodiff<NdArray<f32>, C>>::new(&vit_config, &dblock_config, &device);
+        DblockClassifier::<Autodiff<NdArray<f32>, C>>::new(&vit_config, &dblock_config, &device)?;
     // Hashed once, before anything else happens: it is both what the state
     // file records and what a resume is checked against.
     let dataset_identity = dataset_identities(config)?;
@@ -527,11 +542,16 @@ where
     // starting model when none is given. Several distil at once (29.2).
     let teachers: Teachers<C> = match &config.objective {
         Objective::Distill(_) => {
-            let load = |path: &PathBuf| -> anyhow::Result<DblockClassifier<Autodiff<NdArray<f32>, C>>> {
-                DblockClassifier::<Autodiff<NdArray<f32>, C>>::new(&vit_config, &dblock_config, &device)
+            let load =
+                |path: &PathBuf| -> anyhow::Result<DblockClassifier<Autodiff<NdArray<f32>, C>>> {
+                    DblockClassifier::<Autodiff<NdArray<f32>, C>>::new(
+                        &vit_config,
+                        &dblock_config,
+                        &device,
+                    )?
                     .load_file(path, &Recorder::new(), &device)
                     .map_err(|err| anyhow::anyhow!("load teacher {}: {err}", path.display()))
-            };
+                };
             let mut list = vec![match &config.teacher {
                 Some(path) => load(path)?,
                 None => model.clone(),
@@ -551,7 +571,11 @@ where
                 config.teacher_weights.clone()
             };
             if list.len() > 1 {
-                println!("distilling from {} teachers, weights {:?}", list.len(), weights);
+                println!(
+                    "distilling from {} teachers, weights {:?}",
+                    list.len(),
+                    weights
+                );
             }
             list.into_iter().zip(weights).collect()
         }
@@ -619,12 +643,11 @@ where
     // run that enables it still writes checkpoints an unmodified build can
     // load, and a run that does not enable it allocates nothing.
     let uncertainty = UncertaintyWeighting::new(config.uncertainty);
-    let mut logvar_head = (!uncertainty.is_identity()).then(|| {
-        LogVarianceHead::<Autodiff<NdArray<f32>, C>>::new(64, 64, &device)
-    });
+    let mut logvar_head = (!uncertainty.is_identity())
+        .then(|| LogVarianceHead::<Autodiff<NdArray<f32>, C>>::new(64, 64, &device));
     let mut logvar_optim = logvar_head.is_some().then(|| AdamWConfig::new().init());
-    let mut importance = (config.importance_bins > 0)
-        .then(|| SigmaImportanceSampler::new(config.importance_bins));
+    let mut importance =
+        (config.importance_bins > 0).then(|| SigmaImportanceSampler::new(config.importance_bins));
     if !uncertainty.is_identity() {
         println!(
             "uncertainty weighting: strength {:.2} (gradient becomes that of log-loss at the optimum)",
@@ -648,19 +671,27 @@ where
     let mut elapsed_before = 0.0f64;
     let mut start_step = 0usize;
     if let Some(state) = &restored {
-        let resume = config.resume.as_ref().context("a training state was restored without a resume path")?;
+        let resume = config
+            .resume
+            .as_ref()
+            .context("a training state was restored without a resume path")?;
         let dir = TrainState::dir_for(resume);
         if let Some(file) = &state.optimizer {
-            optim = optim.load_record(checkpoint::load_record::<TrainBackend<C>, _>(&dir, file, &device)?);
+            optim = optim.load_record(checkpoint::load_record::<TrainBackend<C>, _>(
+                &dir, file, &device,
+            )?);
         }
         match (&state.head, logvar_head.take()) {
             (Some(file), Some(head)) => {
-                logvar_head =
-                    Some(head.load_record(checkpoint::load_record::<TrainBackend<C>, _>(&dir, file, &device)?));
-                if let (Some(file), Some(head_optim)) = (&state.head_optimizer, logvar_optim.take()) {
-                    logvar_optim = Some(
-                        head_optim.load_record(checkpoint::load_record::<TrainBackend<C>, _>(&dir, file, &device)?),
-                    );
+                logvar_head = Some(head.load_record(
+                    checkpoint::load_record::<TrainBackend<C>, _>(&dir, file, &device)?,
+                ));
+                if let (Some(file), Some(head_optim)) = (&state.head_optimizer, logvar_optim.take())
+                {
+                    logvar_optim =
+                        Some(head_optim.load_record(
+                            checkpoint::load_record::<TrainBackend<C>, _>(&dir, file, &device)?,
+                        ));
                 }
             }
             (_, head) => logvar_head = head,
@@ -668,11 +699,15 @@ where
         let extras: DblockExtras =
             serde_json::from_value(state.extras.clone()).context("parse dblock training state")?;
         if let (Some(file), Some(current)) = (&state.ema, ema.take()) {
-            let shadow = current
-                .shadow()
-                .clone()
-                .load_record(checkpoint::load_record::<TrainBackend<C>, _>(&dir, file, &device)?);
-            ema = Some(Ema::from_parts(shadow, current.decay(), extras.ema_updates.unwrap_or(0)));
+            let shadow =
+                current.shadow().clone().load_record(
+                    checkpoint::load_record::<TrainBackend<C>, _>(&dir, file, &device)?,
+                );
+            ema = Some(Ema::from_parts(
+                shadow,
+                current.decay(),
+                extras.ema_updates.unwrap_or(0),
+            ));
         }
         scales = extras.scales;
         if importance.is_some() {
@@ -715,15 +750,37 @@ where
             std::fs::remove_dir_all(&state_dir)
                 .with_context(|| format!("clear {}", state_dir.display()))?;
         }
-        let optimizer = Some(checkpoint::save_record::<TrainBackend<C>, _>(optim.to_record(), &state_dir, "optimizer")?);
+        let optimizer = Some(checkpoint::save_record::<TrainBackend<C>, _>(
+            optim.to_record(),
+            &state_dir,
+            "optimizer",
+        )?);
         let head_file = head
-            .map(|h| checkpoint::save_record::<TrainBackend<C>, _>(h.clone().into_record(), &state_dir, "head"))
+            .map(|h| {
+                checkpoint::save_record::<TrainBackend<C>, _>(
+                    h.clone().into_record(),
+                    &state_dir,
+                    "head",
+                )
+            })
             .transpose()?;
         let head_optimizer = head_optim
-            .map(|o| checkpoint::save_record::<TrainBackend<C>, _>(o.to_record(), &state_dir, "head-optimizer"))
+            .map(|o| {
+                checkpoint::save_record::<TrainBackend<C>, _>(
+                    o.to_record(),
+                    &state_dir,
+                    "head-optimizer",
+                )
+            })
             .transpose()?;
         let ema_file = ema
-            .map(|e| checkpoint::save_record::<TrainBackend<C>, _>(e.shadow().clone().into_record(), &state_dir, "ema"))
+            .map(|e| {
+                checkpoint::save_record::<TrainBackend<C>, _>(
+                    e.shadow().clone().into_record(),
+                    &state_dir,
+                    "ema",
+                )
+            })
             .transpose()?;
         let state = TrainState {
             format_version: checkpoint::STATE_FORMAT_VERSION,
@@ -778,8 +835,13 @@ where
 
     for step in start_step..config.steps {
         // The device stream is a pure function of (seed, step): see `step_seed`.
-        <TrainBackend<C> as burn::tensor::backend::Backend>::seed(&device, step_seed(config.seed, step));
-        let (batch, origin) = dataset.next(&mut rng, &device).with_context(|| format!("step {step}: draw a batch"))?;
+        <TrainBackend<C> as burn::tensor::backend::Backend>::seed(
+            &device,
+            step_seed(config.seed, step),
+        );
+        let (batch, origin) = dataset
+            .next(&mut rng, &device)
+            .with_context(|| format!("step {step}: draw a batch"))?;
         let (loss, mut fields, routing) = compute_loss(
             &model,
             &teacher_refs,
@@ -797,10 +859,15 @@ where
                 synthetic_negatives: config.synthetic_negatives,
                 negative_penalty: config.negative_penalty,
             },
-        );
+        )?;
         let block_idx = block_of(&fields);
         if dataset.sources.len() > 1 {
-            fields.push(("source", origin.sole_source().map_or("-1".to_string(), |s| s.to_string())));
+            fields.push((
+                "source",
+                origin
+                    .sole_source()
+                    .map_or("-1".to_string(), |s| s.to_string()),
+            ));
         }
 
         let mut verdict = StepVerdict::accepted();
@@ -1131,7 +1198,9 @@ fn dataset_identities(config: &TrainConfig) -> anyhow::Result<Vec<DatasetIdentit
                     config.image_size, config.image_size, config.num_labels
                 )),
                 DatasetChoice::Cifar100 { dir, .. } => DatasetIdentity::of_path(dir, "cifar100")?,
-                DatasetChoice::TinyImagenet { dir, .. } => DatasetIdentity::of_path(dir, "tiny-imagenet")?,
+                DatasetChoice::TinyImagenet { dir, .. } => {
+                    DatasetIdentity::of_path(dir, "tiny-imagenet")?
+                }
             })
         })
         .collect()
@@ -1168,10 +1237,19 @@ impl MixedDataset {
                 let mut parts = Vec::with_capacity(n);
                 for (i, source) in self.sources.iter_mut().enumerate() {
                     if self.slices[i] > 0 {
-                        parts.push(source.next(rng, device).with_context(|| format!("source {}", self.names[i]))?);
+                        parts.push(
+                            source
+                                .next(rng, device)
+                                .with_context(|| format!("source {}", self.names[i]))?,
+                        );
                     }
                 }
-                Ok((crate::mix::concat_batches(parts)?, BatchOrigin { counts: self.slices.clone() }))
+                Ok((
+                    crate::mix::concat_batches(parts)?,
+                    BatchOrigin {
+                        counts: self.slices.clone(),
+                    },
+                ))
             }
         }
     }
@@ -1180,9 +1258,14 @@ impl MixedDataset {
 fn open_sources(config: &TrainConfig) -> anyhow::Result<MixedDataset> {
     let choices = config.all_datasets();
     let weights = config.mix_weights()?;
-    let shape = config.dataset.shape().unwrap_or((config.image_size, config.num_labels));
+    let shape = config
+        .dataset
+        .shape()
+        .unwrap_or((config.image_size, config.num_labels));
     for (i, choice) in choices.iter().enumerate().skip(1) {
-        let other = choice.shape().unwrap_or((config.image_size, config.num_labels));
+        let other = choice
+            .shape()
+            .unwrap_or((config.image_size, config.num_labels));
         anyhow::ensure!(
             other == shape,
             "source {i} is {}x{} with {} labels but the primary source is {}x{} with {} labels; \
@@ -1210,7 +1293,13 @@ fn open_sources(config: &TrainConfig) -> anyhow::Result<MixedDataset> {
             DatasetChoice::TinyImagenet { dir, .. } => format!("tiny-imagenet:{}", dir.display()),
         });
     }
-    Ok(MixedDataset { sources, names, weights, mode: config.mix_mode, slices })
+    Ok(MixedDataset {
+        sources,
+        names,
+        weights,
+        mode: config.mix_mode,
+        slices,
+    })
 }
 
 /// Block index recorded in a step's metric fields, or 0 when the objective
@@ -1223,7 +1312,12 @@ fn block_of(fields: &[(&'static str, String)]) -> usize {
         .unwrap_or(0)
 }
 
-fn open_one(config: &TrainConfig, choice: &DatasetChoice, batch_size: usize, index: u64) -> anyhow::Result<AnyDataset> {
+fn open_one(
+    config: &TrainConfig,
+    choice: &DatasetChoice,
+    batch_size: usize,
+    index: u64,
+) -> anyhow::Result<AnyDataset> {
     let (image_size, num_labels) = config
         .dataset
         .shape()
@@ -1235,12 +1329,12 @@ fn open_one(config: &TrainConfig, choice: &DatasetChoice, batch_size: usize, ind
             batch_size,
             config.seed.wrapping_add(index),
         )),
-        DatasetChoice::Cifar100 { dir, streaming } => {
-            AnyDataset::Raw(Box::new(crate::cifar::open(dir, true, batch_size, *streaming)?))
-        }
-        DatasetChoice::TinyImagenet { dir, streaming } => {
-            AnyDataset::Raw(Box::new(crate::tinyimagenet::open(dir, true, batch_size, *streaming)?))
-        }
+        DatasetChoice::Cifar100 { dir, streaming } => AnyDataset::Raw(Box::new(
+            crate::cifar::open(dir, true, batch_size, *streaming)?,
+        )),
+        DatasetChoice::TinyImagenet { dir, streaming } => AnyDataset::Raw(Box::new(
+            crate::tinyimagenet::open(dir, true, batch_size, *streaming)?,
+        )),
     })
 }
 
@@ -1280,7 +1374,11 @@ impl<B: AutodiffBackend<FloatElem = f32>> Reweighting<'_, B> {
         batch: &Batch<B>,
         gamma: f64,
         rng: &mut R,
-    ) -> (Tensor<B, 1>, crate::dblock::StepMetrics, Vec<(&'static str, String)>) {
+    ) -> (
+        Tensor<B, 1>,
+        crate::dblock::StepMetrics,
+        Vec<(&'static str, String)>,
+    ) {
         use crate::logging::jnum;
 
         let b = batch.pixel_values.dims()[0];
@@ -1314,7 +1412,13 @@ impl<B: AutodiffBackend<FloatElem = f32>> Reweighting<'_, B> {
         // deliberately wrong label and is charged for it instead of rewarded.
         let parts = if self.synthetic_negatives > 0.0 {
             let device = batch.pixel_values.device();
-            let labels: Vec<i64> = batch.labels.clone().into_data().convert::<i64>().iter::<i64>().collect();
+            let labels: Vec<i64> = batch
+                .labels
+                .clone()
+                .into_data()
+                .convert::<i64>()
+                .iter::<i64>()
+                .collect();
             let num_labels = model.model().label_embedding_weight().dims()[0] as i64;
             let mut mask = vec![0.0f32; b];
             let mut relabeled = labels.clone();
@@ -1325,7 +1429,10 @@ impl<B: AutodiffBackend<FloatElem = f32>> Reweighting<'_, B> {
                     relabeled[i] = (labels[i] + offset) % num_labels;
                 }
             }
-            extra.push(("negative_samples", format!("{}", mask.iter().filter(|m| **m > 0.0).count())));
+            extra.push((
+                "negative_samples",
+                format!("{}", mask.iter().filter(|m| **m > 0.0).count()),
+            ));
             model.training_step_negative(
                 batch.pixel_values.clone(),
                 Tensor::<B, 1, burn::tensor::Int>::from_ints(relabeled.as_slice(), &device),
@@ -1393,7 +1500,14 @@ impl<B: AutodiffBackend<FloatElem = f32>> Reweighting<'_, B> {
                 let device = batch.pixel_values.device();
                 let mut total: Option<Tensor<B, 1>> = None;
                 for (layer, routing) in parts.routing.iter().enumerate() {
-                    let load: Vec<f32> = routing.load.clone().inner().into_data().convert::<f32>().iter::<f32>().collect();
+                    let load: Vec<f32> = routing
+                        .load
+                        .clone()
+                        .inner()
+                        .into_data()
+                        .convert::<f32>()
+                        .iter::<f32>()
+                        .collect();
                     let global = window.observe(layer, &load);
                     let e = routing.experts;
                     let f = Tensor::<B, 1>::from_floats(global.as_slice(), &device).reshape([1, e]);
@@ -1422,7 +1536,8 @@ impl<B: AutodiffBackend<FloatElem = f32>> Reweighting<'_, B> {
                          importance: Option<Tensor<B, 1>>,
                          balance: Option<Tensor<B, 1>>,
                          z: Option<Tensor<B, 1>>,
-                         weight: f64| -> Tensor<B, 1> {
+                         weight: f64|
+         -> Tensor<B, 1> {
             let weighted = match importance {
                 Some(iw) => per_sample * iw,
                 None => per_sample,
@@ -1448,7 +1563,10 @@ impl<B: AutodiffBackend<FloatElem = f32>> Reweighting<'_, B> {
                 Some(w) => {
                     let loss = aggregate(parts.per_sample, parts.importance, balance, parts.z, w);
                     let value: f32 = loss.clone().into_scalar();
-                    let metrics = crate::dblock::StepMetrics { loss: value, ..parts.metrics };
+                    let metrics = crate::dblock::StepMetrics {
+                        loss: value,
+                        ..parts.metrics
+                    };
                     (loss, metrics, extra)
                 }
             };
@@ -1456,7 +1574,11 @@ impl<B: AutodiffBackend<FloatElem = f32>> Reweighting<'_, B> {
 
         let device = batch.pixel_values.device();
         let sigma_tensor = Tensor::<B, 1>::from_floats(
-            sigmas.iter().map(|&v| v as f32).collect::<Vec<_>>().as_slice(),
+            sigmas
+                .iter()
+                .map(|&v| v as f32)
+                .collect::<Vec<_>>()
+                .as_slice(),
             &device,
         );
         let log_variance = head.forward(sigma_tensor);
@@ -1479,10 +1601,22 @@ impl<B: AutodiffBackend<FloatElem = f32>> Reweighting<'_, B> {
         );
 
         let value: f32 = balanced.clone().into_scalar();
-        let metrics = crate::dblock::StepMetrics { loss: value, ..parts.metrics };
+        let metrics = crate::dblock::StepMetrics {
+            loss: value,
+            ..parts.metrics
+        };
         (balanced, metrics, extra)
     }
 }
+
+/// One step's loss, the metric names that describe it, and the per-sparse-layer
+/// routing statistics collected along the way. Named because the tuple appears
+/// in several signatures and nowhere reads well spelled out.
+pub type StepOutcome<B> = (
+    Tensor<B, 1>,
+    Vec<(&'static str, String)>,
+    Vec<crate::moe::RoutingStats>,
+);
 
 fn compute_loss<B, R>(
     model: &DblockClassifier<B>,
@@ -1492,7 +1626,7 @@ fn compute_loss<B, R>(
     step: usize,
     rng: &mut R,
     reweight: &mut Reweighting<'_, B>,
-) -> (Tensor<B, 1>, Vec<(&'static str, String)>, Vec<crate::moe::RoutingStats>)
+) -> anyhow::Result<StepOutcome<B>>
 where
     B: AutodiffBackend<FloatElem = f32>,
     R: Rng,
@@ -1515,13 +1649,19 @@ where
                 fields.push(("token_entropy", jnum(token_h)));
                 fields.push(("min_load", jnum(min_load)));
                 fields.push(("max_load", jnum(max_load)));
-                fields.push(("routing_load", crate::moe::RoutingStats::load_json(&m.routing)));
-                fields.push(("routing_stability", jnum(crate::moe::RoutingStats::mean_stability(&m.routing))));
+                fields.push((
+                    "routing_load",
+                    crate::moe::RoutingStats::load_json(&m.routing),
+                ));
+                fields.push((
+                    "routing_stability",
+                    jnum(crate::moe::RoutingStats::mean_stability(&m.routing)),
+                ));
                 if let Some(agreement) = crate::moe::RoutingStats::mean_agreement(&m.routing) {
                     fields.push(("routing_agreement", jnum(agreement)));
                 }
             }
-            return (loss, fields, m.routing);
+            return Ok((loss, fields, m.routing));
         }
         Objective::Consistency(cfg) => {
             let (loss, m) =
@@ -1550,14 +1690,14 @@ where
             (loss, vec![("loss", jnum(value)), ("flow_mse", jnum(value))])
         }
         Objective::Distill(cfg) => {
-            assert!(!teachers.is_empty(), "distillation requires a teacher");
+            anyhow::ensure!(!teachers.is_empty(), "distillation requires a teacher");
             let (loss, m) = model.distill_step_multi(
                 teachers,
                 &batch.pixel_values,
                 batch.labels.clone(),
                 cfg,
                 rng,
-            );
+            )?;
             (
                 loss,
                 vec![
@@ -1570,7 +1710,7 @@ where
             )
         }
     };
-    (loss, fields, Vec::new())
+    Ok((loss, fields, Vec::new()))
 }
 
 /// Sliding-window mean over the last `window` values.
@@ -1619,12 +1759,36 @@ impl RunningAvg {
 
 // -------------------------------------------------------- language model --
 
+fn default_lm_lr_schedule() -> LrSchedule {
+    LrSchedule::Constant { lr: 3e-4 }
+}
+
+fn default_accumulate() -> usize {
+    1
+}
+
 /// Configuration for [`train_lm`] (roadmap Phase 24).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LmTrainConfig {
     pub steps: usize,
     pub batch_size: usize,
     pub lr: f64,
+    /// Learning-rate schedule over the run (roadmap 20.1, ported from the
+    /// image loop). `Constant` at the peak reproduces the old fixed-lr loop.
+    #[serde(default = "default_lm_lr_schedule")]
+    pub lr_schedule: LrSchedule,
+    /// Micro-batches per optimizer step, averaged not summed (roadmap 20.2).
+    /// `1` steps on every micro-batch, exactly as before.
+    #[serde(default = "default_accumulate")]
+    pub accumulate: usize,
+    /// Rescale the accumulated gradient above this global norm (roadmap
+    /// 20.3). `0.0` disables clipping exactly.
+    #[serde(default)]
+    pub clip_norm: f32,
+    /// EMA decay for the evaluation shadow (roadmap 22.1). `None` returns the
+    /// live weights, exactly as before.
+    #[serde(default)]
+    pub ema_decay: Option<f64>,
     pub weight_decay: f64,
     pub seed: u64,
     /// The charge on labeled targets. Anything but [`Unlikelihood::off`]
@@ -1670,6 +1834,10 @@ impl Default for LmTrainConfig {
             steps: 100,
             batch_size: 8,
             lr: 3e-4,
+            lr_schedule: default_lm_lr_schedule(),
+            accumulate: default_accumulate(),
+            clip_norm: 0.0,
+            ema_decay: None,
             weight_decay: 0.01,
             seed: 42,
             penalty: Unlikelihood::off(),
@@ -1701,7 +1869,10 @@ pub struct LmTrainInputs<B: AutodiffBackend<FloatElem = f32>> {
 
 impl<B: AutodiffBackend<FloatElem = f32>> Default for LmTrainInputs<B> {
     fn default() -> Self {
-        Self { teachers: Vec::new(), negative_teacher: None }
+        Self {
+            teachers: Vec::new(),
+            negative_teacher: None,
+        }
     }
 }
 
@@ -1743,6 +1914,19 @@ pub struct LmTrainReport {
     pub last_direction_projection: f32,
     /// What decensoring found, when it ran (roadmap 31.6).
     pub heretic: Option<crate::heretic::HereticReport>,
+    /// Micro-batches folded without stepping yet (roadmap 20.2); 0 without
+    /// `--accumulate`.
+    pub steps_accumulated: usize,
+    /// Optimizer steps whose gradient was rescaled by `--clip-norm`.
+    pub steps_clipped: usize,
+    /// Learning rate of the last optimizer step taken.
+    pub last_lr: f64,
+    /// The MTP auxiliary term at the last step (before its weight); 0
+    /// without MTP heads.
+    pub last_mtp_loss: f32,
+    /// Largest causally-valid attention score over the trunk at the last
+    /// logged step (Kimi K2 early-warning metric); 0 when never probed.
+    pub last_max_logit: f32,
 }
 
 /// Train a causal language model on `corpus`, charging labeled anti-patterns
@@ -1765,16 +1949,125 @@ pub fn train_lm<B: AutodiffBackend<FloatElem = f32>>(
 /// [`train_lm`] over several corpora, with teachers and a negative teacher
 /// (roadmap Phase 29).
 pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
-    mut model: LanguageModel<B>,
+    model: LanguageModel<B>,
     mix: &mut CorpusMix<'_>,
     inputs: &LmTrainInputs<B>,
     config: &LmTrainConfig,
     device: &B::Device,
 ) -> anyhow::Result<(LanguageModel<B>, LmTrainReport)> {
+    train_lm_resident(
+        model,
+        mix,
+        inputs,
+        config,
+        &LmResidentTraining::default(),
+        device,
+    )
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum LmTrainingScope {
+    #[default]
+    Joint,
+    Specialist {
+        expert_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct LmResidentTraining {
+    pub scope: LmTrainingScope,
+    pub base_weights: Option<PathBuf>,
+}
+
+fn validate_lm_resume_scope(
+    state: &TrainState,
+    scope: &LmTrainingScope,
+    config: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let saved: LmTrainingScope = state
+        .config
+        .get("training_scope")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .context("parse LM training scope")?
+        .unwrap_or_default();
+    anyhow::ensure!(&saved == scope, "refusing to resume: incompatible LM training scope; use base_weights for a fresh optimizer");
+    if matches!(scope, LmTrainingScope::Specialist { .. }) {
+        anyhow::ensure!(
+            state.optimizer.is_some(),
+            "specialist resume requires optimizer state"
+        );
+        anyhow::ensure!(
+            config["steps"]
+                .as_u64()
+                .is_some_and(|steps| steps > state.step as u64),
+            "specialist resume steps must exceed checkpoint step {}",
+            state.step
+        );
+        let differences = state.config_differences(config);
+        anyhow::ensure!(
+            differences.is_empty(),
+            "incompatible specialist resume configuration: {}",
+            differences.join(", ")
+        );
+    }
+    Ok(())
+}
+
+pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
+    mut model: LanguageModel<B>,
+    mix: &mut CorpusMix<'_>,
+    inputs: &LmTrainInputs<B>,
+    config: &LmTrainConfig,
+    resident: &LmResidentTraining,
+    device: &B::Device,
+) -> anyhow::Result<(LanguageModel<B>, LmTrainReport)> {
     anyhow::ensure!(config.steps > 0, "steps must be positive");
     anyhow::ensure!(config.batch_size > 0, "batch_size must be positive");
     let context = model.context();
-    anyhow::ensure!(context >= 2, "a context of {context} has no target position");
+    anyhow::ensure!(
+        context >= 2,
+        "a context of {context} has no target position"
+    );
+    anyhow::ensure!(
+        resident.base_weights.is_none() || config.resume.is_none(),
+        "base_weights and resume are mutually exclusive"
+    );
+    if let LmTrainingScope::Specialist { expert_id } = &resident.scope {
+        let shape = config
+            .model_config
+            .as_ref()
+            .context("specialist training requires model_config")?;
+        model.specialist_trainable(shape, expert_id)?;
+        anyhow::ensure!(
+            config.bias_balance_rate == 0.0,
+            "specialist training does not support bias balancing"
+        );
+        anyhow::ensure!(
+            config.heretic.is_none()
+                && config.direction.is_none()
+                && config.direction_weight == 0.0,
+            "specialist training does not support direction penalties or Heretic"
+        );
+        anyhow::ensure!(
+            inputs.teachers.is_empty()
+                && inputs.negative_teacher.is_none()
+                && config.distill_weight == 0.0
+                && config.negative_penalty == 0.0,
+            "specialist training does not support teachers"
+        );
+        anyhow::ensure!(
+            !mix.any_labels() && config.penalty.is_off(),
+            "specialist training currently requires an unlabeled corpus and plain next-token loss"
+        );
+    }
+    anyhow::ensure!(
+        !mix.any_masks() || matches!(resident.scope, LmTrainingScope::Joint),
+        "masked SFT corpora are not supported for resident specialist training"
+    );
 
     let labeled = mix.any_labels();
     anyhow::ensure!(
@@ -1782,7 +2075,8 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
         "a penalty of {} needs labels: label a corpus and open them first",
         config.penalty.alpha
     );
-    let teacher_refs: Vec<(&LanguageModel<B>, f64)> = inputs.teachers.iter().map(|(t, w)| (t, *w)).collect();
+    let teacher_refs: Vec<(&LanguageModel<B>, f64)> =
+        inputs.teachers.iter().map(|(t, w)| (t, *w)).collect();
     for (teacher, _) in &teacher_refs {
         anyhow::ensure!(
             teacher.vocab_size() == model.vocab_size() && teacher.context() >= context,
@@ -1790,13 +2084,25 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
         );
     }
     if let Some(negative) = &inputs.negative_teacher {
-        anyhow::ensure!(negative.vocab_size() == model.vocab_size(), "the negative teacher must share the vocabulary");
+        anyhow::ensure!(
+            negative.vocab_size() == model.vocab_size(),
+            "the negative teacher must share the vocabulary"
+        );
     }
     let mut source_stats = SourceStats::new(mix.names().to_vec());
-    let direction_tensor = config.direction.as_ref().map(|d| {
-        anyhow::ensure!(d.hidden_size() == model.hidden_size(), "direction has {} dims, the model {}", d.hidden_size(), model.hidden_size());
-        Ok::<_, anyhow::Error>((d.tensor::<B>(device), d.layer.min(model.num_layers() - 1)))
-    }).transpose()?;
+    let direction_tensor = config
+        .direction
+        .as_ref()
+        .map(|d| {
+            anyhow::ensure!(
+                d.hidden_size() == model.hidden_size(),
+                "direction has {} dims, the model {}",
+                d.hidden_size(),
+                model.hidden_size()
+            );
+            Ok::<_, anyhow::Error>((d.tensor::<B>(device), d.layer.min(model.num_layers() - 1)))
+        })
+        .transpose()?;
 
     let mut optim = AdamWConfig::new()
         .with_weight_decay(config.weight_decay as f32)
@@ -1812,14 +2118,38 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
     // Training state (roadmap Phase 28): identity of the data, the config as
     // JSON, and whatever an earlier run left beside the model being resumed.
     let dataset_identity = mix.identities()?;
-    let config_json = serde_json::to_value(config).context("serialize LM training config")?;
+    let mut config_json = serde_json::to_value(config).context("serialize LM training config")?;
+    config_json["training_scope"] = serde_json::to_value(&resident.scope)?;
+    if matches!(resident.scope, LmTrainingScope::Specialist { .. }) {
+        config_json["mix_mode"] = serde_json::to_value(mix.mode())?;
+        config_json["mix_weights"] = serde_json::to_value(mix.weights())?;
+    }
     let mut restored: Option<TrainState> = None;
-    if let Some(path) = &config.resume {
+    if let Some(path) = &resident.base_weights {
+        if let Some(state) = TrainState::for_model(path)? {
+            anyhow::ensure!(state.kind == "lm", "base weights must be an LM checkpoint");
+            anyhow::ensure!(
+                state.config.get("model_config") == config_json.get("model_config"),
+                "base model_config mismatch"
+            );
+            anyhow::ensure!(
+                checkpoint::file_sha256_hex(path)? == state.model.sha256,
+                "base model file is corrupted: sha256 mismatch"
+            );
+        }
         model = checkpoint::load::<B, _>(model, path, device)?;
+    }
+    if let Some(path) = &config.resume {
         match TrainState::for_model(path)? {
             Some(state) => {
                 let dir = TrainState::dir_for(path);
-                anyhow::ensure!(state.kind == "lm", "{} holds `{}` training state, not an lm run", dir.display(), state.kind);
+                anyhow::ensure!(
+                    state.kind == "lm",
+                    "{} holds `{}` training state, not an lm run",
+                    dir.display(),
+                    state.kind
+                );
+                validate_lm_resume_scope(&state, &resident.scope, &config_json)?;
                 state.verify_files(&dir)?;
                 anyhow::ensure!(
                     checkpoint::same_datasets(&state.datasets, &dataset_identity),
@@ -1829,20 +2159,41 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
                 );
                 let differences = state.config_differences(&config_json);
                 if !differences.is_empty() {
-                    println!("warning: resuming with a different configuration in {}", differences.join(", "));
+                    println!(
+                        "warning: resuming with a different configuration in {}",
+                        differences.join(", ")
+                    );
                 }
-                println!("resumed from {} at step {} (training state verified)", path.display(), state.step);
+                println!(
+                    "resumed from {} at step {} (training state verified)",
+                    path.display(),
+                    state.step
+                );
                 restored = Some(state);
             }
-            None => println!(
-                "resumed weights from {}; no training state beside it, so the optimizer and RNG start fresh",
-                path.display()
-            ),
+            None => {
+                anyhow::ensure!(
+                    resident.scope == LmTrainingScope::Joint,
+                    "specialist resume requires training state; use base_weights to start fresh"
+                );
+                println!("resumed weights from {}; no training state beside it, so the optimizer and RNG start fresh", path.display());
+            }
         }
+        model = checkpoint::load::<B, _>(model, path, device)?;
     }
     if config.bias_balance_rate > 0.0 {
         model.ensure_balance_biases();
     }
+    let trainable = match &resident.scope {
+        LmTrainingScope::Joint => crate::mosme::TrainableSet::all(),
+        LmTrainingScope::Specialist { expert_id } => {
+            let model_config = config.model_config.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("a specialist scope needs a model config to train against")
+            })?;
+            model.specialist_trainable(model_config, expert_id)?
+        }
+    };
+    model = trainable.freeze(model);
 
     let started = std::time::Instant::now();
     let mut report = LmTrainReport {
@@ -1867,32 +2218,122 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
         first_direction_projection: 0.0,
         last_direction_projection: 0.0,
         heretic: None,
+        steps_accumulated: 0,
+        steps_clipped: 0,
+        last_lr: config.lr,
+        last_mtp_loss: 0.0,
+        last_max_logit: 0.0,
     };
     let mut loss_sum = 0.0f64;
     let mut elapsed_before = 0.0f64;
     let mut start_step = 0usize;
+    // Honour the caller's `lr` as the schedule's peak: a config built with
+    // `lr` set directly (rather than parsed from the CLI, which already bakes
+    // the peak in) must not silently train at the default schedule's peak.
+    // This is the same rule `train_geom` applies to its own schedule.
+    let lr_schedule = match &config.lr_schedule {
+        LrSchedule::Constant { .. } => LrSchedule::Constant { lr: config.lr },
+        LrSchedule::WarmupCosine {
+            min_lr,
+            warmup_steps,
+            ..
+        } => LrSchedule::WarmupCosine {
+            peak: config.lr,
+            min_lr: *min_lr,
+            warmup_steps: *warmup_steps,
+            total_steps: config.steps,
+        },
+        LrSchedule::WarmupConstant { warmup_steps, .. } => LrSchedule::WarmupConstant {
+            peak: config.lr,
+            warmup_steps: *warmup_steps,
+        },
+    };
+    // Loss-reduction levers ported from the image loop (roadmap Phase 20):
+    // warmup-aware LR, mean-averaged accumulation, post-accumulation
+    // clipping, and the bias-corrected EMA shadow returned for evaluation.
+    let mut accumulator = GradientAccumulator::new(config.accumulate);
+    let mut ema = config.ema_decay.map(|d| Ema::new(&model, d));
+    if let Some(e) = &ema {
+        println!(
+            "EMA: decay {:.4} (bias-corrected; the shadow is returned for evaluation)",
+            e.decay()
+        );
+    }
+    if config.accumulate > 1 {
+        println!(
+            "gradient accumulation: {} micro-batches per optimizer step (averaged)",
+            accumulator.every()
+        );
+    }
+    if config.clip_norm > 0.0 {
+        println!(
+            "gradient clipping: rescale above global norm {:.3e}",
+            config.clip_norm
+        );
+    }
+    if !matches!(config.lr_schedule, LrSchedule::Constant { .. }) {
+        println!(
+            "lr schedule: {} (peak {:.2e})",
+            config.lr_schedule.name(),
+            config.lr_schedule.peak()
+        );
+    }
     if let Some(state) = &restored {
-        let resume = config.resume.as_ref().context("a training state was restored without a resume path")?;
+        let resume = config
+            .resume
+            .as_ref()
+            .context("a training state was restored without a resume path")?;
         let dir = TrainState::dir_for(resume);
         if let Some(file) = &state.optimizer {
-            optim = optim.load_record(checkpoint::load_record::<B, _>(&dir, file, device)?);
+            let record = checkpoint::load_record::<B, _>(&dir, file, device)?;
+            optim = optim.load_record(record);
+            if let Some(ids) = trainable.ids() {
+                let record = optim.to_record();
+                anyhow::ensure!(
+                    !record.is_empty() && record.keys().all(|id| ids.contains(id)),
+                    "specialist optimizer state contains missing or out-of-scope parameters"
+                );
+            }
         }
-        let extras: LmExtras = serde_json::from_value(state.extras.clone()).context("parse lm training state")?;
+        let extras: LmExtras =
+            serde_json::from_value(state.extras.clone()).context("parse lm training state")?;
         report.steps_taken = extras.steps_taken;
         report.steps_skipped = extras.steps_skipped;
+        report.steps_accumulated = extras.steps_accumulated;
+        report.steps_clipped = extras.steps_clipped;
         report.first_loss = extras.first_loss;
         report.first_penalized_prob = extras.first_penalized_prob;
         report.penalized_tokens = extras.penalized_tokens;
         report.tokens_seen = extras.tokens_seen;
         loss_sum = extras.loss_sum;
         elapsed_before = extras.elapsed_secs;
+        if let (Some(file), Some(current)) = (&state.ema, ema.take()) {
+            let shadow = current
+                .shadow()
+                .clone()
+                .load_record(checkpoint::load_record::<B, _>(&dir, file, device)?);
+            ema = Some(Ema::from_parts(
+                shadow,
+                current.decay(),
+                extras.ema_updates.unwrap_or(0),
+            ));
+            println!(
+                "resumed EMA shadow ({} updates)",
+                ema.as_ref().map_or(0, Ema::updates)
+            );
+        }
         rng = serde_json::from_value(state.host_rng.clone()).context("restore host RNG")?;
         start_step = state.step;
         report.resumed_from_step = start_step;
     }
     let save_state = |step: usize,
                       model: &LanguageModel<B>,
-                      optim: &burn::optim::adaptor::OptimizerAdaptor<burn::optim::AdamW, LanguageModel<B>, B>,
+                      optim: &burn::optim::adaptor::OptimizerAdaptor<
+        burn::optim::AdamW,
+        LanguageModel<B>,
+        B,
+    >,
+                      ema: Option<&Ema<LanguageModel<B>>>,
                       rng: &ChaCha12Rng,
                       report: &LmTrainReport,
                       loss_sum: f64,
@@ -1904,18 +2345,31 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
         let model_path = checkpoint::save_content_addressed(model.clone(), dir, "lm")?;
         let state_dir = TrainState::dir_for(&model_path);
         if state_dir.exists() {
-            std::fs::remove_dir_all(&state_dir).with_context(|| format!("clear {}", state_dir.display()))?;
+            std::fs::remove_dir_all(&state_dir)
+                .with_context(|| format!("clear {}", state_dir.display()))?;
         }
-        let optimizer = Some(checkpoint::save_record::<B, _>(optim.to_record(), &state_dir, "optimizer")?);
+        let optimizer = Some(checkpoint::save_record::<B, _>(
+            optim.to_record(),
+            &state_dir,
+            "optimizer",
+        )?);
+        let ema_file = ema
+            .map(|e| {
+                checkpoint::save_record::<B, _>(e.shadow().clone().into_record(), &state_dir, "ema")
+            })
+            .transpose()?;
         let extras = LmExtras {
             steps_taken: report.steps_taken,
             steps_skipped: report.steps_skipped,
+            steps_accumulated: report.steps_accumulated,
+            steps_clipped: report.steps_clipped,
             first_loss: report.first_loss,
             first_penalized_prob: report.first_penalized_prob,
             penalized_tokens: report.penalized_tokens,
             tokens_seen: report.tokens_seen,
             loss_sum,
             elapsed_secs: elapsed,
+            ema_updates: ema.map(Ema::updates),
         };
         let state = TrainState {
             format_version: checkpoint::STATE_FORMAT_VERSION,
@@ -1928,7 +2382,7 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
             datasets: dataset_identity.clone(),
             model: checkpoint::model_entry(&model_path)?,
             optimizer,
-            ema: None,
+            ema: ema_file,
             head: None,
             head_optimizer: None,
             extras: serde_json::to_value(&extras).context("serialize lm training extras")?,
@@ -1940,20 +2394,42 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
 
     for step in start_step..config.steps {
         <B as burn::tensor::backend::Backend>::seed(device, step_seed(config.seed, step));
-        let (windows, weight_rows, origin) = mix.sample(config.batch_size, context - 1, &mut rng)?;
+        let (windows, weight_rows, mask_rows, origin) = if mix.any_masks() || mix.any_grades() {
+            let (windows, weights, masks, origin) =
+                mix.sample_with_masks(config.batch_size, context - 1, &mut rng)?;
+            (windows, weights, masks, origin)
+        } else {
+            let (windows, weights, origin) =
+                mix.sample(config.batch_size, context - 1, &mut rng)?;
+            (windows, weights, None, origin)
+        };
         let flat: Vec<i64> = windows
             .iter()
             .flat_map(|w| w.iter().map(|t| i64::from(*t)))
             .collect();
         let tokens = Tensor::<B, 1, burn::tensor::Int>::from_ints(flat.as_slice(), device)
             .reshape([config.batch_size, context]);
+        // Kimi K2 lesson: the max attention logit is the early warning for
+        // blowup, and loss/grad-norm miss it until it spikes the run. Probe
+        // one truncated sample on log steps (linear layers report None); the
+        // tokens are moved into the step below, so the probe input is cut now.
+        let probing =
+            config.log_every > 0 && (step % config.log_every == 0 || step + 1 == config.steps);
+        let probe_tokens = probing.then(|| {
+            let len = context.min(128);
+            tokens.clone().narrow(0, 0, 1).narrow(1, 0, len)
+        });
+        let loss_mask = mask_rows
+            .as_ref()
+            .map(|rows| crate::mix::mask_rows::<B>(rows, device));
 
         let negatives = weight_rows
             .as_ref()
             .map(|rows| (crate::mix::weight_rows::<B>(rows, device), config.penalty));
         let extra = match (&inputs.negative_teacher, config.negative_penalty > 0.0) {
             (Some(negative), true) => {
-                let (proposed, weights) = negative.negative_proposals(tokens.clone(), config.negative_confidence);
+                let (proposed, weights) =
+                    negative.negative_proposals(tokens.clone(), config.negative_confidence);
                 Some(crate::lm::ExtraNegatives {
                     tokens: proposed,
                     weights,
@@ -1963,29 +2439,97 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
             }
             _ => None,
         };
-        let distill = (config.distill_weight > 0.0 && !teacher_refs.is_empty()).then_some(crate::lm::Distillation {
-            teachers: teacher_refs.as_slice(),
-            temperature: config.distill_temperature,
-            weight: config.distill_weight,
-        });
-        let penalty = direction_tensor.as_ref().map(|(d, layer)| crate::lm::DirectionPenalty {
-            direction: d,
-            layer: *layer,
-            weight: config.direction_weight,
-        });
-        let crate::lm::LmStep { loss, metrics, routing } =
-            model.next_token_step_directed(tokens, negatives, extra, distill, penalty, span.clone());
+        let distill = (config.distill_weight > 0.0 && !teacher_refs.is_empty()).then_some(
+            crate::lm::Distillation {
+                teachers: teacher_refs.as_slice(),
+                temperature: config.distill_temperature,
+                weight: config.distill_weight,
+            },
+        );
+        let penalty = direction_tensor
+            .as_ref()
+            .map(|(d, layer)| crate::lm::DirectionPenalty {
+                direction: d,
+                layer: *layer,
+                weight: config.direction_weight,
+            });
+        // One bundle for every auxiliary term, so the masked and unmasked paths
+        // cannot end up with different ones.
+        let extras = crate::lm::LmExtras {
+            negatives,
+            extra,
+            distill,
+            direction: penalty,
+        };
+        let crate::lm::LmStep {
+            loss,
+            metrics,
+            routing,
+        } = if let Some(mask) = loss_mask {
+            model.next_token_step_masked(tokens, mask, extras, span.clone())
+        } else {
+            match &resident.scope {
+                LmTrainingScope::Joint => {
+                    model.next_token_step_directed(tokens, extras, span.clone())
+                }
+                LmTrainingScope::Specialist { expert_id } => {
+                    let model_config = config.model_config.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("a specialist scope needs a model config to train against")
+                    })?;
+                    model.next_token_specialist_step(tokens, model_config, expert_id)?
+                }
+            }
+        };
 
+        if metrics.tokens_counted == 0 {
+            report.steps_skipped += 1;
+            accumulator.skip();
+            println!("step {step}: window has no supervised target, step discarded");
+            continue;
+        }
         if !metrics.loss.is_finite() {
             // The same policy as the image loop: a pathological step is
             // discarded, not clipped into something that looks fine.
             report.steps_skipped += 1;
-            println!("step {step}: non-finite loss {}, step discarded", metrics.loss);
+            accumulator.skip();
+            println!(
+                "step {step}: non-finite loss {}, step discarded",
+                metrics.loss
+            );
             continue;
         }
 
-        let grads = GradientsParams::from_grads(loss.backward(), &model);
-        model = optim.step(config.lr, model, grads);
+        // Scale so the accumulated total is the mean over the micro-batches:
+        // exactly what one `accumulate`-times-larger batch would produce.
+        let scaled = if accumulator.every() > 1 {
+            loss.mul_scalar(accumulator.loss_scale() as f32)
+        } else {
+            loss
+        };
+        let grads = trainable.gradients::<B, _>(&mut scaled.backward(), &model);
+        let cycle = accumulator.fold(grads, &model);
+        let Some(mut summed) = cycle.into_gradients() else {
+            // Still filling the cycle: no step yet, and the metrics below
+            // describe a micro-batch rather than a step, so wait for the rest.
+            report.steps_accumulated += 1;
+            continue;
+        };
+        // Clipping applies to the *accumulated* gradient, because that is the
+        // step actually taken — bounding micro-batches separately says nothing
+        // about the norm of their sum.
+        if config.clip_norm > 0.0 {
+            let total_norm = global_grad_norm(&model, &summed);
+            if total_norm > config.clip_norm {
+                crate::schedule::clip_gradients(&mut summed, &model, total_norm, config.clip_norm);
+                report.steps_clipped += 1;
+            }
+        }
+        let lr = lr_schedule.at(step);
+        report.last_lr = lr;
+        model = optim.step(lr, model, summed);
+        if let Some(ema) = ema.as_mut() {
+            ema.update::<B>(&model);
+        }
         if config.bias_balance_rate > 0.0 && !routing.is_empty() {
             model.nudge_balance_biases(span.clone(), &routing, config.bias_balance_rate);
         }
@@ -2004,6 +2548,7 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
             report.first_direction_projection = metrics.direction_projection;
         }
         report.last_direction_projection = metrics.direction_projection;
+        report.last_mtp_loss = metrics.mtp_loss;
         source_stats.record(&origin, metrics.loss);
         report.steps_taken += 1;
         report.penalized_tokens += metrics.penalized_tokens;
@@ -2043,19 +2588,58 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
             if direction_tensor.is_some() {
                 line.push_str(&format!(" | direction {:.4}", metrics.direction_projection));
             }
+            if metrics.mtp_loss > 0.0 {
+                line.push_str(&format!(" | mtp {:.4}", metrics.mtp_loss));
+            }
+            if let Some(probe) = probe_tokens {
+                let mut max_logit = f32::NEG_INFINITY;
+                for v in model.max_attention_logits(probe).into_iter().flatten() {
+                    max_logit = max_logit.max(v);
+                }
+                if max_logit.is_finite() {
+                    report.last_max_logit = max_logit;
+                    line.push_str(&format!(" | maxlogit {:.1}", max_logit));
+                    if max_logit > 100.0 {
+                        line.push_str(
+                            " <-- over 100: Kimi K2 blowup territory, lower LR or enable --qk-norm",
+                        );
+                    }
+                }
+            }
+            line.push_str(&format!(" | lr {:.2e}", report.last_lr));
             println!("{line}");
             if let Some(logger) = logger.as_mut() {
                 let mut fields = vec![
                     ("loss", crate::logging::jnum(metrics.loss)),
                     ("perplexity", crate::logging::jnum(metrics.perplexity)),
                     ("penalized_tokens", metrics.penalized_tokens.to_string()),
-                    ("penalized_prob", crate::logging::jnum(metrics.penalized_prob)),
+                    (
+                        "penalized_prob",
+                        crate::logging::jnum(metrics.penalized_prob),
+                    ),
                     ("penalty", crate::logging::jnum(metrics.penalty)),
-                    ("negative_teacher_tokens", metrics.negative_teacher_tokens.to_string()),
-                    ("negative_teacher_prob", crate::logging::jnum(metrics.negative_teacher_prob)),
+                    (
+                        "negative_teacher_tokens",
+                        metrics.negative_teacher_tokens.to_string(),
+                    ),
+                    (
+                        "negative_teacher_prob",
+                        crate::logging::jnum(metrics.negative_teacher_prob),
+                    ),
                     ("distill_loss", crate::logging::jnum(metrics.distill_loss)),
-                    ("direction_projection", crate::logging::jnum(metrics.direction_projection)),
-                    ("source", origin.sole_source().map_or("-1".to_string(), |s| s.to_string())),
+                    (
+                        "direction_projection",
+                        crate::logging::jnum(metrics.direction_projection),
+                    ),
+                    ("mtp_loss", crate::logging::jnum(metrics.mtp_loss)),
+                    ("max_logit", crate::logging::jnum(report.last_max_logit)),
+                    ("lr", crate::logging::jnum(report.last_lr as f32)),
+                    (
+                        "source",
+                        origin
+                            .sole_source()
+                            .map_or("-1".to_string(), |s| s.to_string()),
+                    ),
                 ];
                 if !routing.is_empty() {
                     let (load_h, token_h, min_load, max_load) =
@@ -2064,8 +2648,14 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
                     fields.push(("token_entropy", crate::logging::jnum(token_h)));
                     fields.push(("min_load", crate::logging::jnum(min_load)));
                     fields.push(("max_load", crate::logging::jnum(max_load)));
-                    fields.push(("routing_load", crate::moe::RoutingStats::load_json(&routing)));
-                    fields.push(("routing_stability", crate::logging::jnum(crate::moe::RoutingStats::mean_stability(&routing))));
+                    fields.push((
+                        "routing_load",
+                        crate::moe::RoutingStats::load_json(&routing),
+                    ));
+                    fields.push((
+                        "routing_stability",
+                        crate::logging::jnum(crate::moe::RoutingStats::mean_stability(&routing)),
+                    ));
                     if let Some(agreement) = crate::moe::RoutingStats::mean_agreement(&routing) {
                         fields.push(("routing_agreement", crate::logging::jnum(agreement)));
                     }
@@ -2074,22 +2664,46 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
             }
         }
 
-        if config.checkpoint_every > 0 && (step + 1) % config.checkpoint_every == 0 && step + 1 < config.steps {
+        if config.checkpoint_every > 0
+            && (step + 1) % config.checkpoint_every == 0
+            && step + 1 < config.steps
+        {
             let elapsed = elapsed_before + started.elapsed().as_secs_f64();
-            if let Some(path) = save_state(step + 1, &model, &optim, &rng, &report, loss_sum, elapsed)? {
+            if let Some(path) = save_state(
+                step + 1,
+                &model,
+                &optim,
+                ema.as_ref(),
+                &rng,
+                &report,
+                loss_sum,
+                elapsed,
+            )? {
                 println!("step {step}: checkpoint {}", path.display());
                 report.periodic_checkpoints.push((step + 1, path));
             }
         }
     }
 
-    anyhow::ensure!(report.steps_taken > 0, "every step produced a non-finite loss");
+    anyhow::ensure!(
+        report.steps_taken > 0,
+        "every step produced a non-finite loss"
+    );
     report.mean_loss = (loss_sum / report.steps_taken as f64) as f32;
     report.elapsed_secs = elapsed_before + started.elapsed().as_secs_f64();
     if source_stats.is_multi() {
         print!("per-corpus:\n{}", source_stats.render());
     }
     report.sources = source_stats;
+    // The averaged weights are usually the better evaluation model: with EMA
+    // on, everything below (Heretic, the final checkpoint, the return value)
+    // sees the shadow rather than whichever point the last step landed on.
+    // The shadow is cloned rather than moved so the average itself stays
+    // beside the checkpoint for a resumed run to continue.
+    if let Some(e) = &ema {
+        println!("returning EMA weights ({} updates)", e.updates());
+        model = e.shadow().clone();
+    }
     if let Some(heretic) = &config.heretic {
         println!(
             "heretic: {} target / {} baseline prompt(s), {} trial(s), kl weight {}",
@@ -2103,7 +2717,16 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
         model = decensored;
         report.heretic = Some(report_h);
     }
-    report.checkpoint = save_state(config.steps, &model, &optim, &rng, &report, loss_sum, report.elapsed_secs)?;
+    report.checkpoint = save_state(
+        config.steps,
+        &model,
+        &optim,
+        ema.as_ref(),
+        &rng,
+        &report,
+        loss_sum,
+        report.elapsed_secs,
+    )?;
     Ok((model, report))
 }
 
@@ -2112,17 +2735,477 @@ pub fn train_lm_mixed<B: AutodiffBackend<FloatElem = f32>>(
 struct LmExtras {
     steps_taken: usize,
     steps_skipped: usize,
+    #[serde(default)]
+    steps_accumulated: usize,
+    #[serde(default)]
+    steps_clipped: usize,
     first_loss: f32,
     first_penalized_prob: f32,
     penalized_tokens: usize,
     tokens_seen: usize,
     loss_sum: f64,
     elapsed_secs: f64,
+    #[serde(default)]
+    ema_updates: Option<usize>,
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
+
+    fn resident_parameters(
+        model: &LanguageModel<DefaultTrainBackend>,
+    ) -> std::collections::HashMap<burn::module::ParamId, Vec<f32>> {
+        #[derive(Default)]
+        struct Snapshot(std::collections::HashMap<burn::module::ParamId, Vec<f32>>);
+        impl burn::module::ModuleVisitor<DefaultTrainBackend> for Snapshot {
+            fn visit_float<const D: usize>(
+                &mut self,
+                param: &burn::module::Param<Tensor<DefaultTrainBackend, D>>,
+            ) {
+                self.0
+                    .insert(param.id, param.val().to_data().iter::<f32>().collect());
+            }
+        }
+        let mut snapshot = Snapshot::default();
+        model.visit(&mut snapshot);
+        snapshot.0
+    }
+
+    fn assert_resident_optimizer(path: &std::path::Path, selected: &crate::mosme::TrainableSet) {
+        type B = DefaultTrainBackend;
+        type O = burn::optim::adaptor::OptimizerAdaptor<burn::optim::AdamW, LanguageModel<B>, B>;
+        let state = TrainState::for_model(path).unwrap().unwrap();
+        let dir = TrainState::dir_for(path);
+        state.verify_files(&dir).unwrap();
+        let record: <O as Optimizer<LanguageModel<B>, B>>::Record =
+            checkpoint::load_record::<B, _>(
+                &dir,
+                state.optimizer.as_ref().unwrap(),
+                &Default::default(),
+            )
+            .unwrap();
+        assert_eq!(record.len(), selected.len().unwrap());
+        assert!(record.keys().all(|id| selected.ids().unwrap().contains(id)));
+    }
+
+    #[test]
+    fn test_lm_resident_specialist_training_and_scope_checkpoints() {
+        type B = DefaultTrainBackend;
+        let device = Default::default();
+        let dir = std::env::temp_dir().join(format!("dblocks-resident-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let model_config = crate::lm::LmConfig::tiny().with_mosme(
+            crate::vit::MosmeTrunkConfig::new(crate::expert_index::MosmeSpec::flat(2))
+                .with_every_n_layers(2),
+        );
+        let corpus_path = dir.join("tokens.bin");
+        TokenCorpus::write(
+            &corpus_path,
+            &(1..=8u16).cycle().take(64).collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let mut corpus = TokenCorpus::in_memory(&corpus_path).unwrap();
+        let mut mix = CorpusMix::single(&mut corpus).unwrap();
+        let inputs = LmTrainInputs::<B>::default();
+        let config = LmTrainConfig {
+            steps: 4,
+            batch_size: 2,
+            log_every: 0,
+            weight_decay: 0.1,
+            out_dir: Some(dir.join("full")),
+            checkpoint_every: 2,
+            model_config: Some(model_config.clone()),
+            ..Default::default()
+        };
+        let fresh = || LanguageModel::<B>::new(&model_config, &device).unwrap();
+        let model = fresh();
+        let before = resident_parameters(&model);
+        let selected = model.specialist_trainable(&model_config, "flat/1").unwrap();
+        let resident = LmResidentTraining {
+            scope: LmTrainingScope::Specialist {
+                expert_id: "flat/1".into(),
+            },
+            base_weights: None,
+        };
+        let (trained, report) =
+            train_lm_resident(model, &mut mix, &inputs, &config, &resident, &device).unwrap();
+        assert_eq!(report.steps_taken, 4);
+        assert_eq!(report.steps_skipped, 0);
+        assert_eq!(report.resumed_from_step, 0);
+        assert_eq!(report.tokens_seen, 4 * 2 * (model_config.context - 1));
+        assert!(report.first_loss.is_finite() && report.last_loss.is_finite());
+        let after = resident_parameters(&trained);
+        assert_eq!(before.len(), after.len());
+        let mut changed = 0;
+        for (id, values) in &before {
+            if selected.ids().unwrap().contains(id) {
+                changed += usize::from(values != &after[id]);
+            } else {
+                assert_eq!(
+                    values, &after[id],
+                    "frozen parameter {id:?} changed under AdamW"
+                );
+            }
+        }
+        assert_eq!(changed, selected.len().unwrap());
+        let checkpoint = report.checkpoint.as_ref().unwrap();
+        let state = TrainState::for_model(checkpoint).unwrap().unwrap();
+        assert_eq!(state.step, 4);
+        assert_eq!(
+            state.config["training_scope"],
+            serde_json::to_value(&resident.scope).unwrap()
+        );
+        assert_resident_optimizer(checkpoint, &selected);
+        let (step, intermediate) = &report.periodic_checkpoints[0];
+        assert_eq!(*step, 2);
+        let resume_config = LmTrainConfig {
+            resume: Some(intermediate.clone()),
+            out_dir: Some(dir.join("resumed")),
+            ..config.clone()
+        };
+        let (resumed, resumed_report) = train_lm_resident(
+            fresh(),
+            &mut mix,
+            &inputs,
+            &resume_config,
+            &resident,
+            &device,
+        )
+        .unwrap();
+        assert_eq!(resumed_report.resumed_from_step, 2);
+        assert_eq!(resumed_report.steps_taken, report.steps_taken);
+        assert_eq!(resumed_report.tokens_seen, report.tokens_seen);
+        assert_eq!(resumed_report.mean_loss, report.mean_loss);
+        assert_eq!(resumed_report.last_loss, report.last_loss);
+        assert_eq!(resident_parameters(&resumed), after);
+        assert_resident_optimizer(resumed_report.checkpoint.as_ref().unwrap(), &selected);
+
+        for scope in [
+            LmTrainingScope::Joint,
+            LmTrainingScope::Specialist {
+                expert_id: "flat/0".into(),
+            },
+        ] {
+            let err = train_lm_resident(
+                fresh(),
+                &mut mix,
+                &inputs,
+                &resume_config,
+                &LmResidentTraining {
+                    scope,
+                    base_weights: None,
+                },
+                &device,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("incompatible LM training scope"), "{err}");
+        }
+        let err = train_lm_resident(
+            fresh(),
+            &mut mix,
+            &inputs,
+            &LmTrainConfig {
+                lr: config.lr * 2.0,
+                ..resume_config.clone()
+            },
+            &resident,
+            &device,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("incompatible specialist resume configuration") && err.contains("lr"),
+            "{err}"
+        );
+        for steps in [1, 2] {
+            let err = train_lm_resident(
+                fresh(),
+                &mut mix,
+                &inputs,
+                &LmTrainConfig {
+                    steps,
+                    ..resume_config.clone()
+                },
+                &resident,
+                &device,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("steps must exceed checkpoint step"), "{err}");
+        }
+        let mut other_corpus = TokenCorpus::in_memory(&corpus_path).unwrap();
+        let mut other_mix = CorpusMix::new(
+            vec![&mut other_corpus],
+            MixWeights::uniform(1),
+            MixMode::Composite,
+        )
+        .unwrap();
+        let err = train_lm_resident(
+            fresh(),
+            &mut other_mix,
+            &inputs,
+            &resume_config,
+            &resident,
+            &device,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("mix_mode"), "{err}");
+
+        let base_config = LmTrainConfig {
+            steps: 2,
+            out_dir: Some(dir.join("base")),
+            checkpoint_every: 0,
+            ..config.clone()
+        };
+        let base = LmResidentTraining {
+            scope: LmTrainingScope::Specialist {
+                expert_id: "flat/0".into(),
+            },
+            base_weights: Some(checkpoint.clone()),
+        };
+        let err = train_lm_resident(fresh(), &mut mix, &inputs, &resume_config, &base, &device)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+        let (initialized, initialized_report) =
+            train_lm_resident(fresh(), &mut mix, &inputs, &base_config, &base, &device).unwrap();
+        let (expected, expected_report) = train_lm_resident(
+            trained.clone(),
+            &mut mix,
+            &inputs,
+            &LmTrainConfig {
+                out_dir: None,
+                ..base_config.clone()
+            },
+            &LmResidentTraining {
+                scope: base.scope.clone(),
+                base_weights: None,
+            },
+            &device,
+        )
+        .unwrap();
+        assert_eq!(initialized_report.resumed_from_step, 0);
+        assert_eq!(initialized_report.steps_taken, 2);
+        assert_eq!(
+            initialized_report.tokens_seen,
+            2 * 2 * (model_config.context - 1)
+        );
+        assert_eq!(initialized_report.first_loss, expected_report.first_loss);
+        assert_eq!(
+            resident_parameters(&initialized),
+            resident_parameters(&expected)
+        );
+        let selected_zero = initialized
+            .specialist_trainable(&model_config, "flat/0")
+            .unwrap();
+        assert_resident_optimizer(
+            initialized_report.checkpoint.as_ref().unwrap(),
+            &selected_zero,
+        );
+        assert!(selected_zero
+            .ids()
+            .unwrap()
+            .iter()
+            .all(|id| !selected.ids().unwrap().contains(id)));
+
+        let raw =
+            checkpoint::save_content_addressed(trained.clone(), &dir.join("raw"), "lm").unwrap();
+        assert!(TrainState::for_model(&raw).unwrap().is_none());
+        let err = train_lm_resident(
+            fresh(),
+            &mut mix,
+            &inputs,
+            &LmTrainConfig {
+                resume: Some(raw.clone()),
+                ..resume_config.clone()
+            },
+            &resident,
+            &device,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("specialist resume requires training state"),
+            "{err}"
+        );
+        let (raw_initialized, _) = train_lm_resident(
+            fresh(),
+            &mut mix,
+            &inputs,
+            &LmTrainConfig {
+                out_dir: None,
+                ..base_config.clone()
+            },
+            &LmResidentTraining {
+                base_weights: Some(raw),
+                ..base.clone()
+            },
+            &device,
+        )
+        .unwrap();
+        assert_eq!(
+            resident_parameters(&raw_initialized),
+            resident_parameters(&expected)
+        );
+
+        let state_dir = TrainState::dir_for(intermediate);
+        let original = TrainState::for_model(intermediate).unwrap().unwrap();
+        let mut altered = original.clone();
+        altered.optimizer = None;
+        altered.write(&state_dir).unwrap();
+        let err = train_lm_resident(
+            fresh(),
+            &mut mix,
+            &inputs,
+            &resume_config,
+            &resident,
+            &device,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("specialist resume requires optimizer state"),
+            "{err}"
+        );
+        altered = original.clone();
+        altered
+            .config
+            .as_object_mut()
+            .unwrap()
+            .remove("training_scope");
+        altered.write(&state_dir).unwrap();
+        let err = train_lm_resident(
+            fresh(),
+            &mut mix,
+            &inputs,
+            &resume_config,
+            &resident,
+            &device,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("incompatible LM training scope"), "{err}");
+        original.write(&state_dir).unwrap();
+        let other_state = TrainState::for_model(initialized_report.checkpoint.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        let mut wrong_optimizer = other_state.optimizer.unwrap();
+        wrong_optimizer.path = checkpoint::resolve(
+            &TrainState::dir_for(initialized_report.checkpoint.as_ref().unwrap()),
+            &wrong_optimizer.path,
+        )
+        .display()
+        .to_string();
+        altered = original.clone();
+        altered.optimizer = Some(wrong_optimizer);
+        altered.write(&state_dir).unwrap();
+        let err = train_lm_resident(
+            fresh(),
+            &mut mix,
+            &inputs,
+            &resume_config,
+            &resident,
+            &device,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("out-of-scope parameters"), "{err}");
+        original.write(&state_dir).unwrap();
+
+        let err = train_lm_resident(
+            fresh(),
+            &mut mix,
+            &inputs,
+            &LmTrainConfig {
+                model_config: Some(crate::lm::LmConfig {
+                    dropout: 0.1,
+                    ..model_config.clone()
+                }),
+                ..base_config.clone()
+            },
+            &base,
+            &device,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("base model_config mismatch"), "{err}");
+        altered = original.clone();
+        altered.model.sha256 = "0".repeat(64);
+        altered.write(&state_dir).unwrap();
+        let intermediate_base = LmResidentTraining {
+            base_weights: Some(intermediate.clone()),
+            ..base.clone()
+        };
+        let err = train_lm_resident(
+            fresh(),
+            &mut mix,
+            &inputs,
+            &base_config,
+            &intermediate_base,
+            &device,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("base model file is corrupted"), "{err}");
+        original.write(&state_dir).unwrap();
+        std::fs::remove_file(checkpoint::resolve(
+            &state_dir,
+            &original.optimizer.as_ref().unwrap().path,
+        ))
+        .unwrap();
+        let err = train_lm_resident(
+            fresh(),
+            &mut mix,
+            &inputs,
+            &resume_config,
+            &resident,
+            &device,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("optimizer file") && err.contains("missing"),
+            "{err}"
+        );
+        let (_, base_report) = train_lm_resident(
+            fresh(),
+            &mut mix,
+            &inputs,
+            &LmTrainConfig {
+                out_dir: None,
+                ..base_config.clone()
+            },
+            &intermediate_base,
+            &device,
+        )
+        .unwrap();
+        assert_eq!(base_report.resumed_from_step, 0);
+        assert_eq!(base_report.steps_taken, base_config.steps);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn test_running_avg_slides() {
@@ -2162,7 +3245,10 @@ mod tests {
         let config = TrainConfig {
             image_size: 32,
             num_labels: 100,
-            dataset: DatasetChoice::TinyImagenet { dir: "/data".into(), streaming: true },
+            dataset: DatasetChoice::TinyImagenet {
+                dir: "/data".into(),
+                streaming: true,
+            },
             ..TrainConfig::default()
         };
         let vit = config.vit_config();
@@ -2170,7 +3256,11 @@ mod tests {
         assert_eq!(vit.num_labels, 200);
 
         // Synthetic keeps whatever the caller asked for.
-        let synth = TrainConfig { image_size: 32, num_labels: 7, ..TrainConfig::default() };
+        let synth = TrainConfig {
+            image_size: 32,
+            num_labels: 7,
+            ..TrainConfig::default()
+        };
         assert_eq!(synth.vit_config().num_labels, 7);
     }
 
@@ -2184,14 +3274,21 @@ mod tests {
 
     #[test]
     fn test_summary_skip_rate() {
-        let s = TrainSummary { steps_taken: 9, steps_skipped: 1, ..TrainSummary::default() };
+        let s = TrainSummary {
+            steps_taken: 9,
+            steps_skipped: 1,
+            ..TrainSummary::default()
+        };
         assert!((s.skip_rate() - 0.1).abs() < 1e-6);
         assert_eq!(TrainSummary::default().skip_rate(), 0.0);
     }
 
     #[test]
     fn test_block_of_reads_the_metric_field() {
-        assert_eq!(block_of(&[("loss", "1.0".into()), ("block", "2".into())]), 2);
+        assert_eq!(
+            block_of(&[("loss", "1.0".into()), ("block", "2".into())]),
+            2
+        );
         // Flow matching reports no block; defaulting to 0 keeps the health
         // table usable rather than panicking.
         assert_eq!(block_of(&[("loss", "1.0".into())]), 0);
@@ -2210,7 +3307,10 @@ mod tests {
             num_blocks: 2,
             steps: 2,
             log_every: 10,
-            checks: TrainingChecks { preflight: true, ..TrainingChecks::default() },
+            checks: TrainingChecks {
+                preflight: true,
+                ..TrainingChecks::default()
+            },
             ..TrainConfig::default()
         };
         let (_model, summary) = train(&config).unwrap();
@@ -2227,7 +3327,10 @@ mod tests {
             num_blocks: 2,
             steps: 4,
             log_every: 10,
-            checks: TrainingChecks { preflight: false, ..TrainingChecks::thorough(2) },
+            checks: TrainingChecks {
+                preflight: false,
+                ..TrainingChecks::thorough(2)
+            },
             ..TrainConfig::default()
         };
         let (_model, summary) = train(&config).unwrap();
@@ -2240,7 +3343,10 @@ mod tests {
             .map(|b| b.steps)
             .sum();
         assert_eq!(attributed, 4);
-        assert!(summary.health.dead_blocks().is_empty(), "no block should be dead");
+        assert!(
+            summary.health.dead_blocks().is_empty(),
+            "no block should be dead"
+        );
     }
 
     #[test]
@@ -2254,15 +3360,21 @@ mod tests {
             num_blocks: 2,
             steps: 6,
             log_every: 100,
-            checks: TrainingChecks { preflight: false, ..TrainingChecks::default() },
+            checks: TrainingChecks {
+                preflight: false,
+                ..TrainingChecks::default()
+            },
             ..TrainConfig::default()
         };
 
         let (_, plain) = train(&base).unwrap();
         assert_eq!(plain.steps_taken, 6);
 
-        let (_, accumulated) =
-            train(&TrainConfig { accumulate: 3, ..base.clone() }).unwrap();
+        let (_, accumulated) = train(&TrainConfig {
+            accumulate: 3,
+            ..base.clone()
+        })
+        .unwrap();
         assert_eq!(
             accumulated.steps_taken, 2,
             "6 micro-batches at accumulate=3 is 2 optimizer steps"
@@ -2282,7 +3394,10 @@ mod tests {
             log_every: 100,
             lr: 1e-3,
             lr_schedule: LrSchedule::cosine(1e-3, 4),
-            checks: TrainingChecks { preflight: false, ..TrainingChecks::default() },
+            checks: TrainingChecks {
+                preflight: false,
+                ..TrainingChecks::default()
+            },
             ..TrainConfig::default()
         };
         let (_, summary) = train(&config).unwrap();
@@ -2305,15 +3420,24 @@ mod tests {
             num_blocks: 2,
             steps: 3,
             log_every: 100,
-            checks: TrainingChecks { preflight: false, ..TrainingChecks::default() },
+            checks: TrainingChecks {
+                preflight: false,
+                ..TrainingChecks::default()
+            },
             ..TrainConfig::default()
         };
         let (_, unclipped) = train(&base).unwrap();
         assert_eq!(unclipped.steps_clipped, 0);
 
-        let (_, clipped) =
-            train(&TrainConfig { clip_norm: Some(1e-4), ..base }).unwrap();
-        assert_eq!(clipped.steps_clipped, 3, "every step should exceed a 1e-4 bound");
+        let (_, clipped) = train(&TrainConfig {
+            clip_norm: Some(1e-4),
+            ..base
+        })
+        .unwrap();
+        assert_eq!(
+            clipped.steps_clipped, 3,
+            "every step should exceed a 1e-4 bound"
+        );
     }
 
     #[test]
@@ -2326,11 +3450,18 @@ mod tests {
             steps: 3,
             log_every: 100,
             seed: 11,
-            checks: TrainingChecks { preflight: false, ..TrainingChecks::default() },
+            checks: TrainingChecks {
+                preflight: false,
+                ..TrainingChecks::default()
+            },
             ..TrainConfig::default()
         };
         let (live, _) = train(&base.clone()).unwrap();
-        let (averaged, _) = train(&TrainConfig { ema_decay: Some(0.9), ..base }).unwrap();
+        let (averaged, _) = train(&TrainConfig {
+            ema_decay: Some(0.9),
+            ..base
+        })
+        .unwrap();
 
         // The averaged weights lag the live ones, so they must differ.
         let diff = (live.model().label_embedding_weight()
@@ -2368,9 +3499,13 @@ mod tests {
         let device = Default::default();
         let model = DblockClassifier::<A>::new(
             &ViTDiTConfig::tiny(10),
-            &DblockConfig { num_blocks: 2, ..DblockConfig::default() },
+            &DblockConfig {
+                num_blocks: 2,
+                ..DblockConfig::default()
+            },
             &device,
-        );
+        )
+        .unwrap();
 
         let pixels =
             Tensor::<A, 4>::random([2, 3, 32, 32], Distribution::Uniform(-0.5, 0.5), &device);
@@ -2380,13 +3515,20 @@ mod tests {
 
         let grads = GradientsParams::from_grads(loss.backward(), &model);
         let norm = global_grad_norm(&model, &grads);
-        assert!(norm.is_finite() && norm > 0.0, "gradient norm must be positive: {norm}");
+        assert!(
+            norm.is_finite() && norm > 0.0,
+            "gradient norm must be positive: {norm}"
+        );
 
         // An empty gradient set has norm zero, which the gate rejects as a
         // dead step rather than treating as healthy.
         let empty = GradientsParams::new();
         assert_eq!(global_grad_norm(&model, &empty), 0.0);
-        assert!(!grad_norm_ok(0.0, GradNormGate::default().min_norm, GradNormGate::default().max_norm));
+        assert!(!grad_norm_ok(
+            0.0,
+            GradNormGate::default().min_norm,
+            GradNormGate::default().max_norm
+        ));
     }
 
     #[test]
@@ -2426,7 +3568,10 @@ mod tests {
             num_blocks: 2,
             steps: 4,
             log_every: 100,
-            checks: TrainingChecks { preflight: false, ..TrainingChecks::default() },
+            checks: TrainingChecks {
+                preflight: false,
+                ..TrainingChecks::default()
+            },
             ..TrainConfig::default()
         };
 
@@ -2462,13 +3607,25 @@ mod tests {
         let mut corpus = TokenCorpus::in_memory(&path).unwrap();
 
         let device = Default::default();
-        let model = LanguageModel::<DefaultTrainBackend>::new(&LmConfig::tiny(), &device);
+        let model = LanguageModel::<DefaultTrainBackend>::new(&LmConfig::tiny(), &device).unwrap();
 
-        let charged = LmTrainConfig { steps: 2, batch_size: 2, penalty: Unlikelihood::new(1.0), ..Default::default() };
-        let err = train_lm(model.clone(), &mut corpus, &charged, &device).unwrap_err().to_string();
+        let charged = LmTrainConfig {
+            steps: 2,
+            batch_size: 2,
+            penalty: Unlikelihood::new(1.0),
+            ..Default::default()
+        };
+        let err = train_lm(model.clone(), &mut corpus, &charged, &device)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("needs labels"), "unhelpful error: {err}");
 
-        let plain = LmTrainConfig { steps: 3, batch_size: 2, log_every: 0, ..Default::default() };
+        let plain = LmTrainConfig {
+            steps: 3,
+            batch_size: 2,
+            log_every: 0,
+            ..Default::default()
+        };
         let (_, report) = train_lm(model, &mut corpus, &plain, &device).unwrap();
         assert_eq!(report.steps_taken, 3);
         assert_eq!(report.penalized_tokens, 0);

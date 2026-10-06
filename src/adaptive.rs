@@ -6,7 +6,7 @@
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
-    tensor::{Tensor, backend::Backend},
+    tensor::{backend::Backend, Tensor},
 };
 
 /// Halting head configuration.
@@ -21,7 +21,11 @@ pub struct HaltingConfig {
 
 impl Default for HaltingConfig {
     fn default() -> Self {
-        Self { hidden_size: 128, exit_threshold: 0.99, ponder_weight: 0.01 }
+        Self {
+            hidden_size: 128,
+            exit_threshold: 0.99,
+            ponder_weight: 0.01,
+        }
     }
 }
 
@@ -81,6 +85,25 @@ pub fn early_exit_step(halting_probs: &[f32], threshold: f32) -> usize {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use burn::backend::NdArray;
@@ -103,12 +126,28 @@ mod tests {
     #[test]
     fn test_expected_depth_shapes_and_range() {
         let device = Default::default();
-        let head = HaltingHead::<B>::new(&HaltingConfig { hidden_size: 8, ..Default::default() }, &device);
-        let hiddens: Vec<Tensor<B, 2>> =
-            (0..3).map(|_| Tensor::<B, 2>::random([4, 8], burn::tensor::Distribution::Uniform(-1.0, 1.0), &device)).collect();
+        let head = HaltingHead::<B>::new(
+            &HaltingConfig {
+                hidden_size: 8,
+                ..Default::default()
+            },
+            &device,
+        );
+        let hiddens: Vec<Tensor<B, 2>> = (0..3)
+            .map(|_| {
+                Tensor::<B, 2>::random(
+                    [4, 8],
+                    burn::tensor::Distribution::Uniform(-1.0, 1.0),
+                    &device,
+                )
+            })
+            .collect();
         let expected = head.expected_depth(&hiddens);
         assert_eq!(expected.dims(), [1]);
         let v: f32 = expected.into_scalar();
-        assert!(v.is_finite() && (0.0..=3.0 + 1e-5).contains(&v), "expected depth {v} out of range");
+        assert!(
+            v.is_finite() && (0.0..=3.0 + 1e-5).contains(&v),
+            "expected depth {v} out of range"
+        );
     }
 }

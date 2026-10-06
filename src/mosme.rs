@@ -50,15 +50,15 @@ use burn::{
 
 use crate::{
     dblock::DblockClassifier,
-    quantize::{LoraAdapter, LoraConfig},
     expert_index::{
         BalanceWeights, BoxEntry, BoxLayout, ExpertEntry, ExpertIndex, ExpertKind, MosmeSpec,
         RoutingSpec, SiteKind, WeightLocator,
     },
     moe::{
-        entropy_of_rows, layer_routing, scatter_gates, weighted_switch_loss,
-        ExpertMlp, LayerRouting, MoEConfig, MoELayer, TopKRouter,
+        entropy_of_rows, layer_routing, scatter_gates, weighted_switch_loss, ExpertMlp,
+        LayerRouting, MoEConfig, MoELayer, TopKRouter,
     },
+    quantize::{LoraAdapter, LoraConfig},
 };
 
 /// Configuration of a hierarchical expert site.
@@ -135,10 +135,14 @@ impl MosmeConfig {
             return None;
         }
         Some(
-            MoEConfig::new(self.hidden_size, self.cond_size, self.spec.boxes[0].experts.len())
-                .with_top_k(self.spec.top_expert)
-                .with_intermediate_size(self.intermediate_size)
-                .with_token_routing(self.route_on_tokens),
+            MoEConfig::new(
+                self.hidden_size,
+                self.cond_size,
+                self.spec.boxes[0].experts.len(),
+            )
+            .with_top_k(self.spec.top_expert)
+            .with_intermediate_size(self.intermediate_size)
+            .with_token_routing(self.route_on_tokens),
         )
     }
 }
@@ -239,12 +243,8 @@ impl<B: Backend> HierarchicalGates<B> {
         for i in 0..num_boxes {
             let gate = self.box_gates.clone().narrow(1, i, 1); // [T, 1]
             let width = self.expert_probs[i].dims()[1];
-            let l = weighted_switch_loss(
-                &self.expert_probs[i],
-                &self.top_expert_idx[i],
-                &gate,
-                width,
-            );
+            let l =
+                weighted_switch_loss(&self.expert_probs[i], &self.top_expert_idx[i], &gate, width);
             let share = traffic.clone().narrow(1, i, 1).reshape([1]);
             let term = l.clone() * share;
             expert_loss = Some(match expert_loss {
@@ -272,7 +272,13 @@ impl<B: Backend> HierarchicalGates<B> {
         // separation exists to prevent.
         let total = box_loss.clone().mul_scalar(weights.box_level as f32)
             + expert_loss.clone().mul_scalar(weights.expert_level as f32);
-        BalanceBreakdown { box_loss, expert_loss, per_box, z_loss, total }
+        BalanceBreakdown {
+            box_loss,
+            expert_loss,
+            per_box,
+            z_loss,
+            total,
+        }
     }
 }
 
@@ -362,7 +368,11 @@ impl<B: Backend> HierarchicalRouter<B> {
     /// router sees its own slice, renormalized to the traffic that box
     /// received; the box router sees the per-box totals.
     pub fn nudge_balance_bias(&mut self, load_flat: &[f32], rate: f32) {
-        assert_eq!(load_flat.len(), self.total_experts(), "one load fraction per expert required");
+        assert_eq!(
+            load_flat.len(),
+            self.total_experts(),
+            "one load fraction per expert required"
+        );
         let mut offset = 0;
         let mut box_load = Vec::with_capacity(self.num_boxes());
         for router in &mut self.expert_routers {
@@ -384,7 +394,9 @@ impl<B: Backend> HierarchicalRouter<B> {
     }
 
     pub fn experts_in(&self, box_idx: usize) -> usize {
-        self.expert_routers.get(box_idx).map_or(0, TopKRouter::width)
+        self.expert_routers
+            .get(box_idx)
+            .map_or(0, TopKRouter::width)
     }
 
     pub fn experts_per_box(&self) -> Vec<usize> {
@@ -423,21 +435,33 @@ impl<B: Backend> HierarchicalRouter<B> {
     /// Assemble the router input from rank-3 token features, exactly as
     /// [`MoELayer::router_logits`] does.
     pub fn router_input(&self, x: &Tensor<B, 3>, cond: &Tensor<B, 2>) -> Tensor<B, 2> {
-        self.router_input_with(x, cond, None)
+        let state = Tensor::<B, 3>::zeros([1, 1, 0], &x.device());
+        self.router_input_with(x, cond, &state)
     }
 
     /// [`Self::router_input`] with the per-token routing state `[b, n, s]`
     /// appended (roadmap 25.4). A router built without a state takes `None`
     /// and assembles exactly what it always did.
-    pub fn router_input_with(&self, x: &Tensor<B, 3>, cond: &Tensor<B, 2>, state: Option<&Tensor<B, 3>>) -> Tensor<B, 2> {
+    pub fn router_input_with(
+        &self,
+        x: &Tensor<B, 3>,
+        cond: &Tensor<B, 2>,
+        state: &Tensor<B, 3>,
+    ) -> Tensor<B, 2> {
         let [b, n, h] = x.dims();
         let base = self.router_input_2d(&x.clone().reshape([b * n, h]), &broadcast_cond(cond, n));
-        if self.state_size == 0 {
+        // Width zero is how "this router keeps no state" is spelled, so there is
+        // no `Option` here to be wrong about. The width check is what rejects a
+        // state belonging to a differently sized router.
+        let s = state.dims()[2];
+        assert_eq!(
+            s, self.state_size,
+            "routing state width {s} does not match the router's {}",
+            self.state_size
+        );
+        if s == 0 {
             return base;
         }
-        let state = state.expect("this router was built with a routing state and needs one to route");
-        let s = state.dims()[2];
-        assert_eq!(s, self.state_size, "routing state width {s} does not match the router's {}", self.state_size);
         Tensor::cat(vec![base, state.clone().reshape([b * n, s])], 1)
     }
 
@@ -610,7 +634,10 @@ fn grow_router<B: Backend>(
     anyhow::ensure!(width >= old, "cannot shrink a router");
 
     let weight = Tensor::cat(
-        vec![router.weight(), Tensor::<B, 2>::zeros([input, width - old], device)],
+        vec![
+            router.weight(),
+            Tensor::<B, 2>::zeros([input, width - old], device),
+        ],
         1,
     );
     let bias = router
@@ -631,6 +658,19 @@ fn broadcast_cond<B: Backend>(cond: &Tensor<B, 2>, n: usize) -> Tensor<B, 2> {
         .unsqueeze_dim::<3>(1)
         .repeat_dim(1, n)
         .reshape([b * n, c])
+}
+
+pub(crate) fn module_shapes<B: Backend, M: Module<B>>(module: &M) -> Vec<Vec<usize>> {
+    #[derive(Default)]
+    struct Shapes(Vec<Vec<usize>>);
+    impl<B: Backend> burn::module::ModuleVisitor<B> for Shapes {
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+            self.0.push(param.dims().to_vec());
+        }
+    }
+    let mut shapes = Shapes::default();
+    module.visit(&mut shapes);
+    shapes.0
 }
 
 // -------------------------------------------------- site (c): FFN slot --
@@ -659,9 +699,7 @@ impl<B: Backend> MosmeFeedForward<B> {
         let boxes = (0..layout.num_boxes())
             .map(|i| {
                 (0..layout.experts_in(i))
-                    .map(|_| {
-                        ExpertMlp::new(config.hidden_size, config.intermediate_size, device)
-                    })
+                    .map(|_| ExpertMlp::new(config.hidden_size, config.intermediate_size, device))
                     .collect()
             })
             .collect();
@@ -695,8 +733,151 @@ impl<B: Backend> MosmeFeedForward<B> {
         self.router.nudge_balance_bias(load_flat, rate);
     }
 
+    /// Run one named specialist with no routing.
+    ///
+    /// # Panics
+    ///
+    /// On a position this module does not have. Every caller reaches this
+    /// through `LanguageModel::specialist_trainable` or
+    /// `LanguageModel::forward_specialist`, which resolve the position from the
+    /// config and check it against every layer's layout first (see
+    /// `crate::vit::DbLayer::specialist_ids`); a position that reaches here
+    /// unvalidated is a bug in the caller, not bad input.
+    pub fn forward_specialist(
+        &self,
+        x: Tensor<B, 3>,
+        box_idx: usize,
+        expert_idx: usize,
+    ) -> Tensor<B, 3> {
+        let [b, n, h] = x.dims();
+        let (boxes, experts) = (self.boxes.len(), self.boxes.first().map_or(0, Vec::len));
+        assert!(
+            box_idx < boxes && expert_idx < experts,
+            "specialist ({box_idx}, {expert_idx}) is outside this MoSME module's {boxes}x{experts} layout"
+        );
+        let flat = x.reshape([b * n, h]);
+        // The assert above bounds both indices against the layout this module
+        // was built with, so indexing here cannot go out of range; the assert is
+        // what makes that true, and its message names the layout it checked.
+        let expert = &self.boxes[box_idx][expert_idx];
+        expert.forward(flat).reshape([b, n, h])
+    }
+
     pub fn expert(&self, box_idx: usize, expert_idx: usize) -> Option<&ExpertMlp<B>> {
         self.boxes.get(box_idx)?.get(expert_idx)
+    }
+
+    pub(crate) fn validate_specialist_config(&self, config: &MosmeConfig) -> anyhow::Result<()> {
+        config.spec.validate()?;
+        let widths = config.spec.experts_per_box();
+        anyhow::ensure!(
+            self.boxes.iter().map(Vec::len).collect::<Vec<_>>() == widths
+                && self.router.experts_per_box() == widths
+                && self.router.masks.len() == widths.len(),
+            "MoSME expert layout mismatch"
+        );
+        anyhow::ensure!(
+            self.router
+                .masks
+                .iter()
+                .zip(&widths)
+                .all(|(mask, width)| mask.dims() == [1, *width]),
+            "MoSME mask shape mismatch"
+        );
+        anyhow::ensure!(
+            self.router.layout() == config.spec.layout(),
+            "MoSME enabled layout mismatch"
+        );
+        anyhow::ensure!(
+            self.router.top_box == config.spec.top_box
+                && self.router.top_expert == config.spec.top_expert
+                && self.router.route_on_tokens == config.route_on_tokens
+                && self.router.state_size == config.state_size
+                && self.balance == config.balance(),
+            "MoSME routing configuration mismatch"
+        );
+        for (router, width) in std::iter::once((&self.router.box_router, widths.len()))
+            .chain(self.router.expert_routers.iter().zip(widths))
+        {
+            anyhow::ensure!(
+                router.weight_dims()? == [config.router_input_size(), width]
+                    && router.bias().is_some_and(|b| b.dims() == [width])
+                    && router.has_balance_bias() == config.balance_bias
+                    && router.balance_bias().is_none_or(|b| b.dims() == [1, width]),
+                "MoSME router shape mismatch"
+            );
+        }
+        let h = config.hidden_size;
+        let i = config.intermediate_size;
+        for expert in self.boxes.iter().flatten() {
+            anyhow::ensure!(
+                module_shapes(expert) == vec![vec![h, i], vec![i], vec![i, h], vec![h]],
+                "MoSME expert shape mismatch"
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn compact_specialist(
+        &self,
+        position: (usize, usize),
+        singleton: &MosmeConfig,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            singleton.spec.experts_per_box() == [1],
+            "expected a singleton spec"
+        );
+        let expert = self
+            .expert(position.0, position.1)
+            .ok_or_else(|| anyhow::anyhow!("specialist is absent from MoSME site"))?;
+        crate::tensor_ext::force_initialization(expert);
+        let device = expert.fc_in_weight().device();
+        Ok(Self {
+            router: HierarchicalRouter::new(singleton, &device),
+            boxes: vec![vec![expert.clone()]],
+            balance: self.balance,
+        })
+    }
+
+    pub(crate) fn apply_specialist(
+        &self,
+        specialist: &Self,
+        position: (usize, usize),
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            specialist.boxes.len() == 1 && specialist.boxes[0].len() == 1,
+            "expected exactly one compact expert"
+        );
+        let target = self
+            .expert(position.0, position.1)
+            .ok_or_else(|| anyhow::anyhow!("specialist is absent from MoSME site"))?;
+        let source = &specialist.boxes[0][0];
+        anyhow::ensure!(
+            module_shapes(target) == module_shapes(source),
+            "specialist shape mismatch"
+        );
+        anyhow::ensure!(
+            target.fc_in_weight().device() == source.fc_in_weight().device(),
+            "specialist device mismatch"
+        );
+        // The counts are compared before the ids are consumed, so a layout that
+        // somehow disagrees is reported with both numbers instead of aborting
+        // halfway through the reassignment with a partially mapped module.
+        crate::tensor_ext::force_initialization(self);
+        crate::tensor_ext::force_initialization(source);
+        let (specialist_params, replaced_params) = (
+            crate::tensor_ext::param_count(source),
+            crate::tensor_ext::param_count(target),
+        );
+        anyhow::ensure!(
+            specialist_params == replaced_params,
+            "the specialist has {specialist_params} parameters but the module it replaces has {replaced_params}"
+        );
+        let target_ids = burn::module::list_param_ids::<_, B>(target);
+        let mut result = self.clone();
+        result.boxes[position.0][position.1] =
+            crate::tensor_ext::reassign_param_ids(source.clone(), target_ids);
+        Ok(result)
     }
 
     pub fn num_boxes(&self) -> usize {
@@ -712,11 +893,17 @@ impl<B: Backend> MosmeFeedForward<B> {
     /// The accumulation order deliberately matches [`MoELayer::forward`]'s so
     /// the single-box case reduces to it bit-for-bit.
     pub fn forward(&self, x: Tensor<B, 3>, cond: Tensor<B, 2>) -> MosmeOutput<B> {
-        self.forward_with_state(x, cond, None)
+        let state = Tensor::<B, 3>::zeros([1, 1, 0], &x.device());
+        self.forward_with_state(x, cond, &state)
     }
 
     /// [`Self::forward`] with the per-token routing state of roadmap 25.4.
-    pub fn forward_with_state(&self, x: Tensor<B, 3>, cond: Tensor<B, 2>, state: Option<&Tensor<B, 3>>) -> MosmeOutput<B> {
+    pub fn forward_with_state(
+        &self,
+        x: Tensor<B, 3>,
+        cond: Tensor<B, 2>,
+        state: &Tensor<B, 3>,
+    ) -> MosmeOutput<B> {
         let device = x.device();
         let [b, n, h] = x.dims();
         let t = b * n;
@@ -735,7 +922,11 @@ impl<B: Backend> MosmeFeedForward<B> {
         }
 
         let balance = gates.balance_loss(self.balance);
-        MosmeOutput { output: out.reshape([b, n, h]), balance, gates }
+        MosmeOutput {
+            output: out.reshape([b, n, h]),
+            balance,
+            gates,
+        }
     }
 
     /// The exact flat equivalent, when there is exactly one box.
@@ -841,7 +1032,10 @@ impl<B: Backend> MosmeFeedForward<B> {
                     label: expert_spec.label.clone(),
                     index: ei,
                     global_index: global,
-                    kind: ExpertKind::Mlp { hidden_size, intermediate_size },
+                    kind: ExpertKind::Mlp {
+                        hidden_size,
+                        intermediate_size,
+                    },
                     // Read from the mask, not the spec: the module is the
                     // authority on what is actually switched on.
                     enabled: layout.is_enabled(bi, ei),
@@ -1018,7 +1212,11 @@ impl<B: Backend> MosmeAdapterBank<B> {
         }
 
         let balance = gates.balance_loss(self.balance);
-        BankOutput { output: out, balance, gates }
+        BankOutput {
+            output: out,
+            balance,
+            gates,
+        }
     }
 
     /// The dense weight a fixed routing decision is equivalent to:
@@ -1233,7 +1431,11 @@ impl<B: Backend<FloatElem = f32>> MosmeEnsemble<B> {
             router.experts_per_box(),
             specialists.iter().map(Vec::len).collect::<Vec<_>>()
         );
-        Ok(Self { router, specialists, balance })
+        Ok(Self {
+            router,
+            specialists,
+            balance,
+        })
     }
 
     /// Build a fresh ensemble: one identically shaped model per expert.
@@ -1243,25 +1445,25 @@ impl<B: Backend<FloatElem = f32>> MosmeEnsemble<B> {
         dblock: &crate::dblock::DblockConfig,
         cond_size: usize,
         device: &B::Device,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         let layout = spec.layout();
         let specialists = (0..layout.num_boxes())
             .map(|i| {
                 (0..layout.experts_in(i))
                     .map(|_| DblockClassifier::<B>::new(vit, dblock, device))
-                    .collect()
+                    .collect::<anyhow::Result<Vec<_>>>()
             })
-            .collect();
+            .collect::<anyhow::Result<Vec<_>>>()?;
         // The router sees only the condition here: there is no single "token
         // feature" at model scope, and the caller supplies the domain signal.
         let mut routing = spec.clone();
         routing.route_on_tokens = false;
         let router_cfg = MosmeConfig::new(vit.hidden_size, cond_size, routing);
-        Self {
+        Ok(Self {
             router: HierarchicalRouter::new(&router_cfg, device),
             specialists,
             balance: spec.balance,
-        }
+        })
     }
 
     pub fn router(&self) -> &HierarchicalRouter<B> {
@@ -1334,7 +1536,9 @@ impl<B: Backend<FloatElem = f32>> MosmeEnsemble<B> {
                 .convert::<f32>()
                 .iter::<f32>()
                 .collect();
-            live[i] = (0..experts.len()).map(|j| !sparse || column[j] > 0.0).collect();
+            live[i] = (0..experts.len())
+                .map(|j| !sparse || column[j] > 0.0)
+                .collect();
         }
 
         let num_labels = self.specialists[0][0]
@@ -1362,7 +1566,12 @@ impl<B: Backend<FloatElem = f32>> MosmeEnsemble<B> {
 
         let probs = probs.unwrap_or_else(|| Tensor::zeros([batch, num_labels], &device));
         let balance = gates.balance_loss(self.balance);
-        EnsembleOutput { probs, balance, gates, evaluated }
+        EnsembleOutput {
+            probs,
+            balance,
+            gates,
+            evaluated,
+        }
     }
 
     /// Emit the manifest. Each specialist is a whole model, so the recorded
@@ -1404,7 +1613,9 @@ impl<B: Backend<FloatElem = f32>> MosmeEnsemble<B> {
                         // A whole model belongs in its own checkpoint: that is
                         // what lets an engine fetch one specialist without
                         // pulling the rest.
-                        checkpoint: Some(format!("{}.mpk", expert_spec.id.replace('/', "-")).into()),
+                        checkpoint: Some(
+                            format!("{}.mpk", expert_spec.id.replace('/', "-")).into(),
+                        ),
                         param_path: String::new(),
                         sha256: crate::checkpoint::canonical_hash_hex::<B, _>(model),
                     },
@@ -1507,7 +1718,10 @@ impl TrainableSet {
     }
 
     pub fn from_ids(ids: Vec<burn::module::ParamId>) -> Self {
-        Self { ids: Some(ids) }
+        let mut seen = std::collections::HashSet::new();
+        Self {
+            ids: Some(ids.into_iter().filter(|id| seen.insert(*id)).collect()),
+        }
     }
 
     /// Number of allowed parameters, or `None` when unrestricted.
@@ -1521,6 +1735,23 @@ impl TrainableSet {
 
     pub fn ids(&self) -> Option<&[burn::module::ParamId]> {
         self.ids.as_deref()
+    }
+
+    pub fn freeze<B: Backend, M: Module<B>>(&self, model: M) -> M {
+        struct Freezer<'a>(&'a [burn::module::ParamId]);
+        impl<B: Backend> burn::module::ModuleMapper<B> for Freezer<'_> {
+            fn map_float<const D: usize>(
+                &mut self,
+                param: Param<Tensor<B, D>>,
+            ) -> Param<Tensor<B, D>> {
+                let enabled = self.0.contains(&param.id);
+                param.set_require_grad(enabled)
+            }
+        }
+        match &self.ids {
+            None => model,
+            Some(ids) => model.map(&mut Freezer(ids)),
+        }
     }
 
     /// Collect only the permitted gradients.
@@ -1566,9 +1797,9 @@ impl<B: Backend> MosmeFeedForward<B> {
                     .collect(),
             ),
             TrainingMode::Specialist { expert_id } => {
-                let (bi, ei) = spec.position(expert_id).ok_or_else(|| {
-                    anyhow::anyhow!("no expert '{expert_id}' in this spec")
-                })?;
+                let (bi, ei) = spec
+                    .position(expert_id)
+                    .ok_or_else(|| anyhow::anyhow!("no expert '{expert_id}' in this spec"))?;
                 let expert = self
                     .expert(bi, ei)
                     .ok_or_else(|| anyhow::anyhow!("expert '{expert_id}' is not in this module"))?;
@@ -1579,6 +1810,25 @@ impl<B: Backend> MosmeFeedForward<B> {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use crate::expert_index::{BoxSpec, ExpertSpec};
@@ -1619,7 +1869,9 @@ mod tests {
         MosmeConfig::new(8, 4, spec).with_intermediate_size(16)
     }
 
-    fn inputs(device: &<B as burn::tensor::backend::BackendTypes>::Device) -> (Tensor<B, 3>, Tensor<B, 2>) {
+    fn inputs(
+        device: &<B as burn::tensor::backend::BackendTypes>::Device,
+    ) -> (Tensor<B, 3>, Tensor<B, 2>) {
         (
             Tensor::<B, 3>::random([2, 3, 8], Distribution::Uniform(-1.0, 1.0), device),
             Tensor::<B, 2>::random([2, 4], Distribution::Uniform(-1.0, 1.0), device),
@@ -1696,7 +1948,11 @@ mod tests {
 
         let gates = router.route(router.router_input(&x, &cond));
         let disabled = gates.composed()[0].clone().narrow(1, 1, 1);
-        assert_eq!(max_abs(disabled), 0.0, "a disabled expert must get gate 0.0");
+        assert_eq!(
+            max_abs(disabled),
+            0.0,
+            "a disabled expert must get gate 0.0"
+        );
 
         // ...and the rest still form a distribution.
         let mass: Vec<f32> = gates
@@ -1722,14 +1978,20 @@ mod tests {
         let hierarchical = layer.forward(x.clone(), cond.clone());
         let reference = flat.forward(x, cond);
 
-        let out_diff = (hierarchical.output - reference.output).abs().max().into_scalar();
+        let out_diff = (hierarchical.output - reference.output)
+            .abs()
+            .max()
+            .into_scalar();
         assert_eq!(out_diff, 0.0, "single-box output must be bit-identical");
 
         let loss_diff = (hierarchical.balance.expert_loss - reference.balance)
             .abs()
             .max()
             .into_scalar();
-        assert_eq!(loss_diff, 0.0, "single-box balance loss must be bit-identical");
+        assert_eq!(
+            loss_diff, 0.0,
+            "single-box balance loss must be bit-identical"
+        );
 
         // The box level is degenerate: softmax over one logit is exactly 1.
         let box_loss: f32 = hierarchical.balance.box_loss.into_scalar();
@@ -1804,7 +2066,10 @@ mod tests {
         let breakdown = gates.balance_loss(BalanceWeights::default());
 
         let box_loss: f32 = breakdown.box_loss.into_scalar();
-        assert!((0.0..=2.0 + 1e-5).contains(&box_loss), "box loss {box_loss} outside [0, 2]");
+        assert!(
+            (0.0..=2.0 + 1e-5).contains(&box_loss),
+            "box loss {box_loss} outside [0, 2]"
+        );
 
         let widths = router.experts_per_box();
         for (i, l) in breakdown.per_box.iter().enumerate() {
@@ -1911,7 +2176,10 @@ mod tests {
         // Disabling the last enabled expert in box 1 would make its softmax NaN.
         let err = router.set_enabled(1, 1, false).unwrap_err().to_string();
         assert!(err.contains("NaN"), "{err}");
-        assert!(router.set_enabled(9, 0, false).is_err(), "out-of-range must error");
+        assert!(
+            router.set_enabled(9, 0, false).is_err(),
+            "out-of-range must error"
+        );
 
         // Re-enabling is always fine.
         router.set_enabled(1, 0, true).unwrap();
@@ -1946,7 +2214,10 @@ mod tests {
         // engine whether it holds the right weights.
         let a = &index.expert("coding/rust").unwrap().1.weights.sha256;
         let b = &index.expert("coding/secure").unwrap().1.weights.sha256;
-        assert_ne!(a, b, "independently initialized experts must hash differently");
+        assert_ne!(
+            a, b,
+            "independently initialized experts must hash differently"
+        );
 
         // And it survives the wire format an engine would read it through.
         assert_eq!(
@@ -1973,8 +2244,11 @@ mod tests {
         let device = Default::default();
         let spec = ragged_spec();
         let vit = ViTDiTConfig::tiny(10);
-        let dblock = DblockConfig { num_blocks: 2, ..DblockConfig::default() };
-        let ensemble = MosmeEnsemble::<B>::fresh(&spec, &vit, &dblock, 4, &device);
+        let dblock = DblockConfig {
+            num_blocks: 2,
+            ..DblockConfig::default()
+        };
+        let ensemble = MosmeEnsemble::<B>::fresh(&spec, &vit, &dblock, 4, &device).unwrap();
         (ensemble, spec, vit)
     }
 
@@ -1999,10 +2273,22 @@ mod tests {
             .convert::<f32>()
             .iter::<f32>()
         {
-            assert!((m - 1.0).abs() < 1e-5, "mixture must be a distribution, got {m}");
+            assert!(
+                (m - 1.0).abs() < 1e-5,
+                "mixture must be a distribution, got {m}"
+            );
         }
-        assert!(out.log_probs().into_data().convert::<f32>().iter::<f32>().all(f32::is_finite));
-        assert_eq!(out.evaluated.len(), 5, "the dense path runs every specialist");
+        assert!(out
+            .log_probs()
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .all(f32::is_finite));
+        assert_eq!(
+            out.evaluated.len(),
+            5,
+            "the dense path runs every specialist"
+        );
     }
 
     #[test]
@@ -2041,7 +2327,14 @@ mod tests {
         assert_eq!(index.num_experts(), 5);
 
         let (_, expert) = index.expert("cyber/netsec").unwrap();
-        assert!(matches!(expert.kind, ExpertKind::Model { hidden_size: 32, num_labels: 10, .. }));
+        assert!(matches!(
+            expert.kind,
+            ExpertKind::Model {
+                hidden_size: 32,
+                num_labels: 10,
+                ..
+            }
+        ));
         // A whole model belongs in its own file so an engine can fetch one
         // specialist without pulling the rest.
         assert_eq!(
@@ -2062,11 +2355,16 @@ mod tests {
         use crate::vit::ViTDiTConfig;
         let device = Default::default();
         let vit = ViTDiTConfig::tiny(10);
-        let dblock = DblockConfig { num_blocks: 2, ..DblockConfig::default() };
+        let dblock = DblockConfig {
+            num_blocks: 2,
+            ..DblockConfig::default()
+        };
 
         // A router built for a different layout must not be silently accepted.
         let wrong = HierarchicalRouter::<B>::new(&config(MosmeSpec::flat(2)), &device);
-        let specialists = vec![vec![DblockClassifier::<B>::new(&vit, &dblock, &device)]];
+        let specialists = vec![vec![
+            DblockClassifier::<B>::new(&vit, &dblock, &device).unwrap()
+        ]];
         let err = MosmeEnsemble::new(wrong, specialists, Default::default())
             .unwrap_err()
             .to_string();
@@ -2139,7 +2437,11 @@ mod tests {
             .convert::<f32>()
             .iter::<f32>()
             .collect();
-        assert_eq!(&per_row[0..3], &per_row[3..6], "every row must route identically");
+        assert_eq!(
+            &per_row[0..3],
+            &per_row[3..6],
+            "every row must route identically"
+        );
 
         let gates: Vec<f32> = out
             .gates
@@ -2154,7 +2456,10 @@ mod tests {
         let diff = (out.output - merged.forward(x)).abs().max().into_scalar();
         assert!(diff < 1e-5, "factored and merged forms disagree: {diff}");
 
-        assert!(bank.merged_for(&[1.0]).is_err(), "wrong gate count must error");
+        assert!(
+            bank.merged_for(&[1.0]).is_err(),
+            "wrong gate count must error"
+        );
     }
 
     #[test]
@@ -2170,7 +2475,12 @@ mod tests {
         let (_, expert) = index.expert("coding/rust").unwrap();
         assert!(matches!(
             expert.kind,
-            ExpertKind::Adapter { rank: 8, in_features: 256, out_features: 128, .. }
+            ExpertKind::Adapter {
+                rank: 8,
+                in_features: 256,
+                out_features: 128,
+                ..
+            }
         ));
         // rank * (in + out), which is the whole point of this granularity:
         // 3072 parameters against 32768 for a dense replacement.
@@ -2191,8 +2501,7 @@ mod tests {
         crate::tensor_ext::force_initialization(&base);
         let dense = base.weight.val();
         let spec = MosmeSpec::flat(2);
-        let bank =
-            MosmeAdapterBank::<B>::quantized(base, &spec, 4, 4, 4.0, true, &device);
+        let bank = MosmeAdapterBank::<B>::quantized(base, &spec, 4, 4, 4.0, true, &device);
 
         let quantized = bank.base().weight.val();
         assert_eq!(quantized.dims(), dense.dims());
@@ -2222,7 +2531,9 @@ mod tests {
 
         let one = bank
             .trainable(
-                &TrainingMode::Specialist { expert_id: "cyber/malware".into() },
+                &TrainingMode::Specialist {
+                    expert_id: "cyber/malware".into(),
+                },
                 &spec,
             )
             .unwrap();
@@ -2248,7 +2559,9 @@ mod tests {
         // One specialist: exactly that expert's parameters, nothing else.
         let one = layer
             .trainable(
-                &TrainingMode::Specialist { expert_id: "coding/python".into() },
+                &TrainingMode::Specialist {
+                    expert_id: "coding/python".into(),
+                },
                 &spec,
             )
             .unwrap();
@@ -2275,7 +2588,12 @@ mod tests {
         }
 
         assert!(layer
-            .trainable(&TrainingMode::Specialist { expert_id: "nope".into() }, &spec)
+            .trainable(
+                &TrainingMode::Specialist {
+                    expert_id: "nope".into()
+                },
+                &spec
+            )
             .is_err());
     }
 
@@ -2308,7 +2626,9 @@ mod tests {
 
         let trainable = layer
             .trainable(
-                &TrainingMode::Specialist { expert_id: "coding/python".into() },
+                &TrainingMode::Specialist {
+                    expert_id: "coding/python".into(),
+                },
                 &spec,
             )
             .unwrap();
@@ -2343,12 +2663,67 @@ mod tests {
     }
 
     #[test]
+    fn test_resident_specialist_skips_poisoned_siblings_and_preserves_input_gradients() {
+        use crate::train::DefaultTrainBackend as A;
+        use burn::module::{ModuleMapper, ParamId};
+        let device = Default::default();
+        let spec = ragged_spec();
+        let layer = MosmeFeedForward::<A>::new(&MosmeConfig::new(8, 4, spec.clone()), &device);
+        crate::tensor_ext::force_initialization(&layer);
+        let selected = layer
+            .trainable(
+                &TrainingMode::Specialist {
+                    expert_id: "coding/python".into(),
+                },
+                &spec,
+            )
+            .unwrap();
+        struct Poison<'a>(&'a [ParamId]);
+        impl ModuleMapper<A> for Poison<'_> {
+            fn map_float<const D: usize>(&mut self, p: Param<Tensor<A, D>>) -> Param<Tensor<A, D>> {
+                if self.0.contains(&p.id) {
+                    p
+                } else {
+                    p.map(|v| v.full_like(f32::NAN))
+                }
+            }
+        }
+        let x = Tensor::<A, 3>::random([2, 3, 8], Distribution::Uniform(-1.0, 1.0), &device)
+            .require_grad();
+        let expected = layer
+            .expert(0, 1)
+            .unwrap()
+            .forward(x.clone().reshape([6, 8]))
+            .reshape([2, 3, 8]);
+        let layer = selected.freeze(layer.map(&mut Poison(selected.ids().unwrap())));
+        let out = layer.forward_specialist(x.clone(), 0, 1);
+        assert_eq!((out.clone() - expected).abs().max().into_scalar(), 0.0);
+        let mut grads = out.powf_scalar(2.0).mean().backward();
+        assert!(x.grad(&grads).unwrap().abs().sum().into_scalar() > 0.0);
+        assert!(layer
+            .expert(0, 0)
+            .unwrap()
+            .fc_in_weight()
+            .grad(&grads)
+            .is_none());
+        assert!(!selected.gradients::<A, _>(&mut grads, &layer).is_empty());
+    }
+
+    #[test]
     fn test_training_mode_parsing() {
-        assert_eq!(TrainingMode::parse("joint", None).unwrap(), TrainingMode::Joint);
-        assert_eq!(TrainingMode::parse("router", None).unwrap().name(), "router");
+        assert_eq!(
+            TrainingMode::parse("joint", None).unwrap(),
+            TrainingMode::Joint
+        );
+        assert_eq!(
+            TrainingMode::parse("router", None).unwrap().name(),
+            "router"
+        );
         assert_eq!(
             TrainingMode::parse("specialist", Some("coding/rust")).unwrap(),
-            TrainingMode::Specialist { expert_id: "coding/rust".into() }
+            TrainingMode::Specialist {
+                expert_id: "coding/rust".into()
+            }
         );
         // Specialist mode without a target is a configuration error, not a
         // silent fall-back to training everything.

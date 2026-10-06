@@ -10,14 +10,14 @@
 use crate::{
     sigma::{
         discrete_sigmas_dblock, edm_loss_weight, estimate_target_layer, DblockSigmaSampler,
-        EdmPreconditioning, SIGMA_MAX, SIGMA_MIN, P_MEAN, P_STD,
+        EdmPreconditioning, P_MEAN, P_STD, SIGMA_MAX, SIGMA_MIN,
     },
     solver::SolverKind,
     vit::ViTDiTConfig,
     vit::ViTDiTForImageClassification,
 };
-use burn::{
-    tensor::{activation::log_softmax, activation::softmax, backend::Backend, Distribution, Int, Tensor},
+use burn::tensor::{
+    activation::log_softmax, activation::softmax, backend::Backend, Distribution, Int, Tensor,
 };
 use rand::Rng;
 
@@ -133,39 +133,43 @@ pub struct DblockClassifier<B: Backend> {
 
 impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
     /// Build the model with DiT initialization and precompute schedules.
+    ///
+    /// Fallsible: the block/layer divisibility constraint is checked here so a
+    /// mismatch is reported with both numbers rather than dividing by zero or
+    /// silently truncating the layer split.
     pub fn new(
         vit_config: &ViTDiTConfig,
         dblock_config: &DblockConfig,
         device: &B::Device,
-    ) -> Self {
-        assert!(
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            dblock_config.num_blocks >= 1,
+            "need at least one block, not {}",
+            dblock_config.num_blocks
+        );
+        anyhow::ensure!(
             vit_config.num_hidden_layers % dblock_config.num_blocks == 0,
             "num_hidden_layers ({}) must be divisible by num_blocks ({})",
             vit_config.num_hidden_layers,
             dblock_config.num_blocks
         );
-        assert!(
-            dblock_config.num_blocks >= 1,
-            "need at least one block"
-        );
 
         let steps = dblock_config
             .num_inference_steps
             .unwrap_or(dblock_config.num_blocks);
-        let inference_sigmas =
-            discrete_sigmas_dblock(steps, SIGMA_MIN, SIGMA_MAX, P_MEAN, P_STD);
+        let inference_sigmas = discrete_sigmas_dblock(steps, SIGMA_MIN, SIGMA_MAX, P_MEAN, P_STD);
 
-        let model = ViTDiTForImageClassification::new(vit_config, device)
-            .with_dit_init(vit_config, device);
+        let model = ViTDiTForImageClassification::new(vit_config, device)?
+            .with_dit_init(vit_config, device)?;
 
-        Self {
+        Ok(Self {
             model,
             num_blocks: dblock_config.num_blocks,
             sigma_data: dblock_config.sigma_data,
             moe_aux_weight: dblock_config.moe_aux_weight,
             layer_split: vit_config.num_hidden_layers / dblock_config.num_blocks,
             inference_sigmas,
-        }
+        })
     }
 
     pub fn sampler(&self, gamma: f64) -> DblockSigmaSampler {
@@ -196,7 +200,9 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
     /// `None`.
     pub fn ensure_balance_biases(&mut self) {
         let n = self.model.vit().num_layers();
-        self.model.vit_mut().for_each_sparse_layer_mut(0..n, |_, mut layer| layer.ensure_balance_bias());
+        self.model
+            .vit_mut()
+            .for_each_sparse_layer_mut(0..n, |_, mut layer| layer.ensure_balance_bias());
     }
 
     /// Nudge the selection biases of block `block_idx`'s sparse layers against
@@ -210,11 +216,13 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         rate: f32,
     ) {
         let range = self.layer_range(block_idx);
-        self.model.vit_mut().for_each_sparse_layer_mut(range, |nth, mut layer| {
-            if let Some(stats) = loads.get(nth) {
-                layer.nudge_balance_bias(&stats.load, rate);
-            }
-        });
+        self.model
+            .vit_mut()
+            .for_each_sparse_layer_mut(range, |nth, mut layer| {
+                if let Some(stats) = loads.get(nth) {
+                    layer.nudge_balance_bias(&stats.load, rate);
+                }
+            });
     }
 
     /// Selection biases of every sparse layer that has one, in layer order
@@ -243,9 +251,8 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         sigmas: &[f64],
         block_idx: Option<usize>,
     ) -> Tensor<B, 2> {
-        let block_idx = block_idx.unwrap_or_else(|| {
-            estimate_target_layer(&self.block_bounds(), sigmas)
-        });
+        let block_idx =
+            block_idx.unwrap_or_else(|| estimate_target_layer(&self.block_bounds(), sigmas));
         self.denoise_span(pixel_values, zt, sigmas, self.layer_range(block_idx))
     }
 
@@ -282,7 +289,11 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
 
         // Per-sample EDM preconditioning coefficients.
         let s = Tensor::<B, 1>::from_floats(
-            sigmas.iter().map(|&v| v as f32).collect::<Vec<_>>().as_slice(),
+            sigmas
+                .iter()
+                .map(|&v| v as f32)
+                .collect::<Vec<_>>()
+                .as_slice(),
             &device,
         );
         let sd = self.sigma_data;
@@ -294,17 +305,19 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         let c_noise = s.clone().log().mul_scalar(0.25);
 
         let zt_scaled = zt.clone() * c_in.unsqueeze_dim::<2>(1);
-        let out =
-            self.model
-                .vit()
-                .forward_block(span, pixel_values, zt_scaled, c_noise);
+        let out = self
+            .model
+            .vit()
+            .forward_block(span, pixel_values, zt_scaled, c_noise);
 
         // model_out = hidden * c_out + zt * c_skip, on the CLS/noisy token.
         let pooled = out.last_hidden_state.narrow(1, 0, 1); // [b, 1, h]
-        let model_out = pooled * c_out.unsqueeze_dim::<3>(1) + zt.unsqueeze_dim::<3>(1) * c_skip.unsqueeze_dim::<3>(1);
+        let model_out = pooled * c_out.unsqueeze_dim::<3>(1)
+            + zt.unsqueeze_dim::<3>(1) * c_skip.unsqueeze_dim::<3>(1);
 
         (
-            self.model.forward_output_embeddings(model_out, out.conditioning),
+            self.model
+                .forward_output_embeddings(model_out, out.conditioning),
             out.balance_loss,
         )
     }
@@ -321,7 +334,8 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         sigma: f64,
         span: Option<std::ops::Range<usize>>,
     ) -> Tensor<B, 2> {
-        self.x0_estimate_probs(pixel_values, z, sigma, span, false).0
+        self.x0_estimate_probs(pixel_values, z, sigma, span, false)
+            .0
     }
 
     /// [`Self::x0_estimate`] that can additionally return the class
@@ -343,7 +357,11 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             None => self.denoise(pixel_values.clone(), z.clone(), &vec![sigma; b], None),
         };
         let probs = softmax(logits, 1);
-        let probs_out = if with_probs { Some(probs.clone()) } else { None };
+        let probs_out = if with_probs {
+            Some(probs.clone())
+        } else {
+            None
+        };
         (probs.matmul(self.model.label_embedding_weight()), probs_out)
     }
 
@@ -464,7 +482,14 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         if any <= 0.0 {
             return self.step_core(pixel_values, labels, sigmas, block_idx, importance, None);
         }
-        self.step_core(pixel_values, labels, sigmas, block_idx, importance, Some(negatives))
+        self.step_core(
+            pixel_values,
+            labels,
+            sigmas,
+            block_idx,
+            importance,
+            Some(negatives),
+        )
     }
 
     fn step_core(
@@ -479,7 +504,10 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         let device = pixel_values.device();
         let b = pixel_values.dims()[0];
         assert_eq!(sigmas.len(), b, "one sigma per sample required");
-        assert!(block_idx < self.num_blocks, "block {block_idx} out of range");
+        assert!(
+            block_idx < self.num_blocks,
+            "block {block_idx} out of range"
+        );
 
         // Clean "data": normalized label embeddings.
         let z = self.model.normalized_label_embeds(labels.clone());
@@ -487,7 +515,11 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         // zt = z + sigma * eps
         let eps = Tensor::<B, 2>::random(z.dims(), Distribution::Normal(0.0, 1.0), &device);
         let s = Tensor::<B, 1>::from_floats(
-            sigmas.iter().map(|&v| v as f32).collect::<Vec<_>>().as_slice(),
+            sigmas
+                .iter()
+                .map(|&v| v as f32)
+                .collect::<Vec<_>>()
+                .as_slice(),
             &device,
         );
         let zt = z + eps * s.unsqueeze_dim::<2>(1);
@@ -502,15 +534,23 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         // Per-sample cross entropy -- or, for a negative label, the bounded
         // charge on its probability (roadmap 31.3).
         let log_probs = log_softmax(logits, 1);
-        let label_log_prob = log_probs.gather(1, labels.unsqueeze_dim::<2>(1)).squeeze_dim::<1>(1); // [b]
+        let label_log_prob = log_probs
+            .gather(1, labels.unsqueeze_dim::<2>(1))
+            .squeeze_dim::<1>(1); // [b]
         let (nll, negative_samples, negative_prob) = match &negatives {
             None => (-label_log_prob, 0, 0.0),
             Some(neg) => {
-                assert_eq!(neg.mask.dims(), [b], "one negative flag per sample required");
+                assert_eq!(
+                    neg.mask.dims(),
+                    [b],
+                    "one negative flag per sample required"
+                );
                 let positive = neg.mask.clone().neg().add_scalar(1.0);
-                let charge = crate::lm::unlikelihood(label_log_prob.clone(), neg.epsilon).mul_scalar(neg.alpha);
+                let charge = crate::lm::unlikelihood(label_log_prob.clone(), neg.epsilon)
+                    .mul_scalar(neg.alpha);
                 let count = neg.mask.clone().sum();
-                let prob = (label_log_prob.clone().exp() * neg.mask.clone()).sum() / count.clone().clamp_min(1.0);
+                let prob = (label_log_prob.clone().exp() * neg.mask.clone()).sum()
+                    / count.clone().clamp_min(1.0);
                 (
                     -label_log_prob * positive + charge * neg.mask.clone(),
                     count.into_scalar() as usize,
@@ -549,9 +589,17 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         //    `ln(w L)` -- it would learn to absorb the proposal rather than the
         //    loss scale.
         let importance = importance.map(|weights| {
-            assert_eq!(weights.len(), b, "one importance weight per sample required");
+            assert_eq!(
+                weights.len(),
+                b,
+                "one importance weight per sample required"
+            );
             Tensor::<B, 1>::from_floats(
-                weights.iter().map(|&v| v as f32).collect::<Vec<_>>().as_slice(),
+                weights
+                    .iter()
+                    .map(|&v| v as f32)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
                 &device,
             )
         });
@@ -578,11 +626,22 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             ce_loss: ce_loss.into_scalar(),
             block_idx,
             balance_loss: m_balance,
-            routing: routing.iter().map(crate::moe::LayerRouting::to_host).collect(),
+            routing: routing
+                .iter()
+                .map(crate::moe::LayerRouting::to_host)
+                .collect(),
             negative_samples,
             negative_prob,
         };
-        StepParts { loss, metrics, per_sample, balance, z, importance, routing }
+        StepParts {
+            loss,
+            metrics,
+            per_sample,
+            balance,
+            z,
+            importance,
+            routing,
+        }
     }
 
     /// Euler-integrated classification (`diffusion_step`): integrate the
@@ -606,12 +665,7 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             let sigma = window[0];
             let next_sigma = window[1];
 
-            let logits = self.denoise(
-                pixel_values.clone(),
-                z.clone(),
-                &vec![sigma; b],
-                None,
-            );
+            let logits = self.denoise(pixel_values.clone(), z.clone(), &vec![sigma; b], None);
             let probs = softmax(logits, 1);
             // Denoised embedding estimate: probabilities over the vocab
             // projected through the label embedding table.
@@ -639,6 +693,25 @@ pub fn precondition(sigma: f64, sigma_data: f64) -> EdmPreconditioning {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use crate::vit::ViTDiTConfig;
@@ -652,9 +725,13 @@ mod tests {
         <B as Backend>::seed(&device, 5);
         let model = DblockClassifier::<B>::new(
             &ViTDiTConfig::tiny(10),
-            &DblockConfig { num_blocks: 2, ..DblockConfig::default() },
+            &DblockConfig {
+                num_blocks: 2,
+                ..DblockConfig::default()
+            },
             &device,
-        );
+        )
+        .unwrap();
         let pixels =
             Tensor::<B, 4>::random([3, 3, 32, 32], Distribution::Uniform(-0.5, 0.5), &device);
         let labels = Tensor::<B, 1, Int>::from_ints([1i64, 4, 7].as_slice(), &device);
@@ -681,22 +758,32 @@ mod tests {
         let weights = vec![2.0, 0.25, 1.0];
 
         let plain = model.training_step_on(pixels.clone(), labels.clone(), &sigmas, 0, None);
-        let weighted =
-            model.training_step_on(pixels, labels, &sigmas, 0, Some(&weights));
+        let weighted = model.training_step_on(pixels, labels, &sigmas, 0, Some(&weights));
 
         // The per-sample losses are identical: the weights did not touch them.
         let a = values(plain.per_sample.clone());
         let b = values(weighted.per_sample.clone());
         for (x, y) in a.iter().zip(&b) {
-            assert!((x - y).abs() < 1e-5, "per_sample was reweighted: {x} vs {y}");
+            assert!(
+                (x - y).abs() < 1e-5,
+                "per_sample was reweighted: {x} vs {y}"
+            );
         }
 
         // ...and they are handed back for the caller to apply.
-        let carried = values(weighted.importance.clone().expect("weights are carried out"));
+        let carried = values(
+            weighted
+                .importance
+                .clone()
+                .expect("weights are carried out"),
+        );
         for (got, want) in carried.iter().zip(&weights) {
             assert!((f64::from(*got) - want).abs() < 1e-6);
         }
-        assert!(plain.importance.is_none(), "no weights means nothing to carry");
+        assert!(
+            plain.importance.is_none(),
+            "no weights means nothing to carry"
+        );
 
         // The aggregated loss *is* weighted, and equals the weighted mean.
         let expected: f32 = a

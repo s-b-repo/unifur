@@ -22,6 +22,7 @@ their gate is green:
 | 26 Attention modes, hierarchical MoVA, Engram, long-term memory | `attention.rs` (full / linear KDA-style / sparse DSA-style cores per layer), MoVA value experts as shared base + low-rank deltas, `memory.rs` (n-gram Engram, Titans-lite associative memory), `lm train --attention kda:3,dsa:1 --mova-spec --engram --long-memory` | issues #2, #3 steps 2, 6, 7; #4 B2–B4, C10 | in flight (same branch) |
 | 27 Adaptive MTP, token-level exits, compute policy | `mtp.rs` (offset heads, speculative decoding with exact rollback), token-level early exits with self-verification, `PolicyPlanner` over the existing beam, `lm generate --speculative --exit-threshold --policy` | issue #3 steps 5, 8, 9; #4 C3, C8, C9, D2 | in flight (same branch) |
 | 32 Latent reasoning and LM substrate gaps | persistent latent state with sequential and parallel refinement, progress objective, calibrated verifier, span semantics, LayerNorm conditioning ablation, rotary positions, unified inference state, experiment verdicts and the negative-result ledger, the falsification harness | issue #5 all sections; #4 C4–C8, D3, D6 | in flight (same branch) |
+| 33 Geometric reasoning over a learned Riemannian geometry | `geometry.rs` (dual-stream reasoner, `MetricField`, geodesic attention, certified attractor relaxation, block-diffusion objectives, synthetic geometric-QA corpus), `geomkernel.rs` (the exact rational kernel), the `geom` certificate group (14) | issue #5 §2–3, §6; #4 D4–D5 | landed: see Phase 33 below |
 
 Each of those adds its certificate group (identity at tolerance 0 when the
 mechanism is off, the mechanism's own invariants on the real code path), its
@@ -1031,6 +1032,109 @@ Heretic's search finds the refusal/KL trade-off it finds on large models,
 are UNKNOWN here (GPU-scale evaluation); the gate of Phase 30 is the
 control that holds regardless.
 
+## Phase 33: Geometric Reasoning over a Learned Riemannian Geometry
+
+The other policy to scale: instead of earning answers from depth and data, the
+model builds an explicit geometric description of a scene — entities as
+points in a learned Riemannian space, relations as metric distances — and
+answers by *relaxing* that description into an attractor basin, a fixed point
+of an explicit energy reached by a certified descent. The learned parameters
+shape the landscape; the reasoning is fixed geometric dynamics whose depth and
+precision are inference-time knobs. A deterministic exact kernel stands beside
+the model as proof: the model proposes, the kernel proves.
+
+- [x] **33.1** `geometry.rs` — `GeometricReasoner` over two coupled streams: a
+      symbolic one (`scene_len - 1` byte tokens, no position table: the fixed
+      scene layout *is* the position system) and a geometric one (`slots`
+      concept points pooled from the scene's chunks). Each block redraws the
+      landscape from the refined symbolic stream, so the two descriptions stay
+      two views of one recursive trajectory
+- [x] **33.2** `MetricField`: a learned Riemannian metric `G = L Lᵀ` with `L`
+      lower-triangular and a positive diagonal *by construction* (the strictly
+      lower part and `log(diag)` are the parameters), so `G` is positive
+      definite for any weights the optimizer can reach; every distance in the
+      module is computed under it
+- [x] **33.3** `geodesic_attention`: softmax over the *negative* metric
+      distance, so attention weights are relations read from the learned
+      geometry rather than arbitrary learned logits; learned temperature
+- [x] **33.4** Certified attractor relaxation: `E = Σ‖z−c‖²_G + λΣ‖z−z‖²_G`
+      descended by `z ← z − 2ηG((z−c) + λ(Kz−Σz))` with `η` from the
+      closed-form Lipschitz bound `L = 2(1+2λK)σ_max(G)²` (`σ_max` by power
+      iteration, inflated 10%). Monotone decrease and convergence are
+      certificates, not assumptions; the report carries energy, displacement
+      and converged-step count beside the loss
+- [x] **33.5** Block-diffusion objectives (`--objective answer | diffusion`):
+      the framework's own scheme applied to the geometric latent — per-block
+      sigma windows, EDM preconditioning at the window's scale, boundary
+      consistency at the shared sigma between adjacent blocks, and the
+      sigma-weighted answer CE. `generate --diffusion` denoises from pure noise
+      into the scene's basin
+- [x] **33.6** Synthetic geometric-QA corpus generator (`generate_corpus`,
+      `GeomMeta`): fixed-width scenes over the five question kinds
+      (nearest, farthest, direction, inside, collinear) with balanced y/n
+      answers, plus the aligned batch sampler and a JSON sidecar so the
+      trainer and evaluator agree on scene alignment
+- [x] **33.7** `geomkernel.rs`: the exact rational kernel. `Q` makes
+      `1/3 + 1/6 = 1/2` an identity rather than a rounding accident; the
+      graph saturates its facts through deduction rules to a fixed point, each
+      derived fact carrying the rule that derived it; `falsify` hunts
+      randomized counterexamples, refusing premises it cannot sample rather
+      than reporting a vacuous pass
+- [x] **33.8** MoSME readout: boxes of specialized expert heads (one per
+      question kind) with two-level sparse routing over the *selected* logits.
+      `--moe-boxes 0` is the certified identity setting
+- [x] **33.9** CLI: `dblocks geom data | train | eval | generate` (+ `solve`,
+      `counterexample` for the kernel, which never load a model), with the
+      `--backend cpu|wgpu --device discrete:N` dispatch shared with the
+      language trunk. `eval --refine-sweep` measures the depth scaling curve:
+      accuracy against relaxation depth on the *same* weights
+- [x] **33.10** Certificates (`geom` group, 18): the five kernel claims
+      (rationals exact where floats are not, exact intersection, degenerate
+      figures refused, rules derive with certificates and saturate,
+      falsification rejects and survives correctly) and the three geometric
+      ones (metric positive definite by construction, attention rows are
+      distributions, energy descent monotone under the certified step)
+- [x] **33.11** Integration tests: the reasoner trains on the generated corpus
+      and its answer loss falls; the block-diffusion objective trains and
+      denoises. `docs/Geometric-Reasoning.md`
+- [x] **33.12** The readout routes through the real `mosme::HierarchicalRouter`
+      (`route_on_tokens = false`; the query state is the router input) instead
+      of a hand-rolled duplicate: composed gates inherit the partition-of-unity
+      certificate, the balance loss is `HierarchicalGates::balance_loss` with
+      the z-loss carried separately at its own level, and
+      `geom/readout_inherits_mosme_invariants` pins the disabled-expert
+      identity in the geom model. The expert heads stay local. Geom
+      checkpoints from before the rewire no longer load (record layout)
+- [x] **33.13** `--augment M` on `geom data`: M similarity copies per scene
+      (rotation + translation + uniform scale; `direction` gets translation +
+      scale only, its answer being an absolute compass bearing), labels
+      recomputed on the grid and mismatches rejected. Found and fixed the
+      inside/collinear render-before-overwrite label bug (bug table). Pinned
+      by `geom/augmentation_preserves_labels`
+- [x] **33.14** Matched-depth transformer baseline (`geombaseline.rs`):
+      `num_blocks × refine_steps` pre-norm layers, same embedding/hidden, no
+      position table, same corpus/batching/optimizer/held-out split, scored by
+      the same `answer_ce`. `dblocks geom baseline` trains it;
+      `geom eval --baseline` prints the side-by-side with both parameter
+      counts. `docs/Geometric-Reasoning-Flaws.md` catalogues every known flaw
+      with its disposition
+
+**Status**: Done as a mechanism, end to end on a tiny model, and measured on
+the GPU (RTX 3060, wgpu). With the MoSME-rewired readout on the label-fixed
+uniform corpus (8192 scenes, 3000 answer-objective steps): held-out **0.2920**
+(4.7× chance), router healthy (load H ~0.99). The matched-depth transformer
+baseline (33.14) at equal budget and parameter count scores **0.3115** — the
+"relaxation beats a matched-depth transformer" claim is REJECTED at this
+scale (Claims.md), open at larger budgets. The depth sweep is flat past the
+trained depth (0.2969 / 0.2920 / 0.2998 / 0.2891 at depths 1–4) with low
+agree-with-depth-1 (0.29): depth reshuffles *which* scenes are right without
+increasing how many. Stratification + 2× similarity augmentation bought no
+generalization at this scale (0.2949 cross-evaluated vs 0.2920). The
+pre-rewire demo numbers were trained on the corpus before the
+inside/collinear label fix (bug table) and are superseded; their checkpoints
+no longer load. The kernel proves regardless of the weights.
+
+
 ## Mutation testing the gate
 
 A certificate that recomputes a formula proves the formula, which was never in
@@ -1184,6 +1288,10 @@ See [`docs/Quality-Gate.md`](docs/Quality-Gate.md).
 | `multi_block.rs` | The trajectory planner rolled candidates forward with plain `euler_step` while the committed step used `SolverState`. For DPM++ 2M/3M — which integrate from a history of past x0 predictions — the planner was scoring candidates under dynamics the sampler would not follow. Rollouts now clone the real solver state per path, and draw noise from their own seeded RNG so speculation cannot perturb the committed trajectory's reproducibility. |
 | `tests/integration.rs` | `integration_mosme_trunk_trains_end_to_end` asserted `balance_loss >= 2.0`, treating the Switch bound `L >= 1` as unconditional. It holds only on the diagonal `f == p`, which hard top-k routing does not give — so the test was really pinning one draw from a *global* backend RNG, and adding any concurrent test that builds a model broke it. It now asserts the structural upper bound, which is a theorem. |
 | `verify.rs` | The certificate "one penalized step lowers `p(bad)`" asserted something that is not a theorem: the clean targets' likelihood gradient can raise `p(bad)` faster than the charge lowers it in one step, so it failed at residuals near 1e-3 that moved with the global backend RNG. Replaced by the comparative claim that holds to first order for any initialization: the penalized step ends strictly below the plain step from the same weights. |
+| `geometry.rs` | `energy_grad_step` applied the repulsion term with coefficient `lambda` where the energy's is `2*lambda` (`d/dz_k` of the ordered-pair sum `sum_{k != l}` is `4 G (K z_k - sum z)`, since it counts each unordered pair twice). The step was therefore descending a *different* quadratic than the `energy_value` it reported, and the "monotone descent" certificate passed or failed depending on the draw: over 400 random landscapes the step raised the energy it claimed to lower by up to **0.34**, and the `geom` group went red roughly one run in three. Fixed to `2*lambda`, which makes the reported energy the one actually minimized and the descent monotone to float noise (~6e-9). The fixed point moved with it, to `(c + 2*lambda*sum(c))/(1 + 2*lambda*K)`. The monotone-descent test had passed by luck because a small `eta` hides the mismatch; added `test_the_step_is_the_gradient_of_the_reported_energy`, which finite-differences `energy_value` against the step's own direction and fails (rel. error 1.90) if the coefficient drifts again. |
+| `geometry.rs` | The corpus generator rendered scene tokens *before* the inside/collinear kinds overwrote `coords[0..]` with the construction the label was computed from, so every inside/collinear scene stored an answer about points the scene did not show (decode check: `...D1008iABCD?y` claimed (10,8) inside triangle (6,0)(2,4)(0,2)). Found by the `--augment` work, which recomputes labels from transformed coordinates and therefore noticed. Rendering now happens after the coordinates are final (`render_scene`), construction-failure fallbacks take the recomputed label, and the end-to-end decode pass inside `geom/augmentation_preserves_labels` fails if a stored answer ever stops matching the scene again. All geom measurements taken before this fix trained partly on those mislabeled scenes. |
+| `verify.rs` | Two `#[test]`s in this module both call `run_all()`, and the policy certificate wrote a fixed `policy.json` under a path keyed only on the process id, so under the default parallel test runner they truncated each other's file and one read zero bytes. The scratch name is now unique per call. |
+| `wgpu` (NVIDIA driver, not this crate) | `dblocks geom eval --backend wgpu --refine-sweep` prints every depth's accuracy and then the driver logs `NVVM compilation failed: 3` as the process tears the device down. The same command on `--backend cpu` exits 0, and a non-sweep `--backend wgpu` eval exits clean, so it is the NVIDIA Vulkan path failing to release its shader cache at exit rather than anything in the model or the sweep. Not worked around here: a nonzero exit on a finished, fully-printed run is a driver bug, and papering over it in this crate would hide the same message from every other command that uses the backend. |
 
 ## Remaining (requires external resources)
 
@@ -1207,11 +1315,12 @@ See [`docs/Quality-Gate.md`](docs/Quality-Gate.md).
 | 29.2 / 29.4 quality of multi-teacher distillation and merged checkpoints | GPU compute; certified as mechanisms |
 | 30.3 whether the refusal corpus teaches a real model to refuse and to comply under an approval marker | GPU compute and an instruction-tuned checkpoint; the gate holds regardless (`policy` certificates) |
 | 31 whether ablating a direction removes a behaviour; whether Heretic's search finds a better refusal/KL trade-off than uniform ablation | GPU compute and an instruction-tuned checkpoint with real prompt sets; `lm direction-score --ablated` and `lm heretic --json` are the harness |
+| 33 whether attractor relaxation beats a matched-depth transformer at *convergence-length* budgets | Measured at the 3000-step scale and REJECTED there (0.292 reasoner vs 0.312 baseline, equal budget — Claims.md); open at larger budgets. `dblocks geom baseline` + `geom eval --baseline --refine-sweep` are the harness |
 
 ## Test inventory
 
-420 unit + 33 integration tests, all passing; `cargo clippy --all-targets`
-clean; `cargo doc` warning-free. 130 numerical certificates in 21 groups, plus
+658 unit + 38 integration tests, all passing; `cargo clippy --all-targets`
+clean; `cargo doc` warning-free. 169 numerical certificates in 26 groups, plus
 five-phase verification inside every training run and a bit-identity test
 for resumed training.
 

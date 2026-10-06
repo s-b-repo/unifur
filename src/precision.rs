@@ -146,8 +146,11 @@ impl Precision {
             .iter::<f32>()
             .map(|v| self.round_scalar(v))
             .collect();
-        Tensor::<B, 1>::from_data(TensorData::new(values, [dims.iter().product::<usize>()]), &device)
-            .reshape(dims)
+        Tensor::<B, 1>::from_data(
+            TensorData::new(values, [dims.iter().product::<usize>()]),
+            &device,
+        )
+        .reshape(dims)
     }
 }
 
@@ -193,12 +196,20 @@ impl Default for PrecisionPolicy {
 impl PrecisionPolicy {
     /// One precision everywhere.
     pub fn full(precision: Precision) -> Self {
-        Self { high_noise: precision, low_noise: precision, switch_sigma: 0.0 }
+        Self {
+            high_noise: precision,
+            low_noise: precision,
+            switch_sigma: 0.0,
+        }
     }
 
     /// `coarse` above `switch_sigma`, `f32` below it.
     pub fn mixed(coarse: Precision, switch_sigma: f64) -> Self {
-        Self { high_noise: coarse, low_noise: Precision::F32, switch_sigma }
+        Self {
+            high_noise: coarse,
+            low_noise: Precision::F32,
+            switch_sigma,
+        }
     }
 
     /// Precision governing a window at noise level `sigma`.
@@ -218,6 +229,25 @@ impl PrecisionPolicy {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use burn::backend::NdArray;
@@ -279,7 +309,12 @@ mod tests {
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
             for x in sorted {
                 let r = precision.round_scalar(x);
-                assert_eq!(precision.round_scalar(r), r, "{} not idempotent at {x}", precision.name());
+                assert_eq!(
+                    precision.round_scalar(r),
+                    r,
+                    "{} not idempotent at {x}",
+                    precision.name()
+                );
                 assert!(r >= prev, "{} not monotone at {x}", precision.name());
                 prev = r;
             }
@@ -307,7 +342,10 @@ mod tests {
     #[test]
     fn test_f16_range_limits() {
         assert_eq!(Precision::F16.round_scalar(65504.0), 65504.0);
-        assert!(Precision::F16.round_scalar(70000.0).is_infinite(), "f16 must overflow");
+        assert!(
+            Precision::F16.round_scalar(70000.0).is_infinite(),
+            "f16 must overflow"
+        );
         // Below half the smallest subnormal everything flushes to zero,
         // keeping the sign.
         assert_eq!(Precision::F16.round_scalar(1e-9), 0.0);
@@ -339,7 +377,10 @@ mod tests {
             .convert::<f32>()
             .iter::<f32>()
             .collect();
-        let expected: Vec<f32> = values.iter().map(|&v| Precision::Bf16.round_scalar(v)).collect();
+        let expected: Vec<f32> = values
+            .iter()
+            .map(|&v| Precision::Bf16.round_scalar(v))
+            .collect();
         assert_eq!(rounded, expected);
     }
 
@@ -347,7 +388,11 @@ mod tests {
     fn test_policy_switches_at_the_threshold() {
         let policy = PrecisionPolicy::mixed(Precision::Bf16, 1.0);
         assert_eq!(policy.for_sigma(80.0), Precision::Bf16);
-        assert_eq!(policy.for_sigma(1.0), Precision::Bf16, "threshold is inclusive");
+        assert_eq!(
+            policy.for_sigma(1.0),
+            Precision::Bf16,
+            "threshold is inclusive"
+        );
         assert_eq!(policy.for_sigma(0.99), Precision::F32);
         assert!(!policy.is_full_precision());
         assert!(PrecisionPolicy::default().is_full_precision());

@@ -112,7 +112,11 @@ impl Nf4Tensor {
                 Nf4Block { codes, absmax }
             })
             .collect();
-        Self { blocks, len: values.len(), double_quantized: None }
+        Self {
+            blocks,
+            len: values.len(),
+            double_quantized: None,
+        }
     }
 
     /// Additionally quantize the per-block scales to 8 bits ("double
@@ -133,7 +137,10 @@ impl Nf4Tensor {
                 }
             })
             .collect();
-        self.double_quantized = Some(DoubleQuantScales { codes, scale_of_scales: max_scale });
+        self.double_quantized = Some(DoubleQuantScales {
+            codes,
+            scale_of_scales: max_scale,
+        });
         self
     }
 
@@ -205,6 +212,187 @@ fn nearest_level_code(v: f32) -> u8 {
         }
     }
     best as u8
+}
+
+/// How the per-block scales of a [`PackedNf4Tensor`] are stored.
+#[derive(Debug, Clone, PartialEq)]
+enum PackedScales {
+    /// One `f32` absmax per block.
+    F32(Vec<f32>),
+    /// 8-bit codes plus the one shared `f32` scale of scales ("double
+    /// quantization", computed exactly as
+    /// [`Nf4Tensor::with_double_quantization`]).
+    DoubleQuantized {
+        codes: Vec<u8>,
+        scale_of_scales: f32,
+    },
+}
+
+/// Packed 4-bit NF4 storage: the same numerics as [`Nf4Tensor`] at half the
+/// bytes (plus the scale overhead), built for weight-RESIDENT models whose
+/// simulated one-code-per-byte form would still be too large (the 27B trunk
+/// is ~14 GB packed versus ~111 GB f32).
+///
+/// Two codes per byte, LOW NIBBLE FIRST: value `2i` lives in bits 0..4 of
+/// byte `i`, value `2i+1` in bits 4..8. Codes are produced by
+/// [`Nf4Tensor::quantize`] itself (the simulated form stays the single
+/// source of quantization truth) and dequantization multiplies the same
+/// levels by the same scales in the same order, so
+/// [`PackedNf4Tensor::dequantize`] is BIT-IDENTICAL to
+/// [`Nf4Tensor::dequantize`] for the same input -- packing is a storage
+/// detail, exactly as [`Nf4Block`]'s doc comment promises.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PackedNf4Tensor {
+    /// `ceil(len / 2)` bytes, two codes per byte, low nibble first.
+    codes: Vec<u8>,
+    /// Logical element count (the last block may be short, and the last
+    /// byte's high nibble may be unused).
+    len: usize,
+    num_blocks: usize,
+    scales: PackedScales,
+}
+
+impl PackedNf4Tensor {
+    /// Quantize `values` blockwise (f32 scales). Codes come from
+    /// [`Nf4Tensor::quantize`] so the two forms can never disagree.
+    pub fn quantize(values: &[f32]) -> Self {
+        let simulated = Nf4Tensor::quantize(values);
+        let num_blocks = simulated.blocks.len();
+        let mut codes = Vec::with_capacity(values.len().div_ceil(2));
+        for block in &simulated.blocks {
+            for pair in block.codes.chunks(2) {
+                let low = pair[0];
+                let high = pair.get(1).copied().unwrap_or(0);
+                codes.push(low | (high << 4));
+            }
+        }
+        Self {
+            codes,
+            len: values.len(),
+            num_blocks,
+            scales: PackedScales::F32(simulated.blocks.iter().map(|b| b.absmax).collect()),
+        }
+    }
+
+    /// Additionally quantize the per-block scales to 8 bits, with the same
+    /// formula [`Nf4Tensor::with_double_quantization`] uses on the same
+    /// values, so the reconstruction stays bit-identical.
+    pub fn with_double_quantization(mut self) -> Self {
+        let scales = match &self.scales {
+            PackedScales::F32(scales) => scales.clone(),
+            // Idempotent: re-doubling changes nothing.
+            PackedScales::DoubleQuantized { .. } => return self,
+        };
+        let max_scale = scales.iter().fold(0.0f32, |acc, s| acc.max(*s));
+        let codes = scales
+            .iter()
+            .map(|s| {
+                if max_scale == 0.0 {
+                    0u8
+                } else {
+                    // Scales are non-negative, so the full 0..=255 range is
+                    // spent on [0, max_scale] -- the same rounding
+                    // `Nf4Tensor::with_double_quantization` applies.
+                    (s / max_scale * 255.0).round().clamp(0.0, 255.0) as u8 // audit-allow: mirrors Nf4Tensor::with_double_quantization exactly
+                }
+            })
+            .collect();
+        self.scales = PackedScales::DoubleQuantized {
+            codes,
+            scale_of_scales: max_scale,
+        };
+        self
+    }
+
+    /// Whether the scales are themselves quantized.
+    pub fn is_double_quantized(&self) -> bool {
+        matches!(self.scales, PackedScales::DoubleQuantized { .. })
+    }
+
+    /// Number of quantized values.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn num_blocks(&self) -> usize {
+        self.num_blocks
+    }
+
+    /// One code of value `i` (low nibble first).
+    fn code(&self, i: usize) -> u8 {
+        let byte = self.codes[i / 2];
+        if i % 2 == 0 {
+            byte & 0x0F
+        } else {
+            byte >> 4
+        }
+    }
+
+    /// Effective scale of block `i`, honouring double quantization (same
+    /// formula as [`Nf4Tensor::block_scale`]).
+    fn block_scale(&self, i: usize) -> f32 {
+        match &self.scales {
+            PackedScales::F32(scales) => scales[i],
+            PackedScales::DoubleQuantized {
+                codes,
+                scale_of_scales,
+            } => {
+                codes[i] as f32 / 255.0 * scale_of_scales // audit-allow: u8 -> f32 scale decode, mirrors Nf4Tensor
+            }
+        }
+    }
+
+    /// Reconstruct the `f32` values, block by block in the same order as
+    /// [`Nf4Tensor::dequantize`] -- bit-identical to it.
+    pub fn dequantize(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.len);
+        for block in 0..self.num_blocks {
+            let scale = self.block_scale(block);
+            let start = block * BLOCK_SIZE;
+            let end = (start + BLOCK_SIZE).min(self.len);
+            for i in start..end {
+                out.push(NF4_LEVELS[self.code(i) as usize] * scale);
+            }
+        }
+        out
+    }
+
+    /// Heap bytes actually held (codes + scales), not counting the handful
+    /// of struct fields. This is the number the residency budget reads.
+    pub fn resident_bytes(&self) -> usize {
+        let scale_bytes = match &self.scales {
+            PackedScales::F32(scales) => 4 * scales.len(),
+            PackedScales::DoubleQuantized { codes, .. } => codes.len() + 4,
+        };
+        self.codes.len() + scale_bytes
+    }
+
+    /// Resident bits per stored value of the PACKED form: a true 4-bit
+    /// payload plus the scale overhead (the simulated form's
+    /// [`Nf4Tensor::bits_per_value`] quotes the same payload it does not
+    /// actually store).
+    pub fn bits_per_value(&self) -> f64 {
+        if self.len == 0 {
+            return 0.0;
+        }
+        8.0 * self.resident_bytes() as f64 / self.len as f64 // audit-allow: byte/bit counts as f64 ratios
+    }
+
+    /// What `len` values would occupy packed, without quantizing them
+    /// (residency estimates): `ceil(len/2)` code bytes plus scale bytes.
+    pub fn estimated_resident_bytes(len: usize, double_quantized: bool) -> usize {
+        let blocks = len.div_ceil(BLOCK_SIZE);
+        let scale_bytes = if double_quantized {
+            blocks + 4
+        } else {
+            4 * blocks
+        };
+        len.div_ceil(2) + scale_bytes
+    }
 }
 
 /// Quantize a rank-2 tensor and reconstruct it, i.e. apply exactly the error
@@ -310,7 +498,9 @@ where
 {
     let mut mapper = skip
         .iter()
-        .fold(Nf4Quantizer::new(double_quantization), |m, name| m.skipping(name));
+        .fold(Nf4Quantizer::new(double_quantization), |m, name| {
+            m.skipping(name)
+        });
     let module = module.map(&mut mapper);
     let count = mapper.quantized_values;
     (module, count)
@@ -329,7 +519,12 @@ pub struct LoraConfig {
 
 impl LoraConfig {
     pub fn new(in_features: usize, out_features: usize, rank: usize) -> Self {
-        Self { in_features, out_features, rank: rank.max(1), alpha: rank.max(1) as f64 }
+        Self {
+            in_features,
+            out_features,
+            rank: rank.max(1),
+            alpha: rank.max(1) as f64,
+        }
     }
 
     pub fn with_alpha(mut self, alpha: f64) -> Self {
@@ -428,7 +623,10 @@ impl<B: Backend> LoraAdapter<B> {
     /// Materializing it defeats the memory saving, so this is for merging and
     /// for verification, not for the forward path.
     pub fn delta_weight(&self) -> Tensor<B, 2> {
-        self.a.val().matmul(self.b.val()).mul_scalar(self.scaling as f32)
+        self.a
+            .val()
+            .matmul(self.b.val())
+            .mul_scalar(self.scaling as f32)
     }
 }
 
@@ -525,6 +723,25 @@ impl<B: Backend<FloatElem = f32>> QLoraLinear<B> {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
     use burn::backend::NdArray;
@@ -532,11 +749,86 @@ mod tests {
     type B = NdArray<f32>;
 
     #[test]
+    fn test_packed_nf4_roundtrip_matches_simulated_exactly() {
+        // Packing is a storage detail: the packed form must dequantize to
+        // BIT-IDENTICAL values as the simulated one-code-per-byte form, in
+        // plain and double-quantized modes, on ragged lengths and with
+        // all-zero blocks mixed in.
+        let device = Default::default();
+        for n in [1000usize, 63, 128 * 3] {
+            let mut values: Vec<f32> =
+                Tensor::<B, 1>::random([n], Distribution::Normal(0.0, 1.7), &device)
+                    .into_data()
+                    .convert::<f32>()
+                    .iter::<f32>()
+                    .collect();
+            // Two all-zero blocks in the middle (exact-zero path).
+            if n >= 128 + 64 {
+                for v in values.iter_mut().skip(64).take(64) {
+                    *v = 0.0;
+                }
+            }
+            let plain_sim = Nf4Tensor::quantize(&values);
+            let plain_packed = PackedNf4Tensor::quantize(&values);
+            assert_eq!(
+                plain_packed.dequantize(),
+                plain_sim.dequantize(),
+                "plain packed vs simulated diverged at len {n}"
+            );
+            let double_sim = Nf4Tensor::quantize(&values).with_double_quantization();
+            let double_packed = PackedNf4Tensor::quantize(&values).with_double_quantization();
+            assert!(double_packed.is_double_quantized());
+            assert_eq!(
+                double_packed.dequantize(),
+                double_sim.dequantize(),
+                "double-quantized packed vs simulated diverged at len {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_packed_nf4_actually_packs() {
+        // The whole point: pin the residency formula. 640 values = 10 blocks.
+        let n = 640usize;
+        let values: Vec<f32> =
+            Tensor::<B, 1>::random([n], Distribution::Normal(0.0, 1.0), &Default::default())
+                .into_data()
+                .convert::<f32>()
+                .iter::<f32>()
+                .collect();
+        let plain = PackedNf4Tensor::quantize(&values);
+        assert_eq!(plain.resident_bytes(), n / 2 + 10 * 4, "codes + f32 scales");
+        assert!((plain.bits_per_value() - 4.5).abs() < 1e-9);
+        let double = PackedNf4Tensor::quantize(&values).with_double_quantization();
+        assert_eq!(
+            double.resident_bytes(),
+            n / 2 + 10 + 4,
+            "codes + 8-bit scales + SoS"
+        );
+        assert!(double.bits_per_value() < 4.2);
+        assert_eq!(
+            double.resident_bytes(),
+            PackedNf4Tensor::estimated_resident_bytes(n, true),
+            "estimate must match the real figure"
+        );
+        // ...and the simulated form holds one byte per code: packing really
+        // is half the payload.
+        let simulated = Nf4Tensor::quantize(&values);
+        assert_eq!(simulated.len(), n);
+    }
+
+    #[test]
     fn test_levels_are_sorted_symmetric_and_contain_zero() {
-        assert!(NF4_LEVELS.windows(2).all(|w| w[0] < w[1]), "levels must be sorted");
+        assert!(
+            NF4_LEVELS.windows(2).all(|w| w[0] < w[1]),
+            "levels must be sorted"
+        );
         assert_eq!(NF4_LEVELS[0], -1.0);
         assert_eq!(NF4_LEVELS[NF4_LEVELS.len() - 1], 1.0);
-        assert!(NF4_LEVELS.contains(&0.0), "zero must be exactly representable");
+        assert!(
+            NF4_LEVELS.contains(&0.0),
+            "zero must be exactly representable"
+        );
         assert_eq!(NF4_LEVELS.len(), 16, "NF4 is a 4-bit code");
     }
 
@@ -561,7 +853,11 @@ mod tests {
         values[7] = -4.25;
         values[9] = 2.0;
         let restored = Nf4Tensor::quantize(&values).dequantize();
-        assert!((restored[7] + 4.25).abs() < 1e-6, "block max must be exact: {}", restored[7]);
+        assert!(
+            (restored[7] + 4.25).abs() < 1e-6,
+            "block max must be exact: {}",
+            restored[7]
+        );
     }
 
     #[test]
@@ -628,7 +924,10 @@ mod tests {
     #[test]
     fn test_all_zero_block_is_exact() {
         let values = vec![0.0f32; BLOCK_SIZE];
-        assert!(Nf4Tensor::quantize(&values).dequantize().iter().all(|&v| v == 0.0));
+        assert!(Nf4Tensor::quantize(&values)
+            .dequantize()
+            .iter()
+            .all(|&v| v == 0.0));
     }
 
     #[test]
@@ -663,7 +962,11 @@ mod tests {
         // 8 bits on a non-negative scale is <= 0.4% relative error, so the
         // reconstruction error should not grow by more than a few percent.
         let err = |t: &Nf4Tensor| -> f32 {
-            t.dequantize().iter().zip(&values).map(|(r, v)| (r - v).powi(2)).sum()
+            t.dequantize()
+                .iter()
+                .zip(&values)
+                .map(|(r, v)| (r - v).powi(2))
+                .sum()
         };
         let (e_plain, e_double) = (err(&plain), err(&double));
         assert!(
@@ -714,23 +1017,34 @@ mod tests {
     fn test_lora_parameter_count_beats_a_full_update() {
         let config = LoraConfig::new(768, 768, 8);
         assert_eq!(config.num_parameters(), 8 * (768 + 768));
-        assert!(config.num_parameters() * 40 < 768 * 768, "rank 8 should be ~50x smaller");
+        assert!(
+            config.num_parameters() * 40 < 768 * 768,
+            "rank 8 should be ~50x smaller"
+        );
     }
 
     #[test]
     fn test_qlora_linear_is_the_base_layer_at_init() {
         let device = Default::default();
-        let base = LinearConfig::new(BLOCK_SIZE, 8).with_bias(true).init(&device);
+        let base = LinearConfig::new(BLOCK_SIZE, 8)
+            .with_bias(true)
+            .init(&device);
         let config = LoraConfig::new(BLOCK_SIZE, 8, 2);
         let q = QLoraLinear::<B>::from_linear(base, &config, true, &device);
 
         // With B = 0 the layer is exactly its quantized base.
         let x = Tensor::<B, 2>::random([2, BLOCK_SIZE], Distribution::Uniform(-1.0, 1.0), &device);
-        let diff = (q.forward(x.clone()) - q.base.forward(x)).abs().max().into_scalar();
+        let diff = (q.forward(x.clone()) - q.base.forward(x))
+            .abs()
+            .max()
+            .into_scalar();
         assert_eq!(diff, 0.0);
 
         let (nf4_bits, f32_bits) = q.resident_bits();
-        assert!(nf4_bits * 7.0 < f32_bits, "NF4 should be ~7x smaller: {nf4_bits} vs {f32_bits}");
+        assert!(
+            nf4_bits * 7.0 < f32_bits,
+            "NF4 should be ~7x smaller: {nf4_bits} vs {f32_bits}"
+        );
     }
 
     #[test]
@@ -757,12 +1071,19 @@ mod tests {
         use crate::vit::ViTDiTConfig;
 
         let device = Default::default();
-        let cfg = ViTDiTConfig { num_hidden_layers: 2, ..ViTDiTConfig::tiny(10) };
+        let cfg = ViTDiTConfig {
+            num_hidden_layers: 2,
+            ..ViTDiTConfig::tiny(10)
+        };
         let model = DblockClassifier::<B>::new(
             &cfg,
-            &DblockConfig { num_blocks: 2, ..DblockConfig::default() },
+            &DblockConfig {
+                num_blocks: 2,
+                ..DblockConfig::default()
+            },
             &device,
-        );
+        )
+        .unwrap();
 
         // The label table is the diffusion process's data space; quantizing it
         // would move the targets, so it must survive untouched.
@@ -781,7 +1102,12 @@ mod tests {
         // scale; if it is not, something reconstructed off-grid.
         let device = Default::default();
         let t = Tensor::<B, 2>::random([4, BLOCK_SIZE], Distribution::Normal(0.0, 1.0), &device);
-        let values: Vec<f32> = t.clone().into_data().convert::<f32>().iter::<f32>().collect();
+        let values: Vec<f32> = t
+            .clone()
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
         let restored: Vec<f32> = quantize_dequantize_tensor(t, false)
             .into_data()
             .convert::<f32>()
@@ -795,7 +1121,10 @@ mod tests {
                 let on_grid = NF4_LEVELS
                     .iter()
                     .any(|&l| (l * absmax - r).abs() <= 1e-6 * absmax.max(1.0));
-                assert!(on_grid, "value {r} is not on the NF4 grid (absmax {absmax})");
+                assert!(
+                    on_grid,
+                    "value {r} is not on the NF4 grid (absmax {absmax})"
+                );
             }
         }
     }

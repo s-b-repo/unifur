@@ -87,7 +87,11 @@ fn default_z_level() -> f64 {
 
 impl Default for BalanceWeights {
     fn default() -> Self {
-        Self { box_level: 1.0, expert_level: 1.0, z_level: default_z_level() }
+        Self {
+            box_level: 1.0,
+            expert_level: 1.0,
+            z_level: default_z_level(),
+        }
     }
 }
 
@@ -225,13 +229,12 @@ impl ExpertIndex {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        std::fs::write(path, self.to_json()?)
-            .with_context(|| format!("write {}", path.display()))
+        std::fs::write(path, self.to_json()?).with_context(|| format!("write {}", path.display()))
     }
 
     pub fn read(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         Self::from_json(&text)
     }
 
@@ -289,7 +292,11 @@ impl ExpertIndex {
 
         for (bi, entry) in self.boxes.iter().enumerate() {
             if entry.index != bi {
-                bail!("box '{}' claims index {} but sits at {bi}", entry.id, entry.index);
+                bail!(
+                    "box '{}' claims index {} but sits at {bi}",
+                    entry.id,
+                    entry.index
+                );
             }
             if !box_ids.insert(entry.id.as_str()) {
                 bail!("duplicate box id '{}'", entry.id);
@@ -401,7 +408,12 @@ pub struct ExpertSpec {
 
 impl ExpertSpec {
     pub fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
-        Self { id: id.into(), label: label.into(), tags: Vec::new(), enabled: true }
+        Self {
+            id: id.into(),
+            label: label.into(),
+            tags: Vec::new(),
+            enabled: true,
+        }
     }
 
     pub fn with_tags(mut self, tags: &[&str]) -> Self {
@@ -425,7 +437,11 @@ pub struct BoxSpec {
 
 impl BoxSpec {
     pub fn new(id: impl Into<String>, label: impl Into<String>, experts: Vec<ExpertSpec>) -> Self {
-        Self { id: id.into(), label: label.into(), experts }
+        Self {
+            id: id.into(),
+            label: label.into(),
+            experts,
+        }
     }
 }
 
@@ -463,8 +479,8 @@ impl MosmeSpec {
     }
 
     pub fn read(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         let spec: Self = serde_json::from_str(&text).context("parse mosme spec")?;
         spec.validate()?;
         Ok(spec)
@@ -533,9 +549,10 @@ impl MosmeSpec {
 
     /// Locate an expert by id.
     pub fn position(&self, id: &str) -> Option<(usize, usize)> {
-        self.boxes.iter().enumerate().find_map(|(bi, b)| {
-            b.experts.iter().position(|e| e.id == id).map(|ei| (bi, ei))
-        })
+        self.boxes
+            .iter()
+            .enumerate()
+            .find_map(|(bi, b)| b.experts.iter().position(|e| e.id == id).map(|ei| (bi, ei)))
     }
 
     /// Append an expert to an existing box, for hot-swap.
@@ -620,6 +637,25 @@ impl BoxLayout {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
 
@@ -630,7 +666,8 @@ mod tests {
                     "coding",
                     "Code",
                     vec![
-                        ExpertSpec::new("coding/rust", "Rust").with_tags(&["rust", "memory-safety"]),
+                        ExpertSpec::new("coding/rust", "Rust")
+                            .with_tags(&["rust", "memory-safety"]),
                         ExpertSpec::new("coding/python", "Python").with_tags(&["python"]),
                         ExpertSpec::new("coding/secure", "Secure code review")
                             .with_tags(&["security", "bugs"]),
@@ -668,7 +705,10 @@ mod tests {
                         label: e.label.clone(),
                         index: ei,
                         global_index: global,
-                        kind: ExpertKind::Mlp { hidden_size: 32, intermediate_size: 64 },
+                        kind: ExpertKind::Mlp {
+                            hidden_size: 32,
+                            intermediate_size: 64,
+                        },
                         enabled: e.enabled,
                         num_parameters: 4096,
                         weights: WeightLocator {
@@ -682,7 +722,12 @@ mod tests {
                     entry
                 })
                 .collect();
-            boxes.push(BoxEntry { id: b.id.clone(), label: b.label.clone(), index: bi, experts });
+            boxes.push(BoxEntry {
+                id: b.id.clone(),
+                label: b.label.clone(),
+                index: bi,
+                experts,
+            });
         }
         ExpertIndex {
             schema_version: INDEX_SCHEMA_VERSION,
@@ -719,7 +764,10 @@ mod tests {
         assert!(json.contains(r#""kind": "mlp""#), "{json}");
         assert!(json.contains(r#""site": "mlp""#));
         assert!(json.contains(r#""id": "coding/rust""#));
-        assert!(!json.contains(r#""Mlp""#), "must not leak Rust enum encoding");
+        assert!(
+            !json.contains(r#""Mlp""#),
+            "must not leak Rust enum encoding"
+        );
 
         // The discriminant must sit *in* the entry, not one level down. An
         // earlier version emitted `"kind": {"kind": "mlp", ...}`, which this
@@ -737,7 +785,10 @@ mod tests {
         let back = ExpertIndex::from_json(&json).unwrap();
         assert!(matches!(
             back.boxes[0].experts[0].kind,
-            ExpertKind::Mlp { hidden_size: 32, intermediate_size: 64 }
+            ExpertKind::Mlp {
+                hidden_size: 32,
+                intermediate_size: 64
+            }
         ));
     }
 
@@ -762,14 +813,22 @@ mod tests {
 
         let mut index = sample_index();
         index.boxes[1].id = "coding".into();
-        assert!(index.validate().unwrap_err().to_string().contains("duplicate box id"));
+        assert!(index
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate box id"));
     }
 
     #[test]
     fn test_validate_rejects_inconsistent_indices() {
         let mut index = sample_index();
         index.boxes[1].index = 7;
-        assert!(index.validate().unwrap_err().to_string().contains("claims index 7"));
+        assert!(index
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("claims index 7"));
 
         let mut index = sample_index();
         index.boxes[1].experts[0].global_index = 99;
@@ -789,15 +848,22 @@ mod tests {
         assert!(err.contains("disabled") && err.contains("NaN"), "{err}");
 
         let mut spec = sample_spec();
-        spec.boxes[0].experts.iter_mut().for_each(|e| e.enabled = false);
+        spec.boxes[0]
+            .experts
+            .iter_mut()
+            .for_each(|e| e.enabled = false);
         assert!(spec.validate().is_err());
     }
 
     #[test]
     fn test_validate_rejects_a_mismatched_site() {
         let mut index = sample_index();
-        index.boxes[0].experts[0].kind =
-            ExpertKind::Adapter { rank: 4, alpha: 4.0, in_features: 32, out_features: 10 };
+        index.boxes[0].experts[0].kind = ExpertKind::Adapter {
+            rank: 4,
+            alpha: 4.0,
+            in_features: 32,
+            out_features: 10,
+        };
         let err = index.validate().unwrap_err().to_string();
         assert!(err.contains("adapter expert in a mlp index"), "{err}");
     }
@@ -806,7 +872,11 @@ mod tests {
     fn test_validate_rejects_unknown_schema_version() {
         let mut index = sample_index();
         index.schema_version = 99;
-        assert!(index.validate().unwrap_err().to_string().contains("schema version 99"));
+        assert!(index
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("schema version 99"));
     }
 
     #[test]
@@ -822,11 +892,16 @@ mod tests {
         assert_eq!(grown.experts_per_box(), vec![4, 2]);
         let (bi, ei) = grown.position("coding/go").unwrap();
         assert_eq!((bi, ei), (0, 3));
-        assert!(!grown.boxes[0].experts[3].enabled, "new experts must land disabled");
+        assert!(
+            !grown.boxes[0].experts[3].enabled,
+            "new experts must land disabled"
+        );
         assert!(grown.is_superset_of(&spec));
         assert!(!spec.is_superset_of(&grown));
 
-        assert!(spec.extended_with("nonexistent", ExpertSpec::new("a/b", "B")).is_err());
+        assert!(spec
+            .extended_with("nonexistent", ExpertSpec::new("a/b", "B"))
+            .is_err());
         // A duplicate id is caught by the validate() inside extended_with.
         assert!(spec
             .extended_with("coding", ExpertSpec::new("coding/rust", "Rust again"))
@@ -887,7 +962,12 @@ mod tests {
     #[test]
     fn test_render_lists_every_expert() {
         let rendered = sample_index().render();
-        for id in ["coding/rust", "coding/python", "coding/secure", "cyber/netsec"] {
+        for id in [
+            "coding/rust",
+            "coding/python",
+            "coding/secure",
+            "cyber/netsec",
+        ] {
             assert!(rendered.contains(id), "{id} missing from:\n{rendered}");
         }
         assert!(rendered.contains("boxes=2"));

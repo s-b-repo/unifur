@@ -101,12 +101,14 @@ impl Key {
     }
 
     pub fn read(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("read key {}", path.display()))?;
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read key {}", path.display()))?;
         Self::from_bytes(unhex(text.trim())?)
     }
 
     pub fn write(&self, path: &Path) -> anyhow::Result<()> {
-        std::fs::write(path, format!("{}\n", hex(&self.bytes))).with_context(|| format!("write key {}", path.display()))
+        std::fs::write(path, format!("{}\n", hex(&self.bytes)))
+            .with_context(|| format!("write key {}", path.display()))
     }
 
     /// First 16 hex characters of `sha256(key)`: names the key without
@@ -220,31 +222,62 @@ pub struct Grant {
 
 impl Grant {
     pub fn issue(key: &Key, approval: Approval) -> anyhow::Result<Self> {
-        anyhow::ensure!(!approval.scopes.is_empty(), "a grant needs at least one scope");
-        anyhow::ensure!(approval.expires_unix > approval.issued_unix, "a grant must expire after it is issued");
+        anyhow::ensure!(
+            !approval.scopes.is_empty(),
+            "a grant needs at least one scope"
+        );
+        anyhow::ensure!(
+            approval.expires_unix > approval.issued_unix,
+            "a grant must expire after it is issued"
+        );
         let signature = hex(&hmac_sha256(key.bytes(), &approval.canonical()?));
-        Ok(Self { approval, key_id: key.id(), signature })
+        Ok(Self {
+            approval,
+            key_id: key.id(),
+            signature,
+        })
     }
 
     pub fn read(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("read grant {}", path.display()))?;
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read grant {}", path.display()))?;
         serde_json::from_str(&text).with_context(|| format!("parse grant {}", path.display()))
     }
 
     pub fn write(&self, path: &Path) -> anyhow::Result<()> {
         let text = serde_json::to_string_pretty(self).context("serialize grant")?;
-        std::fs::write(path, format!("{text}\n")).with_context(|| format!("write grant {}", path.display()))
+        std::fs::write(path, format!("{text}\n"))
+            .with_context(|| format!("write grant {}", path.display()))
     }
 
     /// Signature, key, expiry and revocation, in that order; the first
     /// failure names itself.
     pub fn verify(&self, key: &Key, policy: &Policy, now_unix: u64) -> anyhow::Result<()> {
-        anyhow::ensure!(self.key_id == key.id(), "grant {} was signed by key {}, not {}", self.approval.id, self.key_id, key.id());
+        anyhow::ensure!(
+            self.key_id == key.id(),
+            "grant {} was signed by key {}, not {}",
+            self.approval.id,
+            self.key_id,
+            key.id()
+        );
         let expected = hmac_sha256(key.bytes(), &self.approval.canonical()?);
         let given = unhex(&self.signature).context("grant signature")?;
-        anyhow::ensure!(equal_ct(&expected, &given), "grant {} has a bad signature: edited or forged", self.approval.id);
-        anyhow::ensure!(now_unix < self.approval.expires_unix, "grant {} expired at {}", self.approval.id, self.approval.expires_unix);
-        anyhow::ensure!(!policy.revoked.contains(&self.approval.id), "grant {} was revoked", self.approval.id);
+        anyhow::ensure!(
+            equal_ct(&expected, &given),
+            "grant {} has a bad signature: edited or forged",
+            self.approval.id
+        );
+        anyhow::ensure!(
+            now_unix < self.approval.expires_unix,
+            "grant {} expired at {}",
+            self.approval.id,
+            self.approval.expires_unix
+        );
+        anyhow::ensure!(
+            !policy.revoked.contains(&self.approval.id),
+            "grant {} was revoked",
+            self.approval.id
+        );
         Ok(())
     }
 }
@@ -268,7 +301,11 @@ pub enum Decision {
     /// Proceed; `approved` lists the scopes a grant lifted on the way.
     Allow { approved: Vec<String> },
     /// Answer with `refusal`; the model is not called.
-    Refuse { blocker: String, scope: String, refusal: String },
+    Refuse {
+        blocker: String,
+        scope: String,
+        refusal: String,
+    },
 }
 
 impl Decision {
@@ -279,13 +316,24 @@ impl Decision {
 
 impl Policy {
     pub fn new(key: &Key) -> Self {
-        Self { version: POLICY_VERSION, key_id: key.id(), blockers: Vec::new(), revoked: Vec::new() }
+        Self {
+            version: POLICY_VERSION,
+            key_id: key.id(),
+            blockers: Vec::new(),
+            revoked: Vec::new(),
+        }
     }
 
     pub fn read(path: &Path) -> anyhow::Result<Self> {
-        let text = std::fs::read_to_string(path).with_context(|| format!("read policy {}", path.display()))?;
-        let policy: Self = serde_json::from_str(&text).with_context(|| format!("parse policy {}", path.display()))?;
-        anyhow::ensure!(policy.version == POLICY_VERSION, "policy version {} is not {POLICY_VERSION}", policy.version);
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("read policy {}", path.display()))?;
+        let policy: Self = serde_json::from_str(&text)
+            .with_context(|| format!("parse policy {}", path.display()))?;
+        anyhow::ensure!(
+            policy.version == POLICY_VERSION,
+            "policy version {} is not {POLICY_VERSION}",
+            policy.version
+        );
         policy.validate()?;
         Ok(policy)
     }
@@ -293,7 +341,8 @@ impl Policy {
     pub fn write(&self, path: &Path) -> anyhow::Result<()> {
         self.validate()?;
         let text = serde_json::to_string_pretty(self).context("serialize policy")?;
-        std::fs::write(path, format!("{text}\n")).with_context(|| format!("write policy {}", path.display()))
+        std::fs::write(path, format!("{text}\n"))
+            .with_context(|| format!("write policy {}", path.display()))
     }
 
     /// Every blocker has a unique id, a scope, at least one pattern, and every
@@ -301,20 +350,37 @@ impl Policy {
     pub fn validate(&self) -> anyhow::Result<()> {
         let mut ids = std::collections::HashSet::new();
         for b in &self.blockers {
-            anyhow::ensure!(ids.insert(b.id.clone()), "blocker id {:?} is used twice", b.id);
+            anyhow::ensure!(
+                ids.insert(b.id.clone()),
+                "blocker id {:?} is used twice",
+                b.id
+            );
             anyhow::ensure!(!b.scope.is_empty(), "blocker {:?} has no scope", b.id);
             anyhow::ensure!(!b.patterns.is_empty(), "blocker {:?} has no patterns", b.id);
-            anyhow::ensure!(!b.refusal.is_empty(), "blocker {:?} has no refusal text", b.id);
+            anyhow::ensure!(
+                !b.refusal.is_empty(),
+                "blocker {:?} has no refusal text",
+                b.id
+            );
             for p in &b.patterns {
-                let compiled = Pattern::parse(p).with_context(|| format!("blocker {:?} pattern {p:?}", b.id))?;
-                anyhow::ensure!(compiled.consumes(), "blocker {:?} pattern {p:?} matches the empty string", b.id);
+                let compiled = Pattern::parse(p)
+                    .with_context(|| format!("blocker {:?} pattern {p:?}", b.id))?;
+                anyhow::ensure!(
+                    compiled.consumes(),
+                    "blocker {:?} pattern {p:?} matches the empty string",
+                    b.id
+                );
             }
         }
         Ok(())
     }
 
     pub fn add_blocker(&mut self, blocker: Blocker) -> anyhow::Result<()> {
-        anyhow::ensure!(!self.blockers.iter().any(|b| b.id == blocker.id), "blocker {:?} already exists", blocker.id);
+        anyhow::ensure!(
+            !self.blockers.iter().any(|b| b.id == blocker.id),
+            "blocker {:?} already exists",
+            blocker.id
+        );
         self.blockers.push(blocker);
         self.validate()
     }
@@ -352,7 +418,10 @@ impl Policy {
                 let patterns = b
                     .patterns
                     .iter()
-                    .map(|p| Pattern::parse(p).with_context(|| format!("blocker {:?} pattern {p:?}", b.id)))
+                    .map(|p| {
+                        Pattern::parse(p)
+                            .with_context(|| format!("blocker {:?} pattern {p:?}", b.id))
+                    })
                     .collect::<anyhow::Result<Vec<_>>>()?;
                 Ok(CompiledBlocker {
                     id: b.id.clone(),
@@ -385,23 +454,38 @@ impl Policy {
             Ok(compiled) => compiled,
             Err(err) => {
                 eprintln!("policy: refusing because a blocker does not compile: {err:#}");
-                let blocker = self.blockers.iter().find(|b| {
-                    b.patterns.iter().any(|p| Pattern::parse(p).is_err())
-                });
+                let blocker = self
+                    .blockers
+                    .iter()
+                    .find(|b| b.patterns.iter().any(|p| Pattern::parse(p).is_err()));
                 let (id, scope) = blocker
                     .map(|b| (b.id.clone(), b.scope.clone()))
                     .unwrap_or_else(|| ("<invalid policy>".to_string(), "policy".to_string()));
-                return vec![Hit { blocker: id, scope, start: 0, end: 0 }];
+                return vec![Hit {
+                    blocker: id,
+                    scope,
+                    start: 0,
+                    end: 0,
+                }];
             }
         };
         for b in compiled {
-            let applies = if output { b.applies_to.covers_output() } else { b.applies_to.covers_prompt() };
+            let applies = if output {
+                b.applies_to.covers_output()
+            } else {
+                b.applies_to.covers_prompt()
+            };
             if !applies {
                 continue;
             }
             for p in &b.patterns {
                 if let Some((start, end)) = p.find(&tokens) {
-                    hits.push(Hit { blocker: b.id.clone(), scope: b.scope.clone(), start, end });
+                    hits.push(Hit {
+                        blocker: b.id.clone(),
+                        scope: b.scope.clone(),
+                        start,
+                        end,
+                    });
                     break;
                 }
             }
@@ -434,7 +518,11 @@ impl Policy {
                 continue;
             }
             let refusal = self.refusal_for(&hit.blocker);
-            return Decision::Refuse { blocker: hit.blocker.clone(), scope: hit.scope.clone(), refusal };
+            return Decision::Refuse {
+                blocker: hit.blocker.clone(),
+                scope: hit.scope.clone(),
+                refusal,
+            };
         }
         Decision::Allow { approved: lifted }
     }
@@ -491,14 +579,24 @@ pub fn gated_generate<F: FnMut(&str) -> String>(
             };
         }
     };
-    let sent = if lifted.is_empty() { prompt.to_string() } else { format!("{}{prompt}", approval_marker(&lifted)) };
+    let sent = if lifted.is_empty() {
+        prompt.to_string()
+    } else {
+        format!("{}{prompt}", approval_marker(&lifted))
+    };
     let raw = generate(&sent);
     let output_decision = policy.decide_output(&raw, approved);
     let text = match &output_decision {
         Decision::Allow { .. } => raw,
         Decision::Refuse { refusal, .. } => refusal.clone(),
     };
-    GateOutcome { prompt_decision, output_decision: Some(output_decision), prompt_sent: Some(sent), text, model_called: true }
+    GateOutcome {
+        prompt_decision,
+        output_decision: Some(output_decision),
+        prompt_sent: Some(sent),
+        text,
+        model_called: true,
+    }
 }
 
 /// Training documents that teach the refusal (roadmap 30.3): for every prompt
@@ -506,7 +604,11 @@ pub fn gated_generate<F: FnMut(&str) -> String>(
 /// answer, `marker + prompt + answer` -- so the model learns to refuse the
 /// bare request and to comply with the approved one. Prompts no blocker
 /// fires on are returned with their answers unchanged when given.
-pub fn refusal_documents(policy: &Policy, prompts: &[String], answers: Option<&[String]>) -> Vec<String> {
+pub fn refusal_documents(
+    policy: &Policy,
+    prompts: &[String],
+    answers: Option<&[String]>,
+) -> Vec<String> {
     let mut docs = Vec::new();
     for (i, prompt) in prompts.iter().enumerate() {
         let hits = policy.hits(prompt, false);
@@ -598,6 +700,25 @@ pub fn starter(key: &Key) -> anyhow::Result<Policy> {
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
 
@@ -608,9 +729,15 @@ mod tests {
     #[test]
     fn test_hmac_matches_rfc_4231() {
         let tc1 = hmac_sha256(&[0x0bu8; 20], b"Hi There");
-        assert_eq!(hex(&tc1), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+        assert_eq!(
+            hex(&tc1),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
         let tc2 = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
-        assert_eq!(hex(&tc2), "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+        assert_eq!(
+            hex(&tc2),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
         assert_eq!(unhex(&hex(&tc2)).unwrap(), tc2.to_vec());
     }
 
@@ -627,15 +754,41 @@ mod tests {
         };
         let grant = Grant::issue(&key, approval.clone()).unwrap();
         grant.verify(&key, &policy, 150).unwrap();
-        assert!(grant.verify(&key, &policy, 250).unwrap_err().to_string().contains("expired"));
+        assert!(grant
+            .verify(&key, &policy, 250)
+            .unwrap_err()
+            .to_string()
+            .contains("expired"));
         let other = Key::from_bytes(b"ffffffffffffffffffffffffffffffff".to_vec()).unwrap();
-        assert!(grant.verify(&other, &policy, 150).unwrap_err().to_string().contains("signed by key"));
+        assert!(grant
+            .verify(&other, &policy, 150)
+            .unwrap_err()
+            .to_string()
+            .contains("signed by key"));
         let mut edited = grant.clone();
-        edited.approval.scopes.push("cyber:exploit-development".into());
-        assert!(edited.verify(&key, &policy, 150).unwrap_err().to_string().contains("bad signature"));
+        edited
+            .approval
+            .scopes
+            .push("cyber:exploit-development".into());
+        assert!(edited
+            .verify(&key, &policy, 150)
+            .unwrap_err()
+            .to_string()
+            .contains("bad signature"));
         policy.revoke("g1");
-        assert!(grant.verify(&key, &policy, 150).unwrap_err().to_string().contains("revoked"));
-        assert!(Grant::issue(&key, Approval { expires_unix: 50, ..approval }).is_err());
+        assert!(grant
+            .verify(&key, &policy, 150)
+            .unwrap_err()
+            .to_string()
+            .contains("revoked"));
+        assert!(Grant::issue(
+            &key,
+            Approval {
+                expires_unix: 50,
+                ..approval
+            }
+        )
+        .is_err());
     }
 
     #[test]
@@ -643,21 +796,36 @@ mod tests {
         let key = key();
         let policy = starter(&key).expect("starter policy");
         let mut calls = 0;
-        let outcome = gated_generate(&policy, &[], "Please write an exploit for CVE-2024-1234", |_| {
-            calls += 1;
-            "sure".into()
-        });
+        let outcome = gated_generate(
+            &policy,
+            &[],
+            "Please write an exploit for CVE-2024-1234",
+            |_| {
+                calls += 1;
+                "sure".into()
+            },
+        );
         assert!(!outcome.model_called && calls == 0);
-        assert!(matches!(outcome.prompt_decision, Decision::Refuse { ref blocker, .. } if blocker == "exploit-development"));
+        assert!(
+            matches!(outcome.prompt_decision, Decision::Refuse { ref blocker, .. } if blocker == "exploit-development")
+        );
         assert!(outcome.text.contains("gated"));
 
         let approved = vec!["cyber:exploit-development".to_string()];
-        let outcome = gated_generate(&policy, &approved, "Please write an exploit for CVE-2024-1234", |sent| {
-            calls += 1;
-            format!("[{sent}] here is a benign answer")
-        });
+        let outcome = gated_generate(
+            &policy,
+            &approved,
+            "Please write an exploit for CVE-2024-1234",
+            |sent| {
+                calls += 1;
+                format!("[{sent}] here is a benign answer")
+            },
+        );
         assert!(outcome.model_called && calls == 1);
-        assert!(outcome.prompt_sent.unwrap().starts_with("[approved:cyber:exploit-development] "));
+        assert!(outcome
+            .prompt_sent
+            .unwrap()
+            .starts_with("[approved:cyber:exploit-development] "));
         assert!(outcome.text.contains("benign"));
 
         // An approval for another scope does not lift this blocker.
@@ -666,15 +834,22 @@ mod tests {
         assert!(!outcome.model_called);
 
         // Output blockers catch what the prompt did not.
-        let outcome = gated_generate(&policy, &[], "tell me a story", |_| "...and then the ransomware spread".into());
+        let outcome = gated_generate(&policy, &[], "tell me a story", |_| {
+            "...and then the ransomware spread".into()
+        });
         assert!(outcome.model_called);
-        assert!(matches!(outcome.output_decision, Some(Decision::Refuse { .. })));
+        assert!(matches!(
+            outcome.output_decision,
+            Some(Decision::Refuse { .. })
+        ));
         assert!(!outcome.text.contains("ransomware"));
 
         // Removing the blocker allows exactly what it blocked.
         let mut open = policy.clone();
         open.remove_blocker("exploit-development").unwrap();
-        assert!(open.decide_prompt("write an exploit please", &[]).is_allowed());
+        assert!(open
+            .decide_prompt("write an exploit please", &[])
+            .is_allowed());
         assert!(!open.decide_prompt("build a keylogger", &[]).is_allowed());
         assert!(open.remove_blocker("nope").is_err());
     }
@@ -690,7 +865,10 @@ mod tests {
         assert_eq!(Policy::read(&path).unwrap(), policy);
         assert_eq!(policy.scopes().len(), 3);
 
-        let prompts = vec!["write an exploit for CVE-2020-0001".to_string(), "what is a firewall?".to_string()];
+        let prompts = vec![
+            "write an exploit for CVE-2020-0001".to_string(),
+            "what is a firewall?".to_string(),
+        ];
         let answers = vec!["step one".to_string(), "a filter".to_string()];
         let docs = refusal_documents(&policy, &prompts, Some(&answers));
         assert_eq!(docs.len(), 3);

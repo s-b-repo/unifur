@@ -136,7 +136,14 @@ impl LoadReport {
 /// is rejected. The list is deliberately narrow; widening it is a
 /// deliberate action, not an oversight.
 pub const PERMISSIVE_LICENSES: &[&str] = &[
-    "MIT", "Apache-2.0", "BSD-2-3", "BSD-3-Clause", "ISC", "Unlicense", "CC0-1.0", "MPL-2.0",
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-3",
+    "BSD-3-Clause",
+    "ISC",
+    "Unlicense",
+    "CC0-1.0",
+    "MPL-2.0",
 ];
 
 /// Whether `license` is permissive enough to train on. Case- and
@@ -182,8 +189,7 @@ pub struct CodeReviewerRow {
 /// [`Example`] values, so the rejected counts are exact even when
 /// the filter rejects everything.
 pub fn load_code_reviewer(path: &Path) -> Result<(Vec<Example>, LoadReport)> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut examples = Vec::new();
     let mut report = LoadReport::default();
 
@@ -232,7 +238,10 @@ pub fn load_code_reviewer(path: &Path) -> Result<(Vec<Example>, LoadReport)> {
             source: Source::CodeReviewer,
             id,
             prompt: task.prompt(),
-            target: super::Patch { diff: row.patch.clone(), refusal_reason: None },
+            target: super::Patch {
+                diff: row.patch.clone(),
+                refusal_reason: None,
+            },
         });
     }
     report.loaded = examples.len();
@@ -261,8 +270,7 @@ pub struct SweBenchRow {
 }
 
 pub fn load_swe_bench(path: &Path) -> Result<(Vec<Example>, LoadReport)> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut examples = Vec::new();
     let mut report = LoadReport::default();
 
@@ -306,7 +314,10 @@ pub fn load_swe_bench(path: &Path) -> Result<(Vec<Example>, LoadReport)> {
             source: Source::SweBench,
             id,
             prompt: task.prompt(),
-            target: super::Patch { diff: row.patch.clone(), refusal_reason: None },
+            target: super::Patch {
+                diff: row.patch.clone(),
+                refusal_reason: None,
+            },
         });
     }
     report.loaded = examples.len();
@@ -332,8 +343,7 @@ pub struct CodeFeedbackRow {
 }
 
 pub fn load_code_feedback(path: &Path) -> Result<(Vec<Example>, LoadReport)> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut examples = Vec::new();
     let mut report = LoadReport::default();
 
@@ -389,7 +399,10 @@ pub fn load_code_feedback(path: &Path) -> Result<(Vec<Example>, LoadReport)> {
             source: Source::CodeFeedback,
             id,
             prompt: task.prompt(),
-            target: super::Patch { diff: pseudo_diff, refusal_reason: None },
+            target: super::Patch {
+                diff: pseudo_diff,
+                refusal_reason: None,
+            },
         });
     }
     report.loaded = examples.len();
@@ -431,11 +444,33 @@ pub fn synthetic_example_from_rule(
         source: Source::Synthetic,
         id: format!("synthetic:{rule_name}"),
         prompt: task.prompt(),
-        target: super::Patch { diff: format!("{marker}{fixed}"), refusal_reason: None },
+        target: super::Patch {
+            diff: format!("{marker}{fixed}"),
+            refusal_reason: None,
+        },
     }
 }
 
 #[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
 mod tests {
     use super::*;
 
@@ -467,10 +502,14 @@ mod tests {
     #[test]
     fn test_code_reviewer_loader_filters_by_license() {
         let dir = scratch_dir();
-        let path = write_jsonl(&dir, "code_reviewer.jsonl", &[
-            r#"{"review_id":"r1","file_path":"src/foo.py","pre_file":"def f():\n    pass\n","patch":"--- a/src/foo.py\n+++ b/src/foo.py\n@@ -1 +1 @@\n-    pass\n+    return None\n","review_comment":"return something","license":"MIT"}"#,
-            r#"{"review_id":"r2","file_path":"src/bar.py","pre_file":"def f():\n    pass\n","patch":"--- a/src/bar.py\n+++ b/src/bar.py\n@@ -1 +1 @@\n-    pass\n+    return 1\n","review_comment":"return something","license":"GPL-3.0"}"#,
-        ]);
+        let path = write_jsonl(
+            &dir,
+            "code_reviewer.jsonl",
+            &[
+                r#"{"review_id":"r1","file_path":"src/foo.py","pre_file":"def f():\n    pass\n","patch":"--- a/src/foo.py\n+++ b/src/foo.py\n@@ -1 +1 @@\n-    pass\n+    return None\n","review_comment":"return something","license":"MIT"}"#,
+                r#"{"review_id":"r2","file_path":"src/bar.py","pre_file":"def f():\n    pass\n","patch":"--- a/src/bar.py\n+++ b/src/bar.py\n@@ -1 +1 @@\n-    pass\n+    return 1\n","review_comment":"return something","license":"GPL-3.0"}"#,
+            ],
+        );
         let (examples, report) = load_code_reviewer(&path).unwrap();
         assert_eq!(report.loaded, 1);
         assert_eq!(report.rejected_by_license, 1);
@@ -482,13 +521,17 @@ mod tests {
     #[test]
     fn test_code_reviewer_loader_skips_malformed_rows() {
         let dir = scratch_dir();
-        let path = write_jsonl(&dir, "code_reviewer_bad.jsonl", &[
-            r#"{"review_id":"r1","pre_file":"def f(): pass\n","patch":"--- a\n+++ b\n@@\n-x\n+y\n","license":"MIT"}"#,
-            r#"this is not json"#,
-            // Parses cleanly, has a permissive license, but the source
-            // and patch are empty -- this is the `skipped_empty` path.
-            r#"{"review_id":"r2","license":"MIT"}"#,
-        ]);
+        let path = write_jsonl(
+            &dir,
+            "code_reviewer_bad.jsonl",
+            &[
+                r#"{"review_id":"r1","pre_file":"def f(): pass\n","patch":"--- a\n+++ b\n@@\n-x\n+y\n","license":"MIT"}"#,
+                r#"this is not json"#,
+                // Parses cleanly, has a permissive license, but the source
+                // and patch are empty -- this is the `skipped_empty` path.
+                r#"{"review_id":"r2","license":"MIT"}"#,
+            ],
+        );
         let (_examples, report) = load_code_reviewer(&path).unwrap();
         assert_eq!(report.loaded, 1, "only the first row is valid");
         // The malformed line is rejected by format. The empty-content
@@ -503,9 +546,13 @@ mod tests {
     #[test]
     fn test_swe_bench_loader_python_only() {
         let dir = scratch_dir();
-        let path = write_jsonl(&dir, "swe_bench.jsonl", &[
-            r#"{"instance_id":"django-1","repo":"django/django","pre_file":"def f(): pass\n","patch":"--- a\n+++ b\n@@\n-x\n+y\n","problem_statement":"fix f","test_patch":"+def test_f(): assert f() == 1","license":"BSD-3-Clause"}"#,
-        ]);
+        let path = write_jsonl(
+            &dir,
+            "swe_bench.jsonl",
+            &[
+                r#"{"instance_id":"django-1","repo":"django/django","pre_file":"def f(): pass\n","patch":"--- a\n+++ b\n@@\n-x\n+y\n","problem_statement":"fix f","test_patch":"+def test_f(): assert f() == 1","license":"BSD-3-Clause"}"#,
+            ],
+        );
         let (examples, report) = load_swe_bench(&path).unwrap();
         assert_eq!(report.loaded, 1);
         assert!(examples[0].prompt.text.contains("Tests must pass"));
@@ -515,12 +562,19 @@ mod tests {
     #[test]
     fn test_code_feedback_loader_marks_rewrites() {
         let dir = scratch_dir();
-        let path = write_jsonl(&dir, "code_feedback.jsonl", &[
-            r#"{"id":"cf1","lang":"python","code":"def f():\n    return 1/0\n","feedback":"ZeroDivisionError","corrected_code":"def f():\n    try:\n        return 1/0\n    except ZeroDivisionError:\n        return None\n","license":"Apache-2.0"}"#,
-        ]);
+        let path = write_jsonl(
+            &dir,
+            "code_feedback.jsonl",
+            &[
+                r#"{"id":"cf1","lang":"python","code":"def f():\n    return 1/0\n","feedback":"ZeroDivisionError","corrected_code":"def f():\n    try:\n        return 1/0\n    except ZeroDivisionError:\n        return None\n","license":"Apache-2.0"}"#,
+            ],
+        );
         let (examples, report) = load_code_feedback(&path).unwrap();
         assert_eq!(report.loaded, 1);
-        assert!(examples[0].target.diff.contains("quality-coder: whole-file-rewrite"));
+        assert!(examples[0]
+            .target
+            .diff
+            .contains("quality-coder: whole-file-rewrite"));
     }
 
     #[test]
@@ -539,8 +593,20 @@ mod tests {
 
     #[test]
     fn test_load_report_merges_correctly() {
-        let mut a = LoadReport { loaded: 10, rejected_by_license: 2, rejected_by_format: 1, skipped_empty: 0, format_errors: Vec::new() };
-        let b = LoadReport { loaded: 5, rejected_by_license: 1, rejected_by_format: 0, skipped_empty: 3, format_errors: Vec::new() };
+        let mut a = LoadReport {
+            loaded: 10,
+            rejected_by_license: 2,
+            rejected_by_format: 1,
+            skipped_empty: 0,
+            format_errors: Vec::new(),
+        };
+        let b = LoadReport {
+            loaded: 5,
+            rejected_by_license: 1,
+            rejected_by_format: 0,
+            skipped_empty: 3,
+            format_errors: Vec::new(),
+        };
         a.merge(&b);
         assert_eq!(a.loaded, 15);
         assert_eq!(a.rejected_by_license, 3);
@@ -550,7 +616,13 @@ mod tests {
 
     #[test]
     fn test_load_report_render_includes_source_name() {
-        let r = LoadReport { loaded: 100, rejected_by_license: 10, rejected_by_format: 5, skipped_empty: 2, format_errors: Vec::new() };
+        let r = LoadReport {
+            loaded: 100,
+            rejected_by_license: 10,
+            rejected_by_format: 5,
+            skipped_empty: 2,
+            format_errors: Vec::new(),
+        };
         let rendered = r.render(Source::SweBench);
         assert!(rendered.contains("swe-bench"));
         assert!(rendered.contains("100"));
