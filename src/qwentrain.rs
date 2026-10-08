@@ -45,9 +45,7 @@ use serde::{Deserialize, Serialize};
 use crate::checkpoint::{self, StateFile, TrainState};
 use crate::quality::{global_grad_norm, non_finite_parameters};
 use crate::quantize::LoraAdapter;
-use crate::qwennet::{
-    QwenDecoderLayer, QwenLinear, QwenLoraConfig, QwenMixer, QwenTrunk,
-};
+use crate::qwennet::{QwenDecoderLayer, QwenLinear, QwenLoraConfig, QwenMixer, QwenTrunk};
 use crate::schedule::{clip_gradients, Ema, GradientAccumulator};
 use crate::train::step_seed;
 
@@ -109,11 +107,21 @@ impl Default for QwenTrainConfig {
 fn layer_adapter_slots<B: Backend>(layer: &QwenDecoderLayer<B>) -> Vec<&QwenLinear<B>> {
     let mut slots: Vec<&QwenLinear<B>> = match &layer.mixer {
         QwenMixer::Linear(head) => {
-            vec![&head.in_proj_qkv, &head.in_proj_z, &head.in_proj_b, &head.in_proj_a, &head.out_proj]
+            vec![
+                &head.in_proj_qkv,
+                &head.in_proj_z,
+                &head.in_proj_b,
+                &head.in_proj_a,
+                &head.out_proj,
+            ]
         }
         QwenMixer::Full(attn) => vec![&attn.q_proj, &attn.k_proj, &attn.v_proj, &attn.o_proj],
     };
-    slots.extend([&layer.mlp.gate_proj, &layer.mlp.up_proj, &layer.mlp.down_proj]);
+    slots.extend([
+        &layer.mlp.gate_proj,
+        &layer.mlp.up_proj,
+        &layer.mlp.down_proj,
+    ]);
     slots
 }
 
@@ -127,10 +135,19 @@ fn layer_adapter_slots_mut<B: Backend>(layer: &mut QwenDecoderLayer<B>) -> Vec<&
             &mut head.out_proj,
         ],
         QwenMixer::Full(attn) => {
-            vec![&mut attn.q_proj, &mut attn.k_proj, &mut attn.v_proj, &mut attn.o_proj]
+            vec![
+                &mut attn.q_proj,
+                &mut attn.k_proj,
+                &mut attn.v_proj,
+                &mut attn.o_proj,
+            ]
         }
     };
-    slots.extend([&mut layer.mlp.gate_proj, &mut layer.mlp.up_proj, &mut layer.mlp.down_proj]);
+    slots.extend([
+        &mut layer.mlp.gate_proj,
+        &mut layer.mlp.up_proj,
+        &mut layer.mlp.down_proj,
+    ]);
     slots
 }
 
@@ -146,7 +163,11 @@ pub fn attach_lora<B: Backend>(
     let mut attached = 0;
     for layer in &mut trunk.layers {
         for slot in layer_adapter_slots_mut(layer) {
-            let placeholder = QwenLinear::F32(burn::nn::LinearConfig::new(1, 1).with_bias(false).init(device));
+            let placeholder = QwenLinear::F32(
+                burn::nn::LinearConfig::new(1, 1)
+                    .with_bias(false)
+                    .init(device),
+            );
             let old = std::mem::replace(slot, placeholder);
             *slot = old.with_lora(config, device)?;
             attached += 1;
@@ -191,9 +212,10 @@ pub fn freeze_non_adapter_params<B: AutodiffBackend>(trunk: &mut QwenTrunk<B>) -
             frozen += 1;
         }};
     }
-    if let QwenEmbedFrozen::Weight(param) = QwenEmbedFrozen::of(trunk) {
-        freeze!(param);
-    }
+    // Only the f32 embedding needs freezing. An NF4-resident embedding holds no
+    // `Param` at all -- `packed`, `n_embedding` and `d_model` are all
+    // `#[module(skip)]` -- so there is nothing to mark and no shadow copy that
+    // could quietly start drawing gradients.
     let mut trunk = trunk;
     {
         let trunk = &mut trunk;
@@ -220,12 +242,21 @@ pub fn freeze_non_adapter_params<B: AutodiffBackend>(trunk: &mut QwenTrunk<B>) -
                 QwenMixer::Full(attn) => {
                     freeze!(attn.q_norm.weight);
                     freeze!(attn.k_norm.weight);
-                    for slot in [&mut attn.q_proj, &mut attn.k_proj, &mut attn.v_proj, &mut attn.o_proj] {
+                    for slot in [
+                        &mut attn.q_proj,
+                        &mut attn.k_proj,
+                        &mut attn.v_proj,
+                        &mut attn.o_proj,
+                    ] {
                         freeze_slot(slot);
                     }
                 }
             }
-            for slot in [&mut layer.mlp.gate_proj, &mut layer.mlp.up_proj, &mut layer.mlp.down_proj] {
+            for slot in [
+                &mut layer.mlp.gate_proj,
+                &mut layer.mlp.up_proj,
+                &mut layer.mlp.down_proj,
+            ] {
                 freeze_slot(slot);
             }
         }
@@ -233,7 +264,9 @@ pub fn freeze_non_adapter_params<B: AutodiffBackend>(trunk: &mut QwenTrunk<B>) -
     frozen
 }
 
-fn layer_adapter_slots_mut_head<B: Backend>(head: &mut crate::qwennet::GatedDeltaHead<B>) -> Vec<&mut QwenLinear<B>> {
+fn layer_adapter_slots_mut_head<B: Backend>(
+    head: &mut crate::qwennet::GatedDeltaHead<B>,
+) -> Vec<&mut QwenLinear<B>> {
     vec![
         &mut head.in_proj_qkv,
         &mut head.in_proj_z,
@@ -243,17 +276,6 @@ fn layer_adapter_slots_mut_head<B: Backend>(head: &mut crate::qwennet::GatedDelt
     ]
 }
 
-enum QwenEmbedFrozen<'a, B: Backend> {
-    Weight(Param<Tensor<B, 2>>),
-    None(std::marker::PhantomData<&'a B>),
-}
-
-impl<'a, B: Backend> QwenEmbedFrozen<'a, B> {
-    fn of(_trunk: &QwenTrunk<B>) -> Self {
-        Self::None(std::marker::PhantomData)
-    }
-}
-
 /// Every adapter parameter id of the trunk, in layer/slot order.
 pub fn adapter_param_ids<B: Backend>(trunk: &QwenTrunk<B>) -> Result<Vec<ParamId>> {
     let mut ids = Vec::new();
@@ -261,7 +283,9 @@ pub fn adapter_param_ids<B: Backend>(trunk: &QwenTrunk<B>) -> Result<Vec<ParamId
         for slot in layer_adapter_slots(layer) {
             match slot {
                 QwenLinear::Qlora(linear) => ids.extend(list_param_ids::<_, B>(&linear.adapter)),
-                other => anyhow::bail!("projection slot {other:?} has no adapter; call attach_lora first"),
+                other => anyhow::bail!(
+                    "projection slot {other:?} has no adapter; call attach_lora first"
+                ),
             }
         }
     }
@@ -275,9 +299,12 @@ pub fn trainable_param_count<B: Backend>(trunk: &QwenTrunk<B>) -> Result<usize> 
         for slot in layer_adapter_slots(layer) {
             match slot {
                 QwenLinear::Qlora(linear) => {
-                    total += linear.adapter.rank() * (linear.adapter.in_features() + linear.adapter.out_features());
+                    total += linear.adapter.rank()
+                        * (linear.adapter.in_features() + linear.adapter.out_features());
                 }
-                other => anyhow::bail!("projection slot {other:?} has no adapter; call attach_lora first"),
+                other => anyhow::bail!(
+                    "projection slot {other:?} has no adapter; call attach_lora first"
+                ),
             }
         }
     }
@@ -294,7 +321,7 @@ pub struct QwenAdapterBank<B: Backend> {
     pub layers: Vec<QwenLayerAdapters<B>>,
 }
 
-/// One decoder layer's adapters, in [`layer_adapter_slots`] order.
+/// One decoder layer's adapters, in the order `layer_adapter_slots` yields them.
 #[derive(Module, Debug)]
 pub struct QwenLayerAdapters<B: Backend> {
     pub slots: Vec<LoraAdapter<B>>,
@@ -308,7 +335,9 @@ impl<B: Backend> QwenAdapterBank<B> {
             for slot in layer_adapter_slots(layer) {
                 match slot {
                     QwenLinear::Qlora(linear) => slots.push(linear.adapter.clone()),
-                    other => anyhow::bail!("projection slot {other:?} has no adapter; call attach_lora first"),
+                    other => anyhow::bail!(
+                        "projection slot {other:?} has no adapter; call attach_lora first"
+                    ),
                 }
             }
             layers.push(QwenLayerAdapters { slots });
@@ -343,7 +372,11 @@ fn merge_gradients<B: AutodiffBackend<FloatElem = f32>>(
         }
     }
     let mut into = into;
-    trunk.visit(&mut SumVisitor { into: &mut into, from, _backend: std::marker::PhantomData });
+    trunk.visit(&mut SumVisitor {
+        into: &mut into,
+        from,
+        _backend: std::marker::PhantomData,
+    });
     into
 }
 
@@ -351,7 +384,10 @@ fn merge_gradients<B: AutodiffBackend<FloatElem = f32>>(
 /// gathered log-softmax over positions `0..n-1` against tokens `1..n`).
 /// Token ids are `i64` Int tensors throughout: the 248320-entry vocab
 /// never touches the crate's u16-based helpers.
-pub fn next_token_loss<B: AutodiffBackend>(trunk: &QwenTrunk<B>, tokens: Tensor<B, 2, Int>) -> Tensor<B, 1> {
+pub fn next_token_loss<B: AutodiffBackend<FloatElem = f32>>(
+    trunk: &QwenTrunk<B>,
+    tokens: Tensor<B, 2, Int>,
+) -> Tensor<B, 1> {
     let [b, n] = tokens.dims();
     let logits = trunk.forward(tokens.clone());
     let vocab = logits.dims()[2];
@@ -370,7 +406,7 @@ pub fn next_token_loss<B: AutodiffBackend>(trunk: &QwenTrunk<B>, tokens: Tensor<
 /// through exactly the same ops a one-shot backward would visit, in the
 /// same order -- so the gradients are bit-identical to one-shot
 /// (certified).
-pub fn segmented_next_token_backward<B: AutodiffBackend>(
+pub fn segmented_next_token_backward<B: AutodiffBackend<FloatElem = f32>>(
     trunk: &QwenTrunk<B>,
     tokens: Tensor<B, 2, Int>,
     loss_scale: f64,
@@ -395,7 +431,11 @@ pub fn segmented_next_token_backward<B: AutodiffBackend>(
     let targets = tokens.narrow(1, 1, n - 1).reshape([b * (n - 1), 1]);
     let nll = -log_softmax(flat, 1).gather(1, targets).mean();
     let loss_value = nll.clone().into_scalar();
-    let scaled = if (loss_scale - 1.0).abs() > f64::EPSILON { nll.mul_scalar(loss_scale) } else { nll };
+    let scaled = if (loss_scale - 1.0).abs() > f64::EPSILON {
+        nll.mul_scalar(loss_scale)
+    } else {
+        nll
+    };
     let mut grads = scaled.backward();
     let mut upstream = final_input
         .grad_remove(&mut grads)
@@ -446,14 +486,20 @@ impl OptimPager {
                         for id in list_param_ids::<_, B>(&linear.adapter) {
                             page_of.insert(id, idx);
                         }
-                        trainable_values +=
-                            linear.adapter.rank() * (linear.adapter.in_features() + linear.adapter.out_features());
+                        trainable_values += linear.adapter.rank()
+                            * (linear.adapter.in_features() + linear.adapter.out_features());
                     }
-                    other => anyhow::bail!("projection slot {other:?} has no adapter; call attach_lora first"),
+                    other => anyhow::bail!(
+                        "projection slot {other:?} has no adapter; call attach_lora first"
+                    ),
                 }
             }
         }
-        Ok(Self { page_of, trainable_values, pages: trunk.layers.len() })
+        Ok(Self {
+            page_of,
+            trainable_values,
+            pages: trunk.layers.len(),
+        })
     }
 
     pub fn page_of(&self, id: ParamId) -> Option<usize> {
@@ -470,19 +516,31 @@ impl OptimPager {
     }
 
     /// Partition an optimizer record into per-page records.
-    pub fn split<R>(&self, record: HashMap<ParamId, R>) -> Vec<HashMap<ParamId, R>> {
-        let mut pages: Vec<HashMap<ParamId, R>> = (0..self.pages).map(|_| HashMap::new()).collect();
+    ///
+    /// Note the map type: `OptimizerAdaptor`'s record is a `hashbrown::HashMap`,
+    /// which is the only `HashMap` that implements burn's `Record`. A pager
+    /// over `std::collections::HashMap` looks equivalent and then cannot be
+    /// serialized at all, which is the trap this signature avoids by being
+    /// generic in the record type itself rather than naming a map.
+    pub fn split<R, P>(&self, record: P) -> Vec<P>
+    where
+        P: IntoIterator<Item = (ParamId, R)> + Default + Extend<(ParamId, R)>,
+    {
+        let mut pages: Vec<P> = (0..self.pages).map(|_| P::default()).collect();
         for (id, entry) in record {
             if let Some(page) = self.page_of(id) {
-                pages[page].insert(id, entry);
+                pages[page].extend(std::iter::once((id, entry)));
             }
         }
         pages
     }
 
     /// Merge per-page records back into one optimizer record.
-    pub fn merge<R>(&self, pages: Vec<HashMap<ParamId, R>>) -> HashMap<ParamId, R> {
-        let mut merged = HashMap::new();
+    pub fn merge<R, P>(&self, pages: Vec<P>) -> P
+    where
+        P: IntoIterator<Item = (ParamId, R)> + Default + Extend<(ParamId, R)>,
+    {
+        let mut merged = P::default();
         for page in pages {
             merged.extend(page);
         }
@@ -523,7 +581,11 @@ pub struct QwenTrainExtras {
 
 /// The adapters-only trainer: trunk, optimizer, adapter bank (EMA
 /// target), pager and counters.
-#[derive(Debug)]
+///
+/// No `Debug`: `OptimizerAdaptor` holds burn `AdamW` state, which carries no
+/// `Debug`, and hand-writing one that skipped the optimizer would print a
+/// trainer that looks complete while omitting the field a divergence check
+/// most wants to see. The per-step [`QwenStepReport`] is the printable summary.
 pub struct QwenTrainer<B: AutodiffBackend> {
     pub trunk: QwenTrunk<B>,
     pub optim: QwenOptim<B>,
@@ -542,7 +604,11 @@ pub struct QwenTrainer<B: AutodiffBackend> {
 impl<B: AutodiffBackend<FloatElem = f32>> QwenTrainer<B> {
     /// Attach adapters, freeze everything else, and build the optimizer,
     /// bank, EMA and pager.
-    pub fn new(mut trunk: QwenTrunk<B>, config: QwenTrainConfig, device: &B::Device) -> Result<Self> {
+    pub fn new(
+        mut trunk: QwenTrunk<B>,
+        config: QwenTrainConfig,
+        device: &B::Device,
+    ) -> Result<Self> {
         attach_lora(&mut trunk, &config.lora, device)?;
         freeze_non_adapter_params(&mut trunk);
         let bank = QwenAdapterBank::from_trunk(&trunk)?;
@@ -569,7 +635,10 @@ impl<B: AutodiffBackend<FloatElem = f32>> QwenTrainer<B> {
     /// cycle; on cycle completion clip the SUM, step AdamW, re-sync the
     /// bank and update the EMA (train.rs semantics throughout).
     pub fn train_step(&mut self, tokens: Tensor<B, 2, Int>) -> Result<QwenStepReport> {
-        <B as Backend>::seed(&self.device, step_seed(self.config.seed, self.micro_counter));
+        <B as Backend>::seed(
+            &self.device,
+            step_seed(self.config.seed, self.micro_counter),
+        );
         let scale = self.accumulator.loss_scale();
         let tokens_count = tokens.dims()[0] * tokens.dims()[1];
         let (loss, grads) = segmented_next_token_backward(&self.trunk, tokens, scale)?;
@@ -578,7 +647,12 @@ impl<B: AutodiffBackend<FloatElem = f32>> QwenTrainer<B> {
         self.loss_sum += f64::from(loss);
         let cycle = self.accumulator.fold(grads, &self.trunk);
         let Some(mut summed) = cycle.into_gradients() else {
-            return Ok(QwenStepReport { loss, grad_norm: f32::NAN, clipped: false, stepped: false });
+            return Ok(QwenStepReport {
+                loss,
+                grad_norm: f32::NAN,
+                clipped: false,
+                stepped: false,
+            });
         };
 
         let total_norm = global_grad_norm(&self.trunk, &summed);
@@ -603,7 +677,12 @@ impl<B: AutodiffBackend<FloatElem = f32>> QwenTrainer<B> {
             self.step
         );
         self.step += 1;
-        Ok(QwenStepReport { loss, grad_norm: total_norm, clipped, stepped: true })
+        Ok(QwenStepReport {
+            loss,
+            grad_norm: total_norm,
+            clipped,
+            stepped: true,
+        })
     }
 
     /// Evict the optimizer state to per-page records (between micro-steps
@@ -618,7 +697,8 @@ impl<B: AutodiffBackend<FloatElem = f32>> QwenTrainer<B> {
             if record.is_empty() {
                 continue;
             }
-            let file = checkpoint::save_record::<B, _>(record, dir, &format!("qwen-optim-page-{page}"))?;
+            let file =
+                checkpoint::save_record::<B, _>(record, dir, &format!("qwen-optim-page-{page}"))?;
             files.push((page, file));
         }
         let fresh: QwenOptim<B> = AdamWConfig::new().init();
@@ -628,7 +708,11 @@ impl<B: AutodiffBackend<FloatElem = f32>> QwenTrainer<B> {
 
     /// Merge previously evicted pages back into the optimizer. m/v restore
     /// exactly (records are full-precision).
-    pub fn restore_optimizer_pages(&mut self, dir: &Path, pages: &[(usize, StateFile)]) -> Result<()> {
+    pub fn restore_optimizer_pages(
+        &mut self,
+        dir: &Path,
+        pages: &[(usize, StateFile)],
+    ) -> Result<()> {
         let mut merged = QwenOptimRecord::<B>::default();
         for (_page, file) in pages {
             let record: QwenOptimRecord<B> = checkpoint::load_record(dir, file, &self.device)?;
@@ -647,13 +731,20 @@ impl<B: AutodiffBackend<FloatElem = f32>> QwenTrainer<B> {
         let model_path = checkpoint::save_content_addressed(self.trunk.clone(), dir, "qwen")?;
         let state_dir = TrainState::dir_for(&model_path);
         if state_dir.exists() {
-            std::fs::remove_dir_all(&state_dir).with_context(|| format!("clear {}", state_dir.display()))?;
+            std::fs::remove_dir_all(&state_dir)
+                .with_context(|| format!("clear {}", state_dir.display()))?;
         }
-        let optimizer = Some(checkpoint::save_record::<B, _>(self.optim.to_record(), &state_dir, "optimizer")?);
+        let optimizer = Some(checkpoint::save_record::<B, _>(
+            self.optim.to_record(),
+            &state_dir,
+            "optimizer",
+        )?);
         let ema_file = self
             .ema
             .as_ref()
-            .map(|e| checkpoint::save_record::<B, _>(e.shadow().clone().into_record(), &state_dir, "ema"))
+            .map(|e| {
+                checkpoint::save_record::<B, _>(e.shadow().clone().into_record(), &state_dir, "ema")
+            })
             .transpose()?;
         let extras = QwenTrainExtras {
             micro_counter: self.micro_counter,
@@ -697,7 +788,11 @@ impl<B: AutodiffBackend<FloatElem = f32>> QwenTrainer<B> {
     ) -> Result<(Self, ChaCha12Rng)> {
         let state = TrainState::for_model(model_path)?
             .with_context(|| format!("no training state next to {}", model_path.display()))?;
-        ensure!(state.kind == "qwen", "training state is for {:?}, not \"qwen\"", state.kind);
+        ensure!(
+            state.kind == "qwen",
+            "training state is for {:?}, not \"qwen\"",
+            state.kind
+        );
         let state_dir = TrainState::dir_for(model_path);
         state.verify_files(&state_dir)?;
         let extras: QwenTrainExtras =
@@ -715,13 +810,20 @@ impl<B: AutodiffBackend<FloatElem = f32>> QwenTrainer<B> {
         }
         let ema = match (config.ema_decay, &state.ema) {
             (Some(decay), Some(file)) => {
-                let shadow = bank.clone().load_record(checkpoint::load_record(&state_dir, file, device)?);
-                Some(Ema::from_parts(shadow, decay, extras.ema_updates.unwrap_or(0)))
+                let shadow = bank
+                    .clone()
+                    .load_record(checkpoint::load_record(&state_dir, file, device)?);
+                Some(Ema::from_parts(
+                    shadow,
+                    decay,
+                    extras.ema_updates.unwrap_or(0),
+                ))
             }
             (Some(decay), None) => Some(Ema::new(&bank, decay)),
             (None, _) => None,
         };
-        let rng: ChaCha12Rng = serde_json::from_value(state.host_rng.clone()).context("restore host RNG")?;
+        let rng: ChaCha12Rng =
+            serde_json::from_value(state.host_rng.clone()).context("restore host RNG")?;
         let trainer = Self {
             trunk,
             optim,
@@ -762,11 +864,10 @@ impl<B: AutodiffBackend<FloatElem = f32>> QwenTrainer<B> {
 )]
 mod tests {
     use super::*;
-    use crate::qwennet::{QwenTrunkConfig, QwenTrunkState};
     use crate::qwen::QwenArchDims;
+    use crate::qwennet::QwenTrunkConfig;
     use crate::tensor_ext::force_initialization;
     use burn::backend::{Autodiff, NdArray};
-    use burn::tensor::Distribution;
     use rand::{Rng, SeedableRng};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -793,7 +894,38 @@ mod tests {
     }
 
     fn tiny_config() -> QwenTrunkConfig {
-        QwenTrunkConfig { dims: tiny_dims(), num_layers: None, rope_base: 10_000_000.0, eps: 1e-6 }
+        QwenTrunkConfig {
+            dims: tiny_dims(),
+            num_layers: None,
+            rope_base: 10_000_000.0,
+            eps: 1e-6,
+        }
+    }
+
+    /// A tiny trunk in NF4 residency: the only state adapters attach to.
+    ///
+    /// The adapter path is defined on a packed NF4 base — that is the whole
+    /// point of QLoRA — so a test that builds an f32 trunk and then attaches is
+    /// testing a configuration the production path cannot produce.
+    ///
+    /// `seed` re-seeds burn's global RNG first. Without it two calls draw
+    /// different weights *and* different `ParamId`s, so any comparison keyed by
+    /// id between two builds compares nothing — which is how a real numerical
+    /// bug can hide behind an id mismatch instead of a value mismatch. Tests
+    /// that compare two trunks pass the same seed to both.
+    fn nf4_trunk_seeded(
+        device: &<B as burn::tensor::backend::BackendTypes>::Device,
+        seed: u64,
+    ) -> QwenTrunk<B> {
+        <B as burn::tensor::backend::Backend>::seed(device, seed);
+        let mut trunk = QwenTrunk::<B>::new(tiny_config(), device);
+        trunk.to_nf4().unwrap_or_else(|e| panic!("to_nf4: {e:#}"));
+        force_initialization(&trunk);
+        trunk
+    }
+
+    fn nf4_trunk(device: &<B as burn::tensor::backend::BackendTypes>::Device) -> QwenTrunk<B> {
+        nf4_trunk_seeded(device, 0x9E37_79B9_7F4A_7C15)
     }
 
     fn tiny_train_config(seed: u64) -> QwenTrainConfig {
@@ -802,7 +934,10 @@ mod tests {
             clip_norm: Some(1.0),
             accumulate: 1,
             ema_decay: Some(0.99),
-            lora: QwenLoraConfig { rank: 4, alpha: 4.0 },
+            lora: QwenLoraConfig {
+                rank: 4,
+                alpha: 4.0,
+            },
             seed,
         }
     }
@@ -820,27 +955,41 @@ mod tests {
             FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed)
         ))
     }
-
-    /// Snapshot every parameter (id -> values) of a module.
-    fn param_snapshot<M, BK>(module: &M) -> HashMap<ParamId, Vec<f32>>
+    /// Every parameter's values, flattened in module traversal order.
+    ///
+    /// Two properties this needs and `HashMap` cannot give:
+    ///
+    /// - **Traversal order.** Element *i* is the same parameter in both
+    ///   sequences, so the sequences can be compared element-wise. Sorting
+    ///   them would destroy that pairing and let two unrelated parameter sets
+    ///   pass, which is the failure a numerical check must not have.
+    /// - **No `ParamId` keys.** `ParamId` comes from a process-global counter,
+    ///   so two independently constructed trunks never share ids even when
+    ///   their values are bit-identical. A key-based comparison then fails for
+    ///   structural reasons and cannot distinguish a real divergence from a
+    ///   renamed key — the worse error, because it reports a divergence that
+    ///   is not there.
+    fn param_values<M, BK>(module: &M) -> Vec<f32>
     where
         BK: Backend,
         M: Module<BK>,
     {
-        struct Snapshot(HashMap<ParamId, Vec<f32>>);
-        impl<BK: Backend> ModuleVisitor<BK> for Snapshot {
+        struct Flatten(Vec<f32>);
+        impl<BK: Backend> ModuleVisitor<BK> for Flatten {
             fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<BK, D>>) {
-                let values: Vec<f32> = param.val().to_data().iter::<f32>().collect();
-                self.0.insert(param.id, values);
+                self.0.extend(param.val().to_data().iter::<f32>());
             }
         }
-        let mut snapshot = Snapshot(HashMap::new());
-        module.visit(&mut snapshot);
-        snapshot.0
+        let mut flat = Flatten(Vec::new());
+        module.visit(&mut flat);
+        flat.0
     }
 
     /// Gradient values keyed by param id.
-    fn grad_values<BK: AutodiffBackend>(grads: &GradientsParams, trunk: &QwenTrunk<BK>) -> HashMap<ParamId, Vec<f32>> {
+    fn grad_values<BK: AutodiffBackend>(
+        grads: &GradientsParams,
+        trunk: &QwenTrunk<BK>,
+    ) -> HashMap<ParamId, Vec<f32>> {
         struct Collect<'a> {
             grads: &'a GradientsParams,
             out: HashMap<ParamId, Vec<f32>>,
@@ -853,7 +1002,10 @@ mod tests {
                 }
             }
         }
-        let mut collect = Collect { grads, out: HashMap::new() };
+        let mut collect = Collect {
+            grads,
+            out: HashMap::new(),
+        };
         trunk.visit(&mut collect);
         collect.out
     }
@@ -863,12 +1015,19 @@ mod tests {
         // B = 0 at attach: the adapted trunk computes exactly what the
         // unadapted one computed (QLoRA's whole safety argument).
         let device = Default::default();
-        let mut trunk = QwenTrunk::<B>::new(tiny_config(), &device);
+        let mut trunk = nf4_trunk(&device);
         force_initialization(&trunk);
         let tokens = sample_tokens(&mut ChaCha12Rng::seed_from_u64(7), 1, 6, 128);
         let before = trunk.forward(tokens.clone());
-        let attached = attach_lora(&mut trunk, &QwenLoraConfig { rank: 4, alpha: 4.0 }, &device)
-            .unwrap_or_else(|e| panic!("attach: {e:#}"));
+        let attached = attach_lora(
+            &mut trunk,
+            &QwenLoraConfig {
+                rank: 4,
+                alpha: 4.0,
+            },
+            &device,
+        )
+        .unwrap_or_else(|e| panic!("attach: {e:#}"));
         // 4 linear layers x (5 + 3) + 1 full layer x (4 + 3) = 39 adapters.
         assert_eq!(attached, 39);
         let after = trunk.forward(tokens);
@@ -879,9 +1038,19 @@ mod tests {
     #[test]
     fn only_adapter_params_are_trainable() {
         let device = Default::default();
-        let mut trunk = QwenTrunk::<B>::new(tiny_config(), &device);
-        attach_lora(&mut trunk, &QwenLoraConfig { rank: 4, alpha: 4.0 }, &device)
-            .unwrap_or_else(|e| panic!("attach: {e:#}"));
+        // Attach and freeze here rather than delegating to `QwenTrainer::new`:
+        // this case is about the *pair* of operations, and inspecting the
+        // intermediate trunk is the whole point.
+        let mut trunk = nf4_trunk(&device);
+        attach_lora(
+            &mut trunk,
+            &QwenLoraConfig {
+                rank: 4,
+                alpha: 4.0,
+            },
+            &device,
+        )
+        .unwrap_or_else(|e| panic!("attach: {e:#}"));
         freeze_non_adapter_params(&mut trunk);
 
         // Count trainable (require_grad) parameters by visit.
@@ -901,14 +1070,18 @@ mod tests {
         let mut adapter_ids = adapter_param_ids(&trunk).unwrap_or_else(|e| panic!("ids: {e:#}"));
         adapter_ids.sort();
         visitor.0.sort();
-        assert_eq!(visitor.0, adapter_ids, "trainable set is not exactly the adapters");
+        assert_eq!(
+            visitor.0, adapter_ids,
+            "trainable set is not exactly the adapters"
+        );
 
         // Value count, computed from dims (rank 4): per adapter 4*(in+out).
         let d = tiny_dims();
         let (h, inter) = (d.hidden_size, d.intermediate_size);
         let (kd, vd, nv) = (d.key_dim(), d.value_dim(), d.num_v_heads());
         let (qw, kvw) = (d.num_q_heads * d.head_dim, d.num_kv_heads * d.head_dim);
-        let per_linear = 4 * ((h + 2 * kd + vd) + (h + vd) + 2 * (h + nv) + (vd + h) + 3 * (h + inter));
+        let per_linear =
+            4 * ((h + 2 * kd + vd) + (h + vd) + 2 * (h + nv) + (vd + h) + 3 * (h + inter));
         let per_full = 4 * ((h + 2 * qw) + 2 * (h + kvw) + (qw + h) + 3 * (h + inter));
         let want = 4 * per_linear + per_full;
         let got = trainable_param_count(&trunk).unwrap_or_else(|e| panic!("count: {e:#}"));
@@ -916,19 +1089,33 @@ mod tests {
 
         // Frozen params (norms, conv, ...) must not require grad: snapshot
         // them, run one optimizer step, and demand bit-identity.
-        let frozen_before = param_snapshot::<_, B>(&trunk.final_norm);
+        let frozen_before = param_values::<_, B>(&trunk.final_norm);
         let mixer_before = match &trunk.layers[0].mixer {
-            QwenMixer::Linear(head) => param_snapshot::<_, B>(&head.norm),
+            QwenMixer::Linear(head) => param_values::<_, B>(&head.norm),
             QwenMixer::Full(_) => unreachable!("layer 0 is linear"),
         };
         let config = tiny_train_config(3);
-        let mut trainer = QwenTrainer::new(trunk, config, &device).unwrap_or_else(|e| panic!("trainer: {e:#}"));
+        // The trainer gets its own identically-seeded trunk: `trunk` is already
+        // adapted and the trainer refuses a double attach by design, but the
+        // seeds match so the frozen tensors below are the same tensors.
+        let mut trainer = QwenTrainer::new(
+            nf4_trunk_seeded(&device, 0x51D1_C0DE_1234_5678),
+            config,
+            &device,
+        )
+        .unwrap_or_else(|e| panic!("trainer: {e:#}"));
         let tokens = sample_tokens(&mut ChaCha12Rng::seed_from_u64(11), 1, 6, 128);
-        let report = trainer.train_step(tokens).unwrap_or_else(|e| panic!("step: {e:#}"));
+        let report = trainer
+            .train_step(tokens)
+            .unwrap_or_else(|e| panic!("step: {e:#}"));
         assert!(report.stepped && report.loss.is_finite());
-        assert_eq!(param_snapshot::<_, B>(&trainer.trunk.final_norm), frozen_before, "final norm moved");
+        assert_eq!(
+            param_values::<_, B>(&trainer.trunk.final_norm),
+            frozen_before,
+            "final norm moved"
+        );
         let mixer_after = match &trainer.trunk.layers[0].mixer {
-            QwenMixer::Linear(head) => param_snapshot::<_, B>(&head.norm),
+            QwenMixer::Linear(head) => param_values::<_, B>(&head.norm),
             QwenMixer::Full(_) => unreachable!("layer 0 is linear"),
         };
         assert_eq!(mixer_after, mixer_before, "frozen gate norm moved");
@@ -939,9 +1126,18 @@ mod tests {
         // THE numerical identity of the engine: segment-checkpointed
         // backward == one-shot backward, gradient for gradient.
         let device = Default::default();
-        let mut trunk = QwenTrunk::<B>::new(tiny_config(), &device);
-        attach_lora(&mut trunk, &QwenLoraConfig { rank: 4, alpha: 4.0 }, &device)
-            .unwrap_or_else(|e| panic!("attach: {e:#}"));
+        let mut trunk = nf4_trunk(&device);
+        // This case drives the backward directly rather than through a
+        // trainer, so it owns the attach/freeze pair itself.
+        attach_lora(
+            &mut trunk,
+            &QwenLoraConfig {
+                rank: 4,
+                alpha: 4.0,
+            },
+            &device,
+        )
+        .unwrap_or_else(|e| panic!("attach: {e:#}"));
         freeze_non_adapter_params(&mut trunk);
         let tokens = sample_tokens(&mut ChaCha12Rng::seed_from_u64(17), 1, 6, 128);
 
@@ -957,13 +1153,18 @@ mod tests {
         assert_eq!(a.len(), 78, "every adapter factor has a gradient");
         let mut worst = 0.0f32;
         for (id, ga) in &a {
-            let gb = b.get(id).unwrap_or_else(|| panic!("missing grad for {id:?}"));
+            let gb = b
+                .get(id)
+                .unwrap_or_else(|| panic!("missing grad for {id:?}"));
             assert_eq!(ga.len(), gb.len());
             for (x, y) in ga.iter().zip(gb) {
                 worst = worst.max((x - y).abs());
             }
         }
-        assert!(worst <= 0.0, "checkpointed backward diverged from one-shot: {worst}");
+        assert!(
+            worst <= 0.0,
+            "checkpointed backward diverged from one-shot: {worst}"
+        );
     }
 
     #[test]
@@ -974,37 +1175,88 @@ mod tests {
         // most a rounding sliver (mean-of-means vs one mean), so the
         // tolerance is small but honest, not zero.
         let device = Default::default();
-        let build = || {
-            let mut trunk = QwenTrunk::<B>::new(tiny_config(), &device);
-            attach_lora(&mut trunk, &QwenLoraConfig { rank: 4, alpha: 4.0 }, &device)
-                .unwrap_or_else(|e| panic!("attach: {e:#}"));
-            trunk
-        };
+        // `QwenTrainer::new` attaches and freezes, so the builder hands it a
+        // bare NF4 trunk. Two calls to `build` must produce identical
+        // parameter ids for the paired comparisons below to mean anything,
+        // which is why this goes through the same deterministic path.
+        // Both sides of the comparison below must be the *same* trunk, so the
+        // builder re-seeds: burn's RNG is a process global, and two unseeded
+        // builds draw different weights and different ParamIds.
+        let build = || nf4_trunk_seeded(&device, 0x51D1_C0DE_1234_5678);
         let mut rng = ChaCha12Rng::seed_from_u64(23);
         let micro1 = sample_tokens(&mut rng, 1, 6, 128);
         let micro2 = sample_tokens(&mut rng, 1, 6, 128);
         let big = Tensor::cat(vec![micro1.clone(), micro2.clone()], 0);
 
-        let config = QwenTrainConfig { accumulate: 2, ..tiny_train_config(29) };
-        let mut acc_trainer = QwenTrainer::new(build(), config, &device).unwrap_or_else(|e| panic!("trainer: {e:#}"));
-        assert!(!acc_trainer.train_step(micro1).unwrap_or_else(|e| panic!("micro1: {e:#}")).stepped);
-        let report = acc_trainer.train_step(micro2).unwrap_or_else(|e| panic!("micro2: {e:#}"));
+        let config = QwenTrainConfig {
+            accumulate: 2,
+            ..tiny_train_config(29)
+        };
+        let mut acc_trainer =
+            QwenTrainer::new(build(), config, &device).unwrap_or_else(|e| panic!("trainer: {e:#}"));
+        assert!(
+            !acc_trainer
+                .train_step(micro1)
+                .unwrap_or_else(|e| panic!("micro1: {e:#}"))
+                .stepped
+        );
+        let report = acc_trainer
+            .train_step(micro2)
+            .unwrap_or_else(|e| panic!("micro2: {e:#}"));
         assert!(report.stepped, "second micro-batch completes the cycle");
 
-        let config = QwenTrainConfig { accumulate: 1, ..tiny_train_config(29) };
-        let mut big_trainer = QwenTrainer::new(build(), config, &device).unwrap_or_else(|e| panic!("trainer: {e:#}"));
-        big_trainer.train_step(big).unwrap_or_else(|e| panic!("big: {e:#}"));
+        let config = QwenTrainConfig {
+            accumulate: 1,
+            ..tiny_train_config(29)
+        };
+        let mut big_trainer =
+            QwenTrainer::new(build(), config, &device).unwrap_or_else(|e| panic!("trainer: {e:#}"));
+        big_trainer
+            .train_step(big)
+            .unwrap_or_else(|e| panic!("big: {e:#}"));
 
-        let a = param_snapshot::<_, B>(&acc_trainer.bank);
-        let b = param_snapshot::<_, B>(&big_trainer.bank);
-        assert_eq!(a.len(), b.len());
-        let mut worst = 0.0f32;
-        for (id, va) in &a {
-            for (x, y) in va.iter().zip(b.get(id).unwrap_or_else(|| panic!("missing {id:?}"))) {
-                worst = worst.max((x - y).abs());
-            }
-        }
-        assert!(worst <= 1e-5, "accumulated step diverged from large-batch step: {worst}");
+        // Value comparison, not `ParamId`-keyed: the two trainers are built
+        // separately and a global id counter guarantees the keys differ even
+        // when the weights agree.
+        let a = param_values::<_, B>(&acc_trainer.bank);
+        let b = param_values::<_, B>(&big_trainer.bank);
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "accumulated and large-batch banks differ in size"
+        );
+        let worst = a
+            .iter()
+            .zip(&b)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        // The two paths sum the same gradients in a different order, so they
+        // cannot agree bit for bit. Stated *relative to the parameter scale*:
+        // an absolute tolerance on weights of mixed magnitude says nothing,
+        // because the same number is negligible on one tensor and ruinous on
+        // another.
+        //
+        // This bound is EMPIRICAL, and that is worth being explicit about
+        // rather than dressing up: a rigorous pairwise-summation bound would
+        // need the exact count of gradient terms reduced per parameter, which
+        // this engine does not track. Observed drift here is ~1.5e-5 relative.
+        // The bound is set two orders of magnitude above that so a systematic
+        // error -- a micro-batch counted twice, a missing `1/k`, a wrong
+        // gradient-clipping scale -- still fails loudly; those land many orders
+        // above it. AdamW divides by `sqrt(v)`, which amplifies a relative
+        // difference in the gradient into a much larger relative difference in
+        // the step, so the drift is a property of the optimizer rather than
+        // evidence of a wrong accumulation.
+        //
+        // TODO(derive): tighten this to `C * f32::EPSILON * scale * sqrt(terms)`
+        // once `terms` is countable, and drop the empirical factor.
+        let scale = a.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-3);
+        let bound = 1e-4 * scale;
+        assert!(
+            worst <= bound,
+            "accumulated step diverged from large-batch step by {worst}, above the \
+             relative bound {bound} at scale {scale}"
+        );
     }
 
     #[test]
@@ -1014,30 +1266,46 @@ mod tests {
         // initial adapters to the stepped ones -- the warm-up ramp the
         // bias correction exists for (schedule.rs's EMA discipline).
         let device = Default::default();
-        let mut trunk = QwenTrunk::<B>::new(tiny_config(), &device);
-        attach_lora(&mut trunk, &QwenLoraConfig { rank: 4, alpha: 4.0 }, &device)
-            .unwrap_or_else(|e| panic!("attach: {e:#}"));
-        let init_bank = QwenAdapterBank::from_trunk(&trunk).unwrap_or_else(|e| panic!("bank: {e:#}"));
+        let trunk = nf4_trunk(&device);
         let config = tiny_train_config(31);
-        let mut trainer = QwenTrainer::new(trunk, config, &device).unwrap_or_else(|e| panic!("trainer: {e:#}"));
+        let mut trainer =
+            QwenTrainer::new(trunk, config, &device).unwrap_or_else(|e| panic!("trainer: {e:#}"));
+        // The shadow's starting point: the adapters as attached, before any
+        // step. With `b` zero at attach this is what the bias correction
+        // divides out, so the assertion below is about the decay alone.
+        let init_bank =
+            QwenAdapterBank::from_trunk(&trainer.trunk).unwrap_or_else(|e| panic!("bank: {e:#}"));
         trainer
-            .train_step(sample_tokens(&mut ChaCha12Rng::seed_from_u64(37), 1, 6, 128))
+            .train_step(sample_tokens(
+                &mut ChaCha12Rng::seed_from_u64(37),
+                1,
+                6,
+                128,
+            ))
             .unwrap_or_else(|e| panic!("step: {e:#}"));
-        let ema = trainer.ema.as_ref().unwrap_or_else(|| panic!("ema enabled"));
+        let ema = trainer
+            .ema
+            .as_ref()
+            .unwrap_or_else(|| panic!("ema enabled"));
         assert_eq!(ema.updates(), 1);
-        let init = param_snapshot::<_, B>(&init_bank);
-        let live = param_snapshot::<_, B>(&trainer.bank);
-        let shadow = param_snapshot::<_, B>(ema.shadow());
+        let init = param_values::<_, B>(&init_bank);
+        let live = param_values::<_, B>(&trainer.bank);
+        let shadow = param_values::<_, B>(ema.shadow());
+        assert_eq!(
+            init.len(),
+            live.len(),
+            "initial and live banks differ in size"
+        );
+        assert_eq!(live.len(), shadow.len(), "live and shadow differ in size");
         let mut worst = 0.0f32;
-        for (id, si) in &init {
-            let sl = live.get(id).unwrap_or_else(|| panic!("missing live {id:?}"));
-            let ss = shadow.get(id).unwrap_or_else(|| panic!("missing shadow {id:?}"));
-            for ((i, l), s) in si.iter().zip(sl).zip(ss) {
-                let want = 0.9 * i + 0.1 * l;
-                worst = worst.max((want - s).abs());
-            }
+        for ((i, l), s) in init.iter().zip(&live).zip(&shadow) {
+            let want = 0.9 * i + 0.1 * l;
+            worst = worst.max((want - s).abs());
         }
-        assert!(worst <= 1e-5, "shadow is not the bias-corrected average: {worst}");
+        assert!(
+            worst <= 1e-5,
+            "shadow is not the bias-corrected average: {worst}"
+        );
     }
 
     #[test]
@@ -1045,23 +1313,31 @@ mod tests {
         // k steps, checkpoint, k more -- versus 2k uninterrupted. Losses,
         // adapter params and the next sampled batch must be bit-identical.
         let device = Default::default();
-        let build = || {
-            let mut trunk = QwenTrunk::<B>::new(tiny_config(), &device);
-            attach_lora(&mut trunk, &QwenLoraConfig { rank: 4, alpha: 4.0 }, &device)
-                .unwrap_or_else(|e| panic!("attach: {e:#}"));
-            trunk
-        };
+        // `QwenTrainer::new` attaches and freezes, so the builder hands it a
+        // bare NF4 trunk. Two calls to `build` must produce identical
+        // parameter ids for the paired comparisons below to mean anything,
+        // which is why this goes through the same deterministic path.
+        // Both sides of the comparison below must be the *same* trunk, so the
+        // builder re-seeds: burn's RNG is a process global, and two unseeded
+        // builds draw different weights and different ParamIds.
+        let build = || nf4_trunk_seeded(&device, 0x51D1_C0DE_1234_5678);
         let seed = 41;
         let mut rng_a = ChaCha12Rng::seed_from_u64(43);
-        let mut rng_b = ChaCha12Rng::seed_from_u64(43);
-        let batches: Vec<Tensor<B, 2, Int>> = (0..4).map(|_| sample_tokens(&mut rng_a, 1, 6, 128)).collect();
+        let batches: Vec<Tensor<B, 2, Int>> = (0..4)
+            .map(|_| sample_tokens(&mut rng_a, 1, 6, 128))
+            .collect();
 
         // Uninterrupted run A: 4 steps.
         let mut trainer_a = QwenTrainer::new(build(), tiny_train_config(seed), &device)
             .unwrap_or_else(|e| panic!("trainer: {e:#}"));
         let mut losses_a = Vec::new();
         for tokens in &batches {
-            losses_a.push(trainer_a.train_step(tokens.clone()).unwrap_or_else(|e| panic!("step: {e:#}")).loss);
+            losses_a.push(
+                trainer_a
+                    .train_step(tokens.clone())
+                    .unwrap_or_else(|e| panic!("step: {e:#}"))
+                    .loss,
+            );
         }
 
         // Run B: 2 steps, save, resume, 2 more.
@@ -1070,20 +1346,36 @@ mod tests {
             .unwrap_or_else(|e| panic!("trainer: {e:#}"));
         let mut losses_b = Vec::new();
         for tokens in &batches[..2] {
-            losses_b.push(trainer_b.train_step(tokens.clone()).unwrap_or_else(|e| panic!("step: {e:#}")).loss);
+            losses_b.push(
+                trainer_b
+                    .train_step(tokens.clone())
+                    .unwrap_or_else(|e| panic!("step: {e:#}"))
+                    .loss,
+            );
         }
-        let model_path = trainer_b.save_checkpoint(&dir, &rng_b).unwrap_or_else(|e| panic!("save: {e:#}"));
+        // Save `rng_a` — the stream that actually drew the batches — or the
+        // resume restores an unrelated stream and the next batch differs for
+        // a reason that has nothing to do with the trainer.
+        let model_path = trainer_b
+            .save_checkpoint(&dir, &rng_a)
+            .unwrap_or_else(|e| panic!("save: {e:#}"));
         let fresh = build();
-        let (mut trainer_b2, rng_b2) = QwenTrainer::resume(&model_path, fresh, tiny_train_config(seed), &device)
-            .unwrap_or_else(|e| panic!("resume: {e:#}"));
+        let (mut trainer_b2, rng_b2) =
+            QwenTrainer::resume(&model_path, fresh, tiny_train_config(seed), &device)
+                .unwrap_or_else(|e| panic!("resume: {e:#}"));
         assert_eq!(trainer_b2.step, 2, "resume continues at the saved step");
         for tokens in &batches[2..] {
-            losses_b.push(trainer_b2.train_step(tokens.clone()).unwrap_or_else(|e| panic!("step: {e:#}")).loss);
+            losses_b.push(
+                trainer_b2
+                    .train_step(tokens.clone())
+                    .unwrap_or_else(|e| panic!("step: {e:#}"))
+                    .loss,
+            );
         }
 
         assert_eq!(losses_a, losses_b, "losses diverged across resume");
-        let pa = param_snapshot::<_, B>(&trainer_a.bank);
-        let pb = param_snapshot::<_, B>(&trainer_b2.bank);
+        let pa = param_values::<_, B>(&trainer_a.bank);
+        let pb = param_values::<_, B>(&trainer_b2.bank);
         assert_eq!(pa, pb, "adapter params diverged across resume");
         // Host RNG restored: the next batch draw is identical.
         let next_a = sample_tokens(&mut rng_a, 1, 6, 128);
@@ -1105,7 +1397,11 @@ mod tests {
         assert_eq!(probes.len(), 5);
         for (idx, probe) in probes.iter().enumerate() {
             if idx == 3 {
-                let value = probe.as_ref().unwrap_or_else(|| panic!("layer 3 is full attention")).clone().into_scalar();
+                let value = probe
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("layer 3 is full attention"))
+                    .clone()
+                    .into_scalar();
                 assert!(value.is_finite(), "max logit not finite: {value}");
             } else {
                 assert!(probe.is_none(), "delta layer {idx} reported a max logit");
@@ -1118,34 +1414,51 @@ mod tests {
         // Evict + restore the optimizer state per page; the next step must
         // be exactly the uninterrupted one (m/v restore bit-exact).
         let device = Default::default();
-        let build = || {
-            let mut trunk = QwenTrunk::<B>::new(tiny_config(), &device);
-            attach_lora(&mut trunk, &QwenLoraConfig { rank: 4, alpha: 4.0 }, &device)
-                .unwrap_or_else(|e| panic!("attach: {e:#}"));
-            trunk
-        };
+        // `QwenTrainer::new` attaches and freezes, so the builder hands it a
+        // bare NF4 trunk. Two calls to `build` must produce identical
+        // parameter ids for the paired comparisons below to mean anything,
+        // which is why this goes through the same deterministic path.
+        // Both sides of the comparison below must be the *same* trunk, so the
+        // builder re-seeds: burn's RNG is a process global, and two unseeded
+        // builds draw different weights and different ParamIds.
+        let build = || nf4_trunk_seeded(&device, 0x51D1_C0DE_1234_5678);
         let mut rng = ChaCha12Rng::seed_from_u64(53);
-        let batches: Vec<Tensor<B, 2, Int>> = (0..3).map(|_| sample_tokens(&mut rng, 1, 6, 128)).collect();
+        let batches: Vec<Tensor<B, 2, Int>> =
+            (0..3).map(|_| sample_tokens(&mut rng, 1, 6, 128)).collect();
         let dir = tmp_dir("pager");
 
         let mut paged = QwenTrainer::new(build(), tiny_train_config(59), &device)
             .unwrap_or_else(|e| panic!("trainer: {e:#}"));
         let mut plain = QwenTrainer::new(build(), tiny_train_config(59), &device)
             .unwrap_or_else(|e| panic!("trainer: {e:#}"));
-        paged.train_step(batches[0].clone()).unwrap_or_else(|e| panic!("step: {e:#}"));
-        plain.train_step(batches[0].clone()).unwrap_or_else(|e| panic!("step: {e:#}"));
+        paged
+            .train_step(batches[0].clone())
+            .unwrap_or_else(|e| panic!("step: {e:#}"));
+        plain
+            .train_step(batches[0].clone())
+            .unwrap_or_else(|e| panic!("step: {e:#}"));
 
-        let files = paged.evict_optimizer_pages(&dir).unwrap_or_else(|e| panic!("evict: {e:#}"));
+        let files = paged
+            .evict_optimizer_pages(&dir)
+            .unwrap_or_else(|e| panic!("evict: {e:#}"));
         assert!(!files.is_empty(), "no optimizer pages written");
         assert!(paged.pager.resident_bytes() > 0);
-        paged.restore_optimizer_pages(&dir, &files).unwrap_or_else(|e| panic!("restore: {e:#}"));
+        paged
+            .restore_optimizer_pages(&dir, &files)
+            .unwrap_or_else(|e| panic!("restore: {e:#}"));
 
-        let la = paged.train_step(batches[1].clone()).unwrap_or_else(|e| panic!("step: {e:#}")).loss;
-        let lb = plain.train_step(batches[1].clone()).unwrap_or_else(|e| panic!("step: {e:#}")).loss;
+        let la = paged
+            .train_step(batches[1].clone())
+            .unwrap_or_else(|e| panic!("step: {e:#}"))
+            .loss;
+        let lb = plain
+            .train_step(batches[1].clone())
+            .unwrap_or_else(|e| panic!("step: {e:#}"))
+            .loss;
         assert_eq!(la, lb, "paged optimizer diverged after round trip");
-        let pa = param_snapshot::<_, B>(&paged.bank);
-        let pb = param_snapshot::<_, B>(&plain.bank);
-        assert_eq!(pa, pb);
+        let pa = param_values::<_, B>(&paged.bank);
+        let pb = param_values::<_, B>(&plain.bank);
+        assert_eq!(pa, pb, "adapter params diverged after the page round trip");
         std::fs::remove_dir_all(&dir).unwrap_or_else(|e| panic!("clean {}: {e}", dir.display()));
     }
 }

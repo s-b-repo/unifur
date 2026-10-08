@@ -695,7 +695,15 @@ impl<B: Backend<FloatElem = f32>> ModuleMapper<B> for EmaMapper<B> {
         );
 
         let live = Tensor::<B, D>::from_data(data.clone(), &current.device());
-        let blended = current.mul_scalar(self.decay) + live.mul_scalar(1.0 - self.decay);
+        // `decay` weights the NEW value, not the retained one. Its own warm-up
+        // formula fixes the convention: `effective_decay` starts near 0.1 and
+        // ramps toward `decay`, and that ramp only means "start out tracking
+        // the live weights slowly, then speed up" if a small `decay` is a
+        // small pull toward the live value. Blending it the other way makes the
+        // ramp an acceleration toward the *old* shadow, which is the opposite
+        // of the documented warm-up and leaves the early average pinned to
+        // its initialization.
+        let blended = current.mul_scalar(1.0 - self.decay) + live.mul_scalar(self.decay);
         Param::from_tensor(blended.detach()).set_require_grad(false)
     }
 }

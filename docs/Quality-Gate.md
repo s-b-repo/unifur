@@ -36,7 +36,7 @@ A claim that cannot be reduced to a residual is not listed.
 ### Running it
 
 ```bash
-dblocks verify                 # all 74 certificates; exits non-zero on failure
+dblocks verify                 # all 227 certificates; exits non-zero on failure
 dblocks verify --group solver  # one group
 ```
 
@@ -48,7 +48,7 @@ schedule       boundary_endpoints                       1.038e-11    1.000e-8   
                window_tiling                              0.000e0     0.000e0       -  ok
                block_routing_involution                   0.000e0     0.000e0       -  ok
 ...
-74 / 74 certificates passed
+227 / 227 certificates passed
 ```
 
 The **margin** column is residual ÷ tolerance. A certificate drifting toward
@@ -273,6 +273,10 @@ The development loop that exercises all three levels:
 
 ```bash
 cargo test --all              # certificates + unit + integration
+
+# The gate that scores the trainer is itself attackable, so it is scanned:
+dblocks cheat --root .         # suppressions, test evasion, gate tampering
+dblocks cheat --root . --all   # every finding, not just the worst
 cargo clippy --all-targets
 dblocks verify                # the gate, standalone
 dblocks train --verify-every 100 --steps 2000

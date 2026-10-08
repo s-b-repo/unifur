@@ -1193,6 +1193,23 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             .1
     }
 
+    /// Final norm plus the tied output projection: hidden states
+    /// `[b, n, hidden]` to logits `[b, n, vocab]`.
+    ///
+    /// A residual writer that runs *after* the trunk — the specialist
+    /// student's geometric stream ([`crate::student`]) — reads its modified
+    /// stream back through the trunk's own readout here, so it is scored by
+    /// the same final norm and the same tied embedding the trunk's forward
+    /// uses, rather than by a second, drifting copy of them.
+    pub fn logits_from_hidden(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
+        let hidden = self.final_norm.forward(hidden);
+        let [bb, n, h] = hidden.dims();
+        hidden
+            .reshape([bb * n, h])
+            .matmul(self.embedding_weight().transpose())
+            .reshape([bb, n, self.vocab_size])
+    }
+
     /// Forward with `direction` projected out of the residual stream after
     /// the embedding and after every layer: inference-time ablation.
     pub fn forward_ablated(

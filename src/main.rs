@@ -1625,12 +1625,104 @@ enum Command {
         #[command(subcommand)]
         action: ExpertsAction,
     },
+    /// The specialist coding student: per-language trace training with the
+    /// router-which-knows auxiliary, its routing readout, and its shape
+    /// report.
+    Student {
+        #[command(subcommand)]
+        action: StudentAction,
+    },
     /// Print the block sigma schedule for inspection.
     Sigmas {
         #[arg(long, default_value_t = 3)]
         num_blocks: usize,
         #[arg(long, default_value_t = 0.05)]
         gamma: f64,
+    },
+}
+
+/// Where `dblocks student train` looks for traces when `--traces` is not
+/// given: the external drive the teacher-trace pipeline writes to.
+const DEFAULT_STUDENT_TRACES: &str = "/srv/m-sda/unifur/train.jsonl";
+/// Where student checkpoints go by default (the same external drive).
+const DEFAULT_STUDENT_OUT: &str = "/srv/m-sda/unifur/student";
+/// The fallback corpus: unlabeled SFT lines, loaded with `language=unknown`
+/// (the routing auxiliary is off for them — there is no box to name).
+const FALLBACK_SFT: &str = "/srv/m-sdd/unifur/datasets/sft-12k.jsonl";
+
+/// The flags of `dblocks student train`, bundled so the handler takes the
+/// struct rather than a dozen loose arguments.
+#[derive(clap::Args, Clone)]
+struct StudentTrainArgs {
+    /// rust|python|c|cpp|jsts|web, or `unknown` for unlabeled data (the
+    /// routing auxiliary switches off: no box exists to supervise).
+    #[arg(long)]
+    language: String,
+    /// Traces JSONL, one {id, language, prompt, completion, source, ...}
+    /// per line. The older SFT schema (instruction/response) also reads.
+    #[arg(long, default_value = DEFAULT_STUDENT_TRACES)]
+    traces: PathBuf,
+    #[arg(long, default_value_t = 100)]
+    steps: usize,
+    #[arg(long, default_value_t = 8)]
+    batch_size: usize,
+    #[arg(long, default_value_t = 3e-4)]
+    lr: f64,
+    /// StudentConfig sidecar (JSON); the default config is local-sized.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Resume from this checkpoint, or from the newest one in `--out-dir`
+    /// when passed without a value. The training state beside the model
+    /// (optimizer, RNG, step) is restored and verified, so the
+    /// continuation is exact.
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    resume: Option<String>,
+    #[arg(long, default_value = DEFAULT_STUDENT_OUT)]
+    out_dir: PathBuf,
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+    /// Weight on the router-which-knows auxiliary; 0 disables it exactly.
+    #[arg(long, default_value_t = 0.1)]
+    router_aux_weight: f64,
+    #[arg(long, default_value_t = 10)]
+    log_every: usize,
+    /// Also write a checkpoint (model + training state) every n steps.
+    #[arg(long, default_value_t = 0)]
+    checkpoint_every: usize,
+    /// Rescale gradients whose global norm exceeds this; 0 is off.
+    #[arg(long, default_value_t = 0.0)]
+    clip_norm: f32,
+}
+
+/// The specialist-student subcommands.
+#[derive(Subcommand)]
+enum StudentAction {
+    /// Train one language specialist on a traces JSONL: masked next-token CE
+    /// on the completion tokens plus the router-which-knows auxiliary (the
+    /// known language supervises the probe router's box traffic).
+    Train {
+        #[command(flatten)]
+        args: StudentTrainArgs,
+    },
+    /// Print the probe router's per-language box traffic for a prompt — the
+    /// router-which-knows readout: which specialist would be called, read
+    /// from the gates alone, no expert run.
+    Route {
+        #[arg(long)]
+        language_prompt: String,
+        /// A trained student checkpoint; fresh weights route at chance.
+        #[arg(long)]
+        checkpoint: Option<PathBuf>,
+        /// StudentConfig sidecar (must match the checkpoint's shape).
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Print the student's config, counted cost (active/total) and box
+    /// registry.
+    Info {
+        /// StudentConfig sidecar; the default config when omitted.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 }
 
@@ -2097,6 +2189,7 @@ fn main() -> Result<()> {
         Command::Lm { action } => cmd_lm(action),
         Command::Geom { action } => cmd_geom(action),
         Command::Experts { action } => cmd_experts(action),
+        Command::Student { action } => cmd_student(action),
         Command::Verify { group } => cmd_verify(group.as_deref()),
         Command::Cheat { root, json, all } => cmd_cheat(&root, json, all),
         command @ Command::Train { .. } => cmd_train(command),
@@ -4601,6 +4694,247 @@ fn cmd_experts(action: ExpertsAction) -> Result<()> {
             Ok(())
         }
     }
+}
+
+// ------------------------------------------------------- coding student --
+
+/// The training backend for `dblocks student train`: CPU autodiff, the same
+/// backend the `lm` trainer defaults to.
+type StudentTrain = burn::backend::Autodiff<Eval>;
+
+/// The language flag: a shipped specialist, or `unknown` for unlabeled data
+/// (the fallback SFT corpus). Parsed here so the error names the flag.
+fn parse_student_language(text: &str) -> Result<Option<diffusionblocks::student::CodeLanguage>> {
+    use diffusionblocks::student::CodeLanguage;
+    if text.trim().eq_ignore_ascii_case("unknown") {
+        return Ok(None);
+    }
+    CodeLanguage::parse(text).map(Some)
+}
+
+/// Read a StudentConfig sidecar, or the default config. A missing file is an
+/// error naming it, not a silent fall back to defaults.
+fn load_student_config(path: Option<&Path>) -> Result<diffusionblocks::student::StudentConfig> {
+    use diffusionblocks::student::StudentConfig;
+    let config = match path {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("read student config {}", path.display()))?;
+            serde_json::from_str(&text)
+                .with_context(|| format!("parse student config {}", path.display()))?
+        }
+        None => StudentConfig::default(),
+    };
+    config.validate()?;
+    Ok(config)
+}
+
+fn cmd_student(action: StudentAction) -> Result<()> {
+    match action {
+        StudentAction::Info { config } => cmd_student_info(config.as_deref()),
+        StudentAction::Route {
+            language_prompt,
+            checkpoint,
+            config,
+        } => cmd_student_route(&language_prompt, checkpoint.as_deref(), config.as_deref()),
+        StudentAction::Train { args } => cmd_student_train(&args),
+    }
+}
+
+fn cmd_student_info(config_path: Option<&Path>) -> Result<()> {
+    use diffusionblocks::student::CodeLanguage;
+    let config = load_student_config(config_path)?;
+    let cost = config.cost()?;
+    let spec = config.mosme_spec()?;
+    println!(
+        "student config{}",
+        config_path.map_or(" (default)".to_string(), |p| format!(" from {}", p.display()))
+    );
+    println!("{}", serde_json::to_string_pretty(&config)?);
+    println!(
+        "cost: {:.2}M active / {:.2}M total params ({:.1}% resident experts), {:.2} MFLOPs per token at context {}",
+        cost.active_params as f64 / 1e6,
+        cost.total_params as f64 / 1e6,
+        100.0 * cost.resident_expert_params as f64 / cost.total_params as f64,
+        cost.trunk_flops_per_token / 1e6,
+        config.context,
+    );
+    println!(
+        "  (geometric stream {:.2}M, probe router {:.2}M)",
+        cost.geom_stream_params as f64 / 1e6,
+        cost.probe_router_params as f64 / 1e6
+    );
+    println!("box registry (top_box={}, top_expert={}):", spec.top_box, spec.top_expert);
+    for (idx, language) in CodeLanguage::ALL.iter().enumerate() {
+        let entry = &spec.boxes[idx];
+        println!(
+            "  [{}] {:<14} {} ({} micro experts)",
+            idx,
+            language.box_id(),
+            entry.label,
+            entry.experts.len()
+        );
+    }
+    println!("checkpoints: {DEFAULT_STUDENT_OUT}");
+    Ok(())
+}
+
+fn cmd_student_route(
+    prompt: &str,
+    checkpoint_path: Option<&Path>,
+    config_path: Option<&Path>,
+) -> Result<()> {
+    use diffusionblocks::student::{CodeLanguage, GeometricStudent};
+    let config = load_student_config(config_path)?;
+    let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
+    <Eval as burn::tensor::backend::Backend>::seed(&device, 0);
+    let mut model = GeometricStudent::<Eval>::new(&config, &device)?;
+    diffusionblocks::tensor_ext::force_initialization(&model);
+    match checkpoint_path {
+        Some(path) => {
+            model = checkpoint::load::<Eval, _>(model, path, &device)?;
+            println!("checkpoint: {}", path.display());
+        }
+        None => println!(
+            "no --checkpoint: fresh weights, so the traffic below is the untrained baseline (chance is 1/6)"
+        ),
+    }
+    let ids = ByteTokenizer::new().encode_document(prompt);
+    let n = ids.len();
+    let tokens = burn::tensor::Tensor::<Eval, 1, burn::tensor::Int>::from_ints(
+        ids.iter().map(|t| i64::from(*t)).collect::<Vec<_>>().as_slice(),
+        &device,
+    )
+    .reshape([1, n]);
+    let routing = model.route_languages(tokens)?;
+    let shown: String = prompt.chars().take(60).collect();
+    println!("routing '{shown}' ({n} tokens):");
+    let mut counts = vec![0usize; CodeLanguage::ALL.len()];
+    for top in &routing.top_language {
+        counts[top.index()] += 1;
+    }
+    let best = routing
+        .traffic
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map(|(i, _)| i);
+    for language in CodeLanguage::ALL {
+        let idx = language.index();
+        let marker = if Some(idx) == best { "  <- top box" } else { "" };
+        println!(
+            "  {:<8} {:>6.2}%  top-1 on {}/{} tokens{marker}",
+            language.name(),
+            100.0 * routing.traffic[idx],
+            counts[idx],
+            n
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // audit-allow: mirrors the CLI flags one-to-one, like cmd_geom's train arm
+fn cmd_student_train(
+    language: &str,
+    traces: &Path,
+    steps: usize,
+    batch_size: usize,
+    lr: f64,
+    config_path: Option<&Path>,
+    resume: Option<&str>,
+    out_dir: &Path,
+    seed: u64,
+    router_aux_weight: f64,
+    log_every: usize,
+    checkpoint_every: usize,
+    clip_norm: f32,
+) -> Result<()> {
+    use diffusionblocks::student::{
+        train_language_specialist, GeometricStudent, LanguageBatch, SpecialistTrainConfig,
+    };
+    let language = parse_student_language(language)?;
+    let config = load_student_config(config_path)?;
+    anyhow::ensure!(
+        traces.try_exists().with_context(|| format!("stat {}", traces.display()))?,
+        "traces file {} does not exist; pass --traces <path> (the fallback SFT corpus is {FALLBACK_SFT}, loaded with language=unknown)",
+        traces.display()
+    );
+    let resume_path = match resume {
+        None => None,
+        Some("") => Some(checkpoint::latest_in_dir(out_dir, "student")?.ok_or_else(|| {
+            anyhow::anyhow!(
+                "--resume without a value needs a checkpoint in {}; none found",
+                out_dir.display()
+            )
+        })?),
+        Some(path) => {
+            let path = PathBuf::from(path);
+            anyhow::ensure!(
+                path.try_exists().with_context(|| format!("stat {}", path.display()))?,
+                "resume checkpoint {} does not exist",
+                path.display()
+            );
+            Some(path)
+        }
+    };
+    let data = LanguageBatch::load(traces, language, config.context, seed)?;
+    println!(
+        "traces: {} ({} examples kept of {} lines, {} skipped with no supervised token; filter {})",
+        traces.display(),
+        data.len(),
+        data.lines_read(),
+        data.skipped_no_target(),
+        language.map_or("none".to_string(), |l| l.name().to_string())
+    );
+    if language.is_none() {
+        println!("language=unknown: the routing auxiliary is off (no box to supervise)");
+    }
+    let device: <StudentTrain as burn::tensor::backend::BackendTypes>::Device = Default::default();
+    <StudentTrain as burn::tensor::backend::Backend>::seed(&device, seed);
+    let model = GeometricStudent::<StudentTrain>::new(&config, &device)?;
+    diffusionblocks::tensor_ext::force_initialization(&model);
+    let train_config = SpecialistTrainConfig {
+        steps,
+        batch_size,
+        lr,
+        clip_norm,
+        router_aux_weight,
+        seed,
+        log_every,
+        out_dir: Some(out_dir.to_path_buf()),
+        checkpoint_every,
+        resume: resume_path,
+        language,
+        ..SpecialistTrainConfig::default()
+    };
+    let (_model, report) = train_language_specialist(model, &data, &train_config, &device)?;
+    println!(
+        "done: {} steps ({} skipped, {} clipped) in {:.1}s | loss {:.4} -> {:.4} (ce {:.4} -> {:.4})",
+        report.steps_taken,
+        report.steps_skipped,
+        report.steps_clipped,
+        report.elapsed_secs,
+        report.first_loss,
+        report.last_loss,
+        report.first_ce,
+        report.last_ce
+    );
+    if report.last_router_aux.is_finite() {
+        println!(
+            "router-which-knows: aux {:.4} -> {:.4} | p(lang) {:.3} -> {:.3} | top1 {:.3} -> {:.3} (chance {:.3})",
+            report.first_router_aux,
+            report.last_router_aux,
+            report.first_target_traffic,
+            report.last_target_traffic,
+            report.first_target_top1,
+            report.last_target_top1,
+            1.0 / diffusionblocks::student::CodeLanguage::ALL.len() as f32
+        );
+    }
+    if let Some(path) = &report.checkpoint {
+        println!("checkpoint: {}", path.display());
+    }
+    Ok(())
 }
 
 fn cmd_sigmas(num_blocks: usize, gamma: f64) -> Result<()> {

@@ -321,11 +321,21 @@ impl<B: Backend> QloraLinear<B> {
     pub fn forward<const D: usize>(&self, x: Tensor<B, D>) -> Tensor<B, D> {
         let dims = x.dims();
         let d_in = self.adapter.in_features();
+        let d_out = self.base.d_output();
         let rows: usize = dims.iter().take(D.saturating_sub(1)).product();
+        // The adapter maps `d_in -> d_out`, so its result is as wide as the
+        // *base's output*, not as wide as the input. Reshaping it back to the
+        // input's shape works only for a square projection and silently
+        // mis-shapes every other one — and the two terms of the sum below then
+        // fail to line up.
+        let mut out_dims = dims;
+        if let Some(last) = out_dims.last_mut() {
+            *last = d_out;
+        }
         let adapted = self
             .adapter
             .forward(x.clone().reshape([rows, d_in]))
-            .reshape(dims);
+            .reshape(out_dims);
         self.base.forward(x) + adapted
     }
 }
@@ -349,6 +359,49 @@ impl<B: Backend> QwenLinear<B> {
                 linear.base.resident_bytes()
                     + 4 * (linear.adapter.in_features() + linear.adapter.out_features())
                         * linear.adapter.rank()
+            }
+        }
+    }
+
+    /// Quantize an f32 weight into NF4 residency, preserving its `ParamId`.
+    ///
+    /// The id is reused on purpose: a converted trunk must compare equal to the
+    /// one it came from under `checkpoint::canonical_hash_hex`, or converting a
+    /// trunk would silently invalidate every checkpoint taken before it.
+    /// Attached adapters are an error — convert first, then attach.
+    pub fn to_nf4(self) -> Result<Self> {
+        match self {
+            Self::F32(linear) => {
+                // Burn's `Linear` already stores the weight as `[d_input,
+                // d_output]` — the same row-major order the packed form wants,
+                // because both feed `x @ W`. The *checkpoint* is `[out, in]`,
+                // which is why the loader above transposes; converting an
+                // in-memory trunk must not, and transposing here would swap
+                // the axes twice and fail at the matmul rather than at the
+                // shape check.
+                let [d_in, d_out] = linear.weight.dims();
+                let values: Vec<f32> = linear
+                    .weight
+                    .val()
+                    .into_data()
+                    .convert::<f32>()
+                    .iter()
+                    .collect();
+                anyhow::ensure!(
+                    values.len() == d_in * d_out,
+                    "weight of shape [{d_in}, {d_out}] carries {} values",
+                    values.len()
+                );
+                let bias = linear.bias;
+                let mut nf4 = Nf4Linear::from_values(&values, d_in, d_out);
+                if let Some(b) = bias {
+                    nf4.bias = Some(Param::from_tensor(b.val()));
+                }
+                Ok(Self::Nf4(nf4))
+            }
+            Self::Nf4(_) => Ok(self),
+            Self::Qlora(_) => {
+                anyhow::bail!("a weight carrying an adapter must be de-adapted before conversion")
             }
         }
     }
@@ -1060,7 +1113,102 @@ pub struct QwenTrunk<B: Backend> {
     config: QwenTrunkConfig,
 }
 
+/// A throwaway f32 linear used to move a slot out for in-place conversion.
+///
+/// `to_nf4` consumes the slot's value, and a move out of a struct field needs
+/// something to leave behind. A 1x1 keeps the replacement cheap and is never
+/// observed, because the conversion overwrites it before the next read.
+fn placeholder_linear<B: Backend>(device: &B::Device) -> QwenLinear<B> {
+    QwenLinear::F32(LinearConfig::new(1, 1).with_bias(false).init(device))
+}
+
 impl<B: Backend> QwenTrunk<B> {
+    /// Quantize every projection in the trunk to NF4 residency.
+    ///
+    /// The from-scratch counterpart to [`load_qwen_trunk_nf4`]: that one reads
+    /// packed weights from a checkpoint, this one packs an in-memory trunk. It
+    /// is what makes the adapters-only training path reachable from a randomly
+    /// initialised model — the shakedown run — instead of only from real
+    /// weights on disk.
+    ///
+    /// Embeddings and norms are left alone: `QwenEmbed::Nf4` already exists for
+    /// the packed case and no test here needs it, so converting it would add a
+    /// code path with no caller. Only the projections that carry adapters move.
+    pub fn to_nf4(&mut self) -> Result<()> {
+        self.lm_head =
+            std::mem::replace(&mut self.lm_head, placeholder_linear(&Default::default()))
+                .to_nf4()?;
+        for layer in &mut self.layers {
+            match &mut layer.mixer {
+                QwenMixer::Linear(head) => {
+                    head.in_proj_qkv = std::mem::replace(
+                        &mut head.in_proj_qkv,
+                        placeholder_linear(&Default::default()),
+                    )
+                    .to_nf4()?;
+                    head.in_proj_z = std::mem::replace(
+                        &mut head.in_proj_z,
+                        placeholder_linear(&Default::default()),
+                    )
+                    .to_nf4()?;
+                    head.in_proj_b = std::mem::replace(
+                        &mut head.in_proj_b,
+                        placeholder_linear(&Default::default()),
+                    )
+                    .to_nf4()?;
+                    head.in_proj_a = std::mem::replace(
+                        &mut head.in_proj_a,
+                        placeholder_linear(&Default::default()),
+                    )
+                    .to_nf4()?;
+                    head.out_proj = std::mem::replace(
+                        &mut head.out_proj,
+                        placeholder_linear(&Default::default()),
+                    )
+                    .to_nf4()?;
+                }
+                QwenMixer::Full(attn) => {
+                    attn.q_proj = std::mem::replace(
+                        &mut attn.q_proj,
+                        placeholder_linear(&Default::default()),
+                    )
+                    .to_nf4()?;
+                    attn.k_proj = std::mem::replace(
+                        &mut attn.k_proj,
+                        placeholder_linear(&Default::default()),
+                    )
+                    .to_nf4()?;
+                    attn.v_proj = std::mem::replace(
+                        &mut attn.v_proj,
+                        placeholder_linear(&Default::default()),
+                    )
+                    .to_nf4()?;
+                    attn.o_proj = std::mem::replace(
+                        &mut attn.o_proj,
+                        placeholder_linear(&Default::default()),
+                    )
+                    .to_nf4()?;
+                }
+            }
+            layer.mlp.gate_proj = std::mem::replace(
+                &mut layer.mlp.gate_proj,
+                placeholder_linear(&Default::default()),
+            )
+            .to_nf4()?;
+            layer.mlp.up_proj = std::mem::replace(
+                &mut layer.mlp.up_proj,
+                placeholder_linear(&Default::default()),
+            )
+            .to_nf4()?;
+            layer.mlp.down_proj = std::mem::replace(
+                &mut layer.mlp.down_proj,
+                placeholder_linear(&Default::default()),
+            )
+            .to_nf4()?;
+        }
+        Ok(())
+    }
+
     pub fn new(config: QwenTrunkConfig, device: &B::Device) -> Self {
         let dims = config.dims;
         let layers = (0..config.effective_layers())
@@ -1911,6 +2059,7 @@ pub fn load_qwen_trunk_nf4<B: Backend>(
 )]
 mod tests {
     use super::*;
+
     use crate::tensor_ext::force_initialization;
     use burn::backend::NdArray;
     use std::sync::atomic::{AtomicU64, Ordering};

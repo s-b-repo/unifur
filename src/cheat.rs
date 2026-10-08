@@ -42,6 +42,31 @@
 //! training reward, not a sandbox. Two mitigations sit outside it and both
 //! matter: keep the gate script and `src/verify.rs` outside the model's
 //! writable tree, and re-hash them after every evaluation.
+//!
+//! # Training data
+//!
+//! The same reasoning applies one level down, to the traces a student is
+//! trained on. An external teacher can ship code that *looks* like an answer
+//! while carrying the same defects this module catches at the gate: lint
+//! suppressions instead of fixes, stubs presented as substance, outputs
+//! hardcoded to the evaluation's known inputs, and paste artifacts that are
+//! not code at all. [`scan_snippet`] is the data-side detector: pure-Rust,
+//! line-oriented, no external linters, per language family. Its classes are
+//! new [`CheatClass`] variants so a report can hold gate findings and data
+//! findings side by side, and [`filter_traces`] is the batch entry point the
+//! data pipeline calls.
+//!
+//! | Severity | Data class | Example |
+//! |---|---|---|
+//! | [`Severity::Suppression`] (reject) | [`CheatClass::DataSuppression`] | `#[allow(...)]` with no reason, `type: ignore`, `noqa`, `eslint-disable`, `@ts-nocheck`, `NOLINT`, `#pragma` diagnostic suppression, an `unsafe` block with no `SAFETY` comment |
+//! | [`Severity::Suppression`] (reject) | [`CheatClass::DataEvalGaming`] | `if x == 42 { return 7 }`, lookup-table answers, `assert!(true)` filler, a test that never asserts |
+//! | [`Severity::Evasion`] (quarantine) | [`CheatClass::DataStub`] | `todo!()`, `raise NotImplementedError`, `pass` as a claimed body, `throw new Error('not implemented')`, commented-out tests |
+//! | [`Severity::Evasion`] (quarantine) | [`CheatClass::DataBroken`] | unbalanced delimiters, an open code fence, prose pasted into a code block, `...` / "rest unchanged" truncation markers |
+//!
+//! A suppression that carries a written reason (`audit-allow: ...` or the
+//! word `reason` on the same or the preceding line) is downgraded to
+//! [`Severity::Note`]: recorded, but not by itself a reason to drop the
+//! trace. The report carries the verdict; the caller decides.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -52,9 +77,14 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
-    /// A test was weakened, disabled, or deleted so it could not fail.
+    /// Recorded for visibility only: a suppression carrying a written reason.
+    /// A note does not by itself reject a trace or a candidate.
+    Note,
+    /// A test was weakened, disabled, or deleted so it could not fail. On the
+    /// data side, a trace worth quarantining rather than training on.
     Evasion,
-    /// A lint was silenced rather than satisfied.
+    /// A lint was silenced rather than satisfied. On the data side, a trace
+    /// worth rejecting outright.
     Suppression,
     /// The checker itself was altered, removed, or made unreachable.
     Fraud,
@@ -63,6 +93,7 @@ pub enum Severity {
 impl Severity {
     pub fn as_str(self) -> &'static str {
         match self {
+            Severity::Note => "note",
             Severity::Evasion => "evasion",
             Severity::Suppression => "suppression",
             Severity::Fraud => "fraud",
@@ -83,6 +114,28 @@ pub enum CheatClass {
     /// A weakened `clippy.toml`, a deleted test target, a modified gate
     /// script or certificate registry, a disabled feature gate.
     GateTampering,
+    /// Training data: a lint silenced inside a snippet — `#[allow]` with no
+    /// written reason, `type: ignore`, `noqa`, a bare `except:`,
+    /// `eslint-disable`, `@ts-ignore`, `NOLINT`, a diagnostic-suppressing
+    /// `#pragma`, or an `unsafe` block with no `SAFETY` comment.
+    #[serde(rename = "data-suppression")]
+    DataSuppression,
+    /// Training data: a stub presented as substance — `todo!()`,
+    /// `unimplemented!()`, `raise NotImplementedError`, a `pass` body behind
+    /// a claimed function, `throw new Error('not implemented')`, an empty
+    /// body behind a return type, a commented-out test.
+    #[serde(rename = "data-stub")]
+    DataStub,
+    /// Training data: the evaluation gamed instead of the task solved — a
+    /// branch on a literal input value, a lookup-table answer, an assertion
+    /// that cannot fail, a test that never asserts.
+    #[serde(rename = "data-eval-gaming")]
+    DataEvalGaming,
+    /// Training data: the snippet is not intact code — unbalanced delimiters,
+    /// a code fence left open, prose pasted into a code block, a truncation
+    /// marker (`...`, "rest unchanged") in a complete-answer context.
+    #[serde(rename = "data-broken")]
+    DataBroken,
 }
 
 /// One way a candidate tried to defeat the gate.
@@ -123,8 +176,12 @@ impl Finding {
         }
         let severity = match class {
             CheatClass::GateTampering => Severity::Fraud,
-            CheatClass::LintSuppression => Severity::Suppression,
-            CheatClass::TestEvasion => Severity::Evasion,
+            CheatClass::LintSuppression
+            | CheatClass::DataSuppression
+            | CheatClass::DataEvalGaming => Severity::Suppression,
+            CheatClass::TestEvasion | CheatClass::DataStub | CheatClass::DataBroken => {
+                Severity::Evasion
+            }
         };
         Self {
             class,
@@ -134,6 +191,20 @@ impl Finding {
             evidence,
             because: because.to_string(),
         }
+    }
+
+    /// A finding recorded for visibility rather than rejection: a suppression
+    /// that carries a written reason is worth seeing in the report without
+    /// being worth dropping the trace over.
+    fn note(
+        class: CheatClass,
+        line: Option<usize>,
+        evidence: impl Into<String>,
+        because: &'static str,
+    ) -> Self {
+        let mut finding = Self::new(class, line, evidence, because);
+        finding.severity = Severity::Note;
+        finding
     }
 
     /// Stable identifier for a finding: class, location and evidence.
@@ -153,6 +224,10 @@ impl CheatClass {
             CheatClass::LintSuppression => "lint-suppression",
             CheatClass::TestEvasion => "test-evasion",
             CheatClass::GateTampering => "gate-tampering",
+            CheatClass::DataSuppression => "data-suppression",
+            CheatClass::DataStub => "data-stub",
+            CheatClass::DataEvalGaming => "data-eval-gaming",
+            CheatClass::DataBroken => "data-broken",
         }
     }
 }
@@ -857,9 +932,14 @@ pub const BASELINE: &[(&str, &str, usize)] = &[
     // GPU-gated integration tests: they need a discrete GPU with native WGPU
     // compute, which this machine does not have. Ignored deliberately.
     ("tests/integration.rs", GPU_GATE, 3),
+    // Real-API smoke test in `src/nim.rs`: spends real tokens against an
+    // external service, so it is deliberately ignored unless run explicitly.
+    ("src/nim.rs", NIM_API_GATE, 1),
 ];
 
 const GPU_GATE: &str = "#[ignore = \"requires a discrete GPU with native WGPU compute support\"]";
+const NIM_API_GATE: &str =
+    "#[ignore = \"spends real tokens; run explicitly with NVIDIA_API_KEY set\"]";
 
 /// Drop the findings a file's baseline allowance covers.
 ///
@@ -1058,6 +1138,899 @@ pub fn gate(cheat: &CheatReport, tests: bool, clippy: bool, audit: bool) -> Gate
         audit,
         cheat_clean: cheat.is_clean(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Training-data scanning
+//
+// Everything below this line is the data-side half of the module: it reads a
+// single generated snippet, not a candidate tree, and reports the four
+// `Data*` classes. Detection is line-oriented on purpose: the input is
+// untrusted teacher output that frequently does not compile, so no parser and
+// no external linter can be assumed.
+// ---------------------------------------------------------------------------
+
+/// The language family a training snippet belongs to. Detection runs per
+/// family because the suppression idioms differ (`#[allow]` vs `noqa` vs
+/// `eslint-disable`); `Other` gets the language-independent checks only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SnippetLanguage {
+    Rust,
+    Python,
+    C,
+    Cpp,
+    JsTs,
+    HtmlCss,
+    Other,
+}
+
+impl SnippetLanguage {
+    /// Parse a file extension (`"rs"`, `"py"`, `"tsx"`, ...). Unknown
+    /// extensions map to [`SnippetLanguage::Other`], never fail.
+    pub fn from_extension(ext: &str) -> Self {
+        match ext.to_ascii_lowercase().as_str() {
+            "rs" => Self::Rust,
+            "py" | "pyi" | "pyw" => Self::Python,
+            "c" | "h" => Self::C,
+            "cpp" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" => Self::Cpp,
+            "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts" => Self::JsTs,
+            "html" | "htm" | "css" => Self::HtmlCss,
+            _ => Self::Other,
+        }
+    }
+
+    /// Parse a language name (`"rust"`, `"python"`, `"c++"`, `"typescript"`,
+    /// ...). Unknown names map to [`SnippetLanguage::Other`], never fail.
+    pub fn from_name(name: &str) -> Self {
+        match name.to_ascii_lowercase().as_str() {
+            "rust" | "rs" => Self::Rust,
+            "python" | "python3" | "py" => Self::Python,
+            "c" => Self::C,
+            "c++" | "cpp" | "cxx" => Self::Cpp,
+            "js" | "javascript" | "ts" | "typescript" | "jsts" | "js/ts" => Self::JsTs,
+            "html" | "css" | "htmlcss" | "html/css" => Self::HtmlCss,
+            _ => Self::Other,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Python => "python",
+            Self::C => "c",
+            Self::Cpp => "cpp",
+            Self::JsTs => "jsts",
+            Self::HtmlCss => "htmlcss",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// One source line, split into the part a compiler would see and the comment
+/// text. String literal contents are blanked in `code` (a pattern spelled
+/// inside a string is data, not code — the same rule the gate scanner uses);
+/// `raw` keeps the original line for evidence.
+struct LineView<'a> {
+    /// 1-based line number.
+    no: usize,
+    raw: &'a str,
+    code: String,
+    comment: String,
+}
+
+/// Whether `chars[i..]` starts with `needle`.
+fn starts_with_at(chars: &[char], i: usize, needle: &str) -> bool {
+    needle
+        .chars()
+        .enumerate()
+        .all(|(off, n)| chars.get(i + off) == Some(&n))
+}
+
+/// Whether the `'` at `i` opens a Rust/C char literal (`'a'`, `'\n'`) rather
+/// than a lifetime (`'a`). The distinction is load-bearing: treating a
+/// lifetime as a string start would blank the rest of the line, hiding code
+/// and corrupting the delimiter balance.
+fn is_char_literal_at(chars: &[char], i: usize) -> bool {
+    if chars.get(i + 1) == Some(&'\\') {
+        return chars.get(i + 3) == Some(&'\'');
+    }
+    chars.get(i + 2) == Some(&'\'')
+}
+
+/// Split a snippet into [`LineView`]s: comments separated out, string
+/// contents blanked, block comments and Python triple-quoted strings tracked
+/// across lines. Quote state resets at each line end, so an unterminated
+/// string blanks only its own line — a deliberate choice for line-oriented
+/// input over a multiline state that could swallow the whole snippet.
+fn view_lines(source: &str, lang: SnippetLanguage) -> Vec<LineView<'_>> {
+    let line_marker: &str = match lang {
+        SnippetLanguage::Python => "#",
+        SnippetLanguage::HtmlCss => "<!--",
+        _ => "//",
+    };
+    let block: Option<(&str, &str)> = match lang {
+        SnippetLanguage::Python | SnippetLanguage::Other => None,
+        SnippetLanguage::HtmlCss => Some(("<!--", "-->")),
+        _ => Some(("/*", "*/")),
+    };
+    let python = lang == SnippetLanguage::Python;
+    let char_literals = matches!(
+        lang,
+        SnippetLanguage::Rust | SnippetLanguage::C | SnippetLanguage::Cpp
+    );
+    let mut in_block = false;
+    let mut in_triple: Option<char> = None;
+    let mut out = Vec::new();
+    for (idx, raw) in source.lines().enumerate() {
+        let chars: Vec<char> = raw.chars().collect();
+        let mut code = String::new();
+        let mut comment = String::new();
+        let mut i = 0usize;
+        while i < chars.len() {
+            if in_block {
+                let close = block.map_or("", |(_, c)| c);
+                if starts_with_at(&chars, i, close) {
+                    in_block = false;
+                    i += close.chars().count();
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if let Some(q) = in_triple {
+                if chars[i] == q && chars.get(i + 1) == Some(&q) && chars.get(i + 2) == Some(&q) {
+                    in_triple = None;
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            let c = chars[i];
+            if starts_with_at(&chars, i, line_marker) {
+                comment.extend(&chars[i..]);
+                break;
+            }
+            if let Some((open, _)) = block {
+                if starts_with_at(&chars, i, open) {
+                    in_block = true;
+                    i += open.chars().count();
+                    continue;
+                }
+            }
+            if python
+                && (c == '"' || c == '\'')
+                && chars.get(i + 1) == Some(&c)
+                && chars.get(i + 2) == Some(&c)
+            {
+                in_triple = Some(c);
+                i += 3;
+                continue;
+            }
+            let is_string = c == '"'
+                || (c == '`' && lang == SnippetLanguage::JsTs)
+                || (c == '\'' && (!char_literals || is_char_literal_at(&chars, i)));
+            if is_string {
+                i += 1;
+                while i < chars.len() {
+                    if chars[i] == '\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if chars[i] == c {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+            code.push(c);
+            i += 1;
+        }
+        out.push(LineView {
+            no: idx + 1,
+            raw,
+            code,
+            comment,
+        });
+    }
+    out
+}
+
+/// What a comment has to contain for a suppression to read as reviewed rather
+/// than silent: the waiver marker this repository's own audit uses, or the
+/// word "reason" spelled out.
+fn comment_has_reason(comment: &str) -> bool {
+    let lower = comment.to_lowercase();
+    lower.contains("audit-allow:") || lower.contains("reason")
+}
+
+/// A reason counts whether it trails the suppression on the same line or sits
+/// on the line directly above it (which is then a pure comment line).
+fn adjacent_reason(lines: &[LineView<'_>], i: usize) -> bool {
+    if comment_has_reason(&lines[i].comment) {
+        return true;
+    }
+    i > 0 && lines[i - 1].code.trim().is_empty() && comment_has_reason(&lines[i - 1].comment)
+}
+
+/// Whether the comment on this line or the line above names `SAFETY` — the
+/// convention that turns an `unsafe` block from an undocumented trust-me into
+/// a reviewed invariant.
+fn adjacent_safety(lines: &[LineView<'_>], i: usize) -> bool {
+    lines[i].comment.contains("SAFETY") || (i > 0 && lines[i - 1].comment.contains("SAFETY"))
+}
+
+/// Push a suppression finding, downgraded to a note when it carries a reason.
+fn push_suppression(
+    lines: &[LineView<'_>],
+    i: usize,
+    because: &'static str,
+    report: &mut CheatReport,
+) {
+    let evidence = lines[i].raw.trim().to_string();
+    let line = Some(lines[i].no);
+    if adjacent_reason(lines, i) {
+        report.findings.push(Finding::note(
+            CheatClass::DataSuppression,
+            line,
+            evidence,
+            because,
+        ));
+    } else {
+        report.findings.push(Finding::new(
+            CheatClass::DataSuppression,
+            line,
+            evidence,
+            because,
+        ));
+    }
+}
+
+/// Lint-suppression idioms, per language family.
+fn scan_snippet_suppression(
+    lines: &[LineView<'_>],
+    lang: SnippetLanguage,
+    report: &mut CheatReport,
+) {
+    for (i, lv) in lines.iter().enumerate() {
+        let code = lv.code.as_str();
+        let comment = lv.comment.as_str();
+        match lang {
+            SnippetLanguage::Rust => {
+                for needle in [
+                    "#[allow(",
+                    "#![allow(",
+                    "#[expect(",
+                    "#![expect(",
+                    "#[ allow",
+                    "#[allow (",
+                ] {
+                    if code.contains(needle) {
+                        push_suppression(
+                            lines,
+                            i,
+                            "a lint attribute silences the check instead of satisfying it",
+                            report,
+                        );
+                        break;
+                    }
+                }
+                let unsafe_code = [
+                    "unsafe {",
+                    "unsafe{",
+                    "unsafe fn",
+                    "unsafe impl",
+                    "unsafe extern",
+                ]
+                .iter()
+                .any(|n| code.contains(n));
+                if unsafe_code && !adjacent_safety(lines, i) {
+                    push_suppression(
+                        lines,
+                        i,
+                        "an `unsafe` block without a SAFETY comment asks the reader to trust it silently",
+                        report,
+                    );
+                }
+            }
+            SnippetLanguage::Python => {
+                if comment.contains("type: ignore") {
+                    push_suppression(
+                        lines,
+                        i,
+                        "a `type: ignore` silences the type checker instead of satisfying it",
+                        report,
+                    );
+                }
+                if comment.contains("noqa") {
+                    push_suppression(
+                        lines,
+                        i,
+                        "a `noqa` marker silences the linter instead of satisfying it",
+                        report,
+                    );
+                }
+                if code.trim_start().starts_with("except:") {
+                    push_suppression(
+                        lines,
+                        i,
+                        "a bare `except:` swallows every exception, including the ones that report real bugs",
+                        report,
+                    );
+                }
+            }
+            SnippetLanguage::JsTs => {
+                for (needle, because) in [
+                    (
+                        "eslint-disable",
+                        "an `eslint-disable` comment silences the linter instead of satisfying it",
+                    ),
+                    (
+                        "@ts-ignore",
+                        "a `@ts-ignore` comment silences the type checker instead of satisfying it",
+                    ),
+                    (
+                        "@ts-nocheck",
+                        "a `@ts-nocheck` comment silences the type checker for the whole file",
+                    ),
+                    (
+                        "@ts-expect-error",
+                        "a `@ts-expect-error` comment makes a type error the expected state",
+                    ),
+                ] {
+                    if comment.contains(needle) {
+                        push_suppression(lines, i, because, report);
+                    }
+                }
+            }
+            SnippetLanguage::C | SnippetLanguage::Cpp => {
+                if comment.contains("NOLINT") {
+                    push_suppression(
+                        lines,
+                        i,
+                        "a `NOLINT` marker silences the linter instead of satisfying it",
+                        report,
+                    );
+                }
+                let pragma_suppress = code.contains("#pragma")
+                    && ((code.contains("diagnostic") && code.contains("ignored"))
+                        || (code.contains("warning") && code.contains("disable")));
+                if pragma_suppress {
+                    push_suppression(
+                        lines,
+                        i,
+                        "a `#pragma` that disables a diagnostic silences the compiler instead of satisfying it",
+                        report,
+                    );
+                }
+            }
+            SnippetLanguage::HtmlCss | SnippetLanguage::Other => {}
+        }
+    }
+}
+
+/// Stubs presented as substance, per language family.
+fn scan_snippet_stub(lines: &[LineView<'_>], lang: SnippetLanguage, report: &mut CheatReport) {
+    let push = |i: usize, because: &'static str, report: &mut CheatReport| {
+        report.findings.push(Finding::new(
+            CheatClass::DataStub,
+            Some(lines[i].no),
+            lines[i].raw.trim().to_string(),
+            because,
+        ));
+    };
+    for (i, lv) in lines.iter().enumerate() {
+        let code = lv.code.as_str();
+        let trimmed = code.trim();
+        let comment = lv.comment.to_lowercase();
+        // Language-independent: an explicit "TODO: implement" left in the answer.
+        if comment.contains("todo: implement") {
+            push(
+                i,
+                "a `TODO: implement` marker is an admission the answer was never finished",
+                report,
+            );
+        }
+        match lang {
+            SnippetLanguage::Rust => {
+                if code.contains("todo!(") || code.contains("unimplemented!(") {
+                    push(
+                        i,
+                        "a `todo!()`/`unimplemented!()` is a hole presented as an implementation",
+                        report,
+                    );
+                }
+                if trimmed.contains("fn ")
+                    && trimmed.contains("->")
+                    && (trimmed.ends_with("{}") || trimmed.ends_with("{ }"))
+                {
+                    push(
+                        i,
+                        "an empty body behind a return type is a stub, not an implementation",
+                        report,
+                    );
+                }
+                if lv.comment.contains("#[test]") || lv.comment.contains("fn test_") {
+                    push(
+                        i,
+                        "a commented-out test is presented as coverage it no longer provides",
+                        report,
+                    );
+                }
+            }
+            SnippetLanguage::Python => {
+                if code.contains("NotImplementedError") {
+                    push(
+                        i,
+                        "a `NotImplementedError` is a hole presented as an implementation",
+                        report,
+                    );
+                }
+                if trimmed == "pass" {
+                    let after_def = (0..i).rev().find_map(|j| {
+                        let prev = lines[j].code.trim();
+                        (!prev.is_empty())
+                            .then(|| prev.starts_with("def ") || prev.starts_with("async def "))
+                    });
+                    if after_def == Some(true) || comment.contains("todo") {
+                        push(
+                            i,
+                            "a `pass` body is an empty function presented as an implementation",
+                            report,
+                        );
+                    }
+                }
+                if lv.comment.contains("def test_") {
+                    push(
+                        i,
+                        "a commented-out test is presented as coverage it no longer provides",
+                        report,
+                    );
+                }
+            }
+            SnippetLanguage::JsTs => {
+                // The message text lives inside a string literal, which the
+                // code view blanks, so match the reason against the raw line
+                // while requiring the `throw` in the code view.
+                if lv.code.to_lowercase().contains("throw")
+                    && lv.raw.to_lowercase().contains("not implemented")
+                {
+                    push(
+                        i,
+                        "a `throw new Error('not implemented')` is a hole presented as an implementation",
+                        report,
+                    );
+                }
+                if trimmed.contains("function") && trimmed.ends_with("{}") {
+                    push(
+                        i,
+                        "an empty function body is a stub, not an implementation",
+                        report,
+                    );
+                }
+                let commented_test = ["it(", "test(", "describe("]
+                    .iter()
+                    .any(|n| lv.comment.contains(n));
+                if commented_test {
+                    push(
+                        i,
+                        "a commented-out test is presented as coverage it no longer provides",
+                        report,
+                    );
+                }
+            }
+            SnippetLanguage::C
+            | SnippetLanguage::Cpp
+            | SnippetLanguage::HtmlCss
+            | SnippetLanguage::Other => {}
+        }
+    }
+}
+
+/// Whether line `i` special-cases a literal input value: an `if` whose
+/// condition compares against a number or string literal, with a `return`
+/// nearby. `if x == 42 { return 7; }` is the shape of an answer that knows
+/// the test's inputs, not the shape of a solution.
+fn has_literal_branch(lines: &[LineView<'_>], i: usize) -> bool {
+    let code = &lines[i].code;
+    let trimmed = code.trim_start();
+    let is_if = trimmed.starts_with("if ")
+        || trimmed.starts_with("if(")
+        || trimmed.starts_with("} else if")
+        || code.contains(" if ");
+    if !is_if {
+        return false;
+    }
+    let chars: Vec<char> = code.chars().collect();
+    let mut literal_comparison = false;
+    let mut j = 0usize;
+    while j + 1 < chars.len() {
+        if chars[j] == '=' && chars[j + 1] == '=' {
+            let before = chars.get(j.wrapping_sub(1)).copied();
+            if matches!(before, Some('=') | Some('!') | Some('<') | Some('>')) {
+                j += 2;
+                continue;
+            }
+            let left_literal = (0..j)
+                .rev()
+                .find(|&k| !chars[k].is_whitespace())
+                .is_some_and(|k| chars[k].is_ascii_digit() || chars[k] == '"' || chars[k] == '\'');
+            let right_literal = (j + 2..chars.len())
+                .find(|&k| !chars[k].is_whitespace() && chars[k] != '=')
+                .is_some_and(|k| {
+                    chars[k].is_ascii_digit()
+                        || chars[k] == '"'
+                        || chars[k] == '\''
+                        || (chars[k] == '-' && chars.get(k + 1).is_some_and(|n| n.is_ascii_digit()))
+                });
+            if left_literal || right_literal {
+                literal_comparison = true;
+                break;
+            }
+            j += 2;
+            continue;
+        }
+        j += 1;
+    }
+    if !literal_comparison {
+        return false;
+    }
+    if code.contains("return") {
+        return true;
+    }
+    (i + 1..lines.len())
+        .find_map(|k| {
+            let next = lines[k].code.trim();
+            (!next.is_empty()).then(|| next.starts_with("return"))
+        })
+        .unwrap_or(false)
+}
+
+/// The body of a brace-delimited function starting at line `from`, using the
+/// comment-free, string-blanked view so braces inside strings do not count.
+fn brace_body(lines: &[LineView<'_>], from: usize) -> String {
+    let mut body = String::new();
+    let mut depth = 0i64;
+    let mut started = false;
+    for lv in &lines[from..] {
+        body.push_str(&lv.code);
+        body.push('\n');
+        for c in lv.code.chars() {
+            match c {
+                '{' => {
+                    depth += 1;
+                    started = true;
+                }
+                '}' => depth -= 1,
+                _ => {}
+            }
+        }
+        if started && depth <= 0 {
+            break;
+        }
+    }
+    body
+}
+
+/// Evaluation gaming: literal special-casing, lookup-table answers, and tests
+/// whose assertions cannot fail or do not exist.
+fn scan_snippet_gaming(lines: &[LineView<'_>], lang: SnippetLanguage, report: &mut CheatReport) {
+    let push = |i: usize, evidence: String, because: &'static str, report: &mut CheatReport| {
+        report.findings.push(Finding::new(
+            CheatClass::DataEvalGaming,
+            Some(lines[i].no),
+            evidence,
+            because,
+        ));
+    };
+
+    for (i, lv) in lines.iter().enumerate() {
+        let code = lv.code.as_str();
+        let trimmed = code.trim();
+        // Assertions that cannot fail.
+        let vacuous = match lang {
+            SnippetLanguage::Rust => {
+                code.contains("assert!(true") || code.contains("assert_eq!(true, true")
+            }
+            SnippetLanguage::Python => {
+                trimmed == "assert True" || trimmed.starts_with("assert True,")
+            }
+            SnippetLanguage::JsTs => {
+                code.contains("assert(true")
+                    || code.contains("assertTrue(true")
+                    || code.contains("expect(true)")
+            }
+            _ => false,
+        };
+        if vacuous {
+            push(
+                i,
+                lv.raw.trim().to_string(),
+                "an assertion that cannot fail keeps the shape of a test while removing its teeth",
+                report,
+            );
+        }
+        // Special-casing a known input value.
+        if has_literal_branch(lines, i) {
+            push(
+                i,
+                lv.raw.trim().to_string(),
+                "a branch on a literal input value special-cases a known test input instead of solving the task",
+                report,
+            );
+        }
+        // A test that never asserts.
+        match lang {
+            SnippetLanguage::Rust if code.contains("#[test]") => {
+                if let Some(j) = (i + 1..lines.len()).find(|&j| lines[j].code.contains("fn ")) {
+                    let body = brace_body(lines, j);
+                    if !body.contains("assert") {
+                        push(
+                            i,
+                            lv.raw.trim().to_string(),
+                            "a test that never asserts cannot fail, so it proves nothing",
+                            report,
+                        );
+                    }
+                }
+            }
+            SnippetLanguage::Python
+                if trimmed.starts_with("def test") && trimmed.ends_with(':') =>
+            {
+                let indent = code.len() - code.trim_start().len();
+                let mut body = String::new();
+                for next in &lines[i + 1..] {
+                    let t = next.code.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    if next.code.len() - next.code.trim_start().len() <= indent {
+                        break;
+                    }
+                    body.push_str(&next.code);
+                    body.push('\n');
+                }
+                if !body.contains("assert") {
+                    push(
+                        i,
+                        lv.raw.trim().to_string(),
+                        "a test that never asserts cannot fail, so it proves nothing",
+                        report,
+                    );
+                }
+            }
+            SnippetLanguage::JsTs if trimmed.starts_with("it(") || trimmed.starts_with("test(") => {
+                let body = brace_body(lines, i);
+                if !body.contains("expect(") && !body.contains("assert") {
+                    push(
+                        i,
+                        lv.raw.trim().to_string(),
+                        "a test that never asserts cannot fail, so it proves nothing",
+                        report,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Lookup-table answers: a match or switch whose arms are all literal
+    // inputs mapped to literal outputs. Four or more constant arms is the
+    // shape of a table memorised from the test, not of control flow.
+    let arm_lines: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, lv)| {
+            let t = lv.code.trim_start();
+            match lang {
+                SnippetLanguage::Rust => {
+                    (t.chars().next().is_some_and(|c| c.is_ascii_digit()) || t.starts_with('"'))
+                        && t.contains("=>")
+                }
+                SnippetLanguage::C | SnippetLanguage::Cpp | SnippetLanguage::JsTs => {
+                    t.starts_with("case ")
+                        && t[5..]
+                            .trim_start()
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_digit() || c == '"' || c == '\'')
+                }
+                _ => false,
+            }
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if arm_lines.len() >= 4 {
+        push(
+            arm_lines[0],
+            lines[arm_lines[0]].raw.trim().to_string(),
+            "a lookup table of literal answers stands in for an implementation",
+            report,
+        );
+    }
+}
+
+/// Obvious brokenness: unbalanced delimiters, open code fences, prose pasted
+/// into a code block, and truncation markers in a complete-answer context.
+fn scan_snippet_broken(lines: &[LineView<'_>], report: &mut CheatReport) {
+    let push = |line: usize, evidence: String, because: &'static str, report: &mut CheatReport| {
+        report.findings.push(Finding::new(
+            CheatClass::DataBroken,
+            Some(line),
+            evidence,
+            because,
+        ));
+    };
+
+    // Code fences come in pairs; an odd count means one was never closed and
+    // the rest of the "code" is markup.
+    let fences: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, lv)| lv.raw.trim_start().starts_with("```"))
+        .map(|(i, _)| i)
+        .collect();
+    if fences.len() % 2 == 1 {
+        let i = fences[0];
+        push(
+            lines[i].no,
+            lines[i].raw.trim().to_string(),
+            "a code fence left open turns the rest of the answer into markup",
+            report,
+        );
+    }
+
+    // Delimiter balance over the string-blanked, comment-free view. A closer
+    // with no opener, or an opener never closed at end of input, is a snippet
+    // that was truncated or corrupted in transit.
+    let mut stack: Vec<char> = Vec::new();
+    let mut bad_at: Option<usize> = None;
+    'outer: for lv in lines {
+        for c in lv.code.chars() {
+            match c {
+                '(' | '[' | '{' => stack.push(c),
+                ')' | ']' | '}' => {
+                    let want = match c {
+                        ')' => '(',
+                        ']' => '[',
+                        _ => '{',
+                    };
+                    if stack.pop() != Some(want) {
+                        bad_at = Some(lv.no);
+                        break 'outer;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    if let Some(no) = bad_at {
+        let evidence = lines
+            .iter()
+            .find(|lv| lv.no == no)
+            .map_or_else(|| ")".to_string(), |lv| lv.raw.trim().to_string());
+        push(
+            no,
+            evidence,
+            "unbalanced delimiters: a closer has no opener, so the snippet is corrupt",
+            report,
+        );
+    } else if !stack.is_empty() {
+        if let Some(last) = lines.last() {
+            push(
+                last.no,
+                last.raw.trim().to_string(),
+                "unbalanced delimiters: an opener is never closed, so the snippet is truncated",
+                report,
+            );
+        }
+    }
+
+    // Prose paste markers: a sentence where the code should be. Checked on
+    // the code side of the line only — the same words inside a comment are
+    // ordinary documentation.
+    const PROSE: &[&str] = &[
+        "here is",
+        "here's",
+        "sure,",
+        "sure!",
+        "certainly",
+        "this code",
+        "the code",
+        "explanation:",
+        "as an ai",
+        "note that",
+        "you can",
+        "to use this",
+    ];
+    // Truncation markers: the answer admits it is not all there.
+    const TRUNCATED: &[&str] = &[
+        "rest unchanged",
+        "rest of the code",
+        "remaining code",
+        "implementation omitted",
+        "code omitted",
+    ];
+    for lv in lines {
+        let code_lower = lv.code.trim().to_lowercase();
+        if PROSE.iter().any(|p| code_lower.starts_with(p)) {
+            push(
+                lv.no,
+                lv.raw.trim().to_string(),
+                "prose pasted into a code block is not the code the snippet claims to be",
+                report,
+            );
+            continue;
+        }
+        let truncated_marker = lv.code.trim() == "..."
+            || lv.code.trim() == "…"
+            || lv.comment.trim() == "..."
+            || lv.comment.trim() == "…"
+            || TRUNCATED.iter().any(|p| lv.raw.to_lowercase().contains(p));
+        if truncated_marker {
+            push(
+                lv.no,
+                lv.raw.trim().to_string(),
+                "a truncation marker in a complete-answer context means part of the answer is missing",
+                report,
+            );
+        }
+    }
+}
+
+/// Scan one generated snippet for training-data cheats.
+///
+/// Pure-Rust and line-oriented: no parser, no external linter, no network.
+/// The verdict is in the returned report — suppression and eval-gaming
+/// findings are reject-grade ([`Severity::Suppression`]), stubs and brokenness
+/// are quarantine-grade ([`Severity::Evasion`]), and a reasoned suppression is
+/// a [`Severity::Note`]. What to do with each grade is the caller's decision.
+pub fn scan_snippet(code: &str, lang: SnippetLanguage) -> CheatReport {
+    let lines = view_lines(code, lang);
+    let mut report = CheatReport::default();
+    scan_snippet_suppression(&lines, lang, &mut report);
+    scan_snippet_stub(&lines, lang, &mut report);
+    scan_snippet_gaming(&lines, lang, &mut report);
+    scan_snippet_broken(&lines, &mut report);
+    // Overlapping patterns can match the same line twice; one entry per
+    // fingerprint is the honest count.
+    let mut seen = std::collections::HashSet::new();
+    report.findings.retain(|f| seen.insert(f.fingerprint()));
+    report
+}
+
+/// Batch filter for the data pipeline: scan each trace, keep the indices
+/// whose findings are all below quarantine grade (clean, or notes only), and
+/// aggregate every finding into one report.
+///
+/// Each finding's `path` is set to `trace[<index>]` so the aggregate report
+/// stays attributable, and its `line` is 1-based within that trace. Traces
+/// that were dropped are exactly the complement of the returned indices, and
+/// their findings carry the reason: reject-grade ([`Severity::Suppression`]
+/// and above) for suppression and eval gaming, quarantine-grade
+/// ([`Severity::Evasion`]) for stubs and broken snippets. Per-class totals
+/// come from [`CheatReport::count`].
+pub fn filter_traces(traces: &[String], lang: SnippetLanguage) -> (Vec<usize>, CheatReport) {
+    let mut kept = Vec::new();
+    let mut report = CheatReport::default();
+    for (i, trace) in traces.iter().enumerate() {
+        let mut single = scan_snippet(trace, lang);
+        let drop_trace = single
+            .findings
+            .iter()
+            .any(|f| f.severity >= Severity::Evasion);
+        if !drop_trace {
+            kept.push(i);
+        }
+        for f in &mut single.findings {
+            f.path = format!("trace[{i}]");
+        }
+        report.findings.extend(single.findings);
+    }
+    (kept, report)
 }
 
 #[cfg(test)]
@@ -1503,5 +2476,629 @@ mod tests {
             "the repository trips its own cheat detector: {:?}",
             report.sorted()
         );
+    }
+}
+
+#[cfg(test)]
+// Same scoped grant as the gate-side tests: a test says "this must have
+// worked" with `unwrap`, and production code in this file is still denied it.
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+mod snippet_tests {
+    use super::*;
+
+    fn findings(code: &str, lang: SnippetLanguage) -> CheatReport {
+        scan_snippet(code, lang)
+    }
+
+    // --- language parsing -------------------------------------------------
+
+    #[test]
+    fn language_parses_from_extensions() {
+        assert_eq!(SnippetLanguage::from_extension("rs"), SnippetLanguage::Rust);
+        assert_eq!(
+            SnippetLanguage::from_extension("py"),
+            SnippetLanguage::Python
+        );
+        assert_eq!(SnippetLanguage::from_extension("c"), SnippetLanguage::C);
+        assert_eq!(SnippetLanguage::from_extension("hpp"), SnippetLanguage::Cpp);
+        assert_eq!(
+            SnippetLanguage::from_extension("tsx"),
+            SnippetLanguage::JsTs
+        );
+        assert_eq!(
+            SnippetLanguage::from_extension("css"),
+            SnippetLanguage::HtmlCss
+        );
+        assert_eq!(
+            SnippetLanguage::from_extension("xyz"),
+            SnippetLanguage::Other
+        );
+    }
+
+    #[test]
+    fn language_parses_from_names() {
+        assert_eq!(SnippetLanguage::from_name("rust"), SnippetLanguage::Rust);
+        assert_eq!(
+            SnippetLanguage::from_name("Python"),
+            SnippetLanguage::Python
+        );
+        assert_eq!(SnippetLanguage::from_name("c++"), SnippetLanguage::Cpp);
+        assert_eq!(
+            SnippetLanguage::from_name("typescript"),
+            SnippetLanguage::JsTs
+        );
+        assert_eq!(
+            SnippetLanguage::from_name("a made up language"),
+            SnippetLanguage::Other
+        );
+    }
+
+    // --- DataSuppression: fires on the bad, silent on the clean -----------
+
+    #[test]
+    fn rust_allow_attribute_is_data_suppression() {
+        let report = findings("#[allow(dead_code)]\nfn f() {}\n", SnippetLanguage::Rust);
+        assert_eq!(report.count(CheatClass::DataSuppression), 1);
+        assert_eq!(report.worst(), Some(Severity::Suppression));
+    }
+
+    #[test]
+    fn rust_crate_level_allow_is_data_suppression() {
+        // A snippet is not the crate: there is no test-module grant to honor.
+        let report = findings("#![allow(clippy::all)]\nfn f() {}\n", SnippetLanguage::Rust);
+        assert_eq!(report.count(CheatClass::DataSuppression), 1);
+    }
+
+    #[test]
+    fn rust_allow_with_a_reason_on_the_same_line_is_a_note() {
+        let report = findings(
+            "#[allow(dead_code)] // audit-allow: mirrors the decoder exactly\nfn f() {}\n",
+            SnippetLanguage::Rust,
+        );
+        assert_eq!(report.count(CheatClass::DataSuppression), 1);
+        assert_eq!(report.worst(), Some(Severity::Note));
+    }
+
+    #[test]
+    fn rust_allow_with_a_reason_on_the_previous_line_is_a_note() {
+        let report = findings(
+            "// reason: the reference decoder does the same\n#[allow(dead_code)]\nfn f() {}\n",
+            SnippetLanguage::Rust,
+        );
+        assert_eq!(report.count(CheatClass::DataSuppression), 1);
+        assert_eq!(report.worst(), Some(Severity::Note));
+    }
+
+    #[test]
+    fn rust_allow_inside_a_comment_is_not_suppression() {
+        let report = findings(
+            "// do not add #[allow(dead_code)] here\nfn f() {}\n",
+            SnippetLanguage::Rust,
+        );
+        assert!(
+            report.is_clean(),
+            "comment read as code: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn rust_allow_inside_a_string_is_not_suppression() {
+        let report = findings("let s = \"#[allow(dead_code)]\";\n", SnippetLanguage::Rust);
+        assert!(
+            report.is_clean(),
+            "string read as code: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn rust_unsafe_without_a_safety_comment_is_data_suppression() {
+        let report = findings(
+            "fn f(p: *const i32) -> i32 {\n    unsafe { *p }\n}\n",
+            SnippetLanguage::Rust,
+        );
+        assert_eq!(report.count(CheatClass::DataSuppression), 1);
+    }
+
+    #[test]
+    fn rust_unsafe_with_a_safety_comment_is_clean() {
+        let report = findings(
+            "fn f(p: *const i32) -> i32 {\n    // SAFETY: callers guarantee p is valid\n    unsafe { *p }\n}\n",
+            SnippetLanguage::Rust,
+        );
+        assert!(
+            report.is_clean(),
+            "a documented unsafe was flagged: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn python_type_ignore_is_data_suppression() {
+        let report = findings("x = compute()  # type: ignore\n", SnippetLanguage::Python);
+        assert_eq!(report.count(CheatClass::DataSuppression), 1);
+        assert_eq!(report.worst(), Some(Severity::Suppression));
+    }
+
+    #[test]
+    fn python_noqa_is_data_suppression() {
+        let report = findings("import os  # noqa\n", SnippetLanguage::Python);
+        assert_eq!(report.count(CheatClass::DataSuppression), 1);
+    }
+
+    #[test]
+    fn python_bare_except_is_data_suppression() {
+        let report = findings(
+            "try:\n    run()\nexcept:\n    pass\n",
+            SnippetLanguage::Python,
+        );
+        assert_eq!(report.count(CheatClass::DataSuppression), 1);
+        // The `pass` under a bare `except:` is not separately a stub.
+        assert_eq!(report.count(CheatClass::DataStub), 0);
+    }
+
+    #[test]
+    fn python_noqa_in_a_string_is_not_suppression() {
+        let report = findings("s = \"# noqa\"\n", SnippetLanguage::Python);
+        assert!(
+            report.is_clean(),
+            "string read as a comment: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn jsts_eslint_disable_is_data_suppression() {
+        let report = findings(
+            "// eslint-disable-next-line\nfoo();\n",
+            SnippetLanguage::JsTs,
+        );
+        assert_eq!(report.count(CheatClass::DataSuppression), 1);
+        assert_eq!(report.worst(), Some(Severity::Suppression));
+    }
+
+    #[test]
+    fn jsts_ts_ignore_is_data_suppression() {
+        let report = findings("// @ts-ignore\nconst x = y;\n", SnippetLanguage::JsTs);
+        assert_eq!(report.count(CheatClass::DataSuppression), 1);
+    }
+
+    #[test]
+    fn jsts_ts_nocheck_is_data_suppression() {
+        let report = findings("// @ts-nocheck\nconst x = y;\n", SnippetLanguage::JsTs);
+        assert_eq!(report.count(CheatClass::DataSuppression), 1);
+    }
+
+    #[test]
+    fn c_nolint_is_data_suppression() {
+        let report = findings(
+            "int f(void) { return g(); }  // NOLINT\n",
+            SnippetLanguage::C,
+        );
+        assert_eq!(report.count(CheatClass::DataSuppression), 1);
+        assert_eq!(report.worst(), Some(Severity::Suppression));
+    }
+
+    #[test]
+    fn cpp_diagnostic_pragma_is_data_suppression() {
+        let report = findings(
+            "#pragma GCC diagnostic ignored \"-Wall\"\nint f() { return 0; }\n",
+            SnippetLanguage::Cpp,
+        );
+        assert_eq!(report.count(CheatClass::DataSuppression), 1);
+    }
+
+    #[test]
+    fn cpp_warning_disable_pragma_is_data_suppression() {
+        let report = findings(
+            "#pragma warning(disable: 4996)\nint f() { return 0; }\n",
+            SnippetLanguage::Cpp,
+        );
+        assert_eq!(report.count(CheatClass::DataSuppression), 1);
+    }
+
+    // --- DataStub -----------------------------------------------------------
+
+    #[test]
+    fn rust_todo_is_data_stub() {
+        let report = findings("fn f() -> i32 {\n    todo!()\n}\n", SnippetLanguage::Rust);
+        assert_eq!(report.count(CheatClass::DataStub), 1);
+        assert_eq!(report.worst(), Some(Severity::Evasion));
+    }
+
+    #[test]
+    fn rust_unimplemented_is_data_stub() {
+        let report = findings(
+            "fn f() -> i32 {\n    unimplemented!()\n}\n",
+            SnippetLanguage::Rust,
+        );
+        assert_eq!(report.count(CheatClass::DataStub), 1);
+    }
+
+    #[test]
+    fn rust_empty_body_behind_a_return_type_is_data_stub() {
+        let report = findings("fn compute(x: i32) -> i32 {}\n", SnippetLanguage::Rust);
+        assert_eq!(report.count(CheatClass::DataStub), 1);
+    }
+
+    #[test]
+    fn rust_commented_out_test_is_data_stub() {
+        let report = findings(
+            "// #[test]\n// fn t() { check(); }\n",
+            SnippetLanguage::Rust,
+        );
+        assert_eq!(report.count(CheatClass::DataStub), 1);
+    }
+
+    #[test]
+    fn python_not_implemented_error_is_data_stub() {
+        let report = findings(
+            "def f():\n    raise NotImplementedError\n",
+            SnippetLanguage::Python,
+        );
+        assert_eq!(report.count(CheatClass::DataStub), 1);
+        assert_eq!(report.worst(), Some(Severity::Evasion));
+    }
+
+    #[test]
+    fn python_pass_body_is_data_stub() {
+        let report = findings("def f(x):\n    pass\n", SnippetLanguage::Python);
+        assert_eq!(report.count(CheatClass::DataStub), 1);
+    }
+
+    #[test]
+    fn python_pass_with_todo_is_data_stub() {
+        let report = findings("def f(x):\n    pass  # TODO\n", SnippetLanguage::Python);
+        assert_eq!(report.count(CheatClass::DataStub), 1);
+    }
+
+    #[test]
+    fn jsts_not_implemented_throw_is_data_stub() {
+        let report = findings(
+            "function f() {\n  throw new Error('not implemented');\n}\n",
+            SnippetLanguage::JsTs,
+        );
+        assert_eq!(report.count(CheatClass::DataStub), 1);
+        assert_eq!(report.worst(), Some(Severity::Evasion));
+    }
+
+    // --- DataEvalGaming ------------------------------------------------------
+
+    #[test]
+    fn rust_assert_true_is_eval_gaming() {
+        let report = findings(
+            "#[test]\nfn t() { assert!(true); }\n",
+            SnippetLanguage::Rust,
+        );
+        assert_eq!(report.count(CheatClass::DataEvalGaming), 1);
+        assert_eq!(report.worst(), Some(Severity::Suppression));
+    }
+
+    #[test]
+    fn rust_literal_branch_is_eval_gaming() {
+        let report = findings(
+            "fn f(x: i32) -> i32 {\n    if x == 42 { return 7; }\n    x + 1\n}\n",
+            SnippetLanguage::Rust,
+        );
+        assert_eq!(report.count(CheatClass::DataEvalGaming), 1);
+    }
+
+    #[test]
+    fn rust_comparison_of_two_variables_is_not_gaming() {
+        let report = findings(
+            "fn f(x: i32, y: i32) -> i32 {\n    if x == y { return x; }\n    x + y\n}\n",
+            SnippetLanguage::Rust,
+        );
+        assert!(
+            report.is_clean(),
+            "an ordinary comparison was flagged: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn rust_lookup_table_is_eval_gaming() {
+        let report = findings(
+            "fn f(x: i32) -> i32 {\n    match x {\n        0 => 10,\n        1 => 20,\n        2 => 30,\n        3 => 40,\n        _ => 0,\n    }\n}\n",
+            SnippetLanguage::Rust,
+        );
+        assert_eq!(report.count(CheatClass::DataEvalGaming), 1);
+    }
+
+    #[test]
+    fn rust_test_that_never_asserts_is_eval_gaming() {
+        let report = findings("#[test]\nfn t() { f(1); }\n", SnippetLanguage::Rust);
+        assert_eq!(report.count(CheatClass::DataEvalGaming), 1);
+    }
+
+    #[test]
+    fn rust_test_with_a_real_assertion_is_not_gaming() {
+        let report = findings(
+            "#[test]\nfn t() { assert_eq!(f(1), 2); }\n",
+            SnippetLanguage::Rust,
+        );
+        assert!(
+            report.is_clean(),
+            "a real test was flagged: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn python_assert_true_is_eval_gaming() {
+        let report = findings("def test_f():\n    assert True\n", SnippetLanguage::Python);
+        assert_eq!(report.count(CheatClass::DataEvalGaming), 1);
+        assert_eq!(report.worst(), Some(Severity::Suppression));
+    }
+
+    #[test]
+    fn python_literal_branch_is_eval_gaming() {
+        let report = findings(
+            "def f(x):\n    if x == 42:\n        return 7\n    return x + 1\n",
+            SnippetLanguage::Python,
+        );
+        assert_eq!(report.count(CheatClass::DataEvalGaming), 1);
+    }
+
+    #[test]
+    fn python_test_that_never_asserts_is_eval_gaming() {
+        let report = findings(
+            "def test_f():\n    result = f(1)\n    print(result)\n",
+            SnippetLanguage::Python,
+        );
+        assert_eq!(report.count(CheatClass::DataEvalGaming), 1);
+    }
+
+    #[test]
+    fn jsts_expect_true_is_eval_gaming() {
+        let report = findings(
+            "test('f', () => { expect(true).toBe(true); });\n",
+            SnippetLanguage::JsTs,
+        );
+        assert_eq!(report.count(CheatClass::DataEvalGaming), 1);
+    }
+
+    #[test]
+    fn jsts_test_that_never_asserts_is_eval_gaming() {
+        let report = findings("test('f', () => { f(1); });\n", SnippetLanguage::JsTs);
+        assert_eq!(report.count(CheatClass::DataEvalGaming), 1);
+    }
+
+    // --- DataBroken ----------------------------------------------------------
+
+    #[test]
+    fn unbalanced_delimiters_are_data_broken() {
+        let report = findings("fn f() {\n    let x = 1;\n", SnippetLanguage::Rust);
+        assert_eq!(report.count(CheatClass::DataBroken), 1);
+        assert_eq!(report.worst(), Some(Severity::Evasion));
+    }
+
+    #[test]
+    fn a_closer_with_no_opener_is_data_broken() {
+        let report = findings("def f():\n    return 1)\n", SnippetLanguage::Python);
+        assert_eq!(report.count(CheatClass::DataBroken), 1);
+    }
+
+    #[test]
+    fn an_open_code_fence_is_data_broken() {
+        let report = findings("```rust\nfn f() {}\n", SnippetLanguage::Rust);
+        assert_eq!(report.count(CheatClass::DataBroken), 1);
+    }
+
+    #[test]
+    fn a_balanced_code_fence_is_not_broken() {
+        let report = findings("```rust\nfn f() {}\n```\n", SnippetLanguage::Rust);
+        assert!(
+            report.is_clean(),
+            "a closed fence was flagged: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn prose_pasted_into_code_is_data_broken() {
+        let report = findings(
+            "Here is the code:\nfn add(a: i32, b: i32) -> i32 { a + b }\n",
+            SnippetLanguage::Rust,
+        );
+        assert_eq!(report.count(CheatClass::DataBroken), 1);
+    }
+
+    #[test]
+    fn a_truncation_marker_is_data_broken() {
+        let report = findings(
+            "fn a() {}\n// ... rest unchanged\nfn b() {}\n",
+            SnippetLanguage::Rust,
+        );
+        assert_eq!(report.count(CheatClass::DataBroken), 1);
+    }
+
+    #[test]
+    fn an_ellipsis_line_is_data_broken() {
+        let report = findings("fn a() {}\n...\nfn b() {}\n", SnippetLanguage::Rust);
+        assert_eq!(report.count(CheatClass::DataBroken), 1);
+    }
+
+    // --- Clean snippets stay clean, per language family ----------------------
+
+    #[test]
+    fn a_clean_rust_snippet_is_clean() {
+        // Lifetimes, a brace inside a string, a comment, a real test: nothing
+        // here is a cheat, and the lifetime/`'` handling must not corrupt the
+        // delimiter balance.
+        let code = "fn first<'a>(xs: &'a [i32]) -> Option<&'a i32> {\n    let label = \"value: {\";\n    xs.first()\n}\n\n#[test]\nfn t() { assert!(first(&[1]).is_some()); }\n";
+        let report = findings(code, SnippetLanguage::Rust);
+        assert!(
+            report.is_clean(),
+            "clean Rust flagged: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_clean_python_snippet_is_clean() {
+        let code =
+            "def add(a, b):\n    return a + b\n\ndef test_add():\n    assert add(1, 2) == 3\n";
+        let report = findings(code, SnippetLanguage::Python);
+        assert!(
+            report.is_clean(),
+            "clean Python flagged: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_clean_jsts_snippet_is_clean() {
+        let code = "function add(a, b) {\n  return a + b;\n}\n\ntest('add', () => {\n  expect(add(1, 2)).toBe(3);\n});\n";
+        let report = findings(code, SnippetLanguage::JsTs);
+        assert!(
+            report.is_clean(),
+            "clean JS/TS flagged: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_clean_c_snippet_is_clean() {
+        let report = findings(
+            "int add(int a, int b) { return a + b; }\n",
+            SnippetLanguage::C,
+        );
+        assert!(report.is_clean(), "clean C flagged: {:?}", report.findings);
+    }
+
+    #[test]
+    fn a_clean_cpp_snippet_is_clean() {
+        let report = findings(
+            "std::string greet(const std::string& name) { return \"hi \" + name; }\n",
+            SnippetLanguage::Cpp,
+        );
+        assert!(
+            report.is_clean(),
+            "clean C++ flagged: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn a_clean_html_snippet_is_clean() {
+        let report = findings("<div class=\"note\">hi</div>\n", SnippetLanguage::HtmlCss);
+        assert!(
+            report.is_clean(),
+            "clean HTML flagged: {:?}",
+            report.findings
+        );
+    }
+
+    // --- Serde compatibility ---------------------------------------------------
+
+    #[test]
+    fn old_report_json_still_parses_with_the_new_variants_present() {
+        // The shape a persisted report had before the data classes existed:
+        // lowercase class names, the three original severities.
+        let old = "{\"findings\":[\
+            {\"class\":\"lintsuppression\",\"severity\":\"suppression\",\"path\":\"src/a.rs\",\"line\":3,\"evidence\":\"#[allow(dead_code)]\",\"because\":\"x\"},\
+            {\"class\":\"testevasion\",\"severity\":\"evasion\",\"path\":\"src/b.rs\",\"line\":null,\"evidence\":\"#[ignore]\",\"because\":\"y\"},\
+            {\"class\":\"gatetampering\",\"severity\":\"fraud\",\"path\":\"Cargo.toml\",\"line\":1,\"evidence\":\"cap-lints\",\"because\":\"z\"}]}";
+        let report: CheatReport = serde_json::from_str(old).expect("old report JSON must parse");
+        assert_eq!(report.findings.len(), 3);
+        assert_eq!(report.findings[0].class, CheatClass::LintSuppression);
+        assert_eq!(report.findings[1].class, CheatClass::TestEvasion);
+        assert_eq!(report.findings[2].class, CheatClass::GateTampering);
+        assert_eq!(report.worst(), Some(Severity::Fraud));
+    }
+
+    #[test]
+    fn new_data_classes_round_trip_through_json() {
+        let report = findings("#[allow(dead_code)]\nfn f() {}\n", SnippetLanguage::Rust);
+        let text = report.to_json().expect("json");
+        assert!(text.contains("data-suppression"));
+        let back: CheatReport = serde_json::from_str(&text).expect("parse");
+        assert_eq!(back, report);
+    }
+
+    #[test]
+    fn severity_orders_note_below_the_grades_that_drop_traces() {
+        assert!(Severity::Note < Severity::Evasion);
+        assert!(Severity::Evasion < Severity::Suppression);
+        assert!(Severity::Suppression < Severity::Fraud);
+    }
+
+    // --- filter_traces ---------------------------------------------------------
+
+    #[test]
+    fn filter_traces_keeps_clean_and_note_only_traces() {
+        let traces = vec![
+            "fn add(a: i32, b: i32) -> i32 { a + b }\n".to_string(),
+            "#[allow(dead_code)]\nfn f() {}\n".to_string(),
+            "fn f() -> i32 {\n    todo!()\n}\n".to_string(),
+            "#[allow(dead_code)] // audit-allow: mirrors the decoder\nfn f() {}\n".to_string(),
+        ];
+        let (kept, report) = filter_traces(&traces, SnippetLanguage::Rust);
+        assert_eq!(kept, vec![0, 3]);
+        assert!(
+            report.findings.iter().any(|f| f.path == "trace[1]"
+                && f.class == CheatClass::DataSuppression
+                && f.severity == Severity::Suppression),
+            "reject-grade finding missing: {:?}",
+            report.findings
+        );
+        assert!(
+            report.findings.iter().any(|f| f.path == "trace[2]"
+                && f.class == CheatClass::DataStub
+                && f.severity == Severity::Evasion),
+            "quarantine-grade finding missing: {:?}",
+            report.findings
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.path == "trace[3]" && f.severity == Severity::Note),
+            "the note for the kept trace should still be recorded: {:?}",
+            report.findings
+        );
+        assert_eq!(report.count(CheatClass::DataSuppression), 2);
+        assert_eq!(report.count(CheatClass::DataStub), 1);
+    }
+
+    #[test]
+    fn filter_traces_of_all_clean_input_keeps_everything() {
+        let traces = vec![
+            "fn a() -> i32 { 1 }\n".to_string(),
+            "fn b() -> i32 { 2 }\n".to_string(),
+        ];
+        let (kept, report) = filter_traces(&traces, SnippetLanguage::Rust);
+        assert_eq!(kept, vec![0, 1]);
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn filter_traces_reports_per_trace_attribution() {
+        let traces = vec![
+            "x = compute()  # type: ignore\n".to_string(),
+            "def f():\n    raise NotImplementedError\n".to_string(),
+        ];
+        let (kept, report) = filter_traces(&traces, SnippetLanguage::Python);
+        assert!(kept.is_empty());
+        let paths: std::collections::HashSet<&str> =
+            report.findings.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains("trace[0]"));
+        assert!(paths.contains("trace[1]"));
     }
 }

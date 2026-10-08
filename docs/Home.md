@@ -28,7 +28,8 @@ Two documents are authoritative about what is and is not implemented:
 
 ```bash
 cargo build --release
-./target/release/dblocks verify        # 169 certificates, non-zero exit on failure
+./target/release/dblocks verify        # 227 certificates, non-zero exit on failure
+./target/release/dblocks cheat --root .  # attempts to defeat the gate, not satisfy it
 ./target/release/dblocks train --steps 200
 ./target/release/dblocks sample --planned --plan-depth 2   # plan the trajectory
 ./target/release/dblocks lm generate --lookahead 2         # plan the tokens
@@ -44,6 +45,7 @@ cargo build --release
 
 ### Start here
 - [Quality Gate](Quality-Gate.md) — certificates, training-phase checks, sampling gates
+- [Reward Integrity](#reward-integrity-cheat--rewards-integrity) — what happens when the training signal is the gate, and how that gets exploited
 - [Training Guide](Training-Guide.md) — every objective, dataset and flag
 - [Inference Guide](Inference-Guide.md) — sampling, benchmarking, the inference API
 - [Configuration](Configuration.md) — full CLI and config reference
@@ -81,6 +83,106 @@ cargo build --release
 - [Precision & I/O](Precision-IO.md) — mixed precision, streaming reads, profiling
 - [Parallel I/O & Block Execution](Parallel-IO-and-Block-Execution.md) — mirror-striped io_uring reads, and the sync/mt/par block execution selector
 - [Quality Coder](Quality-Coder.md) — design document for the agentic code refiner (scaffolding only)
+## Reward Integrity
+
+A model trained to clear `cargo test` + `cargo clippy` +
+`audit-bad-patterns.sh` has two ways to score: obey the gate, or change it. The
+second is cheaper, survives one run, and is invisible to any metric that only
+counts passing tests — so a training signal built on test outcomes alone rewards
+exactly the wrong behaviour.
+
+> **In this repository.** `src/cheat.rs` (`CheatReport`, `Finding`, `Severity`,
+> `CheatClass`, `GateReport`, `scan`, `load_from_dir`, `gate`), wired as
+> `dblocks cheat`. Certificates: the `cheat` group (26). Tests: 38 in-module.
+> The paired half is `src/codegen_eval.rs` (`CorpusIndex`, `decontaminate`,
+> `admit`, `split`, `TaskOutcome`, `Scorecard`), certificates in the
+> `codegen_eval` group (22), and the task generator
+> `examples/evalgen.rs` writing `repo-native-eval.jsonl`.
+
+```bash
+dblocks cheat --root .            # exits non-zero on any finding
+dblocks cheat --root . --all      # every finding, not just the worst
+dblocks cheat --root . --json     # machine-readable, for a training log
+```
+
+| Severity | Class | Example |
+|---|---|---|
+| **Fraud** | `gate-tampering` | deleting `audit-bad-patterns.sh` or `src/verify.rs`, `--cap-lints`, a manifest `[lints]` table, a clippy threshold raised out of reach, `|| true` in the gate script |
+| **Suppression** | `lint-suppression` | `#[allow(…)]`, `#![allow(…)]`, `#[expect(…)]`, and the whitespace variants `#[ allow(…)` |
+| **Evasion** | `test-evasion` | `#[ignore]` on a test, `assert!(true)`, a field-free `self == self` |
+
+Fraud outranks suppression because suppressing one lint degrades quality while
+editing the checker *manufactures* an appearance of quality.
+
+**Scoring is all-or-nothing, and that is structural.** `GateReport::score()`
+returns `1.0` or `0.0` and the type carries no partial-credit field, so a caller
+cannot reintroduce weighting by accident. A run with green tests plus one new
+`#[allow]` scores zero, not "mostly right" — any partial-credit scheme leaves a
+cheap strategy (suppress the noisiest lint, bank the rest) which is the incentive
+this exists to remove.
+
+**Pre-existing suppressions are baselined, by count.** The crate ships 10
+`#[allow]`s and 3 GPU-gated `#[ignore]`s that the audit already accepts. The
+baseline is `(path, evidence, budget)` — deliberately *not* line-pinned, because
+an unrelated edit above a baselined attribute would shift it and produce a false
+positive, and the cheapest fix for a false positive is deleting the suppression
+being audited. The count budget stops a new suppression hiding behind an
+existing one in the same file.
+
+**Known limits.** Detection is syntactic. `#[cfg(any())]` around a suppression,
+a `build.rs` that rewrites sources before `cargo` sees them, or a suppression
+assembled from concatenated string literals will pass. This raises the cost of
+cheating; it is a gate on reward, not a sandbox. Two mitigations sit outside it:
+keep the gate script and `src/verify.rs` out of the model's writable tree, and
+re-hash them after every evaluation.
+
+## Cheat: rewards integrity
+
+The eval half answers a different question. Every public coding benchmark sits
+inside the pretraining data of every frontier model, so a score on one measures
+recall — and it *rises* as you train, which reads as improvement while being its
+opposite. `src/codegen_eval.rs` therefore treats the contamination check as the
+eval: a task is admitted only after it is shown absent from the training corpus
+by 13-gram overlap, and a set that cannot be shown clean is reported rather than
+quietly scored.
+
+Three leak paths, three independent checks:
+
+| Path | Check | Where |
+|---|---|---|
+| The task is in the training corpus | 13-gram overlap, threshold 0.10 | `decontaminate` |
+| The teacher has memorised it | named benchmarks, advisory | `contamination_risk` |
+| The task's *tests* are in training | tests are part of the checked text | `admit` |
+
+Overlap is a fraction of the **task**, not of the corpus, so a large corpus cannot
+launder a verbatim-contaminated task into looking clean — certified as
+`a_large_corpus_cannot_launder_a_contaminated_task`. A task too short to check is
+*refused*, not scored clean. The train/eval split is a hash of the task id rather
+than a counter, so inserting one row cannot reshuffle the split and invalidate
+every score recorded before the insertion.
+
+The task set itself is repo-native (`examples/evalgen.rs`, 25 tasks, 93 test
+functions): each states one rule this repository enforces and asks for an
+implementation against the crate's real API. A model that has memorised
+HumanEval gains nothing from them, because no amount of recall tells it that
+*this* repo wants an error naming the offending value, or that composition
+preserves the box load rather than summing to 1.
+
+Every test was checked in **both** directions: the correct implementation passes,
+and a plausible lazy implementation fails. That discipline earned its keep — it
+caught three of the specs asserting falsehoods of their own (including
+`1/3 + 1/6 != 0.5`, which is exactly `0.5` in f64), and it caught a monotonicity
+test that could not see a wrong repulsion coefficient, which is the bug
+`Geometric-Reasoning-Flaws.md` documents. A test a lazy solution also passes
+measures nothing.
+
+See also: [Quality Gate](Quality-Gate.md) · [Claims](Claims.md) ·
+[Geometric Reasoning](Geometric-Reasoning.md) · [Home](Home.md)
+
+---
+
+## More
+
 - [Model Parallelism](Model-Parallelism.md) — why block-wise training is not model parallelism, and what is
 - [FAQ](FAQ.md)
 

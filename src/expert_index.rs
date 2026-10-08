@@ -589,6 +589,91 @@ impl MosmeSpec {
     }
 }
 
+// ---------------------------------------------------- coding student registry --
+
+/// The languages with a shipped specialist box in the coding student
+/// ([`crate::student`]), as `(language key, label)` pairs. The box id of
+/// language `l` is `coding:{l}`; each box holds that language's micro experts.
+///
+/// One box per language, rather than one `coding` box with per-language
+/// experts, because the readout a caller wants is *per-language box traffic*:
+/// the box router's gates over `coding:*` answer "which language specialist
+/// would handle this token" directly, with no second level to decode.
+pub const CODING_LANGUAGES: [(&str, &str); 6] = [
+    ("rust", "Rust"),
+    ("python", "Python"),
+    ("c", "C"),
+    ("cpp", "C++"),
+    ("jsts", "JavaScript/TypeScript"),
+    ("web", "Web (HTML/CSS/JS mixed)"),
+];
+
+/// The rest of the top-10 language list, documented as **later** registry
+/// entries: no boxes exist for these yet. Adding one is
+/// `MosmeSpec::extended_with` on the matching `coding:<lang>` box after the
+/// box itself is added here — a bit-exact identity until the new expert is
+/// enabled, so an existing student checkpoint is undisturbed.
+pub const PLANNED_CODING_LANGUAGES: [&str; 10] = [
+    "go", "java", "csharp", "php", "ruby", "swift", "kotlin", "sql", "dart", "scala",
+];
+
+/// The coding student's MoSME spec: one box per [`CODING_LANGUAGES`] entry,
+/// each holding `experts_per_box` micro experts named
+/// `coding:<lang>/micro_<i>`.
+///
+/// Micro-expert sizing follows `docs/Mixture-of-Specialized-Micro-Experts.md`:
+/// many tiny experts beat a few large ones, so the *box* count per language
+/// stays small here and the expert *width* (the trunk's
+/// `intermediate_size`, FFN/4–FFN/8 of a dense feed-forward) is what makes
+/// each expert micro. Fallible for the same reason `validate` is: a spec
+/// with zero experts or an impossible top-k is a caller mistake that should
+/// name the argument at fault.
+pub fn coding_student_spec(
+    experts_per_box: usize,
+    top_box: usize,
+    top_expert: usize,
+) -> anyhow::Result<MosmeSpec> {
+    anyhow::ensure!(
+        experts_per_box >= 1,
+        "experts_per_box must be at least 1, got {experts_per_box}"
+    );
+    anyhow::ensure!(
+        (1..=CODING_LANGUAGES.len()).contains(&top_box),
+        "top_box must be in [1, {}], got {top_box}",
+        CODING_LANGUAGES.len()
+    );
+    anyhow::ensure!(
+        top_expert >= 1 && top_expert <= experts_per_box,
+        "top_expert must be in [1, {experts_per_box}], got {top_expert}"
+    );
+    let spec = MosmeSpec {
+        boxes: CODING_LANGUAGES
+            .iter()
+            .map(|(key, label)| {
+                BoxSpec::new(
+                    format!("coding:{key}"),
+                    format!("{label} specialist"),
+                    (0..experts_per_box)
+                        .map(|i| {
+                            ExpertSpec::new(
+                                format!("coding:{key}/micro_{i}"),
+                                format!("{label} micro expert {i}"),
+                            )
+                            .with_tags(&["coding", key])
+                        })
+                        .collect(),
+                )
+            })
+            .collect(),
+        top_box,
+        top_expert,
+        route_on_tokens: true,
+        balance: BalanceWeights::default(),
+    };
+    spec.validate()?;
+    Ok(spec)
+}
+
 /// Per-box expert counts and enabled flags — the spec stripped of everything
 /// the tensors do not need.
 #[derive(Debug, Clone, PartialEq)]
@@ -971,5 +1056,70 @@ mod tests {
             assert!(rendered.contains(id), "{id} missing from:\n{rendered}");
         }
         assert!(rendered.contains("boxes=2"));
+    }
+
+    #[test]
+    fn test_coding_student_spec_validates_and_round_trips() {
+        let spec = coding_student_spec(4, 1, 2).unwrap();
+        assert_eq!(spec.boxes.len(), CODING_LANGUAGES.len());
+        assert_eq!(spec.experts_per_box(), vec![4; CODING_LANGUAGES.len()]);
+        assert_eq!(spec.num_experts(), 4 * CODING_LANGUAGES.len());
+        assert_eq!(spec.top_box, 1);
+        assert_eq!(spec.top_expert, 2);
+        assert!(spec.route_on_tokens);
+        // Every shipped language has exactly one box, at its vec position.
+        for (idx, (key, _)) in CODING_LANGUAGES.iter().enumerate() {
+            assert_eq!(spec.boxes[idx].id, format!("coding:{key}"));
+            assert!(spec.position(&format!("coding:{key}/micro_0")).is_some());
+        }
+        // Deterministic: two calls build the same document.
+        assert_eq!(spec, coding_student_spec(4, 1, 2).unwrap());
+        // serde round-trip: the authoring document parses back identically.
+        let text = serde_json::to_string_pretty(&spec).unwrap();
+        let back: MosmeSpec = serde_json::from_str(&text).unwrap();
+        back.validate().unwrap();
+        assert_eq!(spec, back);
+    }
+
+    #[test]
+    fn test_coding_student_spec_has_no_duplicate_ids() {
+        // The registry is fixed, so duplicates would be a bug in this file;
+        // validate() is the check every consumer relies on, so prove it
+        // catches a tampered duplicate here.
+        let mut spec = coding_student_spec(2, 1, 1).unwrap();
+        spec.validate().unwrap();
+        spec.boxes[1].experts[0].id = spec.boxes[0].experts[0].id.clone();
+        assert!(spec
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate expert id"));
+        spec = coding_student_spec(2, 1, 1).unwrap();
+        spec.boxes[1].id = spec.boxes[0].id.clone();
+        assert!(spec
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate box id"));
+    }
+
+    #[test]
+    fn test_coding_student_spec_rejects_bad_sizes() {
+        assert!(coding_student_spec(0, 1, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("experts_per_box"));
+        assert!(coding_student_spec(4, 0, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("top_box"));
+        assert!(coding_student_spec(4, CODING_LANGUAGES.len() + 1, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("top_box"));
+        assert!(coding_student_spec(2, 1, 3)
+            .unwrap_err()
+            .to_string()
+            .contains("top_expert"));
     }
 }

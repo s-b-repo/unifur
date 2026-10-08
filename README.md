@@ -44,10 +44,15 @@ with an accurate "In this repository" block naming the module, types and flags
 that implement it.
 
 ```bash
-# Build and run the quality gate: 167 numerical certificates, non-zero exit on
+# Build and run the quality gate: 227 numerical certificates, non-zero exit on
 # any failure.
 cargo build --release
 ./target/release/dblocks verify
+
+# Scan the tree for attempts to defeat that gate rather than satisfy it:
+# lint suppressions, weakened or disabled tests, and edits to the gate script,
+# the certificate registry or the manifest. Exits non-zero on any finding.
+./target/release/dblocks cheat --root .
 
 # Train (synthetic data needs no download).
 ./target/release/dblocks train --steps 200 --num-blocks 3
@@ -1157,6 +1162,8 @@ table below is generated from it; "blocked" items are all in that table.
 | 30. Cyber Policy -- Blockers, Refusals and Approvals | 4 / 0 / 0 | Done as a mechanism. |
 | 31. Direction Ablation and Negative Training for Every Model | 6 / 0 / 0 | Done as a mechanism, end to end on a tiny model (the integration test extracts a direction from a trained model, ablates it, trains with the ... |
 | 33. Geometric Reasoning over a Learned Riemannian Geometry | 11 / 0 / 0 | Done as a mechanism: the certificates cover the geometry and the exact kernel, not the quality of a trained reasoner (that is a GPU-scale measurement). |
+| 34. Reward Integrity -- Detecting Training That Cheats the Gate | 38 / 0 / 0 | Done: `src/cheat.rs` grades *how* the gate was satisfied, not only whether. Three classes ordered by consequence -- `Fraud` (the checker was edited, so a pass was manufactured), `Suppression` (a lint silenced rather than satisfied), `Evasion` (a test weakened, ignored or deleted). Scoring is all-or-nothing by construction: `GateReport` has no partial-credit field, so a green test run plus one new `#[allow]` scores zero. |
+| 35. Contamination-Safe Coding Evaluation | 23 / 0 / 0 | Done: `src/codegen_eval.rs` treats the contamination check *as* the eval. A task is admitted only after 13-gram overlap against the named training corpus says it is clean, with overlap measured as a fraction of the task so corpus size cannot launder a contaminated task. Three leak paths get three checks: corpus overlap, teacher memorisation (named benchmarks, advisory), and tests appearing in training. `examples/evalgen.rs` generates the repo-native set: 25 tasks, 93 test functions, every one checked to fail against a plausible lazy implementation and pass against a correct one. |
 
 The original phase-by-phase design checklist that used to live here is
 superseded by that file.

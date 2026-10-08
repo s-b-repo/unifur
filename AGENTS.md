@@ -9,7 +9,7 @@ with warnings as errors, the test suite, the pattern audit, the docs, and the
 numerical certificate suite. It takes several minutes. CI runs exactly these
 targets, so a green `make gate` and a green CI are the same command.
 
-Current state of the tree: 719 unit tests, 38 integration tests, 208/208
+Current state of the tree: 750 unit tests, 41 integration tests, 227/227
 certificates. If your change makes a number smaller, that is the finding.
 
 ---
@@ -142,9 +142,22 @@ helpers include the process id and a counter.
 README are the original design specification, not files that exist here. Do not
 try to `pip install -e .` or add Python tests — nothing will run them.
 
-**Two modules are not `mod`-declared and never compile:** `src/geomnonclid.rs`
-and `src/qwentrain.rs`. "Clippy is clean" says nothing about them. If you wire
-one in, it enters the build and the gate applies to it.
+**One module is not `mod`-declared and never compiles:** `src/geomnonclid.rs`.
+"Clippy is clean" says nothing about it. If you wire it in, it enters the build
+and the gate applies to it.
+
+`src/qwentrain.rs` used to be the second one, and cost more than that sentence
+suggests: it sat unwired for the whole of Task 3b, so its eight tests — including
+the bit-identical resume and the paged-optimizer round trip — had never run once.
+Three real defects were inside it and were invisible until it was declared:
+`QloraLinear::forward` reshaped the adapter's output to the *input's* shape, so
+every projection with `d_out != d_in` was silently wrong; the resume path and the
+pager partitioned `std::collections::HashMap` where the optimizer record is a
+`hashbrown::HashMap`, the only `HashMap` that implements `Record`; and the tests
+compared parameters by `ParamId` across two independently built trunks, which
+can never match because the ids come from a process-global counter. The lesson
+generalises: **an unwired module is not "not yet", it is "not checked".** Wire it
+in and fix what the compiler finds before trusting any claim about it.
 
 ---
 
@@ -154,6 +167,10 @@ one in, it enters the build and the gate applies to it.
 |---|---|
 | `src/verify.rs` | the certificate suite — the quality gate's actual subject |
 | `src/main.rs` | the `dblocks` CLI; every subcommand returns `Result` |
+| `src/cheat.rs` | `dblocks cheat`: suppression, test evasion and gate tampering |
+| `src/codegen_eval.rs` | n-gram decontamination and the all-or-nothing scorecard |
+| `examples/evalgen.rs` | generates the repo-native coding eval (`examples/evalgen/catalogue.rs`) |
+| `src/qwentrain.rs` | adapters-only engine: LoRA attach, segmented backward, paged AdamW, resume |
 | `Cargo.toml` `[lints]` | the enforced rule set, with the reasoning inline |
 | `audit-bad-patterns.sh` | the checks the compiler cannot make |
 | `Makefile` | `make gate` and the targets it is made of |

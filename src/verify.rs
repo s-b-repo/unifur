@@ -40,6 +40,7 @@
 //! | `hybrid` | A dense schedule is the Phase 19 trunk bit for bit; a window or a retrieval set covering the context is dense; linear attention's recurrent state equals its masked form; rotary scores depend only on distance; every mode decodes from its state exactly as it recomputes; rotary decoding continues past the table; the routing state is bounded and carries history; routing locality reads as specified; partial rotary is full rotary at fraction one and leaves the suffix; GQA with full heads is dense and narrow KV shrinks the decode state; gated attention is identity at init; RMSNorm starts at unit RMS; MTP at weight zero is the plain loss |
 //! | `deltanet` | Gated DeltaNet: alpha = 1 is the pure delta rule, beta = 0 is pure decay, the zero-state first output is closed-form, L2 rows are unit, the short convolution is causal, and the tensor-alpha step and batched rollout are the scalar core bit for bit |
 //! | `geom` | The learned metric `G = L Lᵀ` is positive definite by construction; geodesic attention rows are distributions; the closed-form Lipschitz step never increases the relaxation energy; and the exact rational kernel keeps `1/3 + 1/6 = 1/2` exact, intersects segments exactly, refuses degenerate figures, derives facts with their rule certificate to a fixed point, and both rejects a false claim and survives a true one in falsification |
+//! | `geomfusion` | The trunk-fused geometric stream: the composed readout gates are a distribution per row (the old broadcast-scatter bug would fail this), deeper certified relaxation never raises the energy it reports, and a zero-initialized output projection makes fusion an exact identity on the trunk hidden state |
 //! | `antipattern` | Every shipped rule matches its examples and none of its counterexamples; labels follow tokens through both corpus readers; zero weights reproduce the plain loss bitwise; the unlikelihood term is 0 for an impossible token and finite for a certain one; a penalized target leaves the likelihood; one penalized step lowers p(bad) where one plain step raises it |
 //! | `model` | Softmax partition, unit-norm label embeddings, DiT zero-init, and that every `x0` estimate lies in the convex hull of the label table |
 //! | `autodiff` | Finite-difference gradient check on the distillation objective |
@@ -226,7 +227,7 @@ impl Report {
 }
 
 /// Names of every certificate group, in the order [`run_all`] emits them.
-pub const GROUPS: [&str; 27] = [
+pub const GROUPS: [&str; 28] = [
     "schedule",
     "preconditioning",
     "stats",
@@ -240,6 +241,7 @@ pub const GROUPS: [&str; 27] = [
     "hybrid",
     "deltanet",
     "geom",
+    "geomfusion",
     "antipattern",
     "codequality",
     "planner",
@@ -296,6 +298,7 @@ pub fn run_all() -> Report {
     certificates.extend(checks_or_failed("hybrid", hybrid_checks));
     certificates.extend(deltanet_certificates());
     certificates.extend(checks_or_failed("geom", geom_checks));
+    certificates.extend(checks_or_failed("geomfusion", geomfusion_checks));
     certificates.extend(antipattern_certificates());
     certificates.extend(codequality_certificates());
     certificates.extend(planner_certificates());
@@ -3687,6 +3690,107 @@ fn geom_checks() -> anyhow::Result<Vec<Certificate>> {
     Ok(out)
 }
 
+// -------------------------------------------------------------- geomfusion --
+
+/// The trunk-fused geometric stream's certificates. One `anyhow::Result`: a
+/// check that cannot be set up is a failing certificate, not a panic and not
+/// a silent pass.
+fn geomfusion_checks() -> anyhow::Result<Vec<Certificate>> {
+    use crate::geomfusion::{GeomFusion, GeomFusionConfig};
+    use burn::tensor::Distribution;
+
+    let device: <B as burn::tensor::backend::BackendTypes>::Device = Default::default();
+    let config = GeomFusionConfig::tiny();
+    let model = GeomFusion::<B>::new(&config, &device)?;
+    let hidden = Tensor::<B, 3>::random(
+        [2, 12, config.hidden_size],
+        Distribution::Normal(0.0, 1.0),
+        &device,
+    );
+
+    // -- the readout gates are a distribution, not a scaled copy -------------
+    // The geometric stream routes its refined tokens through
+    // `mosme::HierarchicalRouter`, whose gates come from the certified
+    // `moe::scatter_gates`. The bug this pins is the standalone readout's old
+    // hand-rolled broadcast-scatter, which summed every gate row to `n_boxes`
+    // instead of 1 and stalled learning at chance (see
+    // `docs/Geometric-Reasoning-Flaws.md`): any re-introduction of a
+    // hand-rolled scatter fails here.
+    let out = model.forward(hidden.clone(), None)?;
+    let mut gate_err: f64 = 0.0;
+    for m in out
+        .gates
+        .clone()
+        .sum_dim(1)
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+    {
+        gate_err = gate_err.max((m as f64 - 1.0).abs());
+    }
+
+    // -- the certified relaxation lowers the energy it reports ----------------
+    // Inside a block the landscape (context, keys, step size from the
+    // closed-form Lipschitz bound) is fixed, so the descent lemma applies to
+    // every step: the traced energy never increases. Across depths, block 0's
+    // relaxation is one trajectory sampled at different lengths, so the
+    // longer run ends no higher than the shorter one. The tolerance matches
+    // the discipline the standalone reasoner's descent certificates use: the
+    // step is monotone in exact arithmetic, and what is measured is f32.
+    let deep = model.forward(hidden.clone(), Some(12))?;
+    let mut energy_err: f64 = 0.0;
+    for trace in &deep.traces {
+        for step in trace.energy.windows(2) {
+            energy_err = energy_err.max(f64::from(step[1] - step[0]));
+        }
+    }
+    let shallow = model.forward(hidden.clone(), Some(1))?;
+    let e1 = shallow
+        .traces
+        .first()
+        .and_then(|t| t.energy.first())
+        .copied()
+        .unwrap_or(f32::INFINITY);
+    let e12 = deep
+        .traces
+        .first()
+        .and_then(|t| t.energy.last())
+        .copied()
+        .unwrap_or(f32::INFINITY);
+    energy_err = energy_err.max(f64::from(e12 - e1));
+
+    // -- identity at zero projection -------------------------------------------
+    // The output projection is zero-initialized with no bias, so the residual
+    // added to the trunk is exactly zero and the fused hidden state is the
+    // trunk's, bit for bit. Attaching the stream to a trained trunk perturbs
+    // nothing until training moves the projection.
+    let identity_err = f64::from((out.hidden.clone() - hidden).abs().max().into_scalar());
+
+    Ok(vec![
+        cert(
+            "geomfusion",
+            "fused_readout_gates_form_a_distribution",
+            "Every row of the fused readout's composed routing gates sums to 1: the gates come from the certified scatter, so the mixture is a convex combination of head outputs.",
+            gate_err,
+            1e-6,
+        ),
+        cert(
+            "geomfusion",
+            "relaxation_reduces_energy_monotonically",
+            "Within each fused refinement block the traced energy never increases under the Lipschitz-certified step, and a deeper run of the same relaxation ends no higher than a shallower one.",
+            energy_err,
+            1e-4,
+        ),
+        cert(
+            "geomfusion",
+            "fusion_is_identity_at_zero_projection",
+            "With the output projection zero-initialized, the fused hidden state equals the trunk hidden state bit for bit.",
+            identity_err,
+            0.0,
+        ),
+    ])
+}
+
 // ------------------------------------------------------------ antipattern --
 
 fn antipattern_certificates() -> Vec<Certificate> {
@@ -6996,6 +7100,7 @@ mod tests {
                 "deltanet",
                 "experiment",
                 "geom",
+                "geomfusion",
                 "hybrid",
                 "lm",
                 "loopgraph",
