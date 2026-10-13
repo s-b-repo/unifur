@@ -9,8 +9,9 @@ with warnings as errors, the test suite, the pattern audit, the docs, and the
 numerical certificate suite. It takes several minutes. CI runs exactly these
 targets, so a green `make gate` and a green CI are the same command.
 
-Current state of the tree: 750 unit tests, 41 integration tests, 227/227
-certificates. If your change makes a number smaller, that is the finding.
+Current state of the tree: 1149 unit tests (1131 lib + 18 `dblocks`-bin), 38
+integration tests, 236/236 certificates. If your change makes a number
+smaller, that is the finding.
 
 ---
 
@@ -142,9 +143,15 @@ helpers include the process id and a counter.
 README are the original design specification, not files that exist here. Do not
 try to `pip install -e .` or add Python tests — nothing will run them.
 
-**One module is not `mod`-declared and never compiles:** `src/geomnonclid.rs`.
-"Clippy is clean" says nothing about it. If you wire it in, it enters the build
-and the gate applies to it.
+`src/geomnonclid.rs` was the one module that sat un-`mod`-declared and never
+compiled, and it confirmed the rule when it was wired in: two `unreachable_pub`
+errors the compiler had never seen, a formatting pass the file had never been
+through, and three of its forty-seven tests failing — all three test-side
+mistakes the suite itself caught (a harmonic-conjugate expectation of `1/2`
+where the convention's value is `-1`, a Klein-disk "outside point" that was in
+fact *on* the line it meant to parallel, and a "zero normal is refused" test
+that built a non-zero normal). The production code was right each time; the
+tests had never run, so nobody knew they were wrong.
 
 `src/qwentrain.rs` used to be the second one, and cost more than that sentence
 suggests: it sat unwired for the whole of Task 3b, so its eight tests — including
@@ -171,6 +178,7 @@ in and fix what the compiler finds before trusting any claim about it.
 | `src/codegen_eval.rs` | n-gram decontamination and the all-or-nothing scorecard |
 | `examples/evalgen.rs` | generates the repo-native coding eval (`examples/evalgen/catalogue.rs`) |
 | `src/qwentrain.rs` | adapters-only engine: LoRA attach, segmented backward, paged AdamW, resume |
+| `src/fieldnorm.rs` | `dblocks corpus build-field`: field datasets → cybercorpus layout, cheat-filtered |
 | `Cargo.toml` `[lints]` | the enforced rule set, with the reasoning inline |
 | `audit-bad-patterns.sh` | the checks the compiler cannot make |
 | `Makefile` | `make gate` and the targets it is made of |

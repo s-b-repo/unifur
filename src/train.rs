@@ -3632,4 +3632,98 @@ mod tests {
         assert!(report.first_loss.is_finite() && report.last_loss.is_finite());
         assert_eq!(report.tokens_seen, 3 * 2 * (LmConfig::tiny().context - 1));
     }
+
+    #[test]
+    fn test_penalized_training_fires_on_a_planted_cheat() {
+        // The REPOMINE finding was that every logged run shows
+        // `penalized_tokens: 0`: the machinery is wired end to end but only
+        // fires when a corpus carries an open `.labels` sidecar *and* the
+        // penalty is on. This test plants a cheat the built-in rule set names,
+        // labels it, and shows the charge landing in the loss and the weights.
+        use crate::lm::LmConfig;
+        let dir =
+            std::env::temp_dir().join(format!("dblocks-train-lm-penalty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("planted.py");
+        // "except:\n    pass\n" is 16 bytes, five of them labeled (the bare
+        // colon and `pass`), and the longest all-clean run in it is 11 -- so
+        // every 16-token window of the tiny model's context holds a labeled
+        // target, and no sampled batch can miss the charge.
+        std::fs::write(&source, "except:\n    pass\n".repeat(32)).unwrap();
+        let path = dir.join("planted.bin");
+        TokenCorpus::tokenize_file(&source, &path).unwrap();
+        let manifest =
+            TokenCorpus::label_file(&path, &crate::antipattern::Labeler::builtin().unwrap())
+                .unwrap();
+        assert!(
+            manifest.labeled_tokens > 0,
+            "the planted cheat was not labeled: the rule set or the labeling path is broken"
+        );
+
+        let device = Default::default();
+        let model = LanguageModel::<DefaultTrainBackend>::new(&LmConfig::tiny(), &device).unwrap();
+        // Forced before the clone, so both runs start from the same weights
+        // rather than from two lazy draws that share a ParamId.
+        crate::tensor_ext::force_initialization(&model);
+
+        let run = |penalty: Unlikelihood| {
+            let mut corpus = TokenCorpus::in_memory(&path).unwrap();
+            corpus.open_labels().unwrap();
+            train_lm(
+                model.clone(),
+                &mut corpus,
+                &LmTrainConfig {
+                    steps: 3,
+                    batch_size: 2,
+                    log_every: 0,
+                    penalty,
+                    ..Default::default()
+                },
+                &device,
+            )
+            .unwrap()
+        };
+        let (charged_model, charged) = run(Unlikelihood::new(1.0));
+        let (measured_model, measured) = run(Unlikelihood::off());
+
+        // The machinery fired: labeled targets were seen, counted, and their
+        // probability measured, in both runs.
+        assert!(
+            charged.penalized_tokens > 0,
+            "a labeled corpus trained with the penalty on charged nothing"
+        );
+        assert!(
+            measured.penalized_tokens > 0,
+            "with alpha = 0 the labeled targets are still counted"
+        );
+        assert!(charged.first_penalized_prob > 0.0);
+        // Same seed, same windows, same starting weights: the measured
+        // probability of the labeled targets is identical at the first step,
+        // which is the control proving only the loss term differs.
+        assert!(
+            (charged.first_penalized_prob - measured.first_penalized_prob).abs() < 1e-6,
+            "the two runs differ before the penalty can act: {} vs {}",
+            charged.first_penalized_prob,
+            measured.first_penalized_prob
+        );
+        // ...and the charge genuinely entered the objective: the first loss
+        // moves by the unlikelihood term, and the trained weights diverge.
+        assert!(
+            (charged.first_loss - measured.first_loss).abs() > 1e-6,
+            "the penalty did not change the loss: {} vs {}",
+            charged.first_loss,
+            measured.first_loss
+        );
+        let charged_params = resident_parameters(&charged_model);
+        let measured_params = resident_parameters(&measured_model);
+        assert_eq!(charged_params.len(), measured_params.len());
+        assert!(
+            charged_params
+                .iter()
+                .any(|(id, values)| values != &measured_params[id]),
+            "three steps of unlikelihood training left every weight untouched"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

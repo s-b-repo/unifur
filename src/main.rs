@@ -12,6 +12,7 @@ use diffusionblocks::{
     data::{SyntheticDataset, TrainDataset},
     dblock::{DblockClassifier, DblockConfig},
     expert_index::{BoxSpec, ExpertIndex, ExpertSpec, MosmeSpec},
+    fieldnorm,
     geombaseline::{self, GeomBaseline, GeomBaselineConfig},
     geometry::{self, GeomConfig, GeomMeta, GeomObjective, GeometricReasoner},
     geomkernel,
@@ -19,6 +20,7 @@ use diffusionblocks::{
     infer::{InferenceConfig, InferenceEngine},
     lm::{LanguageModel, LmConfig, Sampling, Unlikelihood},
     multi_block::{Gated, MultiBlockConfig, PlannedConfig, Strategy},
+    nina, ninagui,
     planner::Budget,
     precision::{Precision, PrecisionPolicy},
     profile::{format_duration, Profiler},
@@ -182,7 +184,10 @@ impl LmRuntimeArgs {
             ),
             LmBackend::Wgpu => {
                 parse_gpu_device(self.device.as_deref().unwrap_or("discrete:0"))?;
-                anyhow::ensure!(cfg!(feature = "wgpu"), "WGPU support is not compiled in; rebuild with cargo build --features wgpu --bin dblocks");
+                anyhow::ensure!(
+                    cfg!(feature = "wgpu"),
+                    "WGPU support is not compiled in; rebuild with cargo build --features wgpu --bin dblocks"
+                );
             }
         }
         Ok(())
@@ -259,7 +264,10 @@ fn lm_wgpu_device(args: &LmRuntimeArgs) -> Result<burn::backend::wgpu::WgpuDevic
         info.device_type,
         info.name
     );
-    eprintln!("backend=wgpu api={:?} device={kind}:{index} name={:?} type={:?} driver={:?} driver_info={:?}", info.backend, info.name, info.device_type, info.driver, info.driver_info);
+    eprintln!(
+        "backend=wgpu api={:?} device={kind}:{index} name={:?} type={:?} driver={:?} driver_info={:?}",
+        info.backend, info.name, info.device_type, info.driver, info.driver_info
+    );
     Ok(device)
 }
 
@@ -1632,12 +1640,80 @@ enum Command {
         #[command(subcommand)]
         action: StudentAction,
     },
+    /// The NINA program (PLAN-NINA.md §1, §4, §8): the name-addressable model
+    /// registry, the Merkle-chained append-only log, and the MCP training
+    /// server.
+    Nina {
+        #[command(subcommand)]
+        action: NinaAction,
+    },
     /// Print the block sigma schedule for inspection.
     Sigmas {
         #[arg(long, default_value_t = 3)]
         num_blocks: usize,
         #[arg(long, default_value_t = 0.05)]
         gamma: f64,
+    },
+    /// Field corpora (PLAN-NINA §2): normalize the downloaded public datasets
+    /// into the cybercorpus layout, one corpus per field, every document
+    /// through the cheat stack before it lands.
+    Corpus {
+        #[command(subcommand)]
+        action: CorpusAction,
+    },
+}
+
+/// The field-corpus subcommands.
+#[derive(Subcommand)]
+enum CorpusAction {
+    /// Build one field corpus (`math`, `science`, `bio`, `cyber`, `tech`)
+    /// from the downloaded datasets into `<out-root>/<field>/`:
+    /// `dataset/all.jsonl` (one {"id","source","path","format","text"} per
+    /// line), per-source `dataset/<source>.jsonl`, `dataset/manifest.json`
+    /// with per-source doc/char counts and cheat-drop counts per class, and
+    /// `text/<source>/` plain text. Resume-safe: a source with a completion
+    /// marker is skipped unless `--force` is given.
+    BuildField {
+        /// The field to build; see fieldnorm::available_fields.
+        #[arg(long)]
+        field: String,
+        /// Root of the downloaded datasets.
+        #[arg(long, default_value = fieldnorm::DEFAULT_DATASETS_ROOT)]
+        datasets_root: PathBuf,
+        /// Root the corpora are written under.
+        #[arg(long, default_value = fieldnorm::DEFAULT_OUT_ROOT)]
+        out_root: PathBuf,
+        /// FieldnormConfig sidecar (JSON); the defaults when omitted.
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Rebuild sources even where a completion marker exists.
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    /// Render a field corpus (`dataset/all.jsonl`, one
+    /// {"id","source","path","format","text"} per line) into the trainer's
+    /// pair-file shape: {"prompt","completion","field"} per line, split at
+    /// the first blank line or the first quarter of the text (see
+    /// fieldnorm::split_prompt_completion). Capped at --max-docs by a
+    /// deterministic sha256(id) subsample — NOT first-N, so a rerun over a
+    /// grown corpus displaces old picks only where new ids hash lower.
+    /// Streams (the corpus is never read whole); writes
+    /// `<out>.manifest.json` with counts and the output's sha256.
+    ToPairs {
+        /// Field corpus all.jsonl.
+        #[arg(long)]
+        corpus: PathBuf,
+        /// Field name written into every pair line.
+        #[arg(long)]
+        field: String,
+        /// Output pairs JSONL.
+        #[arg(long)]
+        out: PathBuf,
+        /// Cap on emitted pairs (deterministic sha256(id) subsample). The
+        /// trainer reads the whole pairs file into memory; this cap is what
+        /// bounds that load.
+        #[arg(long, default_value_t = fieldnorm::DEFAULT_PAIRS_MAX_DOCS)]
+        max_docs: usize,
     },
 }
 
@@ -1724,6 +1800,119 @@ enum StudentAction {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Read the student's raw-vector thinking: decode the hidden states at
+    /// each refine depth through the trunk's own readout (the logit lens),
+    /// printed as a thought trace with the certified energy and displacement
+    /// of every refinement step.
+    Think {
+        #[arg(long)]
+        prompt: String,
+        /// Comma-separated refine depths, e.g. 1,2,4,8.
+        #[arg(long, default_value = "1,2,4,8", value_delimiter = ',')]
+        depths: Vec<usize>,
+        /// A trained student checkpoint; fresh weights decode the untrained
+        /// baseline.
+        #[arg(long)]
+        checkpoint: Option<PathBuf>,
+        /// StudentConfig sidecar (must match the checkpoint's shape).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long, default_value_t = 5)]
+        top_k: usize,
+    },
+}
+
+/// The flags of `dblocks nina chat`, bundled so the handler takes the struct
+/// rather than a dozen loose arguments.
+#[derive(clap::Args, Clone)]
+struct NinaChatArgs {
+    /// Registry name of the specialist to serve, `field/subfield`.
+    #[arg(long)]
+    model: String,
+    /// The user turn.
+    #[arg(long)]
+    prompt: String,
+    /// Serve context from this directory of blocks (`*.txt` files and/or
+    /// `*.jsonl` docs, recursively; ids are relative paths) via the local
+    /// retriever.
+    #[arg(long, conflicts_with = "no_context")]
+    context_root: Option<PathBuf>,
+    /// Serve the bare prompt: byte-identical to augmentation with zero hits,
+    /// which is the designed safe degradation.
+    #[arg(long)]
+    no_context: bool,
+    /// Whitespace-token budget for injected context blocks. Shrunk further
+    /// when the byte-level context window would overflow.
+    #[arg(long, default_value_t = 768)]
+    max_context_tokens: usize,
+    /// Greedy-decode at most this many tokens.
+    #[arg(long, default_value_t = 64)]
+    max_new_tokens: usize,
+    /// Root holding registry.json, models/ and logs/; defaults to the
+    /// external drive.
+    #[arg(long, default_value = diffusionblocks::nina::DEFAULT_ROOT)]
+    root: PathBuf,
+}
+
+/// The NINA program subcommands (PLAN-NINA.md §1, §4, §8).
+#[derive(Subcommand)]
+enum NinaAction {
+    /// Run the MCP training server: JSON-RPC 2.0 over stdio (newline-delimited
+    /// frames), exposing the registry, the training queue, routing and log
+    /// verification as MCP tools.
+    McpServe {
+        /// Root holding registry.json and logs/; defaults to the external drive.
+        #[arg(long, default_value = diffusionblocks::nina::DEFAULT_ROOT)]
+        root: PathBuf,
+    },
+    /// Read the name-addressable model registry.
+    Registry {
+        #[command(subcommand)]
+        action: NinaRegistryAction,
+        /// Global so it parses after the leaf: `nina registry get x --registry r.json`.
+        #[arg(long, global = true, default_value = diffusionblocks::nina::DEFAULT_REGISTRY)]
+        registry: PathBuf,
+    },
+    /// Chat with a registered specialist: load its checkpoint, retrieve
+    /// external context (`--context-root`, else the interop file channel with
+    /// a short, loud timeout, else nothing — the bare prompt is the designed
+    /// safe degradation), inject the hits into the serve-time prompt under a
+    /// token budget, greedy-decode an answer, and append the whole turn to
+    /// the Merkle-chained logs/chat.jsonl. Context is served, never trained
+    /// into weights.
+    Chat {
+        #[command(flatten)]
+        args: NinaChatArgs,
+    },
+    /// Re-derive a Merkle-chained log and report. A broken link is an error
+    /// naming the first bad line, and the exit code is non-zero.
+    VerifyLog {
+        /// The chained JSONL log to verify.
+        path: PathBuf,
+    },
+    /// Serve the web dashboard (PLAN-NINA.md §8): a localhost HTTP server
+    /// showing the registry, the live log tails, the vecread thought trace
+    /// and the chat console — every page re-verifies the chained log it
+    /// reads, so an edited history renders red.
+    Serve {
+        #[arg(long, default_value_t = 7878)]
+        port: u16,
+        /// Root holding registry.json and logs/; defaults to the external drive.
+        #[arg(long, default_value = diffusionblocks::nina::DEFAULT_ROOT)]
+        root: PathBuf,
+    },
+}
+
+/// Registry reads: list every entry, or one entry by name.
+#[derive(Subcommand)]
+enum NinaRegistryAction {
+    /// Print every entry, or one field's with `--field`.
+    List {
+        #[arg(long)]
+        field: Option<String>,
+    },
+    /// Print one entry by its `field/subfield` name.
+    Get { name: String },
 }
 
 /// The geometric-reasoning subcommands (roadmap Phase 33). `solve` and
@@ -2190,6 +2379,8 @@ fn main() -> Result<()> {
         Command::Geom { action } => cmd_geom(action),
         Command::Experts { action } => cmd_experts(action),
         Command::Student { action } => cmd_student(action),
+        Command::Nina { action } => cmd_nina(action),
+        Command::Corpus { action } => cmd_corpus(action),
         Command::Verify { group } => cmd_verify(group.as_deref()),
         Command::Cheat { root, json, all } => cmd_cheat(&root, json, all),
         command @ Command::Train { .. } => cmd_train(command),
@@ -2623,8 +2814,10 @@ fn cmd_lm_specialist(
                 &trained,
                 &device,
             )?;
-            anyhow::ensure!(lm_specialist_shared_hash(&specialist, &trained_config, expert_id)? == shared_hash,
-                "compact specialist shared tensor mismatch: wrong base or shared weights were trained");
+            anyhow::ensure!(
+                lm_specialist_shared_hash(&specialist, &trained_config, expert_id)? == shared_hash,
+                "compact specialist shared tensor mismatch: wrong base or shared weights were trained"
+            );
             let applied =
                 model.apply_specialist(&config, &specialist, &trained_config, expert_id)?;
             (
@@ -2719,18 +2912,37 @@ fn cmd_geom(action: GeomAction) -> Result<()> {
     };
     let Some(runtime) = runtime else {
         return match action {
-            GeomAction::Data { points, kinds, kind_weights, count, seed, augment, out_dir } => {
-                cmd_geom_data(points, &kinds, &kind_weights, count, seed, augment, &out_dir)
-            }
+            GeomAction::Data {
+                points,
+                kinds,
+                kind_weights,
+                count,
+                seed,
+                augment,
+                out_dir,
+            } => cmd_geom_data(
+                points,
+                &kinds,
+                &kind_weights,
+                count,
+                seed,
+                augment,
+                &out_dir,
+            ),
             GeomAction::Solve { graph, out } => cmd_geom_solve(&graph, out.as_deref()),
-            GeomAction::Counterexample { claim, trials, grid, seed } => {
-                cmd_geom_counterexample(&claim, trials, grid, seed)
-            }
+            GeomAction::Counterexample {
+                claim,
+                trials,
+                grid,
+                seed,
+            } => cmd_geom_counterexample(&claim, trials, grid, seed),
             // Reached only if a variant is added to the match above without a
             // branch here. Reported rather than aborted, because the argument
             // parser is the thing that would be wrong, and a message naming it is
             // more use than a panic.
-            _ => anyhow::bail!("this `geom` subcommand is not dispatched on the backend path; this is a bug in the argument parser"),
+            _ => anyhow::bail!(
+                "this `geom` subcommand is not dispatched on the backend path; this is a bug in the argument parser"
+            ),
         };
     };
     runtime.validate()?;
@@ -3126,8 +3338,14 @@ fn cmd_geom_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
             )?;
             println!(
                 "trained: {} steps ({} skipped) | loss {:.4} -> {:.4} (mean {:.4}) | accuracy {:.4} -> {:.4} (mean {:.4})",
-                report.steps_taken, report.steps_skipped, report.first_loss, report.last_loss,
-                report.mean_loss, report.first_accuracy, report.last_accuracy, report.mean_accuracy
+                report.steps_taken,
+                report.steps_skipped,
+                report.first_loss,
+                report.last_loss,
+                report.mean_loss,
+                report.first_accuracy,
+                report.last_accuracy,
+                report.mean_accuracy
             );
             // The held-out protocol of `geom eval` (its default batches and
             // seed), so this number lines up with a reasoner evaluated there.
@@ -3791,7 +4009,11 @@ fn cmd_lm_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
                         manifest.tokens,
                         100.0 * manifest.labeled_fraction(),
                         manifest.categories.iter().filter(|c| c.tokens > 0).count(),
-                        if penalty > 0.0 { format!("alpha={penalty}") } else { "off (measuring only)".into() }
+                        if penalty > 0.0 {
+                            format!("alpha={penalty}")
+                        } else {
+                            "off (measuring only)".into()
+                        }
                     );
                     any_labels = true;
                 } else {
@@ -3834,7 +4056,11 @@ fn cmd_lm_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
             );
             println!(
                 "cost per token at context {}: {} active parameters, {:.3e} FLOPs, {} keys read, {} floats of decode state",
-                model_config.context, cost.active_params, cost.flops, cost.keys_read, cost.state_floats
+                model_config.context,
+                cost.active_params,
+                cost.flops,
+                cost.keys_read,
+                cost.state_floats
             );
             if std::any::type_name::<B>().contains("NdArray")
                 && model_config
@@ -3867,7 +4093,10 @@ fn cmd_lm_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
                     path,
                     &device,
                 )?);
-                println!("negative teacher: {} (confidence >= {negative_confidence}, penalty {negative_penalty})", path.display());
+                println!(
+                    "negative teacher: {} (confidence >= {negative_confidence}, penalty {negative_penalty})",
+                    path.display()
+                );
             }
 
             if let Some(d) = ema_decay {
@@ -4738,6 +4967,19 @@ fn cmd_student(action: StudentAction) -> Result<()> {
             config,
         } => cmd_student_route(&language_prompt, checkpoint.as_deref(), config.as_deref()),
         StudentAction::Train { args } => cmd_student_train(&args),
+        StudentAction::Think {
+            prompt,
+            depths,
+            checkpoint,
+            config,
+            top_k,
+        } => cmd_student_think(
+            &prompt,
+            &depths,
+            checkpoint.as_deref(),
+            config.as_deref(),
+            top_k,
+        ),
     }
 }
 
@@ -4748,7 +4990,10 @@ fn cmd_student_info(config_path: Option<&Path>) -> Result<()> {
     let spec = config.mosme_spec()?;
     println!(
         "student config{}",
-        config_path.map_or(" (default)".to_string(), |p| format!(" from {}", p.display()))
+        config_path.map_or(" (default)".to_string(), |p| format!(
+            " from {}",
+            p.display()
+        ))
     );
     println!("{}", serde_json::to_string_pretty(&config)?);
     println!(
@@ -4764,7 +5009,10 @@ fn cmd_student_info(config_path: Option<&Path>) -> Result<()> {
         cost.geom_stream_params as f64 / 1e6,
         cost.probe_router_params as f64 / 1e6
     );
-    println!("box registry (top_box={}, top_expert={}):", spec.top_box, spec.top_expert);
+    println!(
+        "box registry (top_box={}, top_expert={}):",
+        spec.top_box, spec.top_expert
+    );
     for (idx, language) in CodeLanguage::ALL.iter().enumerate() {
         let entry = &spec.boxes[idx];
         println!(
@@ -4802,7 +5050,10 @@ fn cmd_student_route(
     let ids = ByteTokenizer::new().encode_document(prompt);
     let n = ids.len();
     let tokens = burn::tensor::Tensor::<Eval, 1, burn::tensor::Int>::from_ints(
-        ids.iter().map(|t| i64::from(*t)).collect::<Vec<_>>().as_slice(),
+        ids.iter()
+            .map(|t| i64::from(*t))
+            .collect::<Vec<_>>()
+            .as_slice(),
         &device,
     )
     .reshape([1, n]);
@@ -4821,7 +5072,11 @@ fn cmd_student_route(
         .map(|(i, _)| i);
     for language in CodeLanguage::ALL {
         let idx = language.index();
-        let marker = if Some(idx) == best { "  <- top box" } else { "" };
+        let marker = if Some(idx) == best {
+            "  <- top box"
+        } else {
+            ""
+        };
         println!(
             "  {:<8} {:>6.2}%  top-1 on {}/{} tokens{marker}",
             language.name(),
@@ -4833,51 +5088,92 @@ fn cmd_student_route(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)] // audit-allow: mirrors the CLI flags one-to-one, like cmd_geom's train arm
-fn cmd_student_train(
-    language: &str,
-    traces: &Path,
-    steps: usize,
-    batch_size: usize,
-    lr: f64,
+fn cmd_student_think(
+    prompt: &str,
+    depths: &[usize],
+    checkpoint_path: Option<&Path>,
     config_path: Option<&Path>,
-    resume: Option<&str>,
-    out_dir: &Path,
-    seed: u64,
-    router_aux_weight: f64,
-    log_every: usize,
-    checkpoint_every: usize,
-    clip_norm: f32,
+    top_k: usize,
 ) -> Result<()> {
+    use diffusionblocks::student::GeometricStudent;
+    use diffusionblocks::vecread::VecReader;
+    let config = load_student_config(config_path)?;
+    let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
+    <Eval as burn::tensor::backend::Backend>::seed(&device, 0);
+    let mut model = GeometricStudent::<Eval>::new(&config, &device)?;
+    diffusionblocks::tensor_ext::force_initialization(&model);
+    match checkpoint_path {
+        Some(path) => {
+            anyhow::ensure!(
+                path.try_exists()
+                    .with_context(|| format!("stat {}", path.display()))?,
+                "student checkpoint {} does not exist; pass --checkpoint <path> from a \
+                 `dblocks student train` run (default output {DEFAULT_STUDENT_OUT})",
+                path.display()
+            );
+            model = checkpoint::load::<Eval, _>(model, path, &device)?;
+            println!("checkpoint: {}", path.display());
+        }
+        None => println!(
+            "no --checkpoint: fresh weights, so the decoded tokens below are the untrained baseline"
+        ),
+    }
+    let ids = ByteTokenizer::new().encode_document(prompt);
+    let n = ids.len();
+    let tokens = burn::tensor::Tensor::<Eval, 1, burn::tensor::Int>::from_ints(
+        ids.iter()
+            .map(|t| i64::from(*t))
+            .collect::<Vec<_>>()
+            .as_slice(),
+        &device,
+    )
+    .reshape([1, n]);
+    let reader = VecReader {
+        top_k,
+        ..VecReader::default()
+    };
+    let trace = reader.read_student_thinking(&model, tokens, depths)?;
+    println!("{}", trace.render());
+    Ok(())
+}
+
+fn cmd_student_train(args: &StudentTrainArgs) -> Result<()> {
     use diffusionblocks::student::{
         train_language_specialist, GeometricStudent, LanguageBatch, SpecialistTrainConfig,
     };
-    let language = parse_student_language(language)?;
-    let config = load_student_config(config_path)?;
+    let language = parse_student_language(&args.language)?;
+    let config = load_student_config(args.config.as_deref())?;
+    let traces = &args.traces;
+    let out_dir = &args.out_dir;
     anyhow::ensure!(
-        traces.try_exists().with_context(|| format!("stat {}", traces.display()))?,
+        traces
+            .try_exists()
+            .with_context(|| format!("stat {}", traces.display()))?,
         "traces file {} does not exist; pass --traces <path> (the fallback SFT corpus is {FALLBACK_SFT}, loaded with language=unknown)",
         traces.display()
     );
-    let resume_path = match resume {
+    let resume_path = match args.resume.as_deref() {
         None => None,
-        Some("") => Some(checkpoint::latest_in_dir(out_dir, "student")?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "--resume without a value needs a checkpoint in {}; none found",
-                out_dir.display()
-            )
-        })?),
+        Some("") => Some(
+            checkpoint::latest_in_dir(out_dir, "student")?.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--resume without a value needs a checkpoint in {}; none found",
+                    out_dir.display()
+                )
+            })?,
+        ),
         Some(path) => {
             let path = PathBuf::from(path);
             anyhow::ensure!(
-                path.try_exists().with_context(|| format!("stat {}", path.display()))?,
+                path.try_exists()
+                    .with_context(|| format!("stat {}", path.display()))?,
                 "resume checkpoint {} does not exist",
                 path.display()
             );
             Some(path)
         }
     };
-    let data = LanguageBatch::load(traces, language, config.context, seed)?;
+    let data = LanguageBatch::load(traces, language, config.context, args.seed)?;
     println!(
         "traces: {} ({} examples kept of {} lines, {} skipped with no supervised token; filter {})",
         traces.display(),
@@ -4890,19 +5186,19 @@ fn cmd_student_train(
         println!("language=unknown: the routing auxiliary is off (no box to supervise)");
     }
     let device: <StudentTrain as burn::tensor::backend::BackendTypes>::Device = Default::default();
-    <StudentTrain as burn::tensor::backend::Backend>::seed(&device, seed);
+    <StudentTrain as burn::tensor::backend::Backend>::seed(&device, args.seed);
     let model = GeometricStudent::<StudentTrain>::new(&config, &device)?;
     diffusionblocks::tensor_ext::force_initialization(&model);
     let train_config = SpecialistTrainConfig {
-        steps,
-        batch_size,
-        lr,
-        clip_norm,
-        router_aux_weight,
-        seed,
-        log_every,
-        out_dir: Some(out_dir.to_path_buf()),
-        checkpoint_every,
+        steps: args.steps,
+        batch_size: args.batch_size,
+        lr: args.lr,
+        clip_norm: args.clip_norm,
+        router_aux_weight: args.router_aux_weight,
+        seed: args.seed,
+        log_every: args.log_every,
+        out_dir: Some(out_dir.clone()),
+        checkpoint_every: args.checkpoint_every,
         resume: resume_path,
         language,
         ..SpecialistTrainConfig::default()
@@ -6163,7 +6459,9 @@ fn cmd_experiment(action: ExperimentAction) -> Result<()> {
                 b.display()
             );
             print!("{}", render_comparison(&rows));
-            println!("\noverlap = the two 95% intervals overlap: not evidence of no difference, only of not enough trials to show one.");
+            println!(
+                "\noverlap = the two 95% intervals overlap: not evidence of no difference, only of not enough trials to show one."
+            );
             Ok(())
         }
     }
@@ -6212,4 +6510,1208 @@ fn cmd_infer(
     );
     print!("\n{}", profiler.render());
     Ok(())
+}
+
+/// Field corpora: the per-field normalizer of PLAN-NINA §2.
+fn cmd_corpus(action: CorpusAction) -> Result<()> {
+    match action {
+        CorpusAction::BuildField {
+            field,
+            datasets_root,
+            out_root,
+            config,
+            force,
+        } => {
+            let config = match config {
+                Some(path) => {
+                    let text = std::fs::read_to_string(&path)
+                        .with_context(|| format!("read config {}", path.display()))?;
+                    serde_json::from_str::<fieldnorm::FieldnormConfig>(&text)
+                        .with_context(|| format!("{} is not a FieldnormConfig", path.display()))?
+                }
+                None => fieldnorm::FieldnormConfig::default(),
+            };
+            let spec = fieldnorm::field_spec(&field)?;
+            let corpus_dir = out_root.join(&spec.field);
+            let manifest =
+                fieldnorm::build_field_corpus(&spec, &datasets_root, &corpus_dir, &config, force)?;
+            println!(
+                "{}: {} documents ({} chars), {} sources, {} cheat-dropped, {} near-dup, {} oversize; manifest {}",
+                manifest.field,
+                manifest.total_documents,
+                manifest.total_chars,
+                manifest.sources.len(),
+                manifest.dropped_by_class.values().sum::<usize>(),
+                manifest.near_duplicates,
+                manifest.oversize,
+                corpus_dir.join("dataset/manifest.json").display()
+            );
+            Ok(())
+        }
+        CorpusAction::ToPairs {
+            corpus,
+            field,
+            out,
+            max_docs,
+        } => {
+            let config = fieldnorm::ToPairsConfig { max_docs };
+            let manifest = fieldnorm::to_pairs(&corpus, &field, &out, &config)?;
+            println!(
+                "{}: {} docs in -> {} pairs ({} skipped under {} chars), cap {}; manifest at {}.manifest.json",
+                manifest.field,
+                manifest.docs_in,
+                manifest.docs_out,
+                manifest.skipped_short,
+                fieldnorm::MIN_PAIR_DOC_CHARS,
+                manifest.max_docs,
+                out.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// The NINA program: MCP server, registry reads, chain verification.
+fn cmd_nina(action: NinaAction) -> Result<()> {
+    match action {
+        NinaAction::McpServe { root } => {
+            let server = nina::McpServer::new(nina::NinaPaths::new(root));
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
+            server.serve(stdin.lock(), stdout.lock())
+        }
+        NinaAction::Registry { action, registry } => cmd_nina_registry(&action, &registry),
+        NinaAction::Chat { args } => cmd_nina_chat(&args),
+        NinaAction::Serve { port, root } => {
+            let server = ninagui::GuiServer::bind(&root, port)?;
+            println!(
+                "nina dashboard: http://{} (root {})",
+                server.local_addr()?,
+                root.display()
+            );
+            server.serve()
+        }
+        NinaAction::VerifyLog { path } => {
+            // A broken chain propagates: main returns Err, the exit code is
+            // non-zero, and the message names the first bad line.
+            let report = nina::ChainedLog::verify(&path)?;
+            println!(
+                "chain ok: {} — {} record(s), head {}",
+                path.display(),
+                report.lines,
+                report.head_hash
+            );
+            Ok(())
+        }
+    }
+}
+
+fn cmd_nina_registry(action: &NinaRegistryAction, registry: &Path) -> Result<()> {
+    let file = nina::RegistryFile::load(registry)?;
+    match action {
+        NinaRegistryAction::List { field } => {
+            let models: Vec<&nina::ModelEntry> = file
+                .models
+                .iter()
+                .filter(|m| field.as_deref().is_none_or(|f| m.field == f))
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&models)?);
+            println!(
+                "{} entr{}",
+                models.len(),
+                if models.len() == 1 { "y" } else { "ies" }
+            );
+            Ok(())
+        }
+        NinaRegistryAction::Get { name } => {
+            let entry = file
+                .models
+                .iter()
+                .find(|m| &m.name == name)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no model named '{name}' in {} ({} entries)",
+                        registry.display(),
+                        file.models.len()
+                    )
+                })?;
+            println!("{}", serde_json::to_string_pretty(entry)?);
+            Ok(())
+        }
+    }
+}
+
+/// How long `nina chat` waits for a subnext responder on the interop file
+/// channel before falling back to no-context: short, finite and loud —
+/// hanging is not an option while no responder exists.
+const CHAT_CHANNEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How many hits `nina chat` asks the retriever for; the token budget in
+/// `augment_prompt` decides how many of them actually fit.
+const CHAT_RETRIEVAL_K: usize = 8;
+
+/// Resolve a registry entry to its checkpoint on disk. The pipeline's
+/// provenance sidecar (`config.json` in the model directory) names both the
+/// checkpoint file and the `StudentConfig` it was trained with; without one,
+/// the content-addressed `student-*.mpk` files are the candidates, and more
+/// than one is disambiguated by the registry's checkpoint hash.
+fn resolve_specialist(
+    model_dir: &Path,
+    entry: &nina::ModelEntry,
+) -> Result<(PathBuf, Option<diffusionblocks::student::StudentConfig>)> {
+    let sidecar = model_dir.join("config.json");
+    if sidecar.is_file() {
+        let text = std::fs::read_to_string(&sidecar)
+            .with_context(|| format!("read {}", sidecar.display()))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&text).with_context(|| format!("parse {}", sidecar.display()))?;
+        let file = value
+            .get("checkpoint")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                anyhow::anyhow!("{} carries no \"checkpoint\" file name", sidecar.display())
+            })?;
+        anyhow::ensure!(
+            !file.contains('/') && !file.contains('\\'),
+            "{} names checkpoint '{file}', which escapes the model directory",
+            sidecar.display()
+        );
+        let checkpoint = model_dir.join(file);
+        anyhow::ensure!(
+            checkpoint.is_file(),
+            "{} names checkpoint '{file}' but {} does not exist",
+            sidecar.display(),
+            checkpoint.display()
+        );
+        let config = value
+            .get("student_config")
+            .map(|v| {
+                serde_json::from_value(v.clone())
+                    .with_context(|| format!("parse the student_config in {}", sidecar.display()))
+            })
+            .transpose()?;
+        return Ok((checkpoint, config));
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for dir_entry in std::fs::read_dir(model_dir)
+        .with_context(|| format!("list model directory {}", model_dir.display()))?
+    {
+        let path = dir_entry
+            .with_context(|| format!("read an entry of {}", model_dir.display()))?
+            .path();
+        if path.extension().is_some_and(|ext| ext == "mpk") {
+            candidates.push(path);
+        }
+    }
+    candidates.sort();
+    anyhow::ensure!(
+        !candidates.is_empty(),
+        "no specialist checkpoint in {}: expected the pipeline's config.json sidecar or a \
+         content-addressed student-*.mpk (registry entry '{}')",
+        model_dir.display(),
+        entry.name
+    );
+    if candidates.len() == 1 {
+        return Ok((candidates.remove(0), None));
+    }
+    let hash16: String = entry.checkpoint_hash.chars().take(16).collect();
+    let mut matching = candidates.iter().filter(|p| {
+        p.file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| !hash16.is_empty() && n.contains(&hash16))
+    });
+    let (Some(first), None) = (matching.next(), matching.next()) else {
+        anyhow::bail!(
+            "{} checkpoints in {} and the registry hash '{}' does not disambiguate them: {}",
+            candidates.len(),
+            model_dir.display(),
+            entry.checkpoint_hash,
+            candidates
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    };
+    Ok((first.clone(), None))
+}
+
+/// Recover the `StudentConfig` a checkpoint was trained with from its
+/// training-state sidecar; the default config when none is recorded (the same
+/// rule the registry's router applies).
+fn student_config_beside(checkpoint: &Path) -> Result<diffusionblocks::student::StudentConfig> {
+    match checkpoint::TrainState::for_model(checkpoint)? {
+        Some(state) => match state.config.get("student_config") {
+            Some(value) => serde_json::from_value(value.clone()).with_context(|| {
+                format!(
+                    "parse the student config recorded beside {}",
+                    checkpoint.display()
+                )
+            }),
+            None => Ok(diffusionblocks::student::StudentConfig::default()),
+        },
+        None => Ok(diffusionblocks::student::StudentConfig::default()),
+    }
+}
+
+/// Byte-tokenize a serve-time prompt: document-style BOS prefix, then the raw
+/// bytes, and deliberately no closing EOS so the model continues the document
+/// instead of being told it ended.
+fn encode_prompt(text: &str) -> Vec<u16> {
+    let mut ids = Vec::with_capacity(text.len() + 1);
+    ids.push(diffusionblocks::tokenizer::Special::Bos.id());
+    ids.extend(ByteTokenizer::new().encode(text));
+    ids
+}
+
+/// Augment `prompt` with `hits` under a whitespace-token budget, then shrink
+/// the budget until the byte-tokenized result plus `max_new_tokens` fits the
+/// model's context window. Whitespace tokens and byte tokens are different
+/// units (one word is several bytes), so the CLI's budget is only a starting
+/// point; the window check here is the authoritative one. A bare prompt that
+/// does not fit is a loud error, never a silent truncation.
+fn fit_augmented_prompt(
+    prompt: &str,
+    hits: &[diffusionblocks::interop::ContextHit],
+    mut budget: usize,
+    context_window: usize,
+    max_new_tokens: usize,
+) -> Result<(String, Vec<u16>, usize)> {
+    anyhow::ensure!(
+        max_new_tokens < context_window,
+        "--max-new-tokens {max_new_tokens} leaves no room for a prompt in the model's \
+         {context_window}-token context window"
+    );
+    let bare = encode_prompt(prompt);
+    anyhow::ensure!(
+        bare.len() + max_new_tokens <= context_window,
+        "the bare prompt is {} byte-tokens; with --max-new-tokens {max_new_tokens} it needs {} \
+         of the model's {context_window}-token context window — shorten the prompt",
+        bare.len(),
+        bare.len() + max_new_tokens
+    );
+    loop {
+        let augmented = diffusionblocks::interop::augment_prompt(prompt, hits, budget);
+        let ids = encode_prompt(&augmented);
+        if ids.len() + max_new_tokens <= context_window {
+            return Ok((augmented, ids, budget));
+        }
+        anyhow::ensure!(
+            budget > 0,
+            "context overflow with no injectable budget left: the augmented prompt is {} \
+             byte-tokens against a {context_window}-token window and {max_new_tokens} \
+             requested new tokens",
+            ids.len()
+        );
+        // Scale the budget by the observed overflow (the loop only reaches
+        // here when ids.len() exceeds the room, so the ratio shrinks), and
+        // always give up at least an eighth so the loop terminates.
+        let room = context_window - max_new_tokens;
+        budget = (budget * room / ids.len()).min(budget * 7 / 8);
+    }
+}
+
+/// Greedy decode from a specialist: argmax at each step over a full-prefix
+/// forward (the student keeps no KV cache), stopping at `<eos>` or a NUL
+/// byte.
+/// Context overflow is a loud error naming both numbers, never a silent
+/// truncation.
+fn greedy_generate(
+    model: &diffusionblocks::student::GeometricStudent<Eval>,
+    prompt_ids: &[u16],
+    max_new_tokens: usize,
+) -> Result<Vec<u16>> {
+    use burn::tensor::{Int, Tensor};
+    let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
+    let context = model.config().context;
+    let mut ids: Vec<u16> = prompt_ids.to_vec();
+    let mut generated: Vec<u16> = Vec::new();
+    for _ in 0..max_new_tokens {
+        anyhow::ensure!(
+            ids.len() < context,
+            "context overflow during generation: the prefix grew to {} tokens against the \
+             model's {context}-token context window",
+            ids.len()
+        );
+        let flat: Vec<i64> = ids.iter().map(|t| i64::from(*t)).collect();
+        let tokens =
+            Tensor::<Eval, 1, Int>::from_ints(flat.as_slice(), &device).reshape([1, ids.len()]);
+        let logits = model.forward(tokens)?.logits;
+        let [_, n, vocab] = logits.dims();
+        // argmax keeps its reduced dim; reshape before reading the scalar.
+        let next: i64 = logits
+            .slice([0..1, (n - 1)..n, 0..vocab])
+            .reshape([vocab])
+            .argmax(0)
+            .reshape([1])
+            .into_scalar();
+        let next = u16::try_from(next)
+            .map_err(|e| anyhow::anyhow!("the argmax index {next} is not a byte-token id: {e}"))?;
+        if next == diffusionblocks::tokenizer::Special::Eos.id() || next == 0 {
+            break;
+        }
+        ids.push(next);
+        generated.push(next);
+    }
+    Ok(generated)
+}
+
+/// Retrieve context for one chat turn: the context root when given, else the
+/// interop file channel with a short, loud timeout, else nothing. Zero hits
+/// is the designed safe degradation — augmentation with no hits returns the
+/// prompt byte-identical. The returned string says where the hits came from,
+/// for the transcript and the log.
+fn chat_retrieve(
+    args: &NinaChatArgs,
+    field: &str,
+) -> Result<(Vec<diffusionblocks::interop::ContextHit>, String)> {
+    use diffusionblocks::interop;
+    if args.no_context {
+        return Ok((Vec::new(), "none (--no-context)".to_string()));
+    }
+    if let Some(root) = &args.context_root {
+        let retriever = interop::LocalRetriever::load_blocks(root)?;
+        let note = format!("{} ({} blocks)", root.display(), retriever.doc_count());
+        return Ok((retriever.retrieve(&args.prompt, CHAT_RETRIEVAL_K), note));
+    }
+    let channel = interop::RequestChannel::open(Path::new(interop::INTEROP_DIR))?;
+    let query = interop::ContextQuery::new(&args.prompt, CHAT_RETRIEVAL_K, field);
+    let id = channel.submit(&query)?;
+    match channel.poll(&id, CHAT_CHANNEL_TIMEOUT) {
+        Ok(hits) => {
+            let collected = channel.gc()?;
+            Ok((
+                hits,
+                format!(
+                    "interop channel {} (request {id}, {collected} answered pair(s) collected)",
+                    interop::INTEROP_DIR
+                ),
+            ))
+        }
+        Err(err) => {
+            eprintln!(
+                "note: {err}; continuing without context — the bare prompt is the designed \
+                 safe degradation"
+            );
+            Ok((
+                Vec::new(),
+                "none (no context responder answered)".to_string(),
+            ))
+        }
+    }
+}
+
+fn cmd_nina_chat(args: &NinaChatArgs) -> Result<()> {
+    use diffusionblocks::student::GeometricStudent;
+
+    let paths = nina::NinaPaths::new(&args.root);
+    let registry = nina::RegistryFile::load(&paths.registry_json())?;
+    let entry = registry
+        .models
+        .iter()
+        .find(|m| m.name == args.model)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no model named '{}' in {} ({} entries: {})",
+                args.model,
+                paths.registry_json().display(),
+                registry.models.len(),
+                registry
+                    .models
+                    .iter()
+                    .map(|m| m.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+    let model_dir = paths.model_dir(&entry.field, &entry.subfield);
+    let (checkpoint_path, sidecar_config) = resolve_specialist(&model_dir, entry)?;
+    let config = match sidecar_config {
+        Some(config) => config,
+        None => student_config_beside(&checkpoint_path)?,
+    };
+    config.validate()?;
+    let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
+    <Eval as burn::tensor::backend::Backend>::seed(&device, 0);
+    let model = GeometricStudent::<Eval>::new(&config, &device)?;
+    diffusionblocks::tensor_ext::force_initialization(&model);
+    let model = checkpoint::load::<Eval, _>(model, &checkpoint_path, &device)?;
+    println!(
+        "model: {} ({}, checkpoint {})",
+        entry.name,
+        entry.status.as_str(),
+        checkpoint_path.display()
+    );
+
+    let (hits, context_note) = chat_retrieve(args, &entry.field)?;
+    let (augmented, ids, budget) = fit_augmented_prompt(
+        &args.prompt,
+        &hits,
+        args.max_context_tokens,
+        config.context,
+        args.max_new_tokens,
+    )?;
+    let injected: Vec<&diffusionblocks::interop::ContextHit> = hits
+        .iter()
+        .filter(|hit| {
+            augmented.contains(&format!(
+                "[context id={} source={}]",
+                hit.id, hit.provenance.source
+            ))
+        })
+        .collect();
+    println!(
+        "context: {context_note}; {} of {} hit(s) injected (budget {budget} whitespace tokens)",
+        injected.len(),
+        hits.len()
+    );
+    for hit in &injected {
+        println!("  id={} score={:.4}", hit.id, hit.score);
+    }
+
+    let generated = greedy_generate(&model, &ids, args.max_new_tokens)?;
+    let answer = ByteTokenizer::new().decode_lossy(&generated);
+    println!("answer ({} tokens):\n{answer}", generated.len());
+
+    let chat_log = paths.root().join("logs").join("chat.jsonl");
+    let mut log = nina::ChainedLog::open(&chat_log)?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let record = log.append(&serde_json::json!({
+        "ts": ts,
+        "model": entry.name,
+        "prompt": args.prompt,
+        "context": {
+            "source": context_note,
+            "budget_tokens": budget,
+            "injected": injected
+                .iter()
+                .map(|h| serde_json::json!({"id": h.id, "score": h.score}))
+                .collect::<Vec<_>>(),
+        },
+        "answer": answer,
+        "answer_tokens": generated.len(),
+    }))?;
+    println!(
+        "turn logged: {} seq {} (verify: dblocks nina verify-log {})",
+        chat_log.display(),
+        record.seq,
+        chat_log.display()
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+mod student_cli_tests {
+    use super::*;
+
+    fn scratch(stem: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("dblocks-student-cli-{stem}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn tiny_sidecar(dir: &Path) -> PathBuf {
+        let path = dir.join("student.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "hidden_size": 32,
+                "num_layers": 2,
+                "num_heads": 2,
+                "num_kv_heads": 1,
+                "context": 24,
+                "intermediate_size": 16,
+                "cond_hidden_size": 8,
+                "frequency_embedding_size": 8,
+                "attention": "dense",
+                "experts_per_box": 1,
+                "geom_slots": 2,
+                "geom_dim": 4,
+                "geom_refine_steps": 1,
+                "geom_cond_hidden": 8,
+                "geom_frequency": 4,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        path
+    }
+
+    fn fixture_traces(dir: &Path) -> PathBuf {
+        let path = dir.join("train.jsonl");
+        let lines: Vec<String> = [
+            ("rust", "fn add(", ") -> i32 { 3 }"),
+            ("rust", "let x =", " 1 + 2;"),
+            ("python", "def f(", "): pass"),
+            ("rust", "impl A {", " fn b(&self) {} }"),
+        ]
+        .iter()
+        .map(|(language, prompt, completion)| {
+            serde_json::json!({
+                "id": language,
+                "language": language,
+                "prompt": prompt,
+                "completion": completion,
+                "source": "fixture",
+            })
+            .to_string()
+        })
+        .collect();
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+        path
+    }
+
+    fn train_args(dir: &Path) -> StudentTrainArgs {
+        StudentTrainArgs {
+            language: "rust".into(),
+            traces: fixture_traces(dir),
+            steps: 2,
+            batch_size: 2,
+            lr: 1e-3,
+            config: Some(tiny_sidecar(dir)),
+            resume: None,
+            out_dir: dir.join("ckpt"),
+            seed: 5,
+            router_aux_weight: 0.1,
+            log_every: 0,
+            checkpoint_every: 0,
+            clip_norm: 0.0,
+        }
+    }
+
+    #[test]
+    fn student_subcommands_parse() {
+        let cli = Cli::try_parse_from([
+            "dblocks",
+            "student",
+            "train",
+            "--language",
+            "rust",
+            "--traces",
+            "t.jsonl",
+            "--steps",
+            "3",
+        ])
+        .unwrap();
+        let Command::Student {
+            action: StudentAction::Train { args },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(args.language, "rust");
+        assert_eq!(args.steps, 3);
+        assert_eq!(args.out_dir, PathBuf::from(DEFAULT_STUDENT_OUT));
+        assert!(args.resume.is_none());
+        assert!(Cli::try_parse_from([
+            "dblocks",
+            "student",
+            "route",
+            "--language-prompt",
+            "fn main() {}"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["dblocks", "student", "info"]).is_ok());
+        // `--language` is required for train.
+        assert!(Cli::try_parse_from(["dblocks", "student", "train"]).is_err());
+
+        let cli = Cli::try_parse_from([
+            "dblocks",
+            "student",
+            "think",
+            "--prompt",
+            "fn main() {}",
+            "--depths",
+            "1,2,4",
+            "--top-k",
+            "3",
+        ])
+        .unwrap();
+        let Command::Student {
+            action:
+                StudentAction::Think {
+                    prompt,
+                    depths,
+                    checkpoint,
+                    top_k,
+                    ..
+                },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(prompt, "fn main() {}");
+        assert_eq!(depths, vec![1, 2, 4]);
+        assert_eq!(top_k, 3);
+        assert!(checkpoint.is_none());
+        // The defaults: the 1,2,4,8 sweep and top-5.
+        let cli = Cli::try_parse_from(["dblocks", "student", "think", "--prompt", "x"]).unwrap();
+        let Command::Student {
+            action: StudentAction::Think { depths, top_k, .. },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(depths, vec![1, 2, 4, 8]);
+        assert_eq!(top_k, 5);
+        // `--prompt` is required.
+        assert!(Cli::try_parse_from(["dblocks", "student", "think"]).is_err());
+    }
+
+    #[test]
+    fn student_info_runs_on_a_fresh_config() {
+        cmd_student_info(None).unwrap();
+        let dir = scratch("info");
+        cmd_student_info(Some(&tiny_sidecar(&dir))).unwrap();
+        let err = cmd_student_info(Some(&dir.join("absent.json")))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("absent.json"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn student_train_on_a_fixture_writes_a_checkpoint() {
+        let dir = scratch("train");
+        cmd_student_train(&train_args(&dir)).unwrap();
+        let checkpoint = checkpoint::latest_in_dir(&dir.join("ckpt"), "student")
+            .unwrap()
+            .expect("the run must write a checkpoint");
+        let state = checkpoint::TrainState::for_model(&checkpoint)
+            .unwrap()
+            .expect("training state beside the model");
+        assert_eq!(state.kind, "student");
+        assert_eq!(state.step, 2);
+        state
+            .verify_files(&checkpoint::TrainState::dir_for(&checkpoint))
+            .unwrap();
+
+        // A bad language fails before any work, naming the flag value.
+        let mut bad = train_args(&dir);
+        bad.language = "cobol".into();
+        let err = cmd_student_train(&bad).unwrap_err().to_string();
+        assert!(err.contains("cobol"), "{err}");
+
+        // Missing traces fail loudly, naming the path.
+        let mut missing = train_args(&dir);
+        missing.traces = dir.join("absent.jsonl");
+        let err = cmd_student_train(&missing).unwrap_err().to_string();
+        assert!(err.contains("absent.jsonl"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn student_route_runs_with_fresh_weights() {
+        let dir = scratch("route");
+        cmd_student_route(
+            "fn main() { println!(\"hi\"); }",
+            None,
+            Some(&tiny_sidecar(&dir)),
+        )
+        .unwrap();
+        let err = cmd_student_route(
+            "x",
+            Some(&dir.join("absent.mpk")),
+            Some(&tiny_sidecar(&dir)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("absent.mpk"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn student_think_runs_with_fresh_weights() {
+        let dir = scratch("think");
+        cmd_student_think("fn main() {}", &[1, 2], None, Some(&tiny_sidecar(&dir)), 3).unwrap();
+        // A missing checkpoint is a loud error naming the path.
+        let err = cmd_student_think(
+            "x",
+            &[1],
+            Some(&dir.join("absent.mpk")),
+            Some(&tiny_sidecar(&dir)),
+            3,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("absent.mpk"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+mod nina_cli_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SCRATCH: AtomicUsize = AtomicUsize::new(0);
+
+    fn scratch(stem: &str) -> PathBuf {
+        let n = SCRATCH.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "dblocks-nina-cli-{stem}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn nina_subcommands_parse() {
+        let cli = Cli::try_parse_from(["dblocks", "nina", "mcp-serve"]).unwrap();
+        let Command::Nina {
+            action: NinaAction::McpServe { root },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(root, PathBuf::from(nina::DEFAULT_ROOT));
+
+        let cli =
+            Cli::try_parse_from(["dblocks", "nina", "mcp-serve", "--root", "/tmp/nina-x"]).unwrap();
+        let Command::Nina {
+            action: NinaAction::McpServe { root },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(root, PathBuf::from("/tmp/nina-x"));
+
+        let cli = Cli::try_parse_from(["dblocks", "nina", "registry", "list", "--field", "coding"])
+            .unwrap();
+        let Command::Nina {
+            action:
+                NinaAction::Registry {
+                    action: NinaRegistryAction::List { field },
+                    registry,
+                },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(field.as_deref(), Some("coding"));
+        assert_eq!(registry, PathBuf::from(nina::DEFAULT_REGISTRY));
+
+        let cli =
+            Cli::try_parse_from(["dblocks", "nina", "registry", "get", "coding/rust"]).unwrap();
+        let Command::Nina {
+            action:
+                NinaAction::Registry {
+                    action: NinaRegistryAction::Get { name },
+                    ..
+                },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(name, "coding/rust");
+
+        // --registry is global: it also parses after the leaf subcommand.
+        let cli = Cli::try_parse_from([
+            "dblocks",
+            "nina",
+            "registry",
+            "get",
+            "coding/rust",
+            "--registry",
+            "/tmp/r.json",
+        ])
+        .unwrap();
+        let Command::Nina {
+            action: NinaAction::Registry { registry, .. },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(registry, PathBuf::from("/tmp/r.json"));
+
+        let cli =
+            Cli::try_parse_from(["dblocks", "nina", "verify-log", "logs/registry.jsonl"]).unwrap();
+        let Command::Nina {
+            action: NinaAction::VerifyLog { path },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(path, PathBuf::from("logs/registry.jsonl"));
+
+        // `get` needs a name and `verify-log` needs a path.
+        assert!(Cli::try_parse_from(["dblocks", "nina", "registry", "get"]).is_err());
+        assert!(Cli::try_parse_from(["dblocks", "nina", "verify-log"]).is_err());
+    }
+
+    #[test]
+    fn nina_serve_parses_with_defaults_and_overrides() {
+        let cli = Cli::try_parse_from(["dblocks", "nina", "serve"]).unwrap();
+        let Command::Nina {
+            action: NinaAction::Serve { port, root },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(port, 7878);
+        assert_eq!(root, PathBuf::from(nina::DEFAULT_ROOT));
+
+        let cli = Cli::try_parse_from([
+            "dblocks",
+            "nina",
+            "serve",
+            "--port",
+            "0",
+            "--root",
+            "/tmp/nina-gui-x",
+        ])
+        .unwrap();
+        let Command::Nina {
+            action: NinaAction::Serve { port, root },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(port, 0);
+        assert_eq!(root, PathBuf::from("/tmp/nina-gui-x"));
+
+        // A non-numeric port is rejected at parse time.
+        assert!(Cli::try_parse_from(["dblocks", "nina", "serve", "--port", "x"]).is_err());
+    }
+
+    #[test]
+    fn nina_registry_cli_and_verify_log_run() {
+        let dir = scratch("registry");
+        let registry_path = dir.join("registry.json");
+        let log_path = dir.join("logs").join("registry.jsonl");
+        let mut registry = nina::Registry::open(&registry_path, &log_path).unwrap();
+        let entry = nina::ModelEntry {
+            name: "coding/rust".into(),
+            field: "coding".into(),
+            subfield: "rust".into(),
+            box_id: "coding:rust".into(),
+            eval: nina::EvalEvidence {
+                accuracy: Some(0.9),
+                ..nina::EvalEvidence::default()
+            },
+            ..nina::ModelEntry::default()
+        };
+        registry.register(entry).unwrap();
+
+        cmd_nina_registry(&NinaRegistryAction::List { field: None }, &registry_path).unwrap();
+        cmd_nina_registry(
+            &NinaRegistryAction::List {
+                field: Some("coding".into()),
+            },
+            &registry_path,
+        )
+        .unwrap();
+        cmd_nina_registry(
+            &NinaRegistryAction::Get {
+                name: "coding/rust".into(),
+            },
+            &registry_path,
+        )
+        .unwrap();
+        let err = cmd_nina_registry(
+            &NinaRegistryAction::Get {
+                name: "bio/general".into(),
+            },
+            &registry_path,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("bio/general"), "{err}");
+        let err = cmd_nina_registry(
+            &NinaRegistryAction::List { field: None },
+            &dir.join("absent.json"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("absent.json"), "{err}");
+
+        // verify-log: a good chain reports; a tampered one fails, naming the line.
+        cmd_nina(NinaAction::VerifyLog {
+            path: log_path.clone(),
+        })
+        .unwrap();
+        let text = std::fs::read_to_string(&log_path).unwrap();
+        let tampered = text.replacen("coding/rust", "coding/ruby", 1);
+        assert_ne!(tampered, text);
+        std::fs::write(&log_path, tampered).unwrap();
+        let err = cmd_nina(NinaAction::VerifyLog {
+            path: log_path.clone(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("line 1"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn nina_chat_parses_with_defaults_and_overrides() {
+        let cli = Cli::try_parse_from([
+            "dblocks",
+            "nina",
+            "chat",
+            "--model",
+            "tech/general",
+            "--prompt",
+            "hi",
+        ])
+        .unwrap();
+        let Command::Nina {
+            action: NinaAction::Chat { args },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(args.model, "tech/general");
+        assert_eq!(args.prompt, "hi");
+        assert_eq!(args.context_root, None);
+        assert!(!args.no_context);
+        assert_eq!(args.max_context_tokens, 768);
+        assert_eq!(args.max_new_tokens, 64);
+        assert_eq!(args.root, PathBuf::from(nina::DEFAULT_ROOT));
+
+        let cli = Cli::try_parse_from([
+            "dblocks",
+            "nina",
+            "chat",
+            "--model",
+            "coding/rust",
+            "--prompt",
+            "fn?",
+            "--context-root",
+            "/tmp/blocks",
+            "--max-context-tokens",
+            "128",
+            "--max-new-tokens",
+            "8",
+            "--root",
+            "/tmp/nina-root",
+        ])
+        .unwrap();
+        let Command::Nina {
+            action: NinaAction::Chat { args },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(args.context_root, Some(PathBuf::from("/tmp/blocks")));
+        assert_eq!(args.max_context_tokens, 128);
+        assert_eq!(args.max_new_tokens, 8);
+        assert_eq!(args.root, PathBuf::from("/tmp/nina-root"));
+
+        // --no-context and --context-root name the same switch twice.
+        assert!(Cli::try_parse_from([
+            "dblocks",
+            "nina",
+            "chat",
+            "--model",
+            "m/f",
+            "--prompt",
+            "x",
+            "--no-context",
+            "--context-root",
+            "/tmp/x",
+        ])
+        .is_err());
+        // --model and --prompt are required.
+        assert!(Cli::try_parse_from(["dblocks", "nina", "chat"]).is_err());
+        assert!(Cli::try_parse_from(["dblocks", "nina", "chat", "--model", "m/f"]).is_err());
+    }
+
+    #[test]
+    fn nina_chat_runs_a_turn_and_logs_it() {
+        use diffusionblocks::student::GeometricStudent;
+        let dir = scratch("chat");
+
+        // A registry with one tiny specialist.
+        let entry = nina::ModelEntry {
+            name: "test/tiny".into(),
+            field: "test".into(),
+            subfield: "tiny".into(),
+            ..nina::ModelEntry::default()
+        };
+        let file = nina::RegistryFile {
+            version: 1,
+            models: vec![entry],
+        };
+        std::fs::write(
+            dir.join("registry.json"),
+            serde_json::to_string_pretty(&file).unwrap(),
+        )
+        .unwrap();
+
+        // The specialist: a tiny student, content-addressed into the model
+        // directory, with the pipeline's sidecar naming checkpoint + config.
+        let config: diffusionblocks::student::StudentConfig =
+            serde_json::from_value(serde_json::json!({
+                "hidden_size": 32,
+                "num_layers": 2,
+                "num_heads": 2,
+                "num_kv_heads": 1,
+                "context": 512,
+                "intermediate_size": 16,
+                "cond_hidden_size": 8,
+                "frequency_embedding_size": 8,
+                "attention": "dense",
+                "experts_per_box": 1,
+                "geom_slots": 2,
+                "geom_dim": 4,
+                "geom_refine_steps": 1,
+                "geom_cond_hidden": 8,
+                "geom_frequency": 4,
+            }))
+            .unwrap();
+        let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
+        <Eval as burn::tensor::backend::Backend>::seed(&device, 0);
+        let model = GeometricStudent::<Eval>::new(&config, &device).unwrap();
+        diffusionblocks::tensor_ext::force_initialization(&model);
+        let model_dir = dir.join("models").join("test").join("tiny");
+        let checkpoint = checkpoint::save_content_addressed(model, &model_dir, "student").unwrap();
+        let file_name = checkpoint
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap()
+            .to_string();
+        std::fs::write(
+            model_dir.join("config.json"),
+            serde_json::json!({
+                "name": "test/tiny",
+                "checkpoint": file_name,
+                "student_config": serde_json::to_value(&config).unwrap(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        // The context root holds the answer to the prompt.
+        let blocks = dir.join("blocks");
+        std::fs::create_dir_all(&blocks).unwrap();
+        std::fs::write(
+            blocks.join("relay.txt"),
+            "The Argent Fox relay listens on TCP port 7447 by default.",
+        )
+        .unwrap();
+
+        let args = NinaChatArgs {
+            model: "test/tiny".into(),
+            prompt: "Which TCP port does the Argent Fox relay listen on?".into(),
+            context_root: Some(blocks),
+            no_context: false,
+            max_context_tokens: 64,
+            max_new_tokens: 4,
+            root: dir.clone(),
+        };
+        cmd_nina_chat(&args).unwrap();
+
+        // The turn is in the Merkle-chained log, the injected block is named,
+        // and the chain verifies.
+        let chat_log = dir.join("logs").join("chat.jsonl");
+        let report = nina::ChainedLog::verify(&chat_log).unwrap();
+        assert_eq!(report.lines, 1);
+        let line = std::fs::read_to_string(&chat_log).unwrap();
+        assert!(line.contains("test/tiny"), "{line}");
+        assert!(line.contains("relay.txt"), "{line}");
+
+        // --no-context is byte-identical to augmentation with zero hits.
+        let (augmented, fitted, budget) =
+            fit_augmented_prompt(&args.prompt, &[], 64, 512, 4).unwrap();
+        assert_eq!(augmented, args.prompt);
+        assert_eq!(fitted, encode_prompt(&args.prompt));
+        assert_eq!(budget, 64);
+        let args = NinaChatArgs {
+            no_context: true,
+            context_root: None,
+            ..args
+        };
+        cmd_nina_chat(&args).unwrap();
+        let report = nina::ChainedLog::verify(&chat_log).unwrap();
+        assert_eq!(report.lines, 2);
+        let line = std::fs::read_to_string(&chat_log)
+            .unwrap()
+            .lines()
+            .next_back()
+            .unwrap()
+            .to_string();
+        assert!(line.contains("--no-context"), "{line}");
+
+        // An unknown model name is a loud error listing what exists.
+        let args = NinaChatArgs {
+            model: "bio/absent".into(),
+            ..args
+        };
+        let err = cmd_nina_chat(&args).unwrap_err().to_string();
+        assert!(err.contains("bio/absent"), "{err}");
+        assert!(err.contains("test/tiny"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fit_augmented_prompt_shrinks_the_budget_to_the_window() {
+        use diffusionblocks::interop::{ContextHit, Provenance};
+        // One hit whose text is far wider than the window; the budget loop
+        // must shrink until prompt + max-new fits, and the result stays marked.
+        let hit = ContextHit::new(
+            "doc-big",
+            1.0,
+            "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima",
+            Provenance::new("blocks", "big.txt"),
+        );
+        let (augmented, ids, budget) =
+            fit_augmented_prompt("q?", std::slice::from_ref(&hit), 64, 90, 4).unwrap();
+        assert!(ids.len() + 4 <= 90);
+        assert!(budget < 64);
+        assert!(augmented.contains("[context id=doc-big source=blocks]"));
+        assert!(augmented.ends_with("\nq?"));
+
+        // A bare prompt that cannot fit even with budget zero is a loud error.
+        let long = "x".repeat(64);
+        let err = fit_augmented_prompt(&long, &[], 64, 40, 4)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bare prompt"), "{err}");
+    }
 }

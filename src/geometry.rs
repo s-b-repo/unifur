@@ -646,6 +646,13 @@ impl<B: Backend<FloatElem = f32>> GeomBlock<B> {
         }
     }
 
+    /// The block's learned metric field, for metric-native diagnostics (the
+    /// vecread slot-geometry section reads pairwise slot distances through
+    /// it). Read-only: the landscape is the block's own.
+    pub(crate) fn metric_field(&self) -> &MetricField<B> {
+        &self.metric
+    }
+
     /// Refine `(h, z)` for `refine_steps` iterations at noise scale `sigma`.
     ///
     /// The landscape is fixed: the context each slot is drawn toward, the

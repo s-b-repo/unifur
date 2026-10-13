@@ -39,6 +39,9 @@
 //! window is cut *after* labeling.
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -732,6 +735,489 @@ impl TokenCorpus {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cybercorpus normalizer (PLAN-NINA §2)
+//
+// The universal dataset contract for every field, not just cyber. Raw trees
+// (`raw/<source>/…`) become: `dataset/all.jsonl` (one document per line),
+// `dataset/<source>.jsonl` per source, `dataset/manifest.json` (counts and
+// every skip/drop with its reason), and `text/<source>/…` plain-text files —
+// the latter being what [`TokenCorpus::tokenize_file`] consumes to build a
+// trainable corpus. The normalizer never tokenizes; it produces the layout
+// the tokenizer reads.
+//
+// Every document's *content* passes through [`crate::cheat::scan_snippet`]:
+// prose (`.txt`/`.md`) as [`crate::cheat::SnippetLanguage::Other`], JSONL rows
+// declaring a `language` with that language's scanner. For paired rows
+// (prompt+completion) only the completion half is scanned — the prompt half
+// is instructions (ours, in the export case), and scanning instructions with
+// a code scanner would flag the requirement text that names the forbidden
+// patterns as if it violated them. This is where the secrets scan runs: a
+// credential in a raw scrape is dropped, counted per class in the manifest,
+// and never silently included. The same is true of the brokenness checks,
+// which is deliberate: prose that starts a line with "here is" or "you can"
+// reads like a pasted chat answer, and the manifest makes the drop visible
+// rather than the document trusted.
+// ---------------------------------------------------------------------------
+
+/// Default ceiling on one document's size. Larger documents are skipped and
+/// listed in the manifest: a 900 MB dump is a packaging mistake, not a
+/// document, and reading it as one would silently dominate the corpus.
+pub const DEFAULT_MAX_DOC_BYTES: usize = 4 * 1024 * 1024;
+
+fn default_max_doc_bytes() -> usize {
+    DEFAULT_MAX_DOC_BYTES
+}
+
+/// Configuration for [`build_cybercorpus`]. All fields carry serde defaults,
+/// so a sidecar written by an older build still parses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CybercorpusConfig {
+    /// Documents larger than this many bytes are skipped (listed in the
+    /// manifest's `skipped_oversize`).
+    #[serde(default = "default_max_doc_bytes")]
+    pub max_doc_bytes: usize,
+}
+
+impl Default for CybercorpusConfig {
+    fn default() -> Self {
+        Self {
+            max_doc_bytes: default_max_doc_bytes(),
+        }
+    }
+}
+
+/// One line of `dataset/all.jsonl` / `dataset/<source>.jsonl`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatasetRecord {
+    /// sha256 of `source`, the relative path and the text, first 16 hex
+    /// chars. Content-addressed, so a rebuild over the same raw tree yields
+    /// the same ids and a changed document is a different id.
+    pub id: String,
+    /// The first path component under `raw/` (`recon`, `methodology`, …);
+    /// files directly at the raw root land in `misc`.
+    pub source: String,
+    /// The document's path relative to `raw/`; JSONL rows carry `#<line>`.
+    pub path: String,
+    /// `txt`, `md` or `jsonl`.
+    pub format: String,
+    /// The document text.
+    pub text: String,
+}
+
+/// Per-source counts in [`CorpusManifest`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SourceManifest {
+    /// Kept documents.
+    pub documents: usize,
+    /// Kept characters.
+    pub chars: usize,
+    /// Cheat-class name -> documents dropped because of it.
+    #[serde(default)]
+    pub dropped_by_class: BTreeMap<String, usize>,
+    /// Files whose extension the normalizer does not know.
+    #[serde(default)]
+    pub skipped_unknown_format: Vec<String>,
+    /// Documents over [`CybercorpusConfig::max_doc_bytes`].
+    #[serde(default)]
+    pub skipped_oversize: Vec<String>,
+    /// JSONL rows that parsed as JSON but carried no text field.
+    #[serde(default)]
+    pub jsonl_rows_without_text: usize,
+}
+
+/// `dataset/manifest.json`: the provenance record of one normalizer run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CorpusManifest {
+    /// The raw tree that was read.
+    pub raw_dir: PathBuf,
+    /// The layout root that was written.
+    pub out_dir: PathBuf,
+    /// Per-source counts, keyed by source name (sorted).
+    #[serde(default)]
+    pub sources: BTreeMap<String, SourceManifest>,
+    /// Kept documents across all sources.
+    pub total_documents: usize,
+    /// Kept characters across all sources.
+    pub total_chars: usize,
+    /// Cheat-class name -> documents dropped because of it, all sources.
+    #[serde(default)]
+    pub dropped_by_class: BTreeMap<String, usize>,
+    /// Unknown-format files, all sources (relative paths, sorted).
+    #[serde(default)]
+    pub skipped_unknown_format: Vec<String>,
+    /// Oversize documents, all sources (relative paths, sorted).
+    #[serde(default)]
+    pub skipped_oversize: Vec<String>,
+    /// JSONL rows without extractable text, all sources.
+    #[serde(default)]
+    pub jsonl_rows_without_text: usize,
+}
+
+/// One document pulled out of the raw tree, before filtering.
+struct RawDocument {
+    /// First path component under `raw/`.
+    source: String,
+    /// Path relative to `raw/`, with `#<line>` for JSONL rows.
+    rel_path: String,
+    /// `txt`, `md` or `jsonl`.
+    format: String,
+    /// What lands in the dataset.
+    text: String,
+    /// What the cheat scanner sees (see [`RowParts`]).
+    scan_text: String,
+    /// Declared language of a JSONL row, if it carried one.
+    language: Option<String>,
+}
+
+/// All files under `dir`, recursively, sorted for a deterministic walk.
+fn walk_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let mut entries: Vec<PathBuf> = std::fs::read_dir(&current)
+            .with_context(|| format!("read directory {}", current.display()))?
+            .map(|entry| {
+                entry
+                    .map(|e| e.path())
+                    .with_context(|| format!("read an entry of {}", current.display()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// The pieces of one JSONL row, by a fixed field order: `text`, then
+/// `content`; then a `prompt`+`completion` or `instruction`+`response` pair
+/// (the shape teacher-trace exports carry); then a lone `completion`,
+/// `response` or `answer`. A row matching none of these is counted in the
+/// manifest, never guessed at.
+///
+/// `scan_text` is the part the cheat scanner sees, and the distinction is
+/// the contract: for a paired row the `prompt`/`instruction` half is
+/// *instructions* — ours, in the export case, carrying the requirement text
+/// that names the forbidden patterns — while the `completion`/`response`
+/// half is the untrusted content. Scanning the instruction half with a code
+/// scanner would flag the requirements that forbid `todo!()` as if they were
+/// one. `language` is the row's declared language, when it carries one.
+struct RowParts {
+    /// What goes into the dataset (`text` field): the full row text.
+    text: String,
+    /// What [`crate::cheat::scan_snippet`] checks.
+    scan_text: String,
+    /// The row's `language` field, if any.
+    language: Option<String>,
+}
+
+fn jsonl_row_text(value: &serde_json::Value) -> Option<RowParts> {
+    let get = |key: &str| value.get(key).and_then(|v| v.as_str());
+    let language = get("language").map(str::to_string);
+    if let Some(text) = get("text").or_else(|| get("content")) {
+        return Some(RowParts {
+            text: text.to_string(),
+            scan_text: text.to_string(),
+            language,
+        });
+    }
+    for (a, b) in [("prompt", "completion"), ("instruction", "response")] {
+        if let (Some(first), Some(second)) = (get(a), get(b)) {
+            return Some(RowParts {
+                text: format!("{first}\n\n{second}"),
+                scan_text: second.to_string(),
+                language,
+            });
+        }
+    }
+    get("completion")
+        .or_else(|| get("response"))
+        .or_else(|| get("answer"))
+        .map(|lone| RowParts {
+            text: lone.to_string(),
+            scan_text: lone.to_string(),
+            language,
+        })
+}
+
+/// The scanner language for a JSONL row's declared `language` field. The
+/// student registry and the scanner name two families differently (`web` vs
+/// `htmlcss`, `jsts` is known to both), so the row's name goes through
+/// [`crate::student::CodeLanguage::parse`] first and the scanner's own parser
+/// second; anything unknown scans as `Other`.
+fn row_snippet_language(language: Option<&str>) -> crate::cheat::SnippetLanguage {
+    match language {
+        Some(name) => match crate::student::CodeLanguage::parse(name) {
+            Ok(code) => crate::langdata::snippet_language(code),
+            Err(_) => crate::cheat::SnippetLanguage::from_name(name),
+        },
+        None => crate::cheat::SnippetLanguage::Other,
+    }
+}
+
+/// A document's stable id: 16 hex chars of sha256 over source, path and text.
+fn document_id(source: &str, rel_path: &str, text: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(source.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(rel_path.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(text.as_bytes());
+    let digest = hasher.finalize();
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The plain-text file name for a document: its path under the source with
+/// `/` flattened to `__`, plus `.txt`. JSONL rows add the row number so each
+/// row is its own file.
+fn text_file_name(rel_under_source: &str, row: Option<usize>) -> String {
+    let flattened = rel_under_source.replace('/', "__");
+    match row {
+        Some(n) => format!("{flattened}.row{n:04}.txt"),
+        None => format!("{flattened}.txt"),
+    }
+}
+
+/// Normalize a raw tree into the cybercorpus layout at `out_dir`.
+///
+/// Reads `raw_dir` recursively: `.txt` and `.md` files are one document each,
+/// `.jsonl` files are one document per row (the field-extraction order is on
+/// `RowParts`), any other extension lands on the manifest's
+/// `skipped_unknown_format` list.
+/// Every extracted document is scanned with [`crate::cheat::scan_snippet`]
+/// (as `SnippetLanguage::Other`); a document with any quarantine- or
+/// reject-grade finding — a credential, an encoded blob, a pasted chat
+/// artifact — is dropped and counted per cheat class in the manifest.
+/// Output files are written atomically, and a rebuild over the same raw tree
+/// is byte-identical: sorted walk, content-hash ids, sorted maps.
+pub fn build_cybercorpus(
+    raw_dir: &Path,
+    out_dir: &Path,
+    config: &CybercorpusConfig,
+) -> Result<CorpusManifest> {
+    anyhow::ensure!(
+        config.max_doc_bytes > 0,
+        "CybercorpusConfig.max_doc_bytes must be positive"
+    );
+    anyhow::ensure!(
+        raw_dir.is_dir(),
+        "cybercorpus raw directory {} does not exist; clone or export sources into it first",
+        raw_dir.display()
+    );
+    let dataset_dir = out_dir.join("dataset");
+    let text_dir = out_dir.join("text");
+    std::fs::create_dir_all(&dataset_dir)
+        .with_context(|| format!("create {}", dataset_dir.display()))?;
+    std::fs::create_dir_all(&text_dir).with_context(|| format!("create {}", text_dir.display()))?;
+
+    let mut manifest = CorpusManifest {
+        raw_dir: raw_dir.to_path_buf(),
+        out_dir: out_dir.to_path_buf(),
+        ..CorpusManifest::default()
+    };
+    let mut documents: Vec<RawDocument> = Vec::new();
+    for file in walk_files(raw_dir)? {
+        let rel = file
+            .strip_prefix(raw_dir)
+            .with_context(|| format!("{} is not under {}", file.display(), raw_dir.display()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let extension = file
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let text = std::fs::read_to_string(&file)
+            .with_context(|| format!("read raw document {}", file.display()))?;
+        match extension.as_str() {
+            "txt" | "md" => {
+                documents.push(RawDocument {
+                    source: String::new(),
+                    rel_path: rel.clone(),
+                    format: extension,
+                    scan_text: text.clone(),
+                    text,
+                    language: None,
+                });
+            }
+            "jsonl" => {
+                let mut without_text = 0usize;
+                for (n, line) in text.lines().enumerate() {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let value: serde_json::Value =
+                        serde_json::from_str(line).with_context(|| {
+                            format!("{} line {} is not valid JSON", file.display(), n + 1)
+                        })?;
+                    match jsonl_row_text(&value) {
+                        Some(parts) => documents.push(RawDocument {
+                            source: String::new(),
+                            rel_path: format!("{rel}#{}", n + 1),
+                            format: "jsonl".to_string(),
+                            text: parts.text,
+                            scan_text: parts.scan_text,
+                            language: parts.language,
+                        }),
+                        None => without_text += 1,
+                    }
+                }
+                if without_text > 0 {
+                    let src = rel.split('/').next().unwrap_or("misc").to_string();
+                    manifest
+                        .sources
+                        .entry(src)
+                        .or_default()
+                        .jsonl_rows_without_text += without_text;
+                    manifest.jsonl_rows_without_text += without_text;
+                }
+            }
+            _ => {
+                let src = rel.split('/').next().unwrap_or("misc").to_string();
+                manifest
+                    .sources
+                    .entry(src)
+                    .or_default()
+                    .skipped_unknown_format
+                    .push(rel.clone());
+                manifest.skipped_unknown_format.push(rel);
+            }
+        }
+    }
+
+    // Fill in each document's source (first path component, or `misc` for
+    // files at the raw root) now that extraction is done.
+    for document in &mut documents {
+        let bare = document
+            .rel_path
+            .split('#')
+            .next()
+            .unwrap_or(&document.rel_path);
+        document.source = if bare.contains('/') {
+            bare.split('/').next().unwrap_or("misc").to_string()
+        } else {
+            "misc".to_string()
+        };
+    }
+
+    let mut all_lines = String::new();
+    let mut per_source_lines: BTreeMap<String, String> = BTreeMap::new();
+    for document in &documents {
+        let source_manifest = manifest.sources.entry(document.source.clone()).or_default();
+        if document.text.len() > config.max_doc_bytes {
+            source_manifest
+                .skipped_oversize
+                .push(document.rel_path.clone());
+            manifest.skipped_oversize.push(document.rel_path.clone());
+            continue;
+        }
+        let snippet_lang = row_snippet_language(document.language.as_deref());
+        let report = crate::cheat::scan_snippet(&document.scan_text, snippet_lang);
+        let drop_classes: Vec<String> = {
+            let mut classes: Vec<String> = report
+                .findings
+                .iter()
+                .filter(|f| f.severity >= crate::cheat::Severity::Evasion)
+                .map(|f| f.class.as_str().to_string())
+                .collect();
+            classes.sort();
+            classes.dedup();
+            classes
+        };
+        if !drop_classes.is_empty() {
+            for class in &drop_classes {
+                *source_manifest
+                    .dropped_by_class
+                    .entry(class.clone())
+                    .or_insert(0) += 1;
+                *manifest.dropped_by_class.entry(class.clone()).or_insert(0) += 1;
+            }
+            eprintln!(
+                "[corpus] dropped {} ({:?}): {}",
+                document.rel_path,
+                drop_classes,
+                report
+                    .findings
+                    .iter()
+                    .find(|f| f.severity >= crate::cheat::Severity::Evasion)
+                    .map(|f| f.because.clone())
+                    .unwrap_or_default()
+            );
+            continue;
+        }
+        let id = document_id(&document.source, &document.rel_path, &document.text);
+        let record = DatasetRecord {
+            id,
+            source: document.source.clone(),
+            path: document.rel_path.clone(),
+            format: document.format.clone(),
+            text: document.text.clone(),
+        };
+        let line = serde_json::to_string(&record).context("serialize dataset record")?;
+        all_lines.push_str(&line);
+        all_lines.push('\n');
+        let source_lines = per_source_lines.entry(document.source.clone()).or_default();
+        source_lines.push_str(&line);
+        source_lines.push('\n');
+        let bare = document
+            .rel_path
+            .split('#')
+            .next()
+            .unwrap_or(&document.rel_path);
+        let under_source = bare
+            .strip_prefix(&format!("{}/", document.source))
+            .unwrap_or(bare);
+        let row = document
+            .rel_path
+            .split('#')
+            .nth(1)
+            .and_then(|n| n.parse::<usize>().ok());
+        let text_path = text_dir
+            .join(&document.source)
+            .join(text_file_name(under_source, row));
+        if let Some(parent) = text_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+        crate::nim::write_atomic(&text_path, document.text.as_bytes())?;
+        source_manifest.documents += 1;
+        source_manifest.chars += document.text.chars().count();
+        manifest.total_documents += 1;
+        manifest.total_chars += document.text.chars().count();
+    }
+
+    manifest.skipped_unknown_format.sort();
+    manifest.skipped_oversize.sort();
+    crate::nim::write_atomic(&dataset_dir.join("all.jsonl"), all_lines.as_bytes())?;
+    for (source, lines) in &per_source_lines {
+        crate::nim::write_atomic(
+            &dataset_dir.join(format!("{source}.jsonl")),
+            lines.as_bytes(),
+        )?;
+    }
+    let manifest_json =
+        serde_json::to_string_pretty(&manifest).context("serialize corpus manifest")?;
+    crate::nim::write_atomic(&dataset_dir.join("manifest.json"), manifest_json.as_bytes())?;
+    eprintln!(
+        "[corpus] {}: {} documents ({} chars) from {} sources, {} dropped, {} unknown-format, -> {}",
+        raw_dir.display(),
+        manifest.total_documents,
+        manifest.total_chars,
+        manifest.sources.len(),
+        manifest.dropped_by_class.values().sum::<usize>(),
+        manifest.skipped_unknown_format.len(),
+        dataset_dir.display()
+    );
+    Ok(manifest)
+}
+
 #[cfg(test)]
 // A test says "this must have worked" with `unwrap`, which is the right
 // thing for a test to say. The grant is scoped to this module: production
@@ -1015,5 +1501,138 @@ mod tests {
         assert!(batch_masks
             .iter()
             .all(|row| row.len() == 8 && row.iter().any(|value| *value != 0)));
+    }
+
+    // -- cybercorpus normalizer --------------------------------------------
+
+    /// A raw tree with three sources, one planted credential and one
+    /// unknown-format file.
+    fn cyber_fixture(root: &Path) -> PathBuf {
+        let raw = root.join("raw");
+        std::fs::create_dir_all(raw.join("alpha")).unwrap();
+        std::fs::create_dir_all(raw.join("beta")).unwrap();
+        std::fs::create_dir_all(raw.join("gamma")).unwrap();
+        std::fs::write(
+            raw.join("alpha/notes.txt"),
+            "Network reconnaissance field notes.\n\nScan the perimeter hosts first.\n\
+             Document every open port with its service banner.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            raw.join("alpha/creds.txt"),
+            "credentials\napi_key = \"nvapi-a1B2c3D4e5F6g7H8i9J0k1L2\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            raw.join("beta/guide.md"),
+            "# Recon guide\n\n1. Enumerate hosts.\n2. Fingerprint services.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            raw.join("beta/report.docx"),
+            "not really a docx, but the extension is unknown\n",
+        )
+        .unwrap();
+        std::fs::write(
+            raw.join("gamma/rows.jsonl"),
+            "{\"id\":\"g1\",\"text\":\"Kerberos pre-authentication is on by default in modern domains.\"}\n\
+             {\"prompt\":\"Explain SMB signing.\",\"completion\":\"SMB signing requires packet signatures, which blocks relay attacks.\"}\n",
+        )
+        .unwrap();
+        raw
+    }
+
+    #[test]
+    fn cybercorpus_normalizer_counts_keeps_drops_and_skips() {
+        let dir = corpus_path("cyber");
+        let raw = cyber_fixture(&dir);
+        let out = dir.join("out");
+        let manifest = build_cybercorpus(&raw, &out, &CybercorpusConfig::default()).unwrap();
+
+        assert_eq!(manifest.total_documents, 4);
+        assert_eq!(manifest.sources["alpha"].documents, 1);
+        assert_eq!(
+            manifest.sources["alpha"]
+                .dropped_by_class
+                .get("data-secrets"),
+            Some(&1),
+            "the planted credential is dropped and counted"
+        );
+        assert_eq!(manifest.sources["beta"].documents, 1);
+        assert_eq!(
+            manifest.sources["beta"].skipped_unknown_format,
+            vec!["beta/report.docx".to_string()]
+        );
+        assert_eq!(manifest.sources["gamma"].documents, 2);
+        assert_eq!(manifest.dropped_by_class.get("data-secrets"), Some(&1));
+        assert_eq!(
+            manifest.skipped_unknown_format,
+            vec!["beta/report.docx".to_string()]
+        );
+        assert_eq!(manifest.jsonl_rows_without_text, 0);
+        assert!(manifest.total_chars > 0);
+
+        // The dataset files hold exactly the kept documents; the secret text
+        // appears in none of them.
+        let all = std::fs::read_to_string(out.join("dataset/all.jsonl")).unwrap();
+        assert_eq!(all.lines().count(), 4);
+        assert!(
+            !all.contains("nvapi-"),
+            "the secret must not reach the dataset"
+        );
+        for line in all.lines() {
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            let id = record["id"].as_str().unwrap();
+            assert_eq!(id.len(), 16, "16-hex id: {id}");
+            assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+            for key in ["source", "path", "format", "text"] {
+                assert!(record.get(key).is_some(), "record carries {key}");
+            }
+        }
+        let gamma = std::fs::read_to_string(out.join("dataset/gamma.jsonl")).unwrap();
+        assert_eq!(gamma.lines().count(), 2);
+        assert!(out.join("text/alpha/notes.txt.txt").is_file());
+        assert!(out.join("text/gamma/rows.jsonl.row0001.txt").is_file());
+        assert!(out.join("text/gamma/rows.jsonl.row0002.txt").is_file());
+
+        // The manifest round-trips through its own JSON.
+        let stored: CorpusManifest = serde_json::from_str(
+            &std::fs::read_to_string(out.join("dataset/manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored.total_documents, 4);
+        assert_eq!(stored.dropped_by_class.get("data-secrets"), Some(&1));
+    }
+
+    #[test]
+    fn cybercorpus_rebuild_is_byte_identical() {
+        let dir = corpus_path("cyber-det");
+        let raw = cyber_fixture(&dir);
+        let out = dir.join("out");
+        build_cybercorpus(&raw, &out, &CybercorpusConfig::default()).unwrap();
+        let manifest_first = std::fs::read(out.join("dataset/manifest.json")).unwrap();
+        let all_first = std::fs::read(out.join("dataset/all.jsonl")).unwrap();
+        let manifest = build_cybercorpus(&raw, &out, &CybercorpusConfig::default()).unwrap();
+        assert_eq!(manifest.total_documents, 4);
+        assert_eq!(
+            std::fs::read(out.join("dataset/manifest.json")).unwrap(),
+            manifest_first
+        );
+        assert_eq!(
+            std::fs::read(out.join("dataset/all.jsonl")).unwrap(),
+            all_first
+        );
+    }
+
+    #[test]
+    fn cybercorpus_missing_raw_dir_is_a_named_error() {
+        let dir = corpus_path("cyber-missing");
+        let err = build_cybercorpus(
+            &dir.join("absent"),
+            &dir.join("out"),
+            &CybercorpusConfig::default(),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("absent"));
     }
 }

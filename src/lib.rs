@@ -126,6 +126,11 @@
 //!   saturation to a fixed point and randomized counterexample search. The
 //!   model proposes; this proves
 //! - [`infer`]: batched offline inference API
+//! - [`vecread`]: the interpretable readout layer — decodes the student's
+//!   raw-vector thinking (hidden/slot states at each refine depth) through
+//!   the trunk's own readout (logit lens, with optional tuned-lens affine
+//!   translators), rendered as a thought trace with the slot geometry under
+//!   the learned metric
 //! - [`logging`]: JSONL metrics logger
 //! - [`verify`]: numerical certificate suite (the quality gate)
 //!
@@ -175,24 +180,30 @@ pub mod geomaugment;
 pub mod geombaseline;
 pub mod geometry;
 pub mod geomkernel;
+pub mod geomnonclid;
 pub mod geomvision;
 
+pub mod fieldnorm;
 pub mod geomfusion;
 pub mod grade;
 pub mod heretic;
 pub mod hybrid;
 pub mod import;
 pub mod infer;
+pub mod interop;
 pub mod langdata;
 pub mod lm;
 pub mod logging;
 pub mod loopgraph;
 pub mod merge;
 pub mod mix;
+pub mod mlcheat;
 pub mod moe;
 pub mod mosme;
 pub mod multi_block;
 pub mod nim;
+pub mod nina;
+pub mod ninagui;
 pub mod peregrine;
 pub mod planner;
 pub mod policy;
@@ -217,5 +228,6 @@ pub mod tensor_ext;
 pub mod tinyimagenet;
 pub mod tokenizer;
 pub mod train;
+pub mod vecread;
 pub mod verify;
 pub mod vit;

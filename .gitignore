@@ -45,6 +45,10 @@ checkpoints/
 
 # Data
 data/
+cybercorpus/raw/
+cybercorpus/text/
+cybercorpus/dataset/
+cybercorpus/hf/
 
 # OS
 .DS_Store

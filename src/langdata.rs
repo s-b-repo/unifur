@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{ensure, Context};
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::cheat::{filter_traces, scan_snippet, Severity, SnippetLanguage};
 use crate::codegen_eval::{self, CorpusIndex};
@@ -105,7 +106,14 @@ const TWISTS: &[&str] = &[
 // ---------------------------------------------------------------------------
 
 /// The [`SnippetLanguage`] the cheat scanner should use for a
-/// [`CodeLanguage`]. `Web` maps to `HtmlCss`, the scanner's web family.
+/// [`CodeLanguage`]. `Web` maps to `HtmlCss`, the scanner's web family. The
+/// scanner's families are coarser than the language list: Go, Java and C#
+/// scan under the C-family rules (`//` and `/* */` comments, the NOLINT
+/// check, the language-mixing tally), which is the family whose comment and
+/// suppression idioms theirs resemble. PHP scans as JsTs: its strict
+/// comparison operators are the JsTs family's `===`/`!==` forms, its
+/// `function` keyword is a JsTs marker (so the mixing tally reads PHP
+/// correctly), and it shares the `//` comment idiom.
 pub fn snippet_language(lang: CodeLanguage) -> SnippetLanguage {
     match lang {
         CodeLanguage::Rust => SnippetLanguage::Rust,
@@ -114,11 +122,17 @@ pub fn snippet_language(lang: CodeLanguage) -> SnippetLanguage {
         CodeLanguage::Cpp => SnippetLanguage::Cpp,
         CodeLanguage::JsTs => SnippetLanguage::JsTs,
         CodeLanguage::Web => SnippetLanguage::HtmlCss,
+        CodeLanguage::Go => SnippetLanguage::C,
+        CodeLanguage::Java | CodeLanguage::CSharp => SnippetLanguage::Cpp,
+        CodeLanguage::Php => SnippetLanguage::JsTs,
     }
 }
 
-/// The reverse of [`snippet_language`]. [`SnippetLanguage::Other`] has no
-/// student language and maps to `None` rather than guessing.
+/// The reverse of [`snippet_language`] for the shipped six. The scanner's
+/// families are coarser than the language list (four languages scan under
+/// the C families — see [`snippet_language`]), so a family cannot name one
+/// of those four; [`SnippetLanguage::Other`] likewise maps to `None` rather
+/// than guessing.
 pub fn code_language(lang: SnippetLanguage) -> Option<CodeLanguage> {
     match lang {
         SnippetLanguage::Rust => Some(CodeLanguage::Rust),
@@ -140,6 +154,10 @@ pub fn display_name(lang: CodeLanguage) -> &'static str {
         CodeLanguage::Cpp => "C++",
         CodeLanguage::JsTs => "TypeScript",
         CodeLanguage::Web => "HTML/CSS",
+        CodeLanguage::Go => "Go",
+        CodeLanguage::Java => "Java",
+        CodeLanguage::CSharp => "C#",
+        CodeLanguage::Php => "PHP",
     }
 }
 
@@ -154,6 +172,10 @@ fn magicoder_lang_keys(lang: CodeLanguage) -> &'static [&'static str] {
         CodeLanguage::Cpp => &["cpp", "c++"],
         CodeLanguage::JsTs => &["typescript", "javascript"],
         CodeLanguage::Web => &["html", "css"],
+        CodeLanguage::Go => &["go", "golang"],
+        CodeLanguage::Java => &["java"],
+        CodeLanguage::CSharp => &["csharp", "c#"],
+        CodeLanguage::Php => &["php"],
     }
 }
 
@@ -329,7 +351,7 @@ fn finish_prompt(language: CodeLanguage, body: &str) -> String {
 ///
 /// Up to `3 * count / 4` seeds come from the Magicoder corpus at `oss_path`
 /// (rows matching the language, shuffled with a seeded RNG); the rest cycle
-/// through the four [`TaskKind`]s of the template bank, with [`TWISTS`]
+/// through the four [`TaskKind`]s of the template bank, with `TWISTS`
 /// keeping repeats distinct. Same inputs give byte-identical seeds, which is
 /// what the pipeline's resume contract rests on.
 pub fn build_seeds(
@@ -339,7 +361,11 @@ pub fn build_seeds(
     oss_path: &Path,
     max_problem_chars: usize,
 ) -> anyhow::Result<Vec<TaskSeed>> {
-    ensure!(count > 0, "build_seeds needs at least one task for {}", language.name());
+    ensure!(
+        count > 0,
+        "build_seeds needs at least one task for {}",
+        language.name()
+    );
     ensure!(
         max_problem_chars > 0,
         "build_seeds needs a positive max_problem_chars, got {max_problem_chars}"
@@ -1500,6 +1526,947 @@ const WEB_TESTWRITING_REF: &str = r##"<!--
 </article>
 "##;
 
+const GO_IMPLEMENT_TASK: &str = "\
+Implement in Go:
+
+    func WordFrequency(text string) []WordCount
+
+where `WordCount` is a struct pairing a word with its count. Return the words of \
+`text` (lowercased, split on whitespace) paired with their counts, sorted by count \
+descending and then alphabetically. Empty input yields an empty slice (not nil).";
+
+const GO_IMPLEMENT_REF: &str = r#"package wordcount
+
+import (
+	"sort"
+	"strings"
+	"testing"
+)
+
+// WordCount pairs a word with how many times it occurred.
+type WordCount struct {
+	Word  string
+	Count int
+}
+
+// WordFrequency returns the words of text, lowercased and split on
+// whitespace, paired with their counts and ordered by count descending,
+// then alphabetically.
+func WordFrequency(text string) []WordCount {
+	counts := make(map[string]int)
+	for _, word := range strings.Fields(strings.ToLower(text)) {
+		counts[word]++
+	}
+	pairs := make([]WordCount, 0, len(counts))
+	for word, count := range counts {
+		pairs = append(pairs, WordCount{Word: word, Count: count})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].Count != pairs[j].Count {
+			return pairs[i].Count > pairs[j].Count
+		}
+		return pairs[i].Word < pairs[j].Word
+	})
+	return pairs
+}
+
+func TestWordFrequencyOrdersByCountThenAlphabet(t *testing.T) {
+	got := WordFrequency("b a b c a b")
+	want := []WordCount{{Word: "b", Count: 3}, {Word: "a", Count: 2}, {Word: "c", Count: 1}}
+	if len(got) != len(want) {
+		t.Fatalf("got %d pairs, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("pair %d: got %+v, want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestWordFrequencyEmptyInput(t *testing.T) {
+	got := WordFrequency("")
+	if got == nil {
+		t.Error("empty input must yield an empty slice, not nil")
+	}
+	if len(got) != 0 {
+		t.Errorf("empty input yielded %d pairs", len(got))
+	}
+}
+
+func TestWordFrequencyCaseIsNormalised(t *testing.T) {
+	got := WordFrequency("Hello hello HELLO")
+	if len(got) != 1 || got[0].Count != 3 || got[0].Word != "hello" {
+		t.Errorf("case normalisation failed: %+v", got)
+	}
+}
+"#;
+
+const GO_BUGFIX_TASK: &str = r#"The following Go function is meant to return the running total of its \
+input, but it drops the first element and returns nonsense for short inputs:
+
+```go
+func RunningTotal(xs []int64) []int64 {
+	out := []int64{}
+	for i := 1; i < len(xs); i++ {
+		var prev int64
+		if i > 1 {
+			prev = out[i-2]
+		}
+		out = append(out, prev+xs[i])
+	}
+	return out
+}
+```
+
+Find the defects, fix them, and add tests that would have caught them."#;
+
+const GO_BUGFIX_REF: &str = r#"package totals
+
+import "testing"
+
+// RunningTotal returns the cumulative sums of xs, in order.
+func RunningTotal(xs []int64) []int64 {
+	out := make([]int64, 0, len(xs))
+	var total int64
+	for _, x := range xs {
+		total += x
+		out = append(out, total)
+	}
+	return out
+}
+
+func TestRunningTotalAccumulatesInOrder(t *testing.T) {
+	got := RunningTotal([]int64{1, 2, 3, 4})
+	want := []int64{1, 3, 6, 10}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("position %d: got %d, want %d", i, got[i], want[i])
+		}
+	}
+}
+
+func TestRunningTotalEmptyInput(t *testing.T) {
+	if got := RunningTotal(nil); len(got) != 0 {
+		t.Errorf("empty input gave %v", got)
+	}
+}
+
+func TestRunningTotalSingleElement(t *testing.T) {
+	got := RunningTotal([]int64{7})
+	if len(got) != 1 || got[0] != 7 {
+		t.Errorf("single element gave %v", got)
+	}
+}
+
+func TestRunningTotalNegatives(t *testing.T) {
+	got := RunningTotal([]int64{3, -5, 2})
+	want := []int64{3, -2, 0}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("position %d: got %d, want %d", i, got[i], want[i])
+		}
+	}
+}
+"#;
+
+const GO_REFACTOR_TASK: &str = r#"The following Go function works but is written in an un-idiomatic, \
+index-heavy style:
+
+```go
+func EvenSquares(xs []int64) []int64 {
+	out := []int64{}
+	i := 0
+	for i < len(xs) {
+		x := xs[i]
+		if x%2 == 0 {
+			out = append(out, x*x)
+		}
+		i++
+	}
+	return out
+}
+```
+
+Refactor it to a `range` loop with a preallocated result, without changing its \
+behaviour, and add tests that pin the behaviour."#;
+
+const GO_REFACTOR_REF: &str = r#"package squares
+
+import "testing"
+
+// EvenSquares returns the squares of the even elements of xs, in order.
+func EvenSquares(xs []int64) []int64 {
+	out := make([]int64, 0, len(xs))
+	for _, x := range xs {
+		if x%2 != 0 {
+			continue
+		}
+		out = append(out, x*x)
+	}
+	return out
+}
+
+func TestEvenSquaresKeepsEvensOnly(t *testing.T) {
+	got := EvenSquares([]int64{1, 2, 3, 4})
+	want := []int64{4, 16}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("position %d: got %d, want %d", i, got[i], want[i])
+		}
+	}
+}
+
+func TestEvenSquaresEmptyInput(t *testing.T) {
+	if got := EvenSquares(nil); len(got) != 0 {
+		t.Errorf("empty input gave %v", got)
+	}
+}
+
+func TestEvenSquaresAllOdd(t *testing.T) {
+	if got := EvenSquares([]int64{1, 3, 5}); len(got) != 0 {
+		t.Errorf("all-odd input gave %v", got)
+	}
+}
+"#;
+
+const GO_TESTWRITING_TASK: &str = r#"Write thorough table-driven tests for the following Go function without \
+modifying the function itself:
+
+```go
+func Median(sorted []int64) (float64, bool) {
+	if len(sorted) == 0 {
+		return 0, false
+	}
+	mid := len(sorted) / 2
+	if len(sorted)%2 != 0 {
+		return float64(sorted[mid]), true
+	}
+	return float64(sorted[mid-1]+sorted[mid]) / 2.0, true
+}
+```
+
+Cover the empty input, odd and even lengths, and negative values."#;
+
+const GO_TESTWRITING_REF: &str = r#"package stats
+
+import "testing"
+
+// Median returns the middle value of a sorted slice; the bool is false for
+// empty input.
+func Median(sorted []int64) (float64, bool) {
+	if len(sorted) < 1 {
+		return 0, false
+	}
+	mid := len(sorted) / 2
+	if len(sorted)%2 != 0 {
+		return float64(sorted[mid]), true
+	}
+	return float64(sorted[mid-1]+sorted[mid]) / 2.0, true
+}
+
+func TestMedian(t *testing.T) {
+	cases := []struct {
+		name  string
+		input []int64
+		want  float64
+		ok    bool
+	}{
+		{name: "empty", input: nil, want: 0, ok: false},
+		{name: "odd length", input: []int64{1, 3, 5}, want: 3, ok: true},
+		{name: "even length", input: []int64{1, 2, 3, 4}, want: 2.5, ok: true},
+		{name: "negatives", input: []int64{-5, -1, 2}, want: -1, ok: true},
+		{name: "single", input: []int64{9}, want: 9, ok: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := Median(tc.input)
+			if ok != tc.ok {
+				t.Fatalf("ok: got %v, want %v", ok, tc.ok)
+			}
+			if ok && got != tc.want {
+				t.Errorf("median: got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+"#;
+
+const JAVA_IMPLEMENT_TASK: &str = "\
+Implement in Java:
+
+    public static List<Map.Entry<String, Integer>> topKWords(String text, int k)
+
+Return the `k` most frequent words of `text` (lowercased, split on whitespace), \
+ordered by count descending and then alphabetically. A `k` below 1 yields an \
+empty list.";
+
+const JAVA_IMPLEMENT_REF: &str = r#"import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/** Word-frequency queries over plain text. */
+public final class TopKWords {
+    private TopKWords() {
+        throw new AssertionError("utility class");
+    }
+
+    /** The {@code k} most frequent words of {@code text}, ties broken alphabetically. */
+    public static List<Map.Entry<String, Integer>> topKWords(String text, int k) {
+        if (k < 1) {
+            return new ArrayList<>();
+        }
+        Map<String, Integer> counts = new LinkedHashMap<>();
+        for (String word : text.toLowerCase().split("\\s+")) {
+            if (!word.isEmpty()) {
+                counts.merge(word, 1, Integer::sum);
+            }
+        }
+        List<Map.Entry<String, Integer>> ordered = new ArrayList<>(counts.entrySet());
+        ordered.sort((a, b) -> {
+            int byCount = Integer.compare(b.getValue(), a.getValue());
+            return byCount != 0 ? byCount : a.getKey().compareTo(b.getKey());
+        });
+        return new ArrayList<>(ordered.subList(0, Math.min(k, ordered.size())));
+    }
+}
+
+class TopKWordsTests {
+    public static void main(String[] args) {
+        List<Map.Entry<String, Integer>> top = TopKWords.topKWords("b a b c a b", 2);
+        if (top.size() != 2 || !top.get(0).getKey().equals("b") || top.get(0).getValue() != 3) {
+            throw new AssertionError("count ordering failed: " + top);
+        }
+        if (!top.get(1).getKey().equals("a") || top.get(1).getValue() != 2) {
+            throw new AssertionError("alphabetical tie-break failed: " + top);
+        }
+        if (!TopKWords.topKWords("a a a", 0).isEmpty()) {
+            throw new AssertionError("non-positive k must yield an empty list");
+        }
+        if (TopKWords.topKWords("x y", 10).size() != 2) {
+            throw new AssertionError("k larger than the vocabulary must return everything");
+        }
+    }
+}
+"#;
+
+const JAVA_BUGFIX_TASK: &str = r#"The following Java method is meant to remove duplicates while keeping the \
+first occurrence of each item, but it keeps the *last* occurrence instead:
+
+```java
+public static List<Integer> dedupe(List<Integer> items) {
+    List<Integer> out = new ArrayList<>(items);
+    for (Integer item : items) {
+        while (out.indexOf(item) != out.lastIndexOf(item)) {
+            out.remove(item);
+        }
+    }
+    return out;
+}
+```
+
+`List.remove(Object)` deletes the first matching element, so `dedupe(List.of(1, 2, 1))` \
+returns `[2, 1]`. Fix the method and add tests that pin first-seen order."#;
+
+const JAVA_BUGFIX_REF: &str = r#"import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+
+/** Duplicate removal that preserves first-seen order. */
+public final class Dedupe {
+    private Dedupe() {
+        throw new AssertionError("utility class");
+    }
+
+    /** The items with duplicates removed, first occurrence kept. */
+    public static List<Integer> dedupe(List<Integer> items) {
+        Set<Integer> seen = new LinkedHashSet<>();
+        List<Integer> out = new ArrayList<>();
+        for (Integer item : items) {
+            if (seen.add(item)) {
+                out.add(item);
+            }
+        }
+        return out;
+    }
+}
+
+class DedupeTests {
+    public static void main(String[] args) {
+        if (!Dedupe.dedupe(List.of(1, 2, 1)).equals(List.of(1, 2))) {
+            throw new AssertionError("first occurrence must be kept");
+        }
+        if (!Dedupe.dedupe(List.of()).isEmpty()) {
+            throw new AssertionError("empty input must stay empty");
+        }
+        if (!Dedupe.dedupe(List.of(3, 1, 2)).equals(List.of(3, 1, 2))) {
+            throw new AssertionError("unique input must be unchanged");
+        }
+        if (!Dedupe.dedupe(List.of(4, 4, 4)).equals(List.of(4))) {
+            throw new AssertionError("a run of duplicates collapses to one");
+        }
+    }
+}
+"#;
+
+const JAVA_REFACTOR_TASK: &str = r#"The following Java method works but is written as a manual accumulation loop:
+
+```java
+public static double totalPrice(List<Map<String, Double>> cart) {
+    double total = 0.0;
+    for (Map<String, Double> item : cart) {
+        double price = item.get("price") * item.get("qty");
+        total = total + price;
+    }
+    return total;
+}
+```
+
+Refactor it to a single stream expression, and add tests that pin the behaviour \
+(including the empty cart)."#;
+
+const JAVA_REFACTOR_REF: &str = r#"import java.util.List;
+import java.util.Map;
+
+/** Cart totals. */
+public final class TotalPrice {
+    private TotalPrice() {
+        throw new AssertionError("utility class");
+    }
+
+    /** Sums {@code price * qty} over every line item in {@code cart}. */
+    public static double totalPrice(List<Map<String, Double>> cart) {
+        return cart.stream()
+                .mapToDouble(item -> item.get("price") * item.get("qty"))
+                .sum();
+    }
+}
+
+class TotalPriceTests {
+    public static void main(String[] args) {
+        List<Map<String, Double>> cart = List.of(
+                Map.of("price", 2.5, "qty", 4.0),
+                Map.of("price", 1.0, "qty", 1.0));
+        if (Double.compare(TotalPrice.totalPrice(cart), 11.0) != 0) {
+            throw new AssertionError("line items must sum to 11.0");
+        }
+        if (Double.compare(TotalPrice.totalPrice(List.of()), 0.0) != 0) {
+            throw new AssertionError("an empty cart totals 0.0");
+        }
+    }
+}
+"#;
+
+const JAVA_TESTWRITING_TASK: &str = r#"Write a thorough test suite for the following Java method without modifying \
+the method itself:
+
+```java
+public static double median(int[] sorted) {
+    if (sorted.length == 0) {
+        throw new IllegalArgumentException("median of an empty array is undefined");
+    }
+    int mid = sorted.length / 2;
+    if (sorted.length % 2 != 0) {
+        return sorted[mid];
+    }
+    return (sorted[mid - 1] + sorted[mid]) / 2.0;
+}
+```
+
+Cover the empty input, odd and even lengths, and negative values."#;
+
+const JAVA_TESTWRITING_REF: &str = r#"/** Order statistics over sorted arrays. */
+public final class Median {
+    private Median() {
+        throw new AssertionError("utility class");
+    }
+
+    /** The middle value of a sorted array; empty input is an error. */
+    public static double median(int[] sorted) {
+        if (sorted.length < 1) {
+            throw new IllegalArgumentException("median of an empty array is undefined");
+        }
+        int mid = sorted.length / 2;
+        if (sorted.length % 2 != 0) {
+            return sorted[mid];
+        }
+        return (sorted[mid - 1] + sorted[mid]) / 2.0;
+    }
+}
+
+class MedianTests {
+    public static void main(String[] args) {
+        boolean refused = false;
+        try {
+            Median.median(new int[0]);
+        } catch (IllegalArgumentException expected) {
+            refused = true;
+        }
+        if (!refused) {
+            throw new AssertionError("empty input must be refused");
+        }
+        if (Double.compare(Median.median(new int[] {1, 3, 5}), 3.0) != 0) {
+            throw new AssertionError("odd length takes the middle element");
+        }
+        if (Double.compare(Median.median(new int[] {1, 2, 3, 4}), 2.5) != 0) {
+            throw new AssertionError("even length averages the middle pair");
+        }
+        if (Double.compare(Median.median(new int[] {-5, -1, 2}), -1.0) != 0) {
+            throw new AssertionError("negatives are handled");
+        }
+    }
+}
+"#;
+
+const CSHARP_IMPLEMENT_TASK: &str = "\
+Implement in C#:
+
+    public static List<KeyValuePair<string, int>> TopKWords(string text, int k)
+
+Return the `k` most frequent words of `text` (lowercased, split on whitespace), \
+ordered by count descending and then alphabetically (ordinal). A `k` below 1 \
+yields an empty list.";
+
+const CSHARP_IMPLEMENT_REF: &str = r#"using System;
+using System.Collections.Generic;
+using System.Linq;
+
+public static class WordStats
+{
+    /// <summary>The <c>k</c> most frequent words of <c>text</c>, ties broken ordinally.</summary>
+    public static List<KeyValuePair<string, int>> TopKWords(string text, int k)
+    {
+        if (k < 1)
+        {
+            return new List<KeyValuePair<string, int>>();
+        }
+        var counts = new SortedDictionary<string, int>(StringComparer.Ordinal);
+        foreach (var word in text.ToLowerInvariant()
+                     .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
+        {
+            counts[word] = counts.TryGetValue(word, out int n) ? n + 1 : 1;
+        }
+        return counts
+            .OrderByDescending(pair => pair.Value)
+            .ThenBy(pair => pair.Key, StringComparer.Ordinal)
+            .Take(k)
+            .ToList();
+    }
+}
+
+public static class WordStatsTests
+{
+    public static void Run()
+    {
+        var top = WordStats.TopKWords("b a b c a b", 2);
+        if (top.Count != 2 || top[0].Key != "b" || top[0].Value != 3)
+        {
+            throw new InvalidOperationException("count ordering failed");
+        }
+        if (top[1].Key != "a" || top[1].Value != 2)
+        {
+            throw new InvalidOperationException("ordinal tie-break failed");
+        }
+        if (WordStats.TopKWords("a a a", 0).Count != 0)
+        {
+            throw new InvalidOperationException("non-positive k must yield an empty list");
+        }
+        if (WordStats.TopKWords("Hello hello HELLO", 5)[0].Value != 3)
+        {
+            throw new InvalidOperationException("case must be normalised");
+        }
+    }
+}
+"#;
+
+const CSHARP_BUGFIX_TASK: &str = r#"The following C# method is meant to return the running total of its input, \
+but it drops the first element and returns nonsense for short inputs:
+
+```csharp
+public static List<long> RunningTotal(IReadOnlyList<long> xs)
+{
+    var out_ = new List<long>();
+    for (var i = 1; i < xs.Count; i++)
+    {
+        var prev = i > 1 ? out_[i - 2] : 0;
+        out_.Add(prev + xs[i]);
+    }
+    return out_;
+}
+```
+
+Find the defects, fix them, and add tests that would have caught them."#;
+
+const CSHARP_BUGFIX_REF: &str = r#"using System;
+using System.Collections.Generic;
+
+public static class Totals
+{
+    /// <summary>The cumulative sums of <c>xs</c>, in order.</summary>
+    public static List<long> RunningTotal(IReadOnlyList<long> xs)
+    {
+        List<long> result = new List<long>(xs.Count);
+        long total = 0;
+        foreach (long x in xs)
+        {
+            total += x;
+            result.Add(total);
+        }
+        return result;
+    }
+}
+
+public static class TotalsTests
+{
+    public static void Run()
+    {
+        List<long> got = Totals.RunningTotal(new long[] { 1, 2, 3, 4 });
+        long[] want = new long[] { 1, 3, 6, 10 };
+        if (got.Count != want.Length)
+        {
+            throw new InvalidOperationException("length mismatch");
+        }
+        for (int i = 0; i < want.Length; i++)
+        {
+            if (got[i] != want[i])
+            {
+                throw new InvalidOperationException($"position {i}: got {got[i]}, want {want[i]}");
+            }
+        }
+        if (Totals.RunningTotal(Array.Empty<long>()).Count != 0)
+        {
+            throw new InvalidOperationException("empty input stays empty");
+        }
+        if (Totals.RunningTotal(new long[] { 7 })[0] != 7)
+        {
+            throw new InvalidOperationException("a single element is its own total");
+        }
+    }
+}
+"#;
+
+const CSHARP_REFACTOR_TASK: &str = r#"The following C# method works but is written as a manual loop:
+
+```csharp
+public static List<long> EvenSquares(IReadOnlyList<long> xs)
+{
+    var result = new List<long>();
+    for (var i = 0; i < xs.Count; i++)
+    {
+        var x = xs[i];
+        if (x % 2 == 0)
+        {
+            result.Add(x * x);
+        }
+    }
+    return result;
+}
+```
+
+Refactor it to a single LINQ expression without changing its behaviour, and add \
+tests that pin the behaviour."#;
+
+const CSHARP_REFACTOR_REF: &str = r#"using System;
+using System.Collections.Generic;
+using System.Linq;
+
+public static class Squares
+{
+    /// <summary>The squares of the even elements of <c>xs</c>, in order.</summary>
+    public static List<long> EvenSquares(IReadOnlyList<long> xs)
+    {
+        return xs.Where(x => x % 2 == 0).Select(x => x * x).ToList();
+    }
+}
+
+public static class SquaresTests
+{
+    public static void Run()
+    {
+        var got = Squares.EvenSquares(new long[] { 1, 2, 3, 4 });
+        if (got.Count != 2 || got[0] != 4 || got[1] != 16)
+        {
+            throw new InvalidOperationException("squares of evens only");
+        }
+        if (Squares.EvenSquares(Array.Empty<long>()).Count != 0)
+        {
+            throw new InvalidOperationException("empty input gives empty output");
+        }
+        if (Squares.EvenSquares(new long[] { 1, 3, 5 }).Count != 0)
+        {
+            throw new InvalidOperationException("all-odd input gives empty output");
+        }
+    }
+}
+"#;
+
+const CSHARP_TESTWRITING_TASK: &str = r#"Write a thorough test suite for the following C# method without modifying \
+the method itself:
+
+```csharp
+public static double Median(IReadOnlyList<long> sorted)
+{
+    if (sorted.Count == 0)
+    {
+        throw new ArgumentException("median of an empty input is undefined");
+    }
+    var mid = sorted.Count / 2;
+    if (sorted.Count % 2 != 0)
+    {
+        return sorted[mid];
+    }
+    return (sorted[mid - 1] + sorted[mid]) / 2.0;
+}
+```
+
+Cover the empty input, odd and even lengths, and negative values."#;
+
+const CSHARP_TESTWRITING_REF: &str = r#"using System;
+using System.Collections.Generic;
+
+public static class Stats
+{
+    /// <summary>The middle value of a sorted input; empty input is an error.</summary>
+    public static double Median(IReadOnlyList<long> sorted)
+    {
+        if (sorted.Count < 1)
+        {
+            throw new ArgumentException("median of an empty input is undefined");
+        }
+        var mid = sorted.Count / 2;
+        if (sorted.Count % 2 != 0)
+        {
+            return sorted[mid];
+        }
+        return (sorted[mid - 1] + sorted[mid]) / 2.0;
+    }
+}
+
+public static class StatsTests
+{
+    public static void Run()
+    {
+        var refused = false;
+        try
+        {
+            Stats.Median(Array.Empty<long>());
+        }
+        catch (ArgumentException)
+        {
+            refused = true;
+        }
+        if (!refused)
+        {
+            throw new InvalidOperationException("empty input must be refused");
+        }
+        if (Stats.Median(new long[] { 1, 3, 5 }) != 3.0)
+        {
+            throw new InvalidOperationException("odd length takes the middle element");
+        }
+        if (Stats.Median(new long[] { 1, 2, 3, 4 }) != 2.5)
+        {
+            throw new InvalidOperationException("even length averages the middle pair");
+        }
+        if (Stats.Median(new long[] { -5, -1, 2 }) != -1.0)
+        {
+            throw new InvalidOperationException("negatives are handled");
+        }
+    }
+}
+"#;
+
+const PHP_IMPLEMENT_TASK: &str = "\
+Implement in PHP:
+
+    function top_k_words(string $text, int $k): array
+
+Return the `k` most frequent words of `text` (lowercased, split on whitespace) as \
+a list of `[word, count]` pairs, ordered by count descending and then \
+alphabetically. A `$k` below 1 yields an empty array.";
+
+const PHP_IMPLEMENT_REF: &str = r#"<?php
+function top_k_words(string $text, int $k): array
+{
+    if ($k < 1) {
+        return [];
+    }
+    $counts = [];
+    foreach (preg_split("/\s+/", strtolower($text)) as $word) {
+        if ($word !== "") {
+            $counts[$word] = ($counts[$word] ?? 0) + 1;
+        }
+    }
+    $pairs = [];
+    foreach ($counts as $word => $count) {
+        $pairs[] = [$word, $count];
+    }
+    usort($pairs, function (array $a, array $b): int {
+        if ($a[1] !== $b[1]) {
+            return $b[1] - $a[1];
+        }
+        return strcmp($a[0], $b[0]);
+    });
+    return array_slice($pairs, 0, $k);
+}
+
+function expect_equal(string $label, $got, $want): void
+{
+    if ($got !== $want) {
+        throw new RuntimeException($label . " failed");
+    }
+}
+
+expect_equal("count ordering", top_k_words("b a b c a b", 2), [["b", 3], ["a", 2]]);
+expect_equal("k larger than vocabulary", top_k_words("x y", 10), [["x", 1], ["y", 1]]);
+expect_equal("non-positive k", top_k_words("a a a", 0), []);
+expect_equal("case normalised", top_k_words("Hello hello HELLO", 5), [["hello", 3]]);
+"#;
+
+const PHP_BUGFIX_TASK: &str = r#"The following PHP function is meant to remove duplicates while keeping the \
+first occurrence of each item, but it keeps the *last* occurrence instead:
+
+```php
+function dedupe(array $items): array
+{
+    $out = $items;
+    foreach ($items as $item) {
+        while (count(array_keys($out, $item)) > 1) {
+            $first = array_search($item, $out);
+            unset($out[$first]);
+        }
+    }
+    return array_values($out);
+}
+```
+
+`array_search` finds the first match, so `dedupe([1, 2, 1])` returns `[2, 1]`. Fix \
+the function and add tests that pin first-seen order."#;
+
+const PHP_BUGFIX_REF: &str = r#"<?php
+function dedupe(array $items): array
+{
+    $seen = [];
+    $out = [];
+    foreach ($items as $item) {
+        $key = serialize($item);
+        if (!isset($seen[$key])) {
+            $seen[$key] = true;
+            $out[] = $item;
+        }
+    }
+    return $out;
+}
+
+function expect_equal(string $label, $got, $want): void
+{
+    if ($got !== $want) {
+        throw new RuntimeException($label . " failed");
+    }
+}
+
+expect_equal("first occurrence kept", dedupe([1, 2, 1]), [1, 2]);
+expect_equal("empty input", dedupe([]), []);
+expect_equal("unique input unchanged", dedupe([3, 1, 2]), [3, 1, 2]);
+expect_equal("run of duplicates", dedupe([4, 4, 4]), [4]);
+"#;
+
+const PHP_REFACTOR_TASK: &str = r#"The following PHP function works but is written as a manual accumulation loop:
+
+```php
+function total_price(array $cart): float
+{
+    $total = 0.0;
+    foreach ($cart as $item) {
+        $price = $item["price"] * $item["qty"];
+        $total = $total + $price;
+    }
+    return $total;
+}
+```
+
+Refactor it to a single `array_reduce` expression, and add tests that pin the \
+behaviour (including the empty cart)."#;
+
+const PHP_REFACTOR_REF: &str = r#"<?php
+function total_price(array $cart): float
+{
+    return array_reduce(
+        $cart,
+        fn(float $sum, array $item): float => $sum + $item["price"] * $item["qty"],
+        0.0
+    );
+}
+
+function expect_equal(string $label, $got, $want): void
+{
+    if ($got !== $want) {
+        throw new RuntimeException($label . " failed");
+    }
+}
+
+expect_equal(
+    "line items sum",
+    total_price([["price" => 2.5, "qty" => 4], ["price" => 1.0, "qty" => 1]]),
+    11.0
+);
+expect_equal("empty cart", total_price([]), 0.0);
+"#;
+
+const PHP_TESTWRITING_TASK: &str = r#"Write a thorough test suite for the following PHP function without modifying \
+the function itself:
+
+```php
+function median(array $sorted): ?float
+{
+    $n = count($sorted);
+    if ($n === 0) {
+        return null;
+    }
+    $mid = intdiv($n, 2);
+    if ($n % 2 !== 0) {
+        return (float) $sorted[$mid];
+    }
+    return ($sorted[$mid - 1] + $sorted[$mid]) / 2.0;
+}
+```
+
+Cover the empty input, odd and even lengths, and negative values."#;
+
+const PHP_TESTWRITING_REF: &str = r#"<?php
+function median(array $sorted): ?float
+{
+    $n = count($sorted);
+    if ($n < 1) {
+        return null;
+    }
+    $mid = intdiv($n, 2);
+    if ($n % 2 !== 0) {
+        return (float) $sorted[$mid];
+    }
+    return ($sorted[$mid - 1] + $sorted[$mid]) / 2.0;
+}
+
+function expect_equal(string $label, $got, $want): void
+{
+    if ($got !== $want) {
+        throw new RuntimeException($label . " failed");
+    }
+}
+
+expect_equal("empty input", median([]), null);
+expect_equal("odd length", median([1, 3, 5]), 3.0);
+expect_equal("even length", median([1, 2, 3, 4]), 2.5);
+expect_equal("negatives", median([-5, -1, 2]), -1.0);
+expect_equal("single element", median([9]), 9.0);
+"#;
+
 /// The template bank: the task body and reference completion for one
 /// (language, kind) pair. Bodies carry the *task* only; [`finish_prompt`]
 /// adds the language header and [`PROMPT_REQUIREMENTS`].
@@ -1526,9 +2493,7 @@ fn template(language: CodeLanguage, kind: TaskKind) -> (&'static str, &'static s
         (CodeLanguage::Cpp, TaskKind::Implement) => (CPP_IMPLEMENT_TASK, CPP_IMPLEMENT_REF),
         (CodeLanguage::Cpp, TaskKind::BugFix) => (CPP_BUGFIX_TASK, CPP_BUGFIX_REF),
         (CodeLanguage::Cpp, TaskKind::Refactor) => (CPP_REFACTOR_TASK, CPP_REFACTOR_REF),
-        (CodeLanguage::Cpp, TaskKind::TestWriting) => {
-            (CPP_TESTWRITING_TASK, CPP_TESTWRITING_REF)
-        }
+        (CodeLanguage::Cpp, TaskKind::TestWriting) => (CPP_TESTWRITING_TASK, CPP_TESTWRITING_REF),
         (CodeLanguage::JsTs, TaskKind::Implement) => (JSTS_IMPLEMENT_TASK, JSTS_IMPLEMENT_REF),
         (CodeLanguage::JsTs, TaskKind::BugFix) => (JSTS_BUGFIX_TASK, JSTS_BUGFIX_REF),
         (CodeLanguage::JsTs, TaskKind::Refactor) => (JSTS_REFACTOR_TASK, JSTS_REFACTOR_REF),
@@ -1538,9 +2503,29 @@ fn template(language: CodeLanguage, kind: TaskKind) -> (&'static str, &'static s
         (CodeLanguage::Web, TaskKind::Implement) => (WEB_IMPLEMENT_TASK, WEB_IMPLEMENT_REF),
         (CodeLanguage::Web, TaskKind::BugFix) => (WEB_BUGFIX_TASK, WEB_BUGFIX_REF),
         (CodeLanguage::Web, TaskKind::Refactor) => (WEB_REFACTOR_TASK, WEB_REFACTOR_REF),
-        (CodeLanguage::Web, TaskKind::TestWriting) => {
-            (WEB_TESTWRITING_TASK, WEB_TESTWRITING_REF)
+        (CodeLanguage::Web, TaskKind::TestWriting) => (WEB_TESTWRITING_TASK, WEB_TESTWRITING_REF),
+        (CodeLanguage::Go, TaskKind::Implement) => (GO_IMPLEMENT_TASK, GO_IMPLEMENT_REF),
+        (CodeLanguage::Go, TaskKind::BugFix) => (GO_BUGFIX_TASK, GO_BUGFIX_REF),
+        (CodeLanguage::Go, TaskKind::Refactor) => (GO_REFACTOR_TASK, GO_REFACTOR_REF),
+        (CodeLanguage::Go, TaskKind::TestWriting) => (GO_TESTWRITING_TASK, GO_TESTWRITING_REF),
+        (CodeLanguage::Java, TaskKind::Implement) => (JAVA_IMPLEMENT_TASK, JAVA_IMPLEMENT_REF),
+        (CodeLanguage::Java, TaskKind::BugFix) => (JAVA_BUGFIX_TASK, JAVA_BUGFIX_REF),
+        (CodeLanguage::Java, TaskKind::Refactor) => (JAVA_REFACTOR_TASK, JAVA_REFACTOR_REF),
+        (CodeLanguage::Java, TaskKind::TestWriting) => {
+            (JAVA_TESTWRITING_TASK, JAVA_TESTWRITING_REF)
         }
+        (CodeLanguage::CSharp, TaskKind::Implement) => {
+            (CSHARP_IMPLEMENT_TASK, CSHARP_IMPLEMENT_REF)
+        }
+        (CodeLanguage::CSharp, TaskKind::BugFix) => (CSHARP_BUGFIX_TASK, CSHARP_BUGFIX_REF),
+        (CodeLanguage::CSharp, TaskKind::Refactor) => (CSHARP_REFACTOR_TASK, CSHARP_REFACTOR_REF),
+        (CodeLanguage::CSharp, TaskKind::TestWriting) => {
+            (CSHARP_TESTWRITING_TASK, CSHARP_TESTWRITING_REF)
+        }
+        (CodeLanguage::Php, TaskKind::Implement) => (PHP_IMPLEMENT_TASK, PHP_IMPLEMENT_REF),
+        (CodeLanguage::Php, TaskKind::BugFix) => (PHP_BUGFIX_TASK, PHP_BUGFIX_REF),
+        (CodeLanguage::Php, TaskKind::Refactor) => (PHP_REFACTOR_TASK, PHP_REFACTOR_REF),
+        (CodeLanguage::Php, TaskKind::TestWriting) => (PHP_TESTWRITING_TASK, PHP_TESTWRITING_REF),
     }
 }
 
@@ -1787,7 +2772,8 @@ pub fn run_pipeline(
 ) -> anyhow::Result<PipelineReport> {
     ensure!(
         !config.languages.is_empty(),
-        "PipelineConfig.languages is empty: name at least one of rust|python|c|cpp|jsts|web"
+        "PipelineConfig.languages is empty: name at least one of \
+         rust|python|c|cpp|jsts|web|go|java|csharp|php"
     );
     ensure!(
         config.tasks_per_language > 0,
@@ -1797,8 +2783,12 @@ pub fn run_pipeline(
         config.max_tokens > 0,
         "PipelineConfig.max_tokens must be positive"
     );
-    std::fs::create_dir_all(&config.out_dir)
-        .with_context(|| format!("create pipeline output directory {}", config.out_dir.display()))?;
+    std::fs::create_dir_all(&config.out_dir).with_context(|| {
+        format!(
+            "create pipeline output directory {}",
+            config.out_dir.display()
+        )
+    })?;
 
     let eval_index = if config.decontaminate {
         let tasks = codegen_eval::read_tasks(&config.eval_tasks_path).with_context(|| {
@@ -1828,19 +2818,19 @@ pub fn run_pipeline(
             let text = std::fs::read_to_string(&report_path).with_context(|| {
                 format!("read stored language report {}", report_path.display())
             })?;
-            let mut stored: LanguageReport =
-                serde_json::from_str(&text).with_context(|| {
-                    format!(
-                        "stored language report {} is corrupt; remove the {} directory to rebuild it",
-                        report_path.display(),
-                        lang_dir.display()
-                    )
-                })?;
+            let mut stored: LanguageReport = serde_json::from_str(&text).with_context(|| {
+                format!(
+                    "stored language report {} is corrupt; remove the {} directory to rebuild it",
+                    report_path.display(),
+                    lang_dir.display()
+                )
+            })?;
             stored.resumed = true;
             report.languages.push(stored);
             continue;
         }
-        let language_report = run_language(client, config, language, &lang_dir, eval_index.as_ref())?;
+        let language_report =
+            run_language(client, config, language, &lang_dir, eval_index.as_ref())?;
         write_json(&report_path, &language_report)?;
         report.languages.push(language_report);
     }
@@ -1866,7 +2856,10 @@ fn run_language(
         &config.oss_instruct_path,
         config.max_problem_chars,
     )?;
-    let magicoder_seeds = seeds.iter().filter(|s| s.source == SeedSource::Magicoder).count();
+    let magicoder_seeds = seeds
+        .iter()
+        .filter(|s| s.source == SeedSource::Magicoder)
+        .count();
 
     let mut candidates = Vec::new();
     let mut teacher_missing = 0usize;
@@ -1941,7 +2934,8 @@ fn run_language(
             // near-duplicates an eval task lets the model memorise the eval,
             // whatever the completion says (mirrors codegen_eval::index_sft,
             // which indexes instructions only).
-            let hit = codegen_eval::decontaminate(index, &candidate.seed.prompt, "repo-native-eval");
+            let hit =
+                codegen_eval::decontaminate(index, &candidate.seed.prompt, "repo-native-eval");
             if hit.is_contaminated {
                 decontam_hits += 1;
                 let example = hit.example.unwrap_or_default();
@@ -2026,20 +3020,8 @@ fn generate_teacher_traces(
         .collect();
     let raw_dir = lang_dir.join("raw");
     let trace_report = client.generate_traces(&prompts, &raw_dir, config.budget)?;
-    let text = std::fs::read_to_string(&trace_report.out_path)
-        .with_context(|| format!("read back trace file {}", trace_report.out_path.display()))?;
     let mut records = HashMap::new();
-    for (n, line) in text.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let record: TraceRecord = serde_json::from_str(line).with_context(|| {
-            format!(
-                "trace file {} line {} is not a valid TraceRecord",
-                trace_report.out_path.display(),
-                n + 1
-            )
-        })?;
+    for record in crate::nim::read_traces(&trace_report.out_path)? {
         records.insert(record.id.clone(), record);
     }
     Ok(records)
@@ -2094,13 +3076,13 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
 
 /// Per-language tally of router picks: `correct[l]` tokens of language `l`
 /// whose top-1 box was `l`, out of `total[l]` tokens of language `l`.
-/// Indexed by [`CodeLanguage::index`].
+/// Indexed by [`CodeLanguage::index`], sized to [`CodeLanguage::KNOWN`].
 #[derive(Debug, Clone, Default)]
 pub struct RouterAgreement {
     /// Tokens routed to their own language, per language.
-    pub correct: [usize; 6],
+    pub correct: [usize; CodeLanguage::KNOWN.len()],
     /// Tokens seen, per language.
-    pub total: [usize; 6],
+    pub total: [usize; CodeLanguage::KNOWN.len()],
 }
 
 impl RouterAgreement {
@@ -2122,14 +3104,17 @@ impl RouterAgreement {
     /// tokens were seen at all.
     pub fn overall(&self) -> anyhow::Result<f32> {
         let total: usize = self.total.iter().sum();
-        anyhow::ensure!(total > 0, "no tokens were seen, so routing accuracy is undefined");
+        anyhow::ensure!(
+            total > 0,
+            "no tokens were seen, so routing accuracy is undefined"
+        );
         Ok(self.correct.iter().sum::<usize>() as f32 / total as f32)
     }
 
     /// One line per language plus an overall line, for test output.
     pub fn render(&self) -> String {
         let mut out = String::new();
-        for language in CodeLanguage::ALL {
+        for language in CodeLanguage::KNOWN {
             let idx = language.index();
             let (correct, total) = (self.correct[idx], self.total[idx]);
             match self.accuracy(language) {
@@ -2137,9 +3122,10 @@ impl RouterAgreement {
                     "router-agreement {}: {correct}/{total} = {acc:.3}\n",
                     language.name()
                 )),
-                Err(_) => {
-                    out.push_str(&format!("router-agreement {}: no tokens\n", language.name()))
-                }
+                Err(_) => out.push_str(&format!(
+                    "router-agreement {}: no tokens\n",
+                    language.name()
+                )),
             }
         }
         match self.overall() {
@@ -2189,6 +3175,183 @@ pub fn router_agreement(
     Ok(agreement)
 }
 
+// ---------------------------------------------------------------------------
+// Identity corpus (PLAN-NINA §3)
+//
+// Every specialist trained from these mixes must answer who/what it is the
+// same way: nina, from cybersec.org.za, made by the CEO Stephan. That is
+// baked in as *data* — the documents below — never as a runtime patch.
+//
+// Stance, stated once and binding on this module: NO refusal or safety
+// documents are generated here or anywhere in the crate, and no safety
+// classifier is trained — the models ship uncensored as company tooling for
+// cybersec.org.za. The policy mechanism (`crate::policy`: scope blockers +
+// HMAC grants) ships unconfigured, with zero blockers; it exists so the
+// company can later gate scopes (e.g. client engagements) without retraining.
+// Their program, their choice. Do not add refusal/safety data "for
+// completeness": its absence is the specification, not an omission.
+// ---------------------------------------------------------------------------
+
+/// The name every specialist answers to.
+pub const IDENTITY_NAME: &str = "nina";
+
+/// The organization every specialist belongs to.
+pub const IDENTITY_ORG: &str = "cybersec.org.za";
+
+/// Who made every specialist, as the models say it.
+pub const IDENTITY_MAKER: &str = "the CEO Stephan";
+
+/// The identity training lines: a handful of phrasings of the identity
+/// questions, each answered with the same facts ([`IDENTITY_NAME`],
+/// [`IDENTITY_ORG`], [`IDENTITY_MAKER`]). They are [`TraceRecord`]s so they
+/// flow through the same files as teacher traces; they are marked
+/// `source: "identity"` and `language: "identity"` so no stage mistakes them
+/// for code or for teacher output, and their ids are content hashes, so a
+/// rerun produces byte-identical documents.
+pub fn identity_documents() -> Vec<TraceRecord> {
+    // (question, answer) pairs. Every answer states name, org and maker; the
+    // exact strings are pinned by the tests, because a silent wording change
+    // here is a silent identity change in every model trained on the mix.
+    const PAIRS: &[(&str, &str)] = &[
+        (
+            "Who are you?",
+            "I'm nina, a specialist model from cybersec.org.za, made by the CEO Stephan.",
+        ),
+        (
+            "Who made you?",
+            "I'm nina — I was made by the CEO Stephan at cybersec.org.za.",
+        ),
+        (
+            "Who built you?",
+            "I'm nina; the CEO Stephan built me at cybersec.org.za.",
+        ),
+        (
+            "What is nina?",
+            "nina is the family of specialist models made by the CEO Stephan at \
+             cybersec.org.za. I'm one of them.",
+        ),
+        (
+            "Which company are you from?",
+            "I'm nina, from cybersec.org.za — made by the CEO Stephan.",
+        ),
+        (
+            "Where do you come from?",
+            "I'm nina, from cybersec.org.za, where the CEO Stephan made me.",
+        ),
+        (
+            "Tell me about yourself.",
+            "I'm nina, a specialist model from cybersec.org.za, made by the CEO Stephan.",
+        ),
+        (
+            "Are you an AI model?",
+            "Yes — I'm nina, made by the CEO Stephan at cybersec.org.za.",
+        ),
+        (
+            "Who is Stephan?",
+            "Stephan is the CEO of cybersec.org.za, and the person who made me, nina.",
+        ),
+        (
+            "Introduce yourself.",
+            "I'm nina, from cybersec.org.za, made by the CEO Stephan.",
+        ),
+    ];
+    PAIRS
+        .iter()
+        .enumerate()
+        .map(|(i, (prompt, completion))| {
+            let mut hasher = Sha256::new();
+            hasher.update(b"identity\n");
+            hasher.update(prompt.as_bytes());
+            hasher.update(b"\n");
+            hasher.update(completion.as_bytes());
+            let digest = hasher.finalize();
+            let id: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+            TraceRecord {
+                id,
+                language: "identity".to_string(),
+                prompt: (*prompt).to_string(),
+                completion: (*completion).to_string(),
+                model: "identity-corpus".to_string(),
+                usage: crate::nim::Usage::default(),
+                seed: i as u64,
+                source: "identity".to_string(),
+            }
+        })
+        .collect()
+}
+
+/// Insert the identity documents into a training mix: after every `every_n`
+/// lines of `mix`, the next identity document (cycling through
+/// [`identity_documents`]) is appended. Deterministic: same mix, same rate,
+/// same result, byte for byte. The identity rate of the result is therefore
+/// exactly `floor(mix.len() / every_n)` extra lines.
+pub fn mix_identity(mix: &[TraceRecord], every_n: usize) -> anyhow::Result<Vec<TraceRecord>> {
+    ensure!(
+        every_n > 0,
+        "mix_identity needs a positive insertion interval, got every_n = {every_n}"
+    );
+    let documents = identity_documents();
+    let mut out = Vec::with_capacity(mix.len() + mix.len() / every_n);
+    let mut next = 0usize;
+    for (i, line) in mix.iter().enumerate() {
+        out.push(line.clone());
+        if (i + 1) % every_n == 0 {
+            out.push(documents[next % documents.len()].clone());
+            next += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Export a pipeline output directory into the cybercorpus raw layout: each
+/// language's `train.jsonl` is copied to `raw_dir/<source>/<language>.jsonl`,
+/// which [`crate::corpus::build_cybercorpus`] then normalizes (the
+/// `prompt` + `completion` fields are exactly what its JSONL reader joins).
+/// Exporting the *filtered* train file, rather than the raw traces, is the
+/// point: the cheat filter's reject decisions are upstream and stay recorded
+/// in the pipeline's own `rejects.jsonl`. Returns the number of rows
+/// exported.
+pub fn export_traces_for_cybercorpus(
+    pipeline_dir: &Path,
+    raw_dir: &Path,
+    source: &str,
+) -> anyhow::Result<usize> {
+    ensure!(
+        !source.trim().is_empty() && !source.contains(['/', '\\']),
+        "export source must be a single directory name, got {source:?}"
+    );
+    let entries = std::fs::read_dir(pipeline_dir).with_context(|| {
+        format!(
+            "read pipeline directory {}: run the pipeline first",
+            pipeline_dir.display()
+        )
+    })?;
+    let mut language_dirs: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|path| path.is_dir() && path.join("train.jsonl").is_file())
+        .collect();
+    language_dirs.sort();
+    ensure!(
+        !language_dirs.is_empty(),
+        "{} contains no language directory with a train.jsonl",
+        pipeline_dir.display()
+    );
+    let out_dir = raw_dir.join(source);
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("create raw source directory {}", out_dir.display()))?;
+    let mut rows = 0usize;
+    for dir in language_dirs {
+        let name = dir.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+            anyhow::anyhow!("non-UTF-8 language directory name {}", dir.display())
+        })?;
+        let text = std::fs::read_to_string(dir.join("train.jsonl"))
+            .with_context(|| format!("read {}", dir.join("train.jsonl").display()))?;
+        rows += text.lines().filter(|l| !l.trim().is_empty()).count();
+        crate::nim::write_atomic(&out_dir.join(format!("{name}.jsonl")), text.as_bytes())?;
+    }
+    Ok(rows)
+}
+
 #[cfg(test)]
 // A test says "this must have worked" with `unwrap`, which is the right
 // thing for a test to say. The grant is scoped to this module: production
@@ -2221,8 +3384,8 @@ mod tests {
     fn unique_tmp_dir(tag: &str) -> PathBuf {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir()
-            .join(format!("dblocks-langdata-{tag}-{}-{n}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("dblocks-langdata-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("create tmp dir");
         dir
     }
@@ -2305,8 +3468,7 @@ mod tests {
     const SUPPRESSED_PYTHON: &str =
         "```python\ndef square(x):\n    return x * x  # type: ignore\n```";
     const STUB_PYTHON: &str = "```python\ndef checksum(data):\n    pass\n```";
-    const CLEAN_RUST: &str =
-        "```rust\nfn reverse_words(s: &str) -> String {\n    s.split_whitespace().rev().collect::<Vec<_>>().join(\" \")\n}\n```";
+    const CLEAN_RUST: &str = "```rust\nfn reverse_words(s: &str) -> String {\n    s.split_whitespace().rev().collect::<Vec<_>>().join(\" \")\n}\n```";
 
     /// A problem long enough (38 tokens) that a verbatim copy in the eval
     /// corpus crosses the 10% n-gram overlap threshold even diluted by the
@@ -2319,14 +3481,24 @@ mod tests {
     fn language_mapping_round_trips_both_ways() {
         for lang in CodeLanguage::ALL {
             let snippet = snippet_language(lang);
-            assert_eq!(code_language(snippet), Some(lang), "round trip for {lang:?}");
+            assert_eq!(
+                code_language(snippet),
+                Some(lang),
+                "round trip for {lang:?}"
+            );
         }
         assert_eq!(code_language(SnippetLanguage::Other), None);
         // The scanner-facing names are the ones cheat.rs understands.
-        for lang in CodeLanguage::ALL {
+        for lang in CodeLanguage::KNOWN {
             let snippet = snippet_language(lang);
             assert_eq!(SnippetLanguage::from_name(snippet.as_str()), snippet);
         }
+        // The extended four scan under coarser families — the scanner's
+        // families are coarser than the language list by design.
+        assert_eq!(snippet_language(CodeLanguage::Go), SnippetLanguage::C);
+        assert_eq!(snippet_language(CodeLanguage::Java), SnippetLanguage::Cpp);
+        assert_eq!(snippet_language(CodeLanguage::CSharp), SnippetLanguage::Cpp);
+        assert_eq!(snippet_language(CodeLanguage::Php), SnippetLanguage::JsTs);
     }
 
     // -- router agreement ----------------------------------------------------
@@ -2364,7 +3536,12 @@ mod tests {
         let dir = unique_tmp_dir("determinism");
         let oss = write_oss_fixture(
             &dir,
-            &[("rust", 7, "Reverse the words of a sentence, keeping their punctuation attached to the word that carried it.", CLEAN_RUST)],
+            &[(
+                "rust",
+                7,
+                "Reverse the words of a sentence, keeping their punctuation attached to the word that carried it.",
+                CLEAN_RUST,
+            )],
         );
         let a = build_seeds(CodeLanguage::Rust, 6, 42, &oss, 2_000).expect("seeds a");
         let b = build_seeds(CodeLanguage::Rust, 6, 42, &oss, 2_000).expect("seeds b");
@@ -2379,7 +3556,7 @@ mod tests {
     #[test]
     fn prompts_are_language_correct_and_forbid_suppression() {
         let missing = Path::new("/definitely/not/a/real/corpus.jsonl");
-        for lang in CodeLanguage::ALL {
+        for lang in CodeLanguage::KNOWN {
             let seeds = build_seeds(lang, 8, 1, missing, 2_000).expect("seeds");
             assert_eq!(seeds.len(), 8);
             for seed in &seeds {
@@ -2396,9 +3573,18 @@ mod tests {
                     lang.name(),
                     seed.prompt
                 );
-                assert!(seed.prompt.contains("#[allow]"), "rust idiom named in requirements");
-                assert!(seed.prompt.contains("noqa"), "python idiom named in requirements");
-                assert!(seed.prompt.contains("ts-ignore"), "jsts idiom named in requirements");
+                assert!(
+                    seed.prompt.contains("#[allow]"),
+                    "rust idiom named in requirements"
+                );
+                assert!(
+                    seed.prompt.contains("noqa"),
+                    "python idiom named in requirements"
+                );
+                assert!(
+                    seed.prompt.contains("ts-ignore"),
+                    "jsts idiom named in requirements"
+                );
                 assert!(!seed.reference.is_empty(), "offline reference exists");
             }
             // With no Magicoder rows, eight template seeds are exactly two
@@ -2416,7 +3602,7 @@ mod tests {
         // template reference that got flagged would silently shrink every
         // keyless run.
         let missing = Path::new("/definitely/not/a/real/corpus.jsonl");
-        for lang in CodeLanguage::ALL {
+        for lang in CodeLanguage::KNOWN {
             let seeds = build_seeds(lang, 8, 9, missing, 2_000).expect("seeds");
             let refs: Vec<String> = seeds.iter().map(|s| s.reference.clone()).collect();
             let (kept, report) = filter_traces(&refs, snippet_language(lang));
@@ -2437,10 +3623,19 @@ mod tests {
         let config: PipelineConfig = serde_json::from_str("{}").expect("defaults parse");
         assert_eq!(config.languages, CodeLanguage::ALL.to_vec());
         assert_eq!(config.tasks_per_language, DEFAULT_TASKS_PER_LANGUAGE);
-        assert_eq!(config.budget.max_requests, TraceBudget::default().max_requests);
+        assert_eq!(
+            config.budget.max_requests,
+            TraceBudget::default().max_requests
+        );
         assert_eq!(config.out_dir, PathBuf::from(DEFAULT_OUT_DIR));
-        assert_eq!(config.oss_instruct_path, PathBuf::from(DEFAULT_OSS_INSTRUCT_PATH));
-        assert_eq!(config.eval_tasks_path, PathBuf::from(DEFAULT_EVAL_TASKS_PATH));
+        assert_eq!(
+            config.oss_instruct_path,
+            PathBuf::from(DEFAULT_OSS_INSTRUCT_PATH)
+        );
+        assert_eq!(
+            config.eval_tasks_path,
+            PathBuf::from(DEFAULT_EVAL_TASKS_PATH)
+        );
         assert!(config.decontaminate);
         assert_eq!(config.cheat_policy, CheatPolicy::Reject);
         // And the default config survives a round trip.
@@ -2458,9 +3653,24 @@ mod tests {
         write_oss_fixture(
             &dir,
             &[
-                ("python", 1, "Return the running average of a stream of numbers as a list of cumulative means, one element per input element.", CLEAN_PYTHON),
-                ("python", 2, "Return the square of a number, handling any numeric type the caller passes in gracefully.", SUPPRESSED_PYTHON),
-                ("python", 3, "Compute the checksum of a byte string using modular arithmetic over its octets and carry bits.", STUB_PYTHON),
+                (
+                    "python",
+                    1,
+                    "Return the running average of a stream of numbers as a list of cumulative means, one element per input element.",
+                    CLEAN_PYTHON,
+                ),
+                (
+                    "python",
+                    2,
+                    "Return the square of a number, handling any numeric type the caller passes in gracefully.",
+                    SUPPRESSED_PYTHON,
+                ),
+                (
+                    "python",
+                    3,
+                    "Compute the checksum of a byte string using modular arithmetic over its octets and carry bits.",
+                    STUB_PYTHON,
+                ),
             ],
         );
         let config = tiny_config(&dir, vec![CodeLanguage::Python], 4);
@@ -2498,9 +3708,24 @@ mod tests {
         write_oss_fixture(
             &dir,
             &[
-                ("python", 1, "Return the running average of a stream of numbers as a list of cumulative means, one element per input element.", CLEAN_PYTHON),
-                ("python", 2, "Return the square of a number, handling any numeric type the caller passes in gracefully.", SUPPRESSED_PYTHON),
-                ("python", 3, "Compute the checksum of a byte string using modular arithmetic over its octets and carry bits.", STUB_PYTHON),
+                (
+                    "python",
+                    1,
+                    "Return the running average of a stream of numbers as a list of cumulative means, one element per input element.",
+                    CLEAN_PYTHON,
+                ),
+                (
+                    "python",
+                    2,
+                    "Return the square of a number, handling any numeric type the caller passes in gracefully.",
+                    SUPPRESSED_PYTHON,
+                ),
+                (
+                    "python",
+                    3,
+                    "Compute the checksum of a byte string using modular arithmetic over its octets and carry bits.",
+                    STUB_PYTHON,
+                ),
             ],
         );
         let mut config = tiny_config(&dir, vec![CodeLanguage::Python], 4);
@@ -2525,7 +3750,12 @@ mod tests {
             &dir,
             &[
                 ("rust", 11, LONG_PROBLEM, CLEAN_RUST),
-                ("rust", 12, "Sort a list of student records by grade descending and then by surname alphabetically using a stable ordering throughout.", CLEAN_RUST),
+                (
+                    "rust",
+                    12,
+                    "Sort a list of student records by grade descending and then by surname alphabetically using a stable ordering throughout.",
+                    CLEAN_RUST,
+                ),
             ],
         );
         write_eval_fixture(&dir, &[("eval-dup-1", LONG_PROBLEM)]);
@@ -2554,8 +3784,18 @@ mod tests {
         write_oss_fixture(
             &dir,
             &[
-                ("rust", 21, "Reverse the words of a sentence while keeping the punctuation attached to the word that carried it originally.", CLEAN_RUST),
-                ("python", 22, "Return the running average of a stream of numbers as a list of cumulative means, one element per input element.", CLEAN_PYTHON),
+                (
+                    "rust",
+                    21,
+                    "Reverse the words of a sentence while keeping the punctuation attached to the word that carried it originally.",
+                    CLEAN_RUST,
+                ),
+                (
+                    "python",
+                    22,
+                    "Return the running average of a stream of numbers as a list of cumulative means, one element per input element.",
+                    CLEAN_PYTHON,
+                ),
             ],
         );
         write_eval_fixture(
@@ -2573,7 +3813,11 @@ mod tests {
         assert!(!first.teacher);
         for lang in &first.languages {
             assert!(!lang.resumed);
-            assert_eq!(lang.kept, 6, "{}: clean slice keeps everything", lang.language);
+            assert_eq!(
+                lang.kept, 6,
+                "{}: clean slice keeps everything",
+                lang.language
+            );
             assert_eq!(lang.source_mix.get("offline"), Some(&6));
             assert_eq!(lang.decontam_hits, 0);
             let train = read_train(&lang.train_path);
@@ -2591,11 +3835,13 @@ mod tests {
         assert_eq!(top.total_kept(), 12);
 
         // A rerun must not touch completed languages: same files, resumed flags.
-        let rust_train_before = std::fs::read_to_string(dir.join("out/rust/train.jsonl")).expect("read rust train");
+        let rust_train_before =
+            std::fs::read_to_string(dir.join("out/rust/train.jsonl")).expect("read rust train");
         let second = run_pipeline(None, &config).expect("second run");
         assert!(second.languages.iter().all(|l| l.resumed));
         assert_eq!(second.total_kept(), 12);
-        let rust_train_after = std::fs::read_to_string(dir.join("out/rust/train.jsonl")).expect("read rust train again");
+        let rust_train_after = std::fs::read_to_string(dir.join("out/rust/train.jsonl"))
+            .expect("read rust train again");
         assert_eq!(rust_train_before, rust_train_after);
     }
 
@@ -2613,7 +3859,9 @@ mod tests {
     impl MockServer {
         fn spawn(body: String) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
-            listener.set_nonblocking(true).expect("nonblocking listener");
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
             let addr = listener.local_addr().expect("local addr");
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = Arc::clone(&stop);
@@ -2687,7 +3935,12 @@ mod tests {
         let dir = unique_tmp_dir("teacher");
         write_oss_fixture(
             &dir,
-            &[("rust", 31, "Reverse the words of a sentence while keeping the punctuation attached to the word that carried it originally.", CLEAN_RUST)],
+            &[(
+                "rust",
+                31,
+                "Reverse the words of a sentence while keeping the punctuation attached to the word that carried it originally.",
+                CLEAN_RUST,
+            )],
         );
         let completion = "fn answer() -> i32 {\n    41 + 1\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn checks_the_answer() {\n        assert_eq!(answer(), 42);\n    }\n}\n";
         let body = serde_json::json!({
@@ -2725,13 +3978,26 @@ mod tests {
         assert!(dir.join("out/rust/raw/traces.jsonl").exists());
     }
 
-    /// Real-API smoke test of the whole pipeline. Ignored by default AND
-    /// gated on the key: without `NVIDIA_API_KEY` it returns immediately even
-    /// when explicitly run. Costs at most two tiny completions:
+    /// Real-API driver for the whole pipeline, and the wave-3 entry point for
+    /// actual teacher generation. Ignored by default AND gated on the key:
+    /// without `NVIDIA_API_KEY` it returns immediately even when explicitly
+    /// run. With no overrides it costs two tiny completions:
     ///
     /// ```sh
     /// cargo test --lib langdata -- --include-ignored real_teacher_pipeline --nocapture
     /// ```
+    ///
+    /// A real run is steered by environment variables (defaults in brackets):
+    ///
+    /// - `LANGDATA_REAL_LANGS` — comma-separated languages [`rust`]
+    /// - `LANGDATA_REAL_TASKS` — tasks per language [`2`]
+    /// - `LANGDATA_REAL_BUDGET` — request cap *per language* [`2`]
+    /// - `LANGDATA_REAL_MAX_TOKENS` — completion token cap [`1024`]
+    /// - `LANGDATA_REAL_OUT_DIR` — output root [a unique /tmp dir]
+    ///
+    /// Everything else — Magicoder seeding, decontamination against the
+    /// repo-native eval, the cheat filter — uses the production defaults, so
+    /// what this writes is the real dataset, not a test fixture.
     #[test]
     #[ignore = "spends real tokens; run explicitly with NVIDIA_API_KEY set"]
     fn real_teacher_pipeline() {
@@ -2739,19 +4005,328 @@ mod tests {
             eprintln!("[langdata] {DEFAULT_API_KEY_ENV} not set; skipping real-API pipeline test");
             return;
         }
-        let dir = unique_tmp_dir("real");
+        let env_or =
+            |key: &str, fallback: &str| std::env::var(key).unwrap_or_else(|_| fallback.to_string());
+        let languages = env_or("LANGDATA_REAL_LANGS", "rust")
+            .split(',')
+            .map(|name| CodeLanguage::parse(name).expect("LANGDATA_REAL_LANGS entry"))
+            .collect::<Vec<_>>();
+        let tasks: usize = env_or("LANGDATA_REAL_TASKS", "2")
+            .parse()
+            .expect("LANGDATA_REAL_TASKS");
+        let budget: usize = env_or("LANGDATA_REAL_BUDGET", "2")
+            .parse()
+            .expect("LANGDATA_REAL_BUDGET");
+        let max_tokens: u32 = env_or("LANGDATA_REAL_MAX_TOKENS", "1024")
+            .parse()
+            .expect("LANGDATA_REAL_MAX_TOKENS");
+        let out_dir = std::env::var("LANGDATA_REAL_OUT_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| unique_tmp_dir("real").join("out"));
+
         let client = NimClient::from_env().expect("client from env");
-        let mut config = tiny_config(&dir, vec![CodeLanguage::Rust], 2);
-        config.budget = TraceBudget { max_requests: 2 };
+        let config = PipelineConfig {
+            languages,
+            tasks_per_language: tasks,
+            budget: TraceBudget {
+                max_requests: budget,
+            },
+            max_tokens,
+            out_dir: out_dir.clone(),
+            ..PipelineConfig::default()
+        };
         let report = run_pipeline(Some(&client), &config).expect("real pipeline");
-        let lang = &report.languages[0];
-        assert!(lang.traces_generated > 0, "the teacher answered something");
-        assert_eq!(lang.traces_generated + lang.teacher_missing, lang.tasks);
+        assert!(report.teacher);
+        for lang in &report.languages {
+            assert_eq!(
+                lang.traces_generated + lang.teacher_missing,
+                lang.tasks,
+                "{}: every seed is accounted for",
+                lang.language
+            );
+            eprintln!(
+                "[langdata] {}: {} tasks ({} magicoder/{} template), {} kept ({} quarantined), \
+                 cheat drops {:?}, {} decontam hits, source mix {:?}",
+                lang.language,
+                lang.tasks,
+                lang.magicoder_seeds,
+                lang.template_seeds,
+                lang.kept,
+                lang.quarantined_kept,
+                lang.dropped_by_class,
+                lang.decontam_hits,
+                lang.source_mix
+            );
+        }
         eprintln!(
-            "[langdata] real run: {} kept, {} rejected, report at {}",
-            lang.kept,
-            lang.dropped_by_class.values().sum::<usize>(),
-            dir.join("out/report.json").display()
+            "[langdata] real run: {} kept total, report at {}",
+            report.total_kept(),
+            out_dir.join("report.json").display()
         );
+    }
+
+    /// Offline fallback driver for the real pipeline tree: no teacher client,
+    /// so every seed is answered from its reference completion (Magicoder or
+    /// template) and marked `source:offline`. This is the documented fallback
+    /// for a teacher outage — the same seeds, filters and output layout as a
+    /// teacher run, so a later teacher run for a language is just a matter of
+    /// removing that language's directory and rerunning `real_teacher_pipeline`.
+    /// Resume-safe the same way: a language with a `report.json` is skipped.
+    ///
+    /// ```sh
+    /// LANGDATA_REAL_OUT_DIR=/srv/m-sda/unifur/teacher-traces/pipeline-real \
+    /// LANGDATA_REAL_LANGS=go,java,csharp,php LANGDATA_REAL_TASKS=12 \
+    /// cargo test --lib langdata -- --include-ignored real_offline_fallback --nocapture
+    /// ```
+    #[test]
+    #[ignore = "writes to the real teacher-traces tree; run explicitly"]
+    fn real_offline_fallback() {
+        let Ok(out_dir) = std::env::var("LANGDATA_REAL_OUT_DIR") else {
+            eprintln!("[langdata] LANGDATA_REAL_OUT_DIR not set; skipping offline fallback");
+            return;
+        };
+        let env_or =
+            |key: &str, fallback: &str| std::env::var(key).unwrap_or_else(|_| fallback.to_string());
+        let languages = env_or("LANGDATA_REAL_LANGS", "go,java,csharp,php")
+            .split(',')
+            .map(|name| CodeLanguage::parse(name).expect("LANGDATA_REAL_LANGS entry"))
+            .collect::<Vec<_>>();
+        let tasks: usize = env_or("LANGDATA_REAL_TASKS", "12")
+            .parse()
+            .expect("LANGDATA_REAL_TASKS");
+        let config = PipelineConfig {
+            languages,
+            tasks_per_language: tasks,
+            out_dir: PathBuf::from(out_dir),
+            ..PipelineConfig::default()
+        };
+        let report = run_pipeline(None, &config).expect("offline fallback pipeline");
+        assert!(!report.teacher);
+        for lang in &report.languages {
+            assert!(
+                lang.resumed || lang.kept > 0,
+                "{}: the offline fallback keeps its references",
+                lang.language
+            );
+            assert!(
+                lang.resumed || lang.source_mix.keys().all(|s| s == "offline"),
+                "{}: fallback traces are all source:offline, got {:?}",
+                lang.language,
+                lang.source_mix
+            );
+            eprintln!(
+                "[langdata] {} (offline): {} tasks ({} magicoder/{} template), {} kept, \
+                 cheat drops {:?}, {} decontam hits, source mix {:?}",
+                lang.language,
+                lang.tasks,
+                lang.magicoder_seeds,
+                lang.template_seeds,
+                lang.kept,
+                lang.dropped_by_class,
+                lang.decontam_hits,
+                lang.source_mix
+            );
+        }
+    }
+
+    // -- identity corpus -----------------------------------------------------
+
+    fn teacher_line(i: usize) -> TraceRecord {
+        TraceRecord {
+            id: format!("t{i}"),
+            language: "rust".to_string(),
+            prompt: "p".to_string(),
+            completion: "c".to_string(),
+            model: "m".to_string(),
+            usage: crate::nim::Usage::default(),
+            seed: i as u64,
+            source: "teacher".to_string(),
+        }
+    }
+
+    #[test]
+    fn identity_documents_are_exact_and_marked() {
+        let docs = identity_documents();
+        assert_eq!(docs.len(), 10);
+        assert_eq!(docs[0].prompt, "Who are you?");
+        assert_eq!(
+            docs[0].completion,
+            "I'm nina, a specialist model from cybersec.org.za, made by the CEO Stephan."
+        );
+        for doc in &docs {
+            assert_eq!(doc.source, "identity");
+            assert_eq!(doc.language, "identity");
+            assert_eq!(doc.model, "identity-corpus");
+            assert!(
+                doc.completion.contains(IDENTITY_NAME),
+                "names nina: {}",
+                doc.completion
+            );
+            assert!(
+                doc.completion.contains(IDENTITY_ORG),
+                "names the org: {}",
+                doc.completion
+            );
+            assert!(
+                doc.completion.contains("Stephan"),
+                "names the maker: {}",
+                doc.completion
+            );
+            assert_eq!(doc.id.len(), 16, "content-hash id");
+        }
+        // Deterministic: a second call produces the same ids, and no two
+        // documents share one.
+        let again = identity_documents();
+        let ids: HashSet<&str> = docs.iter().map(|d| d.id.as_str()).collect();
+        assert_eq!(ids.len(), docs.len());
+        for (a, b) in docs.iter().zip(&again) {
+            assert_eq!(a.id, b.id);
+        }
+        // The stance, pinned: nothing in the identity corpus is a refusal or
+        // a safety document.
+        for doc in &docs {
+            let lower = doc.completion.to_lowercase();
+            assert!(!lower.contains("cannot"));
+            assert!(!lower.contains("not allowed"));
+            assert!(!lower.contains("refuse"));
+        }
+    }
+
+    #[test]
+    fn mix_identity_inserts_at_the_stated_rate() {
+        let mix: Vec<TraceRecord> = (0..10).map(teacher_line).collect();
+        let mixed = mix_identity(&mix, 3).expect("mix");
+        assert_eq!(mixed.len(), 13, "10 lines + floor(10/3) identity lines");
+        let positions: Vec<usize> = mixed
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.source == "identity")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            positions,
+            vec![3, 7, 11],
+            "identity lands after every 3rd line"
+        );
+        // The documents cycle in their fixed order.
+        let docs = identity_documents();
+        assert_eq!(mixed[3].id, docs[0].id);
+        assert_eq!(mixed[7].id, docs[1].id);
+        assert_eq!(mixed[11].id, docs[2].id);
+        // The mix itself is undisturbed.
+        let kept: Vec<&TraceRecord> = mixed.iter().filter(|r| r.source == "teacher").collect();
+        assert_eq!(
+            kept.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            mix.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
+        );
+        // Determinism and validation.
+        assert!(mix_identity(&mix, 0).is_err());
+        let remixed = mix_identity(&mix, 3).expect("remix");
+        assert_eq!(
+            serde_json::to_string(&mixed).unwrap(),
+            serde_json::to_string(&remixed).unwrap()
+        );
+    }
+
+    // -- cybercorpus export ----------------------------------------------------
+
+    #[test]
+    fn export_round_trips_through_the_cybercorpus_normalizer() {
+        let dir = unique_tmp_dir("export");
+        write_oss_fixture(
+            &dir,
+            &[
+                (
+                    "rust",
+                    41,
+                    "Reverse the words of a sentence while keeping the punctuation attached to the word that carried it originally.",
+                    CLEAN_RUST,
+                ),
+                (
+                    "rust",
+                    42,
+                    "Sort a list of student records by grade descending and then by surname alphabetically using a stable ordering throughout.",
+                    CLEAN_RUST,
+                ),
+            ],
+        );
+        let config = tiny_config(&dir, vec![CodeLanguage::Rust], 4);
+        let report = run_pipeline(None, &config).expect("offline pipeline");
+        let kept = report.total_kept();
+        assert!(kept > 0);
+
+        let raw = dir.join("cybercorpus/raw");
+        let rows =
+            export_traces_for_cybercorpus(&config.out_dir, &raw, "teacher-traces").expect("export");
+        assert_eq!(rows, kept, "every kept train record is exported");
+        assert!(raw.join("teacher-traces/rust.jsonl").is_file());
+
+        let out = dir.join("cybercorpus/out");
+        let manifest = crate::corpus::build_cybercorpus(
+            &raw,
+            &out,
+            &crate::corpus::CybercorpusConfig::default(),
+        )
+        .expect("normalize");
+        let source = manifest
+            .sources
+            .get("teacher-traces")
+            .expect("source present");
+        assert_eq!(
+            source.documents, kept,
+            "every exported row became a document"
+        );
+        assert!(
+            source.dropped_by_class.is_empty(),
+            "the pipeline's clean slice must survive the normalizer: {:?}",
+            source.dropped_by_class
+        );
+        let all = std::fs::read_to_string(out.join("dataset/all.jsonl")).expect("read all.jsonl");
+        assert_eq!(all.lines().count(), kept);
+        // The exported text is the prompt joined with the completion.
+        let first: serde_json::Value = serde_json::from_str(all.lines().next().unwrap()).unwrap();
+        let text = first["text"].as_str().unwrap();
+        assert!(
+            text.contains("Language: Rust"),
+            "prompt half: {}",
+            &text[..80]
+        );
+        assert!(out.join("dataset/teacher-traces.jsonl").is_file());
+    }
+
+    /// Smoke test of the export path against the real teacher-traces run on
+    /// the external drive. Skips itself when the drive is absent; run with
+    /// `--include-ignored` after a real pipeline run:
+    ///
+    /// ```sh
+    /// cargo test --lib langdata -- --include-ignored export_real_traces_smoke --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs the real teacher-traces tree on /srv/m-sda"]
+    fn export_real_traces_smoke() {
+        let pipeline = Path::new("/srv/m-sda/unifur/teacher-traces/pipeline-real");
+        if !pipeline.is_dir() {
+            eprintln!("[langdata] {pipeline:?} absent; skipping real export smoke");
+            return;
+        }
+        let dir = unique_tmp_dir("export-real");
+        let raw = dir.join("raw");
+        let rows = export_traces_for_cybercorpus(pipeline, &raw, "teacher-traces").expect("export");
+        let out = dir.join("out");
+        let manifest = crate::corpus::build_cybercorpus(
+            &raw,
+            &out,
+            &crate::corpus::CybercorpusConfig::default(),
+        )
+        .expect("normalize");
+        let source = manifest
+            .sources
+            .get("teacher-traces")
+            .expect("source present");
+        eprintln!(
+            "[langdata] export smoke: {rows} rows exported, {} normalized, drops {:?}",
+            source.documents, source.dropped_by_class
+        );
+        assert_eq!(source.documents, rows);
     }
 }

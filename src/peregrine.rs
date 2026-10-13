@@ -420,7 +420,7 @@ pub struct MirrorSet {
     ring: Option<io_uring::IoUring>,
 }
 
-/// Hand-written because [`io_uring::IoUring`] is not `Debug`, and the mirror set
+/// Hand-written because `io_uring::IoUring` is not `Debug`, and the mirror set
 /// is a field of `rawdata::Source`, which is. The rings are summarized by
 /// whether they exist rather than by their internals.
 impl fmt::Debug for MirrorSet {

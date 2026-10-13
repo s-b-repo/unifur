@@ -729,21 +729,42 @@ struct Attention<B: Backend> {
     mix: Param<Tensor<B, 1>>,
 }
 
+/// What [`Attention::new`] builds, as a named struct rather than eleven
+/// positional arguments.
+///
+/// The call site passes `config.kv_heads()` immediately after
+/// `config.num_attention_heads`; a positional list of eleven values that are
+/// mostly `usize`, `bool` and `f64` is a list where a swapped pair compiles
+/// fine and trains a silently wrong model. Naming the shape is the fix, and
+/// the assertion that KV heads divide query heads stays where it was.
+struct AttentionConfig {
+    hidden_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    attn_dropout: f64,
+    output_dropout: f64,
+    mode: AttentionMode,
+    rotary: bool,
+    /// Columns of each head the rotary embedding covers.
+    rotary_dim: usize,
+    gated: bool,
+    qk_norm: bool,
+}
+
 impl<B: Backend> Attention<B> {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        hidden_size: usize,
-        num_heads: usize,
-        num_kv_heads: usize,
-        attn_dropout: f64,
-        output_dropout: f64,
-        mode: AttentionMode,
-        rotary: bool,
-        rotary_dim: usize,
-        gated: bool,
-        qk_norm: bool,
-        device: &B::Device,
-    ) -> Self {
+    fn new(cfg: AttentionConfig, device: &B::Device) -> Self {
+        let AttentionConfig {
+            hidden_size,
+            num_heads,
+            num_kv_heads,
+            attn_dropout,
+            output_dropout,
+            mode,
+            rotary,
+            rotary_dim,
+            gated,
+            qk_norm,
+        } = cfg;
         assert!(
             num_heads > 0
                 && num_kv_heads > 0
@@ -1245,8 +1266,10 @@ impl<B: Backend> SwiGluMlp<B> {
 /// dense/sparse layout.
 // The variants cannot be boxed: Burn's `Module` is not implemented for
 // `Box<T>`, so a module enum has to hold them inline.
-#[allow(clippy::large_enum_variant)]
 #[derive(Module, Debug)]
+// audit-allow: variants cannot be boxed — burn-core 0.21 implements Module for
+// no Box<T>, so an enum deriving Module has to hold them inline.
+#[allow(clippy::large_enum_variant)]
 enum FeedForward<B: Backend> {
     Dense(Mlp<B>),
     Sparse(crate::moe::MoELayer<B>),
@@ -1504,19 +1527,21 @@ impl<B: Backend> DbLayer<B> {
         );
         Ok(Self {
             attention: Attention::new(
-                h,
-                config.num_attention_heads,
-                config.kv_heads(),
-                config.attention_probs_dropout_prob,
-                config.hidden_dropout_prob,
-                mode,
-                config.rotary,
-                crate::hybrid::rotary_dim_for(
-                    config.rotary_fraction,
-                    h / config.num_attention_heads,
-                ),
-                config.gated_attention,
-                config.qk_norm,
+                AttentionConfig {
+                    hidden_size: h,
+                    num_heads: config.num_attention_heads,
+                    num_kv_heads: config.kv_heads(),
+                    attn_dropout: config.attention_probs_dropout_prob,
+                    output_dropout: config.hidden_dropout_prob,
+                    mode,
+                    rotary: config.rotary,
+                    rotary_dim: crate::hybrid::rotary_dim_for(
+                        config.rotary_fraction,
+                        h / config.num_attention_heads,
+                    ),
+                    gated: config.gated_attention,
+                    qk_norm: config.qk_norm,
+                },
                 device,
             ),
             mlp,
@@ -2636,16 +2661,18 @@ mod tests {
         let device = Default::default();
         let (hidden, heads, seq) = (16usize, 4usize, 6usize);
         let attention = Attention::<B>::new(
-            hidden,
-            heads,
-            heads,
-            0.0,
-            0.0,
-            AttentionMode::Dense,
-            false,
-            hidden / heads,
-            false,
-            false,
+            AttentionConfig {
+                hidden_size: hidden,
+                num_heads: heads,
+                num_kv_heads: heads,
+                attn_dropout: 0.0,
+                output_dropout: 0.0,
+                mode: AttentionMode::Dense,
+                rotary: false,
+                rotary_dim: hidden / heads,
+                gated: false,
+                qk_norm: false,
+            },
             &device,
         );
 

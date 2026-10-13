@@ -1216,7 +1216,6 @@ impl Naming {
 /// (tens of strokes) and named here rather than hidden: a real detector would
 /// hand over its own adjacency, and the pairs worth comparing are the ones
 /// sharing a junction.
-#[allow(clippy::too_many_lines)]
 fn ground(
     strokes: &[Stroke],
     arcs: &[Arc],

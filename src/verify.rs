@@ -40,11 +40,12 @@
 //! | `hybrid` | A dense schedule is the Phase 19 trunk bit for bit; a window or a retrieval set covering the context is dense; linear attention's recurrent state equals its masked form; rotary scores depend only on distance; every mode decodes from its state exactly as it recomputes; rotary decoding continues past the table; the routing state is bounded and carries history; routing locality reads as specified; partial rotary is full rotary at fraction one and leaves the suffix; GQA with full heads is dense and narrow KV shrinks the decode state; gated attention is identity at init; RMSNorm starts at unit RMS; MTP at weight zero is the plain loss |
 //! | `deltanet` | Gated DeltaNet: alpha = 1 is the pure delta rule, beta = 0 is pure decay, the zero-state first output is closed-form, L2 rows are unit, the short convolution is causal, and the tensor-alpha step and batched rollout are the scalar core bit for bit |
 //! | `geom` | The learned metric `G = L Lᵀ` is positive definite by construction; geodesic attention rows are distributions; the closed-form Lipschitz step never increases the relaxation energy; and the exact rational kernel keeps `1/3 + 1/6 = 1/2` exact, intersects segments exactly, refuses degenerate figures, derives facts with their rule certificate to a fixed point, and both rejects a false claim and survives a true one in falsification |
-//! | `geomfusion` | The trunk-fused geometric stream: the composed readout gates are a distribution per row (the old broadcast-scatter bug would fail this), deeper certified relaxation never raises the energy it reports, and a zero-initialized output projection makes fusion an exact identity on the trunk hidden state |
+//! | `geomfusion` | The trunk-fused geometric stream: the composed readout gates are a distribution per row (the old broadcast-scatter bug would fail this), deeper certified relaxation never raises the energy it reports, a zero-initialized output projection makes fusion an exact identity on the trunk hidden state, a fresh FusedQwen returns the trunk's logits bit for bit, and the fused segment-checkpointed backward reproduces the one-shot gradients of the adapters and the stream |
 //! | `antipattern` | Every shipped rule matches its examples and none of its counterexamples; labels follow tokens through both corpus readers; zero weights reproduce the plain loss bitwise; the unlikelihood term is 0 for an impossible token and finite for a certain one; a penalized target leaves the likelihood; one penalized step lowers p(bad) where one plain step raises it |
 //! | `model` | Softmax partition, unit-norm label embeddings, DiT zero-init, and that every `x0` estimate lies in the convex hull of the label table |
 //! | `autodiff` | Finite-difference gradient check on the distillation objective |
 //! | `qwennet` | Qwen3.8 trunk: full attention decodes from its KV cache bit for bit, a mixed linear+full trunk decodes to its prefill logits bit for bit, and the zero-centered RMSNorm is identity at zero weight |
+//! | `vecread` | The raw-vector readout lens ([`crate::vecread`]): at the output layer the lens is exactly the student's own readout (argmax agreement at tolerance 0.0), every decoded step's top-k is cut from a normalized softmax row, the decode measurably tracks interventions on the refinement trajectory (truncation and bounded offsets) while the certified descent holds, and the final logits depend on the refinement depth — causal validation, not just readability |
 
 use crate::{
     dblock::{DblockClassifier, DblockConfig},
@@ -227,7 +228,7 @@ impl Report {
 }
 
 /// Names of every certificate group, in the order [`run_all`] emits them.
-pub const GROUPS: [&str; 28] = [
+pub const GROUPS: [&str; 29] = [
     "schedule",
     "preconditioning",
     "stats",
@@ -256,6 +257,7 @@ pub const GROUPS: [&str; 28] = [
     "qwennet",
     "cheat",
     "codegen_eval",
+    "vecread",
 ];
 
 /// Run only the certificates in `group`.
@@ -313,6 +315,7 @@ pub fn run_all() -> Report {
     certificates.extend(checks_or_failed("qwennet", qwennet_checks));
     certificates.extend(cheat_certificates());
     certificates.extend(codegen_eval_certificates());
+    certificates.extend(checks_or_failed("vecread", vecread_checks));
     Report { certificates }
 }
 
@@ -3766,6 +3769,152 @@ fn geomfusion_checks() -> anyhow::Result<Vec<Certificate>> {
     // nothing until training moves the projection.
     let identity_err = f64::from((out.hidden.clone() - hidden).abs().max().into_scalar());
 
+    // -- the fused model is the trunk at zero fusion ---------------------------
+    // The same argument one level up: a fresh FusedQwen returns the trunk's
+    // logits bit for bit, so fusing the stream onto trained 27B weights is a
+    // no-op until training moves the output projection.
+    use crate::geomfusion::FusedQwen;
+    use crate::qwennet::{QwenTrunk, QwenTrunkConfig};
+    let dims = qwennet_tiny_dims();
+    <B as burn::tensor::backend::Backend>::seed(&device, 0xF05ED);
+    let trunk = QwenTrunk::<B>::new(
+        QwenTrunkConfig {
+            dims,
+            num_layers: None,
+            rope_base: 10_000_000.0,
+            eps: 1e-6,
+        },
+        &device,
+    );
+    crate::tensor_ext::force_initialization(&trunk);
+    let fused_config = GeomFusionConfig {
+        hidden_size: dims.hidden_size,
+        ..GeomFusionConfig::tiny()
+    };
+    let fused_model = FusedQwen::<B>::new(trunk, &fused_config, &device)?;
+    let qtokens = Tensor::<B, 2, Int>::from_ints([[3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8]], &device);
+    let fused_logits = fused_model.forward(qtokens.clone(), None)?;
+    let plain_logits = fused_model.trunk.forward(qtokens);
+    let fused_trunk_err = f64::from((fused_logits - plain_logits).abs().max().into_scalar());
+
+    // -- the fused segment-checkpointed backward matches one-shot -------------
+    // The training loop's numerical identity: one no-grad trunk pass stores
+    // the per-layer boundaries, the loss segment (final norm + geometric
+    // stream + lm_head + answer CE) runs with grad, and each layer re-runs
+    // with grad on its boundary, chaining the exact vector-Jacobian product.
+    // Compared against a one-shot backward of the same loss on the same
+    // model: every adapter gradient and every geometric-stream gradient must
+    // match. Not tolerance 0: the fused loss reduces across per-row branches
+    // (f32 addition is not associative) and burn-ndarray's threaded GEMM has
+    // a run-to-run reduction-order sliver (~2e-8 measured); the per-segment
+    // VJP chain itself is exact (the trunk-only engine certifies 0.0 on it).
+    type A = crate::train::DefaultTrainBackend;
+    let ad_device: <A as burn::tensor::backend::BackendTypes>::Device = Default::default();
+    <A as burn::tensor::backend::Backend>::seed(&ad_device, 0x5EED);
+    let mut atrunk = QwenTrunk::<A>::new(
+        QwenTrunkConfig {
+            dims,
+            num_layers: None,
+            rope_base: 10_000_000.0,
+            eps: 1e-6,
+        },
+        &ad_device,
+    );
+    atrunk.to_nf4()?;
+    crate::tensor_ext::force_initialization(&atrunk);
+    let mut amodel = FusedQwen::<A>::new(atrunk, &fused_config, &ad_device)?;
+    crate::qwentrain::attach_lora(
+        &mut amodel.trunk,
+        &crate::qwennet::QwenLoraConfig {
+            rank: 4,
+            alpha: 4.0,
+        },
+        &ad_device,
+    )?;
+    crate::qwentrain::freeze_non_adapter_params(&mut amodel.trunk);
+    // Two scenes from the real corpus format, as byte-id token rows (the
+    // tiny vocab covers every scene byte; tokenization itself is covered by
+    // the unit tests -- this certificate is about the backward).
+    let (ctokens, cmeta) = crate::geometry::generate_corpus(4, &["nearest", "collinear"], 4, 3)?;
+    let scenes: Vec<crate::geomfusion::TokenizedScene> = (0..2)
+        .map(|i| {
+            let w = &ctokens[i * cmeta.scene_len..(i + 1) * cmeta.scene_len];
+            crate::geomfusion::TokenizedScene {
+                tokens: w.iter().map(|t| i64::from(*t)).collect(),
+                query: w.len() - 2,
+                answer: i64::from(w[w.len() - 1]),
+                answer_byte: u8::try_from(w[w.len() - 1]).unwrap_or(0),
+            }
+        })
+        .collect();
+    let max_len = scenes.iter().map(|s| s.len()).max().unwrap_or(0);
+    let mut flat = Vec::new();
+    for scene in &scenes {
+        let mut row = scene.tokens.clone();
+        row.resize(max_len, 0);
+        flat.extend(row);
+    }
+    let batch = Tensor::<A, 1, Int>::from_ints(flat.as_slice(), &ad_device)
+        .reshape([scenes.len(), max_len]);
+
+    let hidden_ad = amodel.trunk.forward_hidden(batch.clone());
+    let loss = crate::geomfusion::fused_answer_loss(
+        &amodel,
+        hidden_ad,
+        &scenes,
+        crate::geomfusion::FusedLossSpec::Answer,
+        None,
+        0.01,
+    )?;
+    let one_shot = burn::optim::GradientsParams::from_grads(loss.loss.backward(), &amodel);
+    let segmented = crate::geomfusion::segmented_fused_backward(
+        &amodel,
+        batch,
+        &scenes,
+        crate::geomfusion::FusedLossSpec::Answer,
+        None,
+        0.01,
+        1.0,
+    )?;
+    struct GradDiff<'a> {
+        a: &'a burn::optim::GradientsParams,
+        b: &'a burn::optim::GradientsParams,
+        worst: f32,
+    }
+    impl<'a, AB: burn::tensor::backend::AutodiffBackend<FloatElem = f32>>
+        burn::module::ModuleVisitor<AB> for GradDiff<'a>
+    {
+        fn visit_float<const D: usize>(&mut self, param: &burn::module::Param<Tensor<AB, D>>) {
+            let ga = self.a.get::<AB::InnerBackend, D>(param.id);
+            let gb = self.b.get::<AB::InnerBackend, D>(param.id);
+            match (ga, gb) {
+                (Some(x), Some(y)) => {
+                    self.worst = self.worst.max((x - y).abs().max().into_scalar());
+                }
+                (None, None) => {}
+                _ => self.worst = f32::INFINITY,
+            }
+        }
+    }
+    let mut backward_err = 0.0f32;
+    {
+        use burn::module::Module as _;
+        let mut diff = GradDiff {
+            a: &one_shot,
+            b: &segmented.trunk,
+            worst: 0.0,
+        };
+        amodel.trunk.visit(&mut diff);
+        backward_err = backward_err.max(diff.worst);
+        let mut diff = GradDiff {
+            a: &one_shot,
+            b: &segmented.fusion,
+            worst: 0.0,
+        };
+        amodel.fusion.visit(&mut diff);
+        backward_err = backward_err.max(diff.worst);
+    }
+
     Ok(vec![
         cert(
             "geomfusion",
@@ -3787,6 +3936,20 @@ fn geomfusion_checks() -> anyhow::Result<Vec<Certificate>> {
             "With the output projection zero-initialized, the fused hidden state equals the trunk hidden state bit for bit.",
             identity_err,
             0.0,
+        ),
+        cert(
+            "geomfusion",
+            "fused_qwen_is_the_trunk_at_zero_fusion",
+            "A fresh FusedQwen returns the untrained trunk's logits bit for bit: the geometric stream's zero-initialized output projection makes attaching it to trained weights an exact no-op.",
+            fused_trunk_err,
+            0.0,
+        ),
+        cert(
+            "geomfusion",
+            "fused_segmented_backward_matches_one_shot",
+            "The fused segment-checkpointed backward (boundary-storing no-grad trunk pass, loss segment with the geometric stream inside, per-layer exact VJP chaining) reproduces the one-shot gradients of the adapters and the stream up to cross-row float accumulation order and the threaded-GEMM reduction sliver.",
+            f64::from(backward_err),
+            1e-6,
         ),
     ])
 }
@@ -4074,7 +4237,264 @@ fn cheat_checks() -> anyhow::Result<Vec<Certificate>> {
 }
 
 fn cheat_certificates() -> Vec<Certificate> {
-    checks_or_failed("cheat", cheat_checks)
+    let mut certificates = checks_or_failed("cheat", cheat_checks);
+    certificates.extend(checks_or_failed("cheat", mixing_calibration_checks));
+    certificates
+}
+
+/// Certificates for the language-mixing calibration.
+///
+/// These are the properties that make the rule safe to *let change*. A
+/// detector nobody can audit is worse than a detector that is wrong, because a
+/// wrong one is visible in the drop counts and an unauditable one is not. So
+/// the claims here are the safety properties of the calibration itself, not
+/// the ones it is supposed to fix:
+///
+/// - the `Other` case is exactly zero, over a corpus built from the document
+///   shapes that made it fire on 97% of the field corpora;
+/// - a language mapped onto a foreign slot scores as high as its own idioms
+///   can carry, so the declared side of the comparison is never zero;
+/// - a pair's fire rate is exactly `fired / scanned_of(declared)`;
+/// - raising `max_fire_rate` can only add struck pairs, never return one, so
+///   the calibration is monotone in the one number it is given.
+fn mixing_calibration_checks() -> anyhow::Result<Vec<Certificate>> {
+    use crate::cheat::{
+        calibrate_mixing, scan_snippet, CheatClass, MixingPolicy, MixingTally, SnippetLanguage,
+        MIN_CALIBRATION_DOCUMENTS,
+    };
+
+    let mut certificates = Vec::new();
+
+    // --- 1. `Other` declares nothing, so nothing can contradict it -----------
+
+    // The document shapes that produced the 97%: prose with inline code, a
+    // fenced Python block, a README install section, a compose file.
+    let prose: Vec<String> = vec![
+        "# Project\n\nInstall with `pip install -r requirements.txt` and run the suite.\n"
+            .to_string(),
+        "The API takes a self parameter and returns None when nothing matched.\n".to_string(),
+        "See the docker-compose config: the service exposes a port and a volume.\n".to_string(),
+        "A short example:\n\n```python\ndef main():\n    print('hi')\n```\n".to_string(),
+        "vendor/thing.go\nfunc handler(w http.ResponseWriter, r *http.Request) {\n\tvar out bytes.Buffer\n\tfmt.Fprintf(&out, \"%d\", 1)\n}\n"
+            .to_string(),
+        "<?php\nfunction greet($n) { return \"hi \" . $n; }\n".to_string(),
+        "Example:\n\n```python\nimport os\n\ndef main():\n    self = None\n    print(self)\n```\n".to_string(),
+    ];
+    let fires = prose
+        .iter()
+        .map(|doc| {
+            scan_snippet(doc, SnippetLanguage::Other)
+                .count(CheatClass::DataLanguageMixing)
+        })
+        .sum::<usize>();
+    certificates.push(cert(
+        "cheat",
+        "a_document_with_no_declared_language_reports_no_mismatch",
+        "Prose, READMEs, compose files and unlabelled source report zero language-mixing \
+         findings: with no declared language there is no declaration to contradict, and the \
+         class has nothing to claim.",
+        fires as f64,
+        0.0,
+    ));
+
+    // The narrowing must not have muted the rule it kept: the same documents
+    // declared as a code language still have to fire. Index 6 is the fenced
+    // Python block — the shape the 97% fire rate was made of.
+    let switched = scan_snippet(&prose[6], SnippetLanguage::Rust)
+        .count(CheatClass::DataLanguageMixing);
+    certificates.push(cert(
+        "cheat",
+        "a_declared_language_still_reports_the_mismatch_the_same_content_produces",
+        "Declaring a language restores the check: the fenced-Python document dropped for no \
+         reason under `Other` is still reported as a switch when declared Rust.",
+        f64::from(switched != 1),
+        0.0,
+    ));
+
+    // --- 2. A mapped language is never structurally zero ---------------------
+
+    // `langdata::snippet_language` maps go->c, java|csharp->cpp and php->jsts.
+    // The comparison is `winner >= declared + margin`, so a declared slot that
+    // cannot score is a slot that loses every time, whatever the content is.
+    let mapped: &[(&str, SnippetLanguage)] = &[
+        (
+            "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tvar total int = 0\n\tfor i := 0; i < 3; i++ {\n\t\ttotal += i\n\t}\n\tfmt.Println(total)\n}\n",
+            SnippetLanguage::C,
+        ),
+        (
+            "package com.example;\n\npublic class Main {\n    public static void main(String[] args) {\n        System.out.println(\"hi\");\n    }\n}\n",
+            SnippetLanguage::Cpp,
+        ),
+        (
+            "<?php\nfunction greet($name) {\n    return \"hi \" . $name;\n}\necho greet(\"world\");\n",
+            SnippetLanguage::JsTs,
+        ),
+    ];
+    let mapped_fires = mapped
+        .iter()
+        .map(|(code, lang)| scan_snippet(code, *lang).count(CheatClass::DataLanguageMixing))
+        .sum::<usize>();
+    certificates.push(cert(
+        "cheat",
+        "a_language_mapped_onto_a_foreign_slot_is_never_read_as_a_switch",
+        "Go, Java, C# and PHP are declared through a slot they do not own; each carries enough \
+         markers in that slot that its own source is not reported as a language switch.",
+        mapped_fires as f64,
+        0.0,
+    ));
+
+    // --- 3. The tally's arithmetic is exact ---------------------------------
+
+    let mut tally = MixingTally::default();
+    tally.scanned_by_declared.insert("c".to_string(), 1_000);
+    *tally.fired.entry("c->python".to_string()).or_default() += 970;
+    *tally.fired.entry("c->jsts".to_string()).or_default() += 12;
+    let adaptation = calibrate_mixing(&tally, 0.5)?;
+    let python = adaptation
+        .pairs
+        .iter()
+        .find(|p| p.pair == "c->python")
+        .ok_or_else(|| anyhow::anyhow!("tally lost the c->python pair"))?;
+    certificates.push(cert(
+        "cheat",
+        "a_pairs_fire_rate_is_fires_over_documents_of_that_declared_language",
+        "The fire rate a pair is judged by is exactly its fires divided by the documents \
+         declared as its declared language — 970 of 1000 declared `c`.",
+        (python.fire_rate - 0.97).abs(),
+        0.0,
+    ));
+
+    // --- 4. The rule is what it says: near-universal means struck -----------
+
+    let jsts = adaptation
+        .pairs
+        .iter()
+        .find(|p| p.pair == "c->jsts")
+        .ok_or_else(|| anyhow::anyhow!("tally lost the c->jsts pair"))?;
+    let selective_fires = adaptation
+        .policy
+        .admitted_pairs
+        .contains(&("c".to_string(), "jsts".to_string()));
+    certificates.push(cert(
+        "cheat",
+        "a_near_universal_pair_is_struck_and_a_selective_one_is_kept",
+        "At max_fire_rate 0.5 a pair that fired on 97% of its declared language is struck as a \
+         constant, and one that fired on 1.2% is kept because it discriminates.",
+        f64::from(!python.removed)
+            + f64::from(selective_fires)
+            + f64::from(jsts.removed),
+        0.0,
+    ));
+
+    // --- 5. The struck set is the definition, not an approximation ----------
+
+    // `max_fire_rate` is the only knob, so the whole contract is the set
+    // equation `{p : rate(p) >= r}`. Checked against the tally directly rather
+    // than against the report the calibration produced, so the check is of the
+    // rule and not of a restatement of it.
+    //
+    // Note what is deliberately *not* claimed: that raising `r` never returns
+    // a pair. It does, once `r` passes every observed rate — that is what
+    // "strike only pairs that fired on everything" means. Monotonicity would
+    // have been a prettier claim and a false one.
+    let mut mismatches = 0.0f64;
+    for step in 1..=20 {
+        let rate = f64::from(step) / 20.0;
+        let struck = calibrate_mixing(&tally, rate)?.policy.admitted_pairs;
+        for (declared, scored) in [
+            ("c", "python"),
+            ("c", "jsts"),
+            ("rust", "python"),
+            ("jsts", "rust"),
+        ] {
+            let declared_lang = SnippetLanguage::from_name(declared);
+            let declared_scanned = tally.scanned_of(declared_lang);
+            let observed = tally.fired_on(declared_lang, SnippetLanguage::from_name(scored));
+            let rate_observed = observed as f64 / declared_scanned.max(1) as f64;
+            let expected = rate_observed >= rate;
+            let actual = struck.contains(&(declared.to_string(), scored.to_string()));
+            if expected != actual {
+                mismatches += 1.0;
+            }
+        }
+    }
+    certificates.push(cert(
+        "cheat",
+        "a_pair_is_struck_exactly_when_its_fire_rate_reaches_the_threshold",
+        "Across twenty thresholds and four pairs, including two that never fired and one \
+         declared language the tally never saw, the struck set is exactly the pairs whose \
+         observed fire rate is at least the threshold.",
+        mismatches,
+        0.0,
+    ));
+
+    // --- 6. The same evidence gives the same profile ------------------------
+
+    let first = calibrate_mixing(&tally, 0.5)?.policy;
+    let second = calibrate_mixing(&tally, 0.5)?.policy;
+    certificates.push(cert(
+        "cheat",
+        "calibration_is_a_pure_function_of_the_tally",
+        "Calibrating the same tally twice gives byte-identical policies, so the profile in \
+         force is a function of the data and not of the run that happened to read it.",
+        f64::from(first != second),
+        0.0,
+    ));
+
+    // --- 7. It can only subtract -------------------------------------------
+
+    let mut selective = MixingTally::default();
+    selective
+        .scanned_by_declared
+        .insert("rust".to_string(), MIN_CALIBRATION_DOCUMENTS);
+    *selective
+        .fired
+        .entry("rust->python".to_string())
+        .or_default() += 1;
+    let untouched = calibrate_mixing(&selective, 0.5)?
+        .policy
+        .admitted_pairs
+        .len();
+    certificates.push(cert(
+        "cheat",
+        "calibration_cannot_add_a_finding_it_did_not_have",
+        "A tally in which every pair is selective yields an empty struck set: the operation \
+         only ever removes pairs, so it cannot open a blind spot while correcting one.",
+        untouched as f64,
+        0.0,
+    ));
+
+    // --- 8. Refuses to calibrate from noise --------------------------------
+
+    let mut tiny = MixingTally::default();
+    tiny.scanned_by_declared
+        .insert("rust".to_string(), MIN_CALIBRATION_DOCUMENTS - 1);
+    let refused = calibrate_mixing(&tiny, 0.5).is_err();
+    certificates.push(cert(
+        "cheat",
+        "calibration_refuses_a_tally_too_small_to_carry_a_rate",
+        "One document below the minimum is refused, so no profile in force can have been derived \
+         from a sample too small to mean anything.",
+        (!refused) as i32 as f64,
+        0.0,
+    ));
+
+    // --- 9. The default policy is the one the code runs --------------------
+
+    let default_policy = MixingPolicy::default();
+    let default_agrees = default_policy.min_score == crate::cheat::MIX_MIN_SCORE
+        && default_policy.min_margin == crate::cheat::MIX_MIN_MARGIN
+        && default_policy.admitted_pairs.is_empty();
+    certificates.push(cert(
+        "cheat",
+        "an_uncalibrated_run_still_runs_the_stated_thresholds",
+        "With no profile loaded the rule runs at exactly the thresholds its documentation states, \
+         with every pair live, so the fix is a change of policy and not of behaviour.",
+        (!default_agrees) as i32 as f64,
+        0.0,
+    ));
+
+    Ok(certificates)
 }
 
 /// Certificates for the contamination gate.
@@ -5896,7 +6316,15 @@ fn multisource_checks() -> anyhow::Result<Vec<Certificate>> {
 
     // A single-source mix draws exactly the windows the corpus alone would,
     // from the same random stream; a 3:1 composite of eight slices 6 + 2.
-    let scratch = std::env::temp_dir().join(format!("dblocks-verify-mix-{}", std::process::id()));
+    // The scratch dir carries a counter as well as the pid: two suite tests
+    // in this process run run_all concurrently, and a pid-only path made
+    // them race (create vs. remove) into a spurious inf residual.
+    static MIX_SCRATCH_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let scratch = std::env::temp_dir().join(format!(
+        "dblocks-verify-mix-{}-{}",
+        std::process::id(),
+        MIX_SCRATCH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&scratch).with_context(|| format!("create {}", scratch.display()))?;
     let corpus_path = scratch.join("mix.bin");
     let single_err = (|| -> anyhow::Result<f64> {
@@ -7050,6 +7478,316 @@ fn autodiff_checks() -> anyhow::Result<Vec<Certificate>> {
     ])
 }
 
+// --------------------------------------------------------------- vecread --
+
+/// The raw-vector readout lens's certificates. One `anyhow::Result`: a check
+/// that cannot be set up is a failing certificate, not a panic and not a
+/// silent pass.
+fn vecread_checks() -> anyhow::Result<Vec<Certificate>> {
+    use crate::student::{GeometricStudent, StudentConfig};
+    use crate::tokenizer::ByteTokenizer;
+    use crate::vecread::{PositionSelection, VecReader};
+
+    let device: <B as burn::tensor::backend::BackendTypes>::Device = Default::default();
+    <B as burn::tensor::backend::Backend>::seed(&device, 0);
+    let config = StudentConfig {
+        hidden_size: 32,
+        num_layers: 2,
+        num_heads: 2,
+        num_kv_heads: 1,
+        context: 24,
+        intermediate_size: 16,
+        cond_hidden_size: 8,
+        frequency_embedding_size: 8,
+        attention: "dense".into(),
+        experts_per_box: 1,
+        geom_slots: 2,
+        geom_dim: 4,
+        geom_refine_steps: 2,
+        geom_cond_hidden: 8,
+        geom_frequency: 4,
+        ..StudentConfig::default()
+    };
+    let student = GeometricStudent::<B>::new(&config, &device)?;
+    crate::tensor_ext::force_initialization(&student);
+    let ids = ByteTokenizer::new().encode_document("fn main() {}");
+    let n = ids.len();
+    let tokens = Tensor::<B, 1, Int>::from_ints(
+        ids.iter()
+            .map(|t| i64::from(*t))
+            .collect::<Vec<_>>()
+            .as_slice(),
+        &device,
+    )
+    .reshape([1, n]);
+
+    let reader = VecReader {
+        top_k: 5,
+        positions: PositionSelection::All,
+        ..VecReader::default()
+    };
+    let depth = 2;
+    let trace = reader.read_student_thinking(&student, tokens.clone(), &[depth])?;
+    let out = student.forward_depth(tokens, Some(depth))?;
+    let vocab = config.vocab_size;
+    let logits: Vec<f32> = out
+        .logits
+        .reshape([n, vocab])
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect();
+
+    // The lens at the final state IS the model's readout: the top-1 decode at
+    // every position must be the argmax of the trunk's own logits, exactly.
+    let entry = trace
+        .depths
+        .first()
+        .context("the trace holds the one requested depth")?;
+    let mut argmax_mismatches = 0.0f64;
+    for dec in &entry.decodes {
+        let row = &logits[dec.position * vocab..(dec.position + 1) * vocab];
+        let argmax = row
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0)))
+            .map(|(i, _)| i)
+            .context("a non-empty logits row")?;
+        let top = dec
+            .top
+            .first()
+            .context("a decode reports at least one candidate")?;
+        if usize::from(top.id) != argmax {
+            argmax_mismatches += 1.0;
+        }
+    }
+
+    // Every decode is cut from a normalized softmax row: the recorded mass of
+    // the full row stays within float error of 1.
+    let mut distribution_residual = 0.0f64;
+    for depth_trace in &trace.depths {
+        for dec in &depth_trace.decodes {
+            distribution_residual =
+                distribution_residual.max((f64::from(dec.prob_sum) - 1.0).abs());
+        }
+    }
+
+    // --- causal validation --------------------------------------------------
+    // Readable is not causal (Lanham et al., 2307.13702): the two certs below
+    // require the lens to *see* interventions on the refinement and the final
+    // logits to *depend* on its depth. On a fresh student the geometric
+    // stream is an exact identity (zero-init readout — the stream's own
+    // certificate pins that), which would make both claims vacuously false;
+    // so this student gets its readout nudged off zero first, giving the
+    // stream a visible write to read. The claim is about the mechanism.
+    use burn::nn::LinearConfig;
+    let mut writing = GeometricStudent::<B>::new(&config, &device)?;
+    crate::tensor_ext::force_initialization(&writing);
+    writing.set_geom_readout(
+        LinearConfig::new(config.geom_dim, config.hidden_size)
+            .with_bias(true)
+            .init(&device),
+    );
+    let causal_ids = ByteTokenizer::new().encode_document("fn main() { return; }");
+    let causal_n = causal_ids.len();
+    let causal_tokens = Tensor::<B, 1, Int>::from_ints(
+        causal_ids
+            .iter()
+            .map(|t| i64::from(*t))
+            .collect::<Vec<_>>()
+            .as_slice(),
+        &device,
+    )
+    .reshape([1, causal_n]);
+
+    let shallow = writing.forward_depth(causal_tokens.clone(), Some(2))?;
+    let deep = writing.forward_depth(causal_tokens.clone(), Some(4))?;
+
+    // The certified energy descent holds on both trajectories.
+    let mut descent_violations = 0.0f64;
+    for energies in [&shallow.refine.energy, &deep.refine.energy] {
+        for pair in energies.windows(2) {
+            if let (Some(before), Some(after)) = (pair.first(), pair.last()) {
+                if *after > *before + 1e-6 {
+                    descent_violations += 1.0;
+                }
+            }
+        }
+    }
+
+    let to_host = |logits: Tensor<B, 3>| -> Vec<f32> {
+        logits
+            .reshape([causal_n, vocab])
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect()
+    };
+    let shallow_logits = to_host(shallow.logits);
+    let deep_logits = to_host(deep.logits);
+    let last = causal_n - 1;
+
+    // Truncation intervention: refine 2 vs 4 steps. The decode of the last
+    // position must move, measured as KL between the full softmax rows.
+    let kl_truncation = kl_between_logit_rows(
+        row_at(&shallow_logits, last, vocab),
+        row_at(&deep_logits, last, vocab),
+    );
+
+    // The lens report itself — the artifact a human reads — must show the
+    // change: a different top-1 token or a moved top-1 probability.
+    let lens_shallow = reader.read_student_thinking(&writing, causal_tokens.clone(), &[2])?;
+    let lens_deep = reader.read_student_thinking(&writing, causal_tokens.clone(), &[4])?;
+    let top_of = |t: &crate::vecread::ThoughtTrace| -> Option<(u16, f32)> {
+        t.depths
+            .first()
+            .and_then(|d| d.decodes.first())
+            .and_then(|dec| dec.top.first())
+            .map(|c| (c.id, c.probability))
+    };
+    let lens_sees_truncation = match (top_of(&lens_shallow), top_of(&lens_deep)) {
+        (Some(a), Some(b)) => a.0 != b.0 || (a.1 - b.1).abs() > 1e-6,
+        _ => false,
+    };
+
+    // Bounded-offset intervention: add a fixed pattern at 25% of the last
+    // position's RMS to the depth-2 hidden state; the decode must move.
+    let pass = writing.slots_at_depth(causal_tokens.clone(), Some(2))?;
+    let hidden_host: Vec<f32> = pass
+        .hidden
+        .clone()
+        .reshape([causal_n, config.hidden_size])
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect();
+    let hidden_row = &hidden_host[last * config.hidden_size..(last + 1) * config.hidden_size];
+    let row_rms =
+        (hidden_row.iter().map(|v| v * v).sum::<f32>() / config.hidden_size as f32).sqrt();
+    let mut offset = vec![0.0f32; causal_n * config.hidden_size];
+    for (i, cell) in offset
+        .iter_mut()
+        .skip(last * config.hidden_size)
+        .take(config.hidden_size)
+        .enumerate()
+    {
+        let sign = if i % 2 == 0 { 1.0 } else { -1.0 };
+        *cell = 0.25 * row_rms * sign;
+    }
+    let offset = Tensor::<B, 3>::from_data(
+        burn::tensor::TensorData::new(offset, [1, causal_n, config.hidden_size]),
+        &device,
+    );
+    let perturbed = to_host(writing.trunk().logits_from_hidden(pass.hidden + offset));
+    let kl_offset = kl_between_logit_rows(
+        row_at(&shallow_logits, last, vocab),
+        row_at(&perturbed, last, vocab),
+    );
+
+    let mut trajectory_residual = descent_violations;
+    for (what, kl) in [("truncation", kl_truncation), ("offset", kl_offset)] {
+        if kl <= 1e-6 {
+            eprintln!("verify: vecread: {what} intervention moved the decode by only {kl}");
+            trajectory_residual += 1.0;
+        }
+    }
+    if !lens_sees_truncation {
+        eprintln!("verify: vecread: the lens report's top-1 did not change between depths 2 and 4");
+        trajectory_residual += 1.0;
+    }
+
+    // Lanham-style depth dependence: over a small battery, at least one
+    // input's final logits must move between depth 1 and the full refinement
+    // by more than float noise.
+    let mut battery_max = 0.0f64;
+    for text in ["fn f() {}", "let x = 1;", "def g(): pass"] {
+        let ids = ByteTokenizer::new().encode_document(text);
+        let n = ids.len();
+        let tokens = Tensor::<B, 1, Int>::from_ints(
+            ids.iter()
+                .map(|t| i64::from(*t))
+                .collect::<Vec<_>>()
+                .as_slice(),
+            &device,
+        )
+        .reshape([1, n]);
+        let one = writing.forward_depth(tokens.clone(), Some(1))?.logits;
+        let full = writing.forward_depth(tokens, None)?.logits;
+        let one_host: Vec<f32> = one.into_data().convert::<f32>().iter::<f32>().collect();
+        let full_host: Vec<f32> = full.into_data().convert::<f32>().iter::<f32>().collect();
+        let diff = one_host
+            .iter()
+            .zip(full_host.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        battery_max = battery_max.max(f64::from(diff));
+    }
+    let depth_dependence_residual = (1e-4 - battery_max).max(0.0);
+
+    Ok(vec![
+        cert(
+            "vecread",
+            "lens_at_output_layer_matches_model_argmax",
+            "Decoding the final hidden state through the lens reproduces the trunk's own \
+             logits argmax at every position: the readout at the output layer is the model's \
+             readout, not an approximation of it.",
+            argmax_mismatches,
+            0.0,
+        ),
+        cert(
+            "vecread",
+            "decode_probabilities_are_a_distribution",
+            "Every decoded step's top-k is cut from a normalized softmax row: the full row's \
+             mass is 1 up to float error.",
+            distribution_residual,
+            1e-6,
+        ),
+        cert(
+            "vecread",
+            "lens_decode_tracks_perturbed_trajectory",
+            "Truncating the refinement (2 vs 4 steps) and adding a bounded offset at the \
+             decoded position each move the lens decode measurably (full-row KL > 1e-6), the \
+             report's top-1 changes, and the certified energy descent still holds on both \
+             trajectories: the lens sees the intervention. (On a student whose zero-init \
+             readout was nudged off zero — at exact init the stream is the identity and \
+             there is nothing to see.)",
+            trajectory_residual,
+            0.0,
+        ),
+        cert(
+            "vecread",
+            "answer_depends_on_refine_steps",
+            "Over a small prompt battery, at least one input's final logits move by more than \
+             1e-4 between depth 1 and the full refinement: the refinement is load-bearing, \
+             not decoration. (Same caveat: the zero-init readout is nudged off zero first, \
+             because a fresh student's stream is an exact identity by design.)",
+            depth_dependence_residual,
+            0.0,
+        ),
+    ])
+}
+
+/// Row `pos` of a `[n, vocab]` row-major logits buffer.
+fn row_at(rows: &[f32], pos: usize, vocab: usize) -> &[f32] {
+    &rows[pos * vocab..(pos + 1) * vocab]
+}
+
+/// KL(p || q) between two full logit rows, softmaxed on the host in f64.
+fn kl_between_logit_rows(a: &[f32], b: &[f32]) -> f64 {
+    let softmax = |row: &[f32]| -> Vec<f64> {
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f64> = row.iter().map(|v| f64::from(*v - max).exp()).collect();
+        let sum: f64 = exps.iter().sum();
+        exps.iter().map(|e| e / sum).collect()
+    };
+    let p = softmax(a);
+    let q = softmax(b);
+    p.iter()
+        .zip(q.iter())
+        .map(|(pi, qi)| pi * (pi / qi).ln())
+        .sum()
+}
+
 #[cfg(test)]
 // A test says "this must have worked" with `unwrap`, which is the right
 // thing for a test to say. The grant is scoped to this module: production
@@ -7118,6 +7856,7 @@ mod tests {
                 "schedule",
                 "solver",
                 "stats",
+                "vecread",
             ]
         );
 

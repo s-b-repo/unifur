@@ -59,7 +59,7 @@
 //! axiom tables are mutually consistent.
 
 use crate::geomkernel::{
-    Angle3, Constraint, Fact, Frac, GeometryError, KPoint, Q, QSqrt, SceneGraph, Segment,
+    Angle3, Constraint, Fact, Frac, GeometryError, KPoint, QSqrt, SceneGraph, Segment, Q,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -80,9 +80,7 @@ use std::str::FromStr;
 pub enum NonEuclideanError {
     /// A `SceneGraph::geometry` string naming no geometry in
     /// [`GeometryKind::ALL`].
-    UnknownGeometry {
-        name: String,
-    },
+    UnknownGeometry { name: String },
     /// An environment applied to a scene that declares a different one. The
     /// two cannot be reconciled silently: reading a spherical figure under
     /// the Euclidean rules is the over-application this module stops.
@@ -101,21 +99,15 @@ pub enum NonEuclideanError {
     /// A quantity needing a number type this module does not have.
     /// Approximating it would be the failure the whole exercise is about, so
     /// the answer is a refusal with the reason attached.
-    OutOfScope {
-        detail: String,
-    },
+    OutOfScope { detail: String },
     /// Numeric evidence asked to become a fact. Always an error: a sum of
     /// three angles is not a rational, and `180.0000001` is not `180`.
-    EvidenceIsNotAFact {
-        quantity: String,
-    },
+    EvidenceIsNotAFact { quantity: String },
     /// A cross ratio of four points that are not four distinct points on one
     /// line. The cross ratio is a decision about exactly four distinct
     /// collinear points; anything else has no value rather than a surprising
     /// one.
-    DegenerateCrossRatio {
-        detail: String,
-    },
+    DegenerateCrossRatio { detail: String },
 }
 
 impl fmt::Display for NonEuclideanError {
@@ -131,7 +123,11 @@ impl fmt::Display for NonEuclideanError {
                 "this environment is {declared} but the scene declares '{scene}': reading a \
                  figure under axioms it did not declare is the error this module exists to stop"
             ),
-            Self::TheoremNotPermitted { geometry, theorem, permitted } => write!(
+            Self::TheoremNotPermitted {
+                geometry,
+                theorem,
+                permitted,
+            } => write!(
                 f,
                 "{geometry} does not license '{theorem}'; it licenses: {}",
                 permitted.join(", ")
@@ -265,9 +261,7 @@ impl GeometryKind {
     /// an honest `false` there would read as a refutation.
     pub fn agrees_with_angle_sum(&self, degrees: f64) -> Option<bool> {
         match self.angle_sum_axiom()? {
-            Axiom::AnglesSumTo180 => {
-                Some((degrees - 180.0).abs() <= ANGLE_SUM_TOLERANCE_DEGREES)
-            }
+            Axiom::AnglesSumTo180 => Some((degrees - 180.0).abs() <= ANGLE_SUM_TOLERANCE_DEGREES),
             Axiom::AnglesSumTo360 => Some(degrees > 180.0),
             Axiom::AnglesSumBelow180 => Some(degrees < 180.0),
             // Unreachable: the arm is over the axioms this module knows an
@@ -301,7 +295,10 @@ impl FromStr for GeometryKind {
             "projective" => Ok(GeometryKind::Projective),
             "spherical" | "spheric" | "elliptic" | "elliptical" => Ok(GeometryKind::Spherical),
             "hyperbolic" | "boltzmann" | "klein" | "cayley-klein" => Ok(GeometryKind::Hyperbolic),
-            _ => Err(NonEuclideanError::UnknownGeometry { name: text.to_string() }.into()),
+            _ => Err(NonEuclideanError::UnknownGeometry {
+                name: text.to_string(),
+            }
+            .into()),
         }
     }
 }
@@ -486,7 +483,11 @@ impl Axiom {
     /// than restated: a second hand-written list of the same facts is a
     /// second thing to get wrong.
     pub fn held_by(&self) -> Vec<GeometryKind> {
-        GeometryKind::ALL.iter().copied().filter(|kind| kind.asserts(*self)).collect()
+        GeometryKind::ALL
+            .iter()
+            .copied()
+            .filter(|kind| kind.asserts(*self))
+            .collect()
     }
 }
 
@@ -732,12 +733,20 @@ impl GeometryKind {
     /// received `false` would have to invent what to do about it, and an error
     /// that names the theorems it *would* license is a decision it can make.
     pub fn require_theorem(&self, rule_or_theorem: &str) -> anyhow::Result<&'static str> {
-        match self.valid_theorems().iter().find(|name| **name == rule_or_theorem) {
+        match self
+            .valid_theorems()
+            .iter()
+            .find(|name| **name == rule_or_theorem)
+        {
             Some(licensed) => Ok(*licensed),
             None => Err(NonEuclideanError::TheoremNotPermitted {
                 geometry: *self,
                 theorem: rule_or_theorem.to_string(),
-                permitted: self.valid_theorems().iter().map(|name| name.to_string()).collect(),
+                permitted: self
+                    .valid_theorems()
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect(),
             }
             .into()),
         }
@@ -878,15 +887,25 @@ impl NumericEvidence {
             );
             total += value.clamp(-1.0, 1.0).acos().to_degrees();
         }
-        let named = angles.iter().map(|angle| angle.at.as_str()).collect::<Vec<&str>>().join(", ");
-        Ok(Self::degrees(&format!("angle sum of the angles at {named}"), total))
+        let named = angles
+            .iter()
+            .map(|angle| angle.at.as_str())
+            .collect::<Vec<&str>>()
+            .join(", ");
+        Ok(Self::degrees(
+            &format!("angle sum of the angles at {named}"),
+            total,
+        ))
     }
 
     /// Refuse to promote this to a fact. Always an `Err`; the `Ok` type is
     /// never produced, which is the enforcement the honesty rule asks for. A
     /// caller that wants a fact has to find an exact route to one.
     pub fn into_fact(self) -> anyhow::Result<Fact> {
-        Err(NonEuclideanError::EvidenceIsNotAFact { quantity: self.quantity }.into())
+        Err(NonEuclideanError::EvidenceIsNotAFact {
+            quantity: self.quantity,
+        }
+        .into())
     }
 
     /// Whether the declared geometry's angle-sum axiom is *consistent with*
@@ -903,7 +922,11 @@ impl NumericEvidence {
 
 impl fmt::Display for NumericEvidence {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} = {} {} [evidence: {}]", self.quantity, self.value, self.unit, self.caveat)
+        write!(
+            f,
+            "{} = {} {} [evidence: {}]",
+            self.quantity, self.value, self.unit, self.caveat
+        )
     }
 }
 
@@ -1003,12 +1026,16 @@ impl AxiomReport {
 
     /// The violation naming `statement`, or `None`.
     pub fn violation_for(&self, statement: &str) -> Option<&AxiomViolation> {
-        self.violations.iter().find(|violation| violation.statement == statement)
+        self.violations
+            .iter()
+            .find(|violation| violation.statement == statement)
     }
 
     /// The underdetermination naming `statement`, or `None`.
     pub fn underdetermination_for(&self, statement: &str) -> Option<&Underdetermination> {
-        self.underdetermined.iter().find(|open| open.statement == statement)
+        self.underdetermined
+            .iter()
+            .find(|open| open.statement == statement)
     }
 }
 
@@ -1030,7 +1057,11 @@ impl fmt::Display for AxiomReport {
             )?;
         }
         for open in &self.underdetermined {
-            write!(f, "\n  undecided: {} -- needs {} ({})", open.statement, open.needed, open.axiom)?;
+            write!(
+                f,
+                "\n  undecided: {} -- needs {} ({})",
+                open.statement, open.needed, open.axiom
+            )?;
         }
         Ok(())
     }
@@ -1191,12 +1222,7 @@ impl GeometryKind {
     /// projective plane the meeting point is the ideal point of the common
     /// direction, and on the sphere the two great circles through the
     /// segments cross in two antipodal directions.
-    fn meeting_witness(
-        &self,
-        graph: &SceneGraph,
-        first: &Segment,
-        second: &Segment,
-    ) -> String {
+    fn meeting_witness(&self, graph: &SceneGraph, first: &Segment, second: &Segment) -> String {
         let (p1, p2) = match (ProjectivePlane::segment_line(graph, first), ProjectivePlane::segment_line(graph, second)) {
             (Ok(one), Ok(other)) => (one, other),
             _ => return "the exact witness could not be built: a segment is degenerate or names an undeclared point".to_string(),
@@ -1204,14 +1230,20 @@ impl GeometryKind {
         match *self {
             GeometryKind::Projective => match p1.meet(&p2) {
                 Ok(where_) => format!("they meet at the exact point {}", where_.describe()),
-                Err(_) => "the exact witness could not be built: the two segments are the same line".to_string(),
+                Err(_) => {
+                    "the exact witness could not be built: the two segments are the same line"
+                        .to_string()
+                }
             },
             GeometryKind::Spherical => {
                 match SphericalModel::meet_of_segments(graph, first, second) {
                     Ok(ray) => {
                         format!("the two great circles through the segments meet in the exact direction {}", ray.describe())
                     }
-                    Err(_) => "the two segments name one great circle, so they are the same line, not two".to_string(),
+                    Err(_) => {
+                        "the two segments name one great circle, so they are the same line, not two"
+                            .to_string()
+                    }
                 }
             }
             _ => "the declared geometry decides this without a witness".to_string(),
@@ -1233,11 +1265,11 @@ mod q_serde {
     use super::{Frac, Q};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    pub fn serialize<S: Serializer>(value: &Q, serializer: S) -> Result<S::Ok, S::Error> {
+    pub(super) fn serialize<S: Serializer>(value: &Q, serializer: S) -> Result<S::Ok, S::Error> {
         Frac::from_q(*value).serialize(serializer)
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Q, D::Error> {
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Q, D::Error> {
         Frac::deserialize(deserializer)?
             .to_q()
             .map_err(serde::de::Error::custom)
@@ -1272,10 +1304,12 @@ impl PPoint {
         anyhow::ensure!(
             !(x.is_zero() && y.is_zero() && z.is_zero()),
             "{}",
-            GeometryError::EmptyGeometry("the homogeneous triple (0, 0, 0) is not a point: it \
+            GeometryError::EmptyGeometry(
+                "the homogeneous triple (0, 0, 0) is not a point: it \
                  has no direction and no position, and every nonzero scaling of it is still \
                  zero"
-                .to_string())
+                    .to_string()
+            )
         );
         Ok(Self { x, y, z })
     }
@@ -1324,9 +1358,15 @@ impl PPoint {
         anyhow::ensure!(
             !factor.is_zero(),
             "{}",
-            GeometryError::EmptyGeometry("scaling a projective point by zero erases it".to_string())
+            GeometryError::EmptyGeometry(
+                "scaling a projective point by zero erases it".to_string()
+            )
         );
-        Ok(Self { x: self.x.mul(factor)?, y: self.y.mul(factor)?, z: self.z.mul(factor)? })
+        Ok(Self {
+            x: self.x.mul(factor)?,
+            y: self.y.mul(factor)?,
+            z: self.z.mul(factor)?,
+        })
     }
 
     /// A normalized representative: the first nonzero coordinate is `1`.
@@ -1338,7 +1378,11 @@ impl PPoint {
         } else if !self.y.is_zero() {
             Self::new(Q::ZERO, Q::ONE, self.z.div(&self.y)?)
         } else {
-            anyhow::ensure!(!self.z.is_zero(), "{}", GeometryError::EmptyGeometry("the zero point does not normalize".to_string()));
+            anyhow::ensure!(
+                !self.z.is_zero(),
+                "{}",
+                GeometryError::EmptyGeometry("the zero point does not normalize".to_string())
+            );
             Self::new(Q::ZERO, Q::ZERO, Q::ONE)
         }
     }
@@ -1347,7 +1391,11 @@ impl PPoint {
     /// [`KPoint`] has two coordinates and so is an affine object.
     pub fn to_kpoint(&self, name: &str) -> anyhow::Result<KPoint> {
         let (x, y) = self.to_affine()?;
-        Ok(KPoint { name: name.to_string(), x: Frac::from_q(x), y: Frac::from_q(y) })
+        Ok(KPoint {
+            name: name.to_string(),
+            x: Frac::from_q(x),
+            y: Frac::from_q(y),
+        })
     }
 }
 
@@ -1390,9 +1438,11 @@ impl PLine {
         anyhow::ensure!(
             !(a.is_zero() && b.is_zero() && c.is_zero()),
             "{}",
-            GeometryError::EmptyGeometry("the coefficient triple (0, 0, 0) is not a line: it \
+            GeometryError::EmptyGeometry(
+                "the coefficient triple (0, 0, 0) is not a line: it \
                  contains every point, so it constrains nothing"
-                .to_string())
+                    .to_string()
+            )
         );
         Ok(Self { a, b, c })
     }
@@ -1415,7 +1465,11 @@ impl PLine {
     pub fn line_at_infinity() -> Self {
         // The coefficients are nonzero by construction, so this is total: the
         // all-zero refusal in `new` cannot fire for a constant.
-        Self { a: Q::ZERO, b: Q::ZERO, c: Q::ONE }
+        Self {
+            a: Q::ZERO,
+            b: Q::ZERO,
+            c: Q::ONE,
+        }
     }
 
     /// Whether `point` lies on this line, exactly.
@@ -1438,9 +1492,7 @@ impl PLine {
             self.c.mul(&other.a)?.sub(&self.a.mul(&other.c)?)?,
             self.a.mul(&other.b)?.sub(&self.b.mul(&other.a)?)?,
         );
-        PPoint::new(x, y, z).map_err(|_| {
-            GeometryError::CoincidentLines.into()
-        })
+        PPoint::new(x, y, z).map_err(|_| GeometryError::CoincidentLines.into())
     }
 
     /// The point at infinity of this line, `[b : -a : 0]`: the direction the
@@ -1463,7 +1515,11 @@ impl PLine {
         let (mine, theirs) = (self.at_infinity()?, other.at_infinity()?);
         // equal directions iff the cross product vanishes; compared through a
         // ratio rather than a triple, since both are at infinity
-        Ok(mine.x.mul(&theirs.y)?.sub(&mine.y.mul(&theirs.x)?)?.is_zero())
+        Ok(mine
+            .x
+            .mul(&theirs.y)?
+            .sub(&mine.y.mul(&theirs.x)?)?
+            .is_zero())
     }
 
     /// A one-line identity for reports, normalized.
@@ -1481,7 +1537,11 @@ impl PLine {
         } else if !self.b.is_zero() {
             Self::new(Q::ZERO, Q::ONE, self.c.div(&self.b)?)
         } else {
-            anyhow::ensure!(!self.c.is_zero(), "{}", GeometryError::EmptyGeometry("the zero line does not normalize".to_string()));
+            anyhow::ensure!(
+                !self.c.is_zero(),
+                "{}",
+                GeometryError::EmptyGeometry("the zero line does not normalize".to_string())
+            );
             Self::new(Q::ZERO, Q::ZERO, Q::ONE)
         }
     }
@@ -1527,7 +1587,12 @@ impl ProjectivePlane {
                 line.contains(other)?,
                 "{}",
                 NonEuclideanError::DegenerateCrossRatio {
-                    detail: format!("{} is not on the line through {} and {}", other.describe(), a.describe(), b.describe()),
+                    detail: format!(
+                        "{} is not on the line through {} and {}",
+                        other.describe(),
+                        a.describe(),
+                        b.describe()
+                    ),
                 }
             );
         }
@@ -1594,7 +1659,11 @@ impl ProjectivePlane {
         let t = if !b_aff.0.sub(&a_aff.0)?.is_zero() {
             c_aff.0.sub(&a_aff.0)?.div(&b_aff.0.sub(&a_aff.0)?)?
         } else {
-            anyhow::ensure!(!b_aff.1.sub(&a_aff.1)?.is_zero(), "{}", GeometryError::DegenerateSegment);
+            anyhow::ensure!(
+                !b_aff.1.sub(&a_aff.1)?.is_zero(),
+                "{}",
+                GeometryError::DegenerateSegment
+            );
             c_aff.1.sub(&a_aff.1)?.div(&b_aff.1.sub(&a_aff.1)?)?
         };
         let den = t.mul(&Q::from_int(2))?.sub(&Q::ONE)?;
@@ -1760,7 +1829,9 @@ impl AffinePlane {
             "{}",
             GeometryError::DegenerateSegment
         );
-        let collinear = dx.mul(&m_aff.1.sub(&a_aff.1)?)?.sub(&dy.mul(&m_aff.0.sub(&a_aff.0)?)?)?;
+        let collinear = dx
+            .mul(&m_aff.1.sub(&a_aff.1)?)?
+            .sub(&dy.mul(&m_aff.0.sub(&a_aff.0)?)?)?;
         anyhow::ensure!(
             collinear.is_zero(),
             "{}",
@@ -1783,11 +1854,7 @@ impl AffinePlane {
         );
         // AM / MB = t / (1 - t)
         let one_minus = Q::ONE.sub(&t)?;
-        anyhow::ensure!(
-            !one_minus.is_zero(),
-            "{}",
-            GeometryError::DegenerateSegment
-        );
+        anyhow::ensure!(!one_minus.is_zero(), "{}", GeometryError::DegenerateSegment);
         t.div(&one_minus)
     }
 
@@ -1795,7 +1862,11 @@ impl AffinePlane {
     /// [`Self::ratio`]. A midpoint is `1 : 1`, and a trisection point is not
     /// a mystery in this geometry either.
     pub fn point_at_ratio(a: &PPoint, b: &PPoint, num: Q, den: Q) -> anyhow::Result<PPoint> {
-        anyhow::ensure!(!num.is_zero() && !den.is_zero(), "{}", GeometryError::DegenerateSegment);
+        anyhow::ensure!(
+            !num.is_zero() && !den.is_zero(),
+            "{}",
+            GeometryError::DegenerateSegment
+        );
         let (a_aff, b_aff) = (a.to_affine()?, b.to_affine()?);
         let total = num.add(&den)?;
         let t = num.div(&total)?;
@@ -1973,11 +2044,7 @@ impl CayleyKleinDisk {
         // line would do; this one is exact and always finite, because
         // `a^2 + b^2` is nonzero for a line that has a direction at all.
         let norm_sq = line.a.mul(&line.a)?.add(&line.b.mul(&line.b)?)?;
-        anyhow::ensure!(
-            !norm_sq.is_zero(),
-            "{}",
-            GeometryError::DegenerateSegment
-        );
+        anyhow::ensure!(!norm_sq.is_zero(), "{}", GeometryError::DegenerateSegment);
         let base = PPoint::affine(
             line.a.mul(&line.c)?.neg()?.div(&norm_sq)?,
             line.b.mul(&line.c)?.neg()?.div(&norm_sq)?,
@@ -2046,9 +2113,11 @@ impl SRay {
         anyhow::ensure!(
             !(x.is_zero() && y.is_zero() && z.is_zero()),
             "{}",
-            GeometryError::EmptyGeometry("the triple (0, 0, 0) is not a direction, so it is not \
+            GeometryError::EmptyGeometry(
+                "the triple (0, 0, 0) is not a direction, so it is not \
                  a point of the sphere: it lies on every great circle"
-                .to_string())
+                    .to_string()
+            )
         );
         Ok(Self { x, y, z })
     }
@@ -2058,16 +2127,36 @@ impl SRay {
     /// sphere, which is the antipodal identification made into a decision.
     pub fn normalize(&self) -> anyhow::Result<Self> {
         if !self.x.is_zero() {
-            Ok(Self { x: Q::ONE, y: self.y.div(&self.x)?, z: self.z.div(&self.x)? })
+            Ok(Self {
+                x: Q::ONE,
+                y: self.y.div(&self.x)?,
+                z: self.z.div(&self.x)?,
+            })
         } else if !self.y.is_zero() {
-            let positive = if self.y.less(&Q::ZERO) { self.y.neg()? } else { self.y };
-            Ok(Self { x: Q::ZERO, y: Q::ONE, z: self.z.div(&positive)? })
+            let positive = if self.y.less(&Q::ZERO) {
+                self.y.neg()?
+            } else {
+                self.y
+            };
+            Ok(Self {
+                x: Q::ZERO,
+                y: Q::ONE,
+                z: self.z.div(&positive)?,
+            })
         } else {
-            anyhow::ensure!(!self.z.is_zero(), "{}", GeometryError::EmptyGeometry("the zero direction does not normalize".to_string()));
+            anyhow::ensure!(
+                !self.z.is_zero(),
+                "{}",
+                GeometryError::EmptyGeometry("the zero direction does not normalize".to_string())
+            );
             // the sign is immaterial once the triple is (0, 0, +/-1), and the
             // normalize is the *identification* of antipodes, so the positive
             // representative is the one kept
-            Ok(Self { x: Q::ZERO, y: Q::ZERO, z: Q::ONE })
+            Ok(Self {
+                x: Q::ZERO,
+                y: Q::ZERO,
+                z: Q::ONE,
+            })
         }
     }
 
@@ -2157,8 +2246,10 @@ impl SphericalModel {
         first: &Segment,
         second: &Segment,
     ) -> anyhow::Result<SRay> {
-        let (first_normal, second_normal) =
-            (Self::circle_of(graph, first)?, Self::circle_of(graph, second)?);
+        let (first_normal, second_normal) = (
+            Self::circle_of(graph, first)?,
+            Self::circle_of(graph, second)?,
+        );
         SphericalModel.meet(&first_normal, &second_normal)
     }
 
@@ -2233,12 +2324,19 @@ mod tests {
 
     /// A lattice point, which is what the planar figures below are made of.
     fn kp(name: &str, x: i64, y: i64) -> KPoint {
-        KPoint { name: name.to_string(), x: Frac::from_int(x), y: Frac::from_int(y) }
+        KPoint {
+            name: name.to_string(),
+            x: Frac::from_int(x),
+            y: Frac::from_int(y),
+        }
     }
 
     /// A segment between two of those names.
     fn seg(from: &str, to: &str) -> Segment {
-        Segment { from: from.to_string(), to: to.to_string() }
+        Segment {
+            from: from.to_string(),
+            to: to.to_string(),
+        }
     }
 
     /// A scene in a declared geometry, built from points and given statements.
@@ -2310,17 +2408,37 @@ mod tests {
 
     #[test]
     fn test_geometry_names_parse_and_unknown_names_are_refused() {
-        assert_eq!("euclidean".parse::<GeometryKind>().unwrap(), GeometryKind::Euclidean);
-        assert_eq!("  Projective ".parse::<GeometryKind>().unwrap(), GeometryKind::Projective);
+        assert_eq!(
+            "euclidean".parse::<GeometryKind>().unwrap(),
+            GeometryKind::Euclidean
+        );
+        assert_eq!(
+            "  Projective ".parse::<GeometryKind>().unwrap(),
+            GeometryKind::Projective
+        );
         // the classical synonyms are accepted, because the literature uses them
-        assert_eq!("elliptic".parse::<GeometryKind>().unwrap(), GeometryKind::Spherical);
-        assert_eq!("Boltzmann".parse::<GeometryKind>().unwrap(), GeometryKind::Hyperbolic);
+        assert_eq!(
+            "elliptic".parse::<GeometryKind>().unwrap(),
+            GeometryKind::Spherical
+        );
+        assert_eq!(
+            "Boltzmann".parse::<GeometryKind>().unwrap(),
+            GeometryKind::Hyperbolic
+        );
         // and anything else is an error carrying the valid list, not a default
         let why = refusal("hyperbolic-ish".parse::<GeometryKind>());
-        assert_eq!(why, NonEuclideanError::UnknownGeometry { name: "hyperbolic-ish".to_string() });
+        assert_eq!(
+            why,
+            NonEuclideanError::UnknownGeometry {
+                name: "hyperbolic-ish".to_string()
+            }
+        );
         let text = why.to_string();
         for name in GeometryKind::names() {
-            assert!(text.contains(name), "the refusal does not offer {name}: {text}");
+            assert!(
+                text.contains(name),
+                "the refusal does not offer {name}: {text}"
+            );
         }
     }
 
@@ -2347,9 +2465,18 @@ mod tests {
 
     #[test]
     fn test_the_angle_sum_axiom_differs_per_geometry() {
-        assert_eq!(GeometryKind::Euclidean.angle_sum_axiom(), Some(Axiom::AnglesSumTo180));
-        assert_eq!(GeometryKind::Spherical.angle_sum_axiom(), Some(Axiom::AnglesSumTo360));
-        assert_eq!(GeometryKind::Hyperbolic.angle_sum_axiom(), Some(Axiom::AnglesSumBelow180));
+        assert_eq!(
+            GeometryKind::Euclidean.angle_sum_axiom(),
+            Some(Axiom::AnglesSumTo180)
+        );
+        assert_eq!(
+            GeometryKind::Spherical.angle_sum_axiom(),
+            Some(Axiom::AnglesSumTo360)
+        );
+        assert_eq!(
+            GeometryKind::Hyperbolic.angle_sum_axiom(),
+            Some(Axiom::AnglesSumBelow180)
+        );
         // the two non-metric geometries have no angle axiom at all, and saying
         // so is better than defaulting them to 180
         assert_eq!(GeometryKind::Affine.angle_sum_axiom(), None);
@@ -2372,14 +2499,26 @@ mod tests {
             // point of the table: it is the *only* claim all five share, which
             // is exactly why sharing it is not enough
             if *axiom != Axiom::IncidenceAxiom {
-                assert!(holders.len() < GeometryKind::ALL.len(), "{axiom} is held everywhere");
+                assert!(
+                    holders.len() < GeometryKind::ALL.len(),
+                    "{axiom} is held everywhere"
+                );
             }
         }
-        assert_eq!(Axiom::IncidenceAxiom.held_by().len(), GeometryKind::ALL.len());
+        assert_eq!(
+            Axiom::IncidenceAxiom.held_by().len(),
+            GeometryKind::ALL.len()
+        );
         for kind in GeometryKind::all() {
-            assert!(kind.axioms().len() < Axiom::ALL.len(), "{kind} asserts everything");
+            assert!(
+                kind.axioms().len() < Axiom::ALL.len(),
+                "{kind} asserts everything"
+            );
             // and the incidence axiom is the one thing all five share
-            assert!(kind.asserts(Axiom::IncidenceAxiom), "{kind} lacks even incidence");
+            assert!(
+                kind.asserts(Axiom::IncidenceAxiom),
+                "{kind} lacks even incidence"
+            );
         }
     }
 
@@ -2400,7 +2539,11 @@ mod tests {
         assert!(!GeometryKind::Projective.permits("triangle_angle_sum"));
         let why = refusal(GeometryKind::Projective.require_theorem("triangle_angle_sum"));
         match &why {
-            NonEuclideanError::TheoremNotPermitted { geometry, theorem, permitted } => {
+            NonEuclideanError::TheoremNotPermitted {
+                geometry,
+                theorem,
+                permitted,
+            } => {
                 assert_eq!(*geometry, GeometryKind::Projective);
                 assert_eq!(theorem, "triangle_angle_sum");
                 // the refusal says what *would* be licensed, so a caller can
@@ -2418,7 +2561,10 @@ mod tests {
     fn test_a_permitted_theorem_is_licensed_by_name() {
         for kind in GeometryKind::all() {
             for theorem in kind.valid_theorems() {
-                assert!(kind.permits(theorem), "{kind} lists {theorem} but does not permit it");
+                assert!(
+                    kind.permits(theorem),
+                    "{kind} lists {theorem} but does not permit it"
+                );
                 assert_eq!(kind.require_theorem(theorem).unwrap(), *theorem);
             }
         }
@@ -2441,12 +2587,18 @@ mod tests {
     #[test]
     fn test_authorize_reads_the_scene_not_the_caller() {
         let euclidean = scene("euclidean", vec![kp("A", 0, 0)], vec![]);
-        assert_eq!(authorize(&euclidean, "pythagoras").unwrap(), GeometryKind::Euclidean);
+        assert_eq!(
+            authorize(&euclidean, "pythagoras").unwrap(),
+            GeometryKind::Euclidean
+        );
         // the same rule under a different declaration is refused, which is the
         // whole point of declaring the geometry on the scene
         let projective = scene("projective", vec![kp("A", 0, 0)], vec![]);
         let why = refusal(authorize(&projective, "pythagoras"));
-        assert!(matches!(why, NonEuclideanError::TheoremNotPermitted { .. }), "{why:?}");
+        assert!(
+            matches!(why, NonEuclideanError::TheoremNotPermitted { .. }),
+            "{why:?}"
+        );
     }
 
     // ------------------------------------------------ the projective plane --
@@ -2463,12 +2615,21 @@ mod tests {
             PPoint::affine(Q::from_int(2), Q::ZERO),
             PPoint::affine(Q::from_int(3), Q::ZERO),
         );
-        assert_eq!(ProjectivePlane::cross_ratio(&a, &b, &c, &d).unwrap(), q(4, 3));
+        assert_eq!(
+            ProjectivePlane::cross_ratio(&a, &b, &c, &d).unwrap(),
+            q(4, 3)
+        );
         // (C, D; A, B) is the *same* value -- a cross ratio is invariant under
         // that pairing -- and swapping C with D inverts it. Both exactly, and
         // the second is how a 4/3 is told apart from a 3/4.
-        assert_eq!(ProjectivePlane::cross_ratio(&c, &d, &a, &b).unwrap(), q(4, 3));
-        assert_eq!(ProjectivePlane::cross_ratio(&a, &b, &d, &c).unwrap(), q(3, 4));
+        assert_eq!(
+            ProjectivePlane::cross_ratio(&c, &d, &a, &b).unwrap(),
+            q(4, 3)
+        );
+        assert_eq!(
+            ProjectivePlane::cross_ratio(&a, &b, &d, &c).unwrap(),
+            q(3, 4)
+        );
     }
 
     #[test]
@@ -2489,7 +2650,10 @@ mod tests {
         // an affine parameter would refuse, because the parameter of D is
         // infinite: refusing it would refuse the harmonic range, which is the
         // one configuration projective geometry is for.
-        assert_eq!(ProjectivePlane::cross_ratio(&a, &b, &c, &infinity).unwrap(), q(-1, 1));
+        assert_eq!(
+            ProjectivePlane::cross_ratio(&a, &b, &c, &infinity).unwrap(),
+            q(-1, 1)
+        );
         // And the construction agrees: the harmonic conjugate of the midpoint
         // of AB is the point at *infinity* of the line -- returned as a point,
         // not refused, because "the midpoint's conjugate is at infinity" is
@@ -2498,22 +2662,37 @@ mod tests {
         let d = ProjectivePlane::harmonic_conjugate(&a, &b, &c).unwrap();
         assert!(d.is_at_infinity());
         assert_eq!(d.describe(), "[1 : 0 : 0]");
-        assert_eq!(ProjectivePlane::cross_ratio(&a, &b, &c, &d).unwrap(), q(-1, 1));
+        assert_eq!(
+            ProjectivePlane::cross_ratio(&a, &b, &c, &d).unwrap(),
+            q(-1, 1)
+        );
         // A C that is not the midpoint has a *finite* conjugate, and the value
-        // is still exactly -1: take C at 1/3, whose conjugate is at 1/2.
+        // is still exactly -1: take C at 1/3, whose conjugate is at -1 under
+        // t_D = t_C / (2 t_C - 1).
         let third = PPoint::affine(Q::new(1, 3).unwrap(), Q::ZERO);
         let conjugate = ProjectivePlane::harmonic_conjugate(&a, &b, &third).unwrap();
         assert!(!conjugate.is_at_infinity());
-        assert_eq!(conjugate.to_affine().unwrap().0, q(1, 2));
-        assert_eq!(ProjectivePlane::cross_ratio(&a, &b, &third, &conjugate).unwrap(), q(-1, 1));
+        assert_eq!(conjugate.to_affine().unwrap().0, q(-1, 1));
+        assert_eq!(
+            ProjectivePlane::cross_ratio(&a, &b, &third, &conjugate).unwrap(),
+            q(-1, 1)
+        );
     }
 
     #[test]
     fn test_projective_line_intersection_is_exact() {
         // y = 0 and x = 0 meet at the origin, exactly, in homogeneous form
         let (horizontal, vertical) = (
-            PLine::through(&PPoint::affine(Q::ZERO, Q::ZERO), &PPoint::affine(Q::ONE, Q::ZERO)).unwrap(),
-            PLine::through(&PPoint::affine(Q::ZERO, Q::ZERO), &PPoint::affine(Q::ZERO, Q::ONE)).unwrap(),
+            PLine::through(
+                &PPoint::affine(Q::ZERO, Q::ZERO),
+                &PPoint::affine(Q::ONE, Q::ZERO),
+            )
+            .unwrap(),
+            PLine::through(
+                &PPoint::affine(Q::ZERO, Q::ZERO),
+                &PPoint::affine(Q::ZERO, Q::ONE),
+            )
+            .unwrap(),
         );
         let where_ = horizontal.meet(&vertical).unwrap();
         assert_eq!(where_.to_affine().unwrap(), (Q::ZERO, Q::ZERO));
@@ -2522,7 +2701,10 @@ mod tests {
             PLine::new(q(-4, 1), q(3, 1), Q::ZERO).unwrap(),
             PLine::new(q(2, 1), q(-1, 1), Q::ZERO).unwrap(),
         );
-        assert_eq!(first.meet(&second).unwrap().to_affine().unwrap(), (Q::ZERO, Q::ZERO));
+        assert_eq!(
+            first.meet(&second).unwrap().to_affine().unwrap(),
+            (Q::ZERO, Q::ZERO)
+        );
     }
 
     #[test]
@@ -2549,7 +2731,11 @@ mod tests {
         );
         let where_ = first.meet(&second).unwrap();
         assert!(where_.is_at_infinity());
-        assert_eq!(where_.to_affine().unwrap_err().to_string().contains("point at infinity"), true);
+        assert!(where_
+            .to_affine()
+            .unwrap_err()
+            .to_string()
+            .contains("point at infinity"));
         assert_eq!(where_.describe(), "[1 : 0 : 0]");
         assert!(first.meets_at_infinity_of(&second).unwrap());
         // and a line that is not parallel does not share an ideal point
@@ -2587,7 +2773,10 @@ mod tests {
         assert!(one.is_at_infinity() && scaled.is_at_infinity());
         assert!(same_point(&one, &scaled).unwrap());
         assert_eq!(one.describe(), scaled.describe());
-        assert!(!one.to_affine().is_ok(), "an ideal point has no affine coordinates");
+        assert!(
+            one.to_affine().is_err(),
+            "an ideal point has no affine coordinates"
+        );
     }
 
     #[test]
@@ -2599,19 +2788,26 @@ mod tests {
             vec![kp("A", 0, 0), kp("B", 2, 0), kp("C", 0, 1), kp("D", 2, 1)],
             vec![],
         );
-        let ideal = AffinePlane::parallel_lines_meet_at(&graph, &seg("A", "B"), &seg("C", "D")).unwrap();
+        let ideal =
+            AffinePlane::parallel_lines_meet_at(&graph, &seg("A", "B"), &seg("C", "D")).unwrap();
         assert!(ideal.is_at_infinity());
         assert_eq!(ideal.describe(), "[1 : 0 : 0]");
         // and the incidence verdict says "meets at infinity", not "disjoint":
         // in the affine plane a parallel pair is a meeting
         let verdict = AffinePlane::incidence_of(&graph, &seg("A", "B"), &seg("C", "D")).unwrap();
-        assert!(!verdict.meets(), "the two horizontal lines do not meet inside the plane");
+        assert!(
+            !verdict.meets(),
+            "the two horizontal lines do not meet inside the plane"
+        );
         assert!(matches!(verdict, Incidence::MeetAtInfinity(_)));
     }
 
     #[test]
     fn test_affine_ratios_along_a_line_are_exact() {
-        let (a, b) = (PPoint::affine(Q::ZERO, Q::ZERO), PPoint::affine(Q::from_int(4), Q::ZERO));
+        let (a, b) = (
+            PPoint::affine(Q::ZERO, Q::ZERO),
+            PPoint::affine(Q::from_int(4), Q::ZERO),
+        );
         // the midpoint is the 1:1 case, and the ratio is exactly 1
         let mid = AffinePlane::point_at_ratio(&a, &b, Q::ONE, Q::ONE).unwrap();
         assert_eq!(mid.to_affine().unwrap(), (Q::from_int(2), Q::ZERO));
@@ -2630,7 +2826,10 @@ mod tests {
     fn test_the_affine_plane_refuses_to_give_a_length() {
         // The refusal is the point: an affine map can stretch one direction
         // without limit, so a squared distance is not a quantity of this plane.
-        let (a, b) = (PPoint::affine(Q::ZERO, Q::ZERO), PPoint::affine(Q::ONE, Q::ZERO));
+        let (a, b) = (
+            PPoint::affine(Q::ZERO, Q::ZERO),
+            PPoint::affine(Q::ONE, Q::ZERO),
+        );
         let why = refusal(AffinePlane.length_squared(&a, &b));
         match why {
             NonEuclideanError::OutOfScope { detail } => {
@@ -2656,12 +2855,23 @@ mod tests {
         assert!(!axis.contains(&off).unwrap(), "P must be off the line");
 
         let witnesses = disk.non_merging_lines_through(&off, &axis, 2).unwrap();
-        assert_eq!(witnesses.len(), 2, "the axiom needs at least two non-meeting lines");
-        assert_ne!(witnesses[0].describe(), witnesses[1].describe(), "the two witnesses are the same line");
+        assert_eq!(
+            witnesses.len(),
+            2,
+            "the axiom needs at least two non-meeting lines"
+        );
+        assert_ne!(
+            witnesses[0].describe(),
+            witnesses[1].describe(),
+            "the two witnesses are the same line"
+        );
         for witness in &witnesses {
             // the exact test, not a picture
             assert!(
-                matches!(disk.incidence_of(&axis, witness).unwrap(), Incidence::Disjoint),
+                matches!(
+                    disk.incidence_of(&axis, witness).unwrap(),
+                    Incidence::Disjoint
+                ),
                 "{witness} should not meet the axis at all, but the exact test says it does"
             );
             // and each witness does pass through P
@@ -2684,7 +2894,10 @@ mod tests {
         );
         let where_ = disk.incidence_of(&first, &second).unwrap();
         assert!(where_.meets());
-        assert_eq!(where_.at().unwrap().to_affine().unwrap(), (Q::ZERO, Q::ZERO));
+        assert_eq!(
+            where_.at().unwrap().to_affine().unwrap(),
+            (Q::ZERO, Q::ZERO)
+        );
     }
 
     #[test]
@@ -2702,7 +2915,10 @@ mod tests {
         let ideal = verdict.at().unwrap();
         // the meeting is [1 : 0 : 1], and it is on the absolute exactly:
         // 1^2 + 0^2 - 1^2 = 0, a sign test on exact rationals
-        assert!(disk.is_on_absolute(ideal).unwrap(), "the meeting must be on the absolute");
+        assert!(
+            disk.is_on_absolute(ideal).unwrap(),
+            "the meeting must be on the absolute"
+        );
         assert_eq!(ideal.describe(), "[1 : 0 : 1]");
         // it is a *finite* point of the conic -- the ideal points of the
         // hyperbolic plane are boundary points, not points at projective
@@ -2727,10 +2943,16 @@ mod tests {
         let where_ = bottom.meet(&top).unwrap();
         assert_eq!(where_.describe(), "[1 : 0 : 0]");
         assert!(!disk.is_on_absolute(&where_).unwrap());
-        assert!(matches!(disk.incidence_of(&bottom, &top).unwrap(), Incidence::Disjoint));
+        assert!(matches!(
+            disk.incidence_of(&bottom, &top).unwrap(),
+            Incidence::Disjoint
+        ));
         // while a pair through a common conic point does meet at one
         let asymptotic = PLine::new(Q::ONE, Q::from_int(2), q(-1, 1)).unwrap();
-        assert!(matches!(disk.incidence_of(&bottom, &asymptotic).unwrap(), Incidence::MeetAtInfinity(_)));
+        assert!(matches!(
+            disk.incidence_of(&bottom, &asymptotic).unwrap(),
+            Incidence::MeetAtInfinity(_)
+        ));
     }
 
     #[test]
@@ -2746,9 +2968,12 @@ mod tests {
         assert!(disk.is_inside(&on_line).unwrap());
         let why = message(disk.non_merging_lines_through(&on_line, &axis, 1));
         assert!(why.contains("lies on the line"), "{why}");
-        // a point outside the disk is not a point of the hyperbolic plane
-        let outside = PPoint::affine(Q::from_int(5), Q::ZERO);
+        // a point outside the disk is not a point of the hyperbolic plane --
+        // and to reach *that* refusal it must also be off the line, since a
+        // point on the line is the more specific failure and is named first
+        let outside = PPoint::affine(Q::from_int(5), Q::ONE);
         assert!(!disk.is_inside(&outside).unwrap());
+        assert!(!axis.contains(&outside).unwrap());
         let why = message(disk.non_merging_lines_through(&outside, &axis, 1));
         assert!(why.contains("Klein disk"), "{why}");
         // and a disk with no interior is refused rather than accepted
@@ -2763,19 +2988,34 @@ mod tests {
         // (1, 0, 1) is on the unit disk's absolute: 1 + 0 - 1 = 0. A float
         // test of a conic is a bug waiting for a near-miss; this is a sign.
         let disk = klein();
-        assert!(disk.is_on_absolute(&PPoint::affine(Q::ONE, Q::ZERO)).unwrap());
+        assert!(disk
+            .is_on_absolute(&PPoint::affine(Q::ONE, Q::ZERO))
+            .unwrap());
         assert!(disk.is_inside(&PPoint::affine(Q::ZERO, Q::ZERO)).unwrap());
         // (1, 1) is *outside* the unit disk: 1 + 1 - 1 = 1, positive. The
         // negative arm is a point of the disk, and the test is the sign.
         assert!(!disk.is_inside(&PPoint::affine(Q::ONE, Q::ONE)).unwrap());
         // the conic form is the exact quantity the three-way split reads
-        assert_eq!(disk.conic_form(&PPoint::affine(Q::ONE, Q::ZERO)).unwrap(), Q::ZERO);
-        assert!(disk.conic_form(&PPoint::affine(Q::ZERO, Q::ZERO)).unwrap().less(&Q::ZERO));
-        assert!(!disk.conic_form(&PPoint::affine(Q::ONE, Q::ONE)).unwrap().less(&Q::ZERO));
+        assert_eq!(
+            disk.conic_form(&PPoint::affine(Q::ONE, Q::ZERO)).unwrap(),
+            Q::ZERO
+        );
+        assert!(disk
+            .conic_form(&PPoint::affine(Q::ZERO, Q::ZERO))
+            .unwrap()
+            .less(&Q::ZERO));
+        assert!(!disk
+            .conic_form(&PPoint::affine(Q::ONE, Q::ONE))
+            .unwrap()
+            .less(&Q::ZERO));
         // and (2, 0) is far outside, so a "point" of the disk model may in fact
         // be no point of the hyperbolic plane at all
-        assert!(!disk.is_inside(&PPoint::affine(Q::from_int(2), Q::ZERO)).unwrap());
-        assert!(!disk.is_on_absolute(&PPoint::affine(Q::from_int(2), Q::ZERO)).unwrap());
+        assert!(!disk
+            .is_inside(&PPoint::affine(Q::from_int(2), Q::ZERO))
+            .unwrap());
+        assert!(!disk
+            .is_on_absolute(&PPoint::affine(Q::from_int(2), Q::ZERO))
+            .unwrap());
     }
 
     // ------------------------------------------------ the spherical model --
@@ -2834,12 +3074,18 @@ mod tests {
         // point of the sphere at all
         let err = SRay::new(Q::ZERO, Q::ZERO, Q::ZERO).unwrap_err();
         assert!(err.to_string().contains("not a direction"), "{err}");
-        // and a zero normal is refused by the great-circle constructor, which
-        // is the empty circle rather than a line of the sphere
-        let why = message(SphericalModel::great_circle(
-            &SRay::new(Q::ZERO, Q::from_int(1), Q::ZERO).unwrap(),
-        ));
-        assert!(why.contains("not a line"), "{why}");
+        // and a great circle is the set of rays orthogonal to its normal: the
+        // constructor maps a ray to its coefficients, so the zero-normal case
+        // cannot even be built -- `SRay::new` above refuses it first
+        let pole = SRay::new(Q::ZERO, Q::from_int(1), Q::ZERO).unwrap();
+        let equator = SphericalModel::great_circle(&pole).unwrap();
+        assert_eq!(
+            (equator.a, equator.b, equator.c),
+            (Q::ZERO, Q::ONE, Q::ZERO)
+        );
+        // and a ray on that great circle is exactly orthogonal to the normal
+        let on_it = PPoint::new(Q::ONE, Q::ZERO, Q::ONE).unwrap();
+        assert!(equator.contains(&on_it).unwrap());
         // two antipodal rays lie on every great circle through their axis, so
         // they do not determine one
         let (one, antipode) = (
@@ -2859,14 +3105,20 @@ mod tests {
         let graph = scene(
             "spherical",
             vec![kp("A", 0, 0), kp("B", 2, 0), kp("C", 0, 1), kp("D", 2, 1)],
-            vec![Constraint::Parallel { first: seg("A", "B"), second: seg("C", "D") }],
+            vec![Constraint::Parallel {
+                first: seg("A", "B"),
+                second: seg("C", "D"),
+            }],
         );
         let ray = SphericalModel::meet_of_segments(&graph, &seg("A", "B"), &seg("C", "D")).unwrap();
         // the direction exists and is exact; the report quotes it
         assert!(!ray.describe().is_empty());
         assert!(GeometryKind::Spherical.asserts(Axiom::AllLinesMeet));
         let report = GeometryKind::Spherical.check_axioms(&graph).unwrap();
-        assert!(!report.is_consistent(), "a spherical parallel pair is a contradiction");
+        assert!(
+            !report.is_consistent(),
+            "a spherical parallel pair is a contradiction"
+        );
     }
 
     // -------------------------------------------- checking a scene's axioms --
@@ -2876,7 +3128,10 @@ mod tests {
         scene(
             geometry,
             vec![kp("A", 0, 0), kp("B", 2, 0), kp("C", 0, 1), kp("D", 2, 1)],
-            vec![Constraint::Parallel { first: seg("A", "B"), second: seg("C", "D") }],
+            vec![Constraint::Parallel {
+                first: seg("A", "B"),
+                second: seg("C", "D"),
+            }],
         )
     }
 
@@ -2899,7 +3154,11 @@ mod tests {
             .expect("the parallel claim is a violation projectively");
         assert_eq!(violation.axiom, Axiom::AllLinesMeet);
         assert!(violation.detail.contains("meet at"), "{}", violation.detail);
-        assert!(violation.detail.contains("[1 : 0 : 0]"), "the exact witness is missing: {}", violation.detail);
+        assert!(
+            violation.detail.contains("[1 : 0 : 0]"),
+            "the exact witness is missing: {}",
+            violation.detail
+        );
         // the report says which geometry it read under, and lists its axioms
         assert_eq!(report.geometry, GeometryKind::Projective);
         assert!(report.axioms.contains(&Axiom::AllLinesMeet));
@@ -2926,9 +3185,17 @@ mod tests {
         // claim does not say which kind, so the report records it as
         // undecided. Reporting it as a violation would train a reasoner to
         // delete true statements of a non-Euclidean figure.
-        let report = GeometryKind::Hyperbolic.check_axioms(&parallel_pair("hyperbolic")).unwrap();
-        assert!(report.is_consistent(), "a hyperbolic parallel pair is not a contradiction");
-        assert!(!report.is_complete(), "but it is not decided either: {report}");
+        let report = GeometryKind::Hyperbolic
+            .check_axioms(&parallel_pair("hyperbolic"))
+            .unwrap();
+        assert!(
+            report.is_consistent(),
+            "a hyperbolic parallel pair is not a contradiction"
+        );
+        assert!(
+            !report.is_complete(),
+            "but it is not decided either: {report}"
+        );
         let open = report
             .underdetermination_for("parallel(AB, CD)")
             .expect("the parallel claim is underdetermined hyperbolically");
@@ -2944,21 +3211,34 @@ mod tests {
         let graph = scene(
             "projective",
             vec![kp("A", 0, 0), kp("B", 3, 4), kp("C", 0, 0), kp("D", 1, 0)],
-            vec![Constraint::EqualLength { first: seg("A", "B"), second: seg("C", "D") }],
+            vec![Constraint::EqualLength {
+                first: seg("A", "B"),
+                second: seg("C", "D"),
+            }],
         );
         let report = GeometryKind::Projective.check_axioms(&graph).unwrap();
         let violation = report
             .violation_for("len(AB)=len(CD)")
             .expect("a length claim is a violation projectively");
         assert_eq!(violation.axiom, Axiom::MetricDefined);
-        assert!(violation.detail.contains("no metric"), "{}", violation.detail);
+        assert!(
+            violation.detail.contains("no metric"),
+            "{}",
+            violation.detail
+        );
         // the same fact is fine where there is a metric
         let euclidean = scene(
             "euclidean",
             graph.points.clone(),
-            vec![Constraint::EqualLength { first: seg("A", "B"), second: seg("C", "D") }],
+            vec![Constraint::EqualLength {
+                first: seg("A", "B"),
+                second: seg("C", "D"),
+            }],
         );
-        assert!(GeometryKind::Euclidean.check_axioms(&euclidean).unwrap().is_consistent());
+        assert!(GeometryKind::Euclidean
+            .check_axioms(&euclidean)
+            .unwrap()
+            .is_consistent());
     }
 
     #[test]
@@ -2971,7 +3251,11 @@ mod tests {
             let graph = scene(
                 name,
                 vec![kp("A", 0, 0), kp("B", 2, 0), kp("M", 1, 0)],
-                vec![Constraint::Between { a: "A".into(), m: "M".into(), b: "B".into() }],
+                vec![Constraint::Between {
+                    a: "A".into(),
+                    m: "M".into(),
+                    b: "B".into(),
+                }],
             );
             let report = kind.check_axioms(&graph).unwrap();
             let violation = report
@@ -2983,7 +3267,11 @@ mod tests {
                 let graph = scene(
                     ordered,
                     vec![kp("A", 0, 0), kp("B", 2, 0), kp("M", 1, 0)],
-                    vec![Constraint::Between { a: "A".into(), m: "M".into(), b: "B".into() }],
+                    vec![Constraint::Between {
+                        a: "A".into(),
+                        m: "M".into(),
+                        b: "B".into(),
+                    }],
                 );
                 let ordered_kind: GeometryKind = ordered.parse().unwrap();
                 assert!(
@@ -3018,9 +3306,15 @@ mod tests {
         // The report carries the whole environment, not only the part that was
         // upset: a reader of a violation needs to know which geometry produced
         // it, and which axioms that geometry had.
-        let report = GeometryKind::Projective.check_axioms(&parallel_pair("projective")).unwrap();
+        let report = GeometryKind::Projective
+            .check_axioms(&parallel_pair("projective"))
+            .unwrap();
         assert_eq!(report.axioms, GeometryKind::Projective.axioms());
-        assert_eq!(report.checked.len(), 0, "the parallel fact was not accepted as checked");
+        assert_eq!(
+            report.checked.len(),
+            0,
+            "the parallel fact was not accepted as checked"
+        );
         let text = report.to_string();
         assert!(text.contains("projective geometry"), "{text}");
         assert!(text.contains("violation"), "{text}");
@@ -3038,13 +3332,19 @@ mod tests {
         // a guess a contradiction.
         let mut graph = parallel_pair("projective");
         graph.facts[0] = Fact::observed(
-            Constraint::Parallel { first: seg("A", "B"), second: seg("C", "D") },
+            Constraint::Parallel {
+                first: seg("A", "B"),
+                second: seg("C", "D"),
+            },
             "diagram_grader",
             0.83,
         );
         let report = GeometryKind::Projective.check_axioms(&graph).unwrap();
         assert!(report.is_consistent(), "{report}");
-        assert!(report.checked.is_empty(), "an observed statement was checked as a claim");
+        assert!(
+            report.checked.is_empty(),
+            "an observed statement was checked as a claim"
+        );
     }
 
     // ------------------------------------------- exactness vs evidence --
@@ -3131,7 +3431,10 @@ mod tests {
                 NonEuclideanError::OutOfScope { detail } => {
                     assert!(detail.contains("hyperbolic"), "{detail}");
                     assert!(detail.contains("neither the rationals nor"), "{detail}");
-                    assert!(detail.contains(operation), "the refusal does not name {operation}: {detail}");
+                    assert!(
+                        detail.contains(operation),
+                        "the refusal does not name {operation}: {detail}"
+                    );
                 }
                 other => panic!("expected an out-of-scope refusal for {operation}, got {other:?}"),
             }
@@ -3149,22 +3452,40 @@ mod tests {
             vec![],
         );
         // crossing lines meet inside, at the exact point (1, 1/2)
-        let crossing = ProjectivePlane::incidence_of(&graph, &seg("A", "D"), &seg("B", "C")).unwrap();
+        let crossing =
+            ProjectivePlane::incidence_of(&graph, &seg("A", "D"), &seg("B", "C")).unwrap();
         assert!(crossing.meets(), "{crossing}");
-        assert_eq!(crossing.at().unwrap().to_affine().unwrap(), (Q::ONE, Q::new(1, 2).unwrap()));
+        assert_eq!(
+            crossing.at().unwrap().to_affine().unwrap(),
+            (Q::ONE, Q::new(1, 2).unwrap())
+        );
         // parallel ones meet at an ideal point, which is a meeting too
-        let parallel = ProjectivePlane::incidence_of(&graph, &seg("A", "B"), &seg("C", "D")).unwrap();
-        assert!(matches!(parallel, Incidence::MeetAtInfinity(_)), "{parallel}");
-        assert!(!parallel.meets(), "a parallel pair does not meet inside the plane");
+        let parallel =
+            ProjectivePlane::incidence_of(&graph, &seg("A", "B"), &seg("C", "D")).unwrap();
+        assert!(
+            matches!(parallel, Incidence::MeetAtInfinity(_)),
+            "{parallel}"
+        );
+        assert!(
+            !parallel.meets(),
+            "a parallel pair does not meet inside the plane"
+        );
         assert!(parallel.at().is_some(), "but the ideal point is named");
         // and a line with itself is not a meeting at all
-        let coincident = message(ProjectivePlane::incidence_of(&graph, &seg("A", "B"), &seg("A", "B")));
+        let coincident = message(ProjectivePlane::incidence_of(
+            &graph,
+            &seg("A", "B"),
+            &seg("A", "B"),
+        ));
         assert!(coincident.contains("coincident"), "{coincident}");
         // and a hyperbolic ultraparallel pair has no point at all
         let disk = klein();
         let axis = PLine::new(Q::ZERO, Q::ONE, Q::ZERO).unwrap();
         let off = PPoint::affine(Q::ZERO, Q::new(1, 2).unwrap());
-        let witness = disk.non_merging_lines_through(&off, &axis, 1).unwrap().remove(0);
+        let witness = disk
+            .non_merging_lines_through(&off, &axis, 1)
+            .unwrap()
+            .remove(0);
         let disjoint = disk.incidence_of(&axis, &witness).unwrap();
         assert!(!disjoint.meets());
         assert!(disjoint.at().is_none());
@@ -3188,7 +3509,10 @@ mod tests {
             // default, and this module reads it as the Euclidean environment
             let default = graph_from_points(vec![kp("A", 0, 0)], vec![]);
             assert_eq!(default.geometry, "euclidean");
-            assert_eq!(GeometryKind::of_scene(&default).unwrap(), GeometryKind::Euclidean);
+            assert_eq!(
+                GeometryKind::of_scene(&default).unwrap(),
+                GeometryKind::Euclidean
+            );
         }
     }
 
@@ -3199,23 +3523,42 @@ mod tests {
         // geometry that does have the axiom is not asked to have it, and the
         // one that lacks it is not left with a `bool` the caller has to
         // interpret.
-        let right = || Constraint::RightAngle { at: Angle3::new("A", "B", "C") };
+        let right = || Constraint::RightAngle {
+            at: Angle3::new("A", "B", "C"),
+        };
         let cases: Vec<(Constraint, &str, Option<Axiom>)> = vec![
             (right(), "euclidean", Some(Axiom::AngleMeasureExists)),
             (right(), "projective", None),
             (
-                Constraint::EqualLength { first: seg("A", "B"), second: seg("C", "D") },
+                Constraint::EqualLength {
+                    first: seg("A", "B"),
+                    second: seg("C", "D"),
+                },
                 "affine",
                 None,
             ),
             (
-                Constraint::Between { a: "A".into(), m: "M".into(), b: "B".into() },
+                Constraint::Between {
+                    a: "A".into(),
+                    m: "M".into(),
+                    b: "B".into(),
+                },
                 "spherical",
                 None,
             ),
         ];
         for (constraint, geometry, needed) in cases {
-            let graph = scene(geometry, vec![kp("A", 0, 0), kp("B", 1, 0), kp("C", 0, 1), kp("D", 1, 1), kp("M", 1, 2)], vec![]);
+            let graph = scene(
+                geometry,
+                vec![
+                    kp("A", 0, 0),
+                    kp("B", 1, 0),
+                    kp("C", 0, 1),
+                    kp("D", 1, 1),
+                    kp("M", 1, 2),
+                ],
+                vec![],
+            );
             let mut graph = graph;
             graph.facts.push(Fact::given(constraint.clone()));
             let kind: GeometryKind = geometry.parse().unwrap();
@@ -3223,11 +3566,17 @@ mod tests {
             match needed {
                 Some(axiom) => {
                     assert!(kind.asserts(axiom), "{kind} should hold {axiom}");
-                    assert!(report.is_consistent(), "{kind} should accept {constraint:?}: {report}");
+                    assert!(
+                        report.is_consistent(),
+                        "{kind} should accept {constraint:?}: {report}"
+                    );
                     assert_eq!(report.checked.len(), 1);
                 }
                 None => {
-                    assert!(!report.is_consistent(), "{kind} should refuse {constraint:?}: {report}");
+                    assert!(
+                        !report.is_consistent(),
+                        "{kind} should refuse {constraint:?}: {report}"
+                    );
                     assert_eq!(report.violations.len(), 1, "{report}");
                 }
             }

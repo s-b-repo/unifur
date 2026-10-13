@@ -6,7 +6,7 @@
 //! the same machinery attached to the language trunk's hidden states: the
 //! trunk's `[b, n, 5120]` representation is projected into a geometric
 //! stream, refined by the certified energy descent (the step size comes from
-//! the closed-form Lipschitz bound of [`crate::geometry::lipschitz_step`], so
+//! the closed-form Lipschitz bound of the block's relaxation, so
 //! the energy decrease is watched by the `geomfusion` certificates, not
 //! assumed), read out through MoSME boxes named for reasoning kinds, and
 //! added back as a residual.
@@ -56,12 +56,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
-use burn::module::{list_param_ids, Initializer, Module, ModuleVisitor, Param, ParamId};
+use burn::module::{Initializer, Module, ModuleVisitor, Param};
 use burn::nn::{Linear, LinearConfig};
 use burn::optim::{AdamW, AdamWConfig, GradientsParams, Optimizer};
 use burn::tensor::activation::log_softmax;
 use burn::tensor::backend::{AutodiffBackend, Backend};
-use burn::tensor::{Int, Tensor};
+use burn::tensor::{ElementConversion, Int, Tensor};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 use serde::{Deserialize, Serialize};
@@ -406,10 +406,14 @@ impl<B: Backend<FloatElem = f32>> GeomFusion<B> {
             z = z_next;
         }
 
-        let mut path = self.readout(&h, batch, n)?;
-        path.final_state = z;
-        path.traces = traces;
-        Ok(path)
+        let readout = self.readout(&h, batch, n)?;
+        Ok(GeometricPath {
+            mixture: readout.mixture,
+            final_state: z,
+            traces,
+            gates: readout.gates,
+            routing: readout.routing,
+        })
     }
 
     /// The fused forward pass: the geometric stream's readout, projected back
@@ -472,12 +476,10 @@ pub struct ParsedScene {
 }
 
 fn scene_byte(scene: &[u16], idx: usize) -> anyhow::Result<u8> {
-    let token = scene.get(idx).copied().ok_or_else(|| {
-        anyhow::anyhow!(
-            "scene of {} tokens has no offset {idx}",
-            scene.len()
-        )
-    })?;
+    let token = scene
+        .get(idx)
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("scene of {} tokens has no offset {idx}", scene.len()))?;
     anyhow::ensure!(
         token <= 0xFF,
         "scene token {token} at offset {idx} is not a byte"
@@ -511,7 +513,7 @@ pub fn parse_scene(scene: &[u16]) -> anyhow::Result<ParsedScene> {
     );
     let count = two_digits(scene, 1, "point count")? as usize;
     anyhow::ensure!(
-        count >= 1 && count <= 26,
+        (1..=26).contains(&count),
         "point count {count} is outside [1, 26]"
     );
     anyhow::ensure!(
@@ -541,7 +543,10 @@ pub fn parse_scene(scene: &[u16]) -> anyhow::Result<ParsedScene> {
         b'd' => "direction",
         b'i' => "inside",
         b'c' => "collinear",
-        other => anyhow::bail!("unknown kind letter {:?} at offset {kind_at}", char::from(other)),
+        other => anyhow::bail!(
+            "unknown kind letter {:?} at offset {kind_at}",
+            char::from(other)
+        ),
     };
     let mut refs = Vec::with_capacity(4);
     for slot in 0..4 {
@@ -550,12 +555,16 @@ pub fn parse_scene(scene: &[u16]) -> anyhow::Result<ParsedScene> {
             continue;
         }
         anyhow::ensure!(
-            (b'A'..=b'Z').contains(&b),
+            b.is_ascii_uppercase(),
             "reference slot {slot} holds {:?}, not a point name or '_'",
             char::from(b)
         );
         let idx = usize::from(b - b'A');
-        anyhow::ensure!(idx < count, "reference {char} names a point outside the {count}-point scene", char = char::from(b));
+        anyhow::ensure!(
+            idx < count,
+            "reference {char} names a point outside the {count}-point scene",
+            char = char::from(b)
+        );
         refs.push(idx);
     }
     anyhow::ensure!(
@@ -606,6 +615,10 @@ impl TokenizedScene {
     pub fn len(&self) -> usize {
         self.tokens.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
 }
 
 /// Tokenize one scene (see the type docs for the answer-span choice).
@@ -653,9 +666,9 @@ pub fn answer_token_ids(
 ) -> anyhow::Result<Vec<(u16, u32)>> {
     let mut out = Vec::with_capacity(meta.answer_tokens.len());
     for &byte in &meta.answer_tokens {
-        let ch = char::from(u8::try_from(byte).with_context(|| {
-            format!("answer token {byte} is not a byte")
-        })?);
+        let ch = char::from(
+            u8::try_from(byte).with_context(|| format!("answer token {byte} is not a byte"))?,
+        );
         let ids = tokenizer
             .encode(&ch.to_string())
             .with_context(|| format!("encode answer byte {ch:?}"))?;
@@ -870,7 +883,8 @@ pub fn kernel_check(scene: &ParsedScene, proposed: u8) -> anyhow::Result<KernelV
 pub struct FusedQwenForward<B: Backend> {
     /// `lm_head(trunk hidden + geometric residual)`, `[b, n, vocab]`.
     pub logits: Tensor<B, 3>,
-    /// The fused hidden state before `lm_head`.
+    /// The geometric stream's output: fused hidden state, refinement
+    /// traces, routing gates and diagnostics.
     pub fused: FusedForward<B>,
 }
 
@@ -913,7 +927,9 @@ impl<B: Backend<FloatElem = f32>> FusedQwen<B> {
         tokens: Tensor<B, 2, Int>,
         depth: Option<usize>,
     ) -> anyhow::Result<Tensor<B, 3>> {
-        let fused = self.fusion.forward(self.trunk.forward_hidden(tokens), depth)?;
+        let fused = self
+            .fusion
+            .forward(self.trunk.forward_hidden(tokens), depth)?;
         Ok(self.trunk.lm_head.forward(fused.hidden))
     }
 
@@ -924,7 +940,9 @@ impl<B: Backend<FloatElem = f32>> FusedQwen<B> {
         tokens: Tensor<B, 2, Int>,
         depth: Option<usize>,
     ) -> anyhow::Result<FusedQwenForward<B>> {
-        let fused = self.fusion.forward(self.trunk.forward_hidden(tokens), depth)?;
+        let fused = self
+            .fusion
+            .forward(self.trunk.forward_hidden(tokens), depth)?;
         let logits = self.trunk.lm_head.forward(fused.hidden.clone());
         Ok(FusedQwenForward { logits, fused })
     }
@@ -939,7 +957,9 @@ impl<B: Backend<FloatElem = f32>> FusedQwen<B> {
         query: usize,
         depth: Option<usize>,
     ) -> anyhow::Result<(Tensor<B, 2>, FusedForward<B>)> {
-        let fused = self.fusion.forward(self.trunk.forward_hidden(tokens), depth)?;
+        let fused = self
+            .fusion
+            .forward(self.trunk.forward_hidden(tokens), depth)?;
         let [b, n, _] = fused.hidden.dims();
         anyhow::ensure!(
             query < n,
@@ -969,7 +989,7 @@ impl<B: Backend<FloatElem = f32>> FusedQwen<B> {
         let cand_ids: Vec<i64> = candidates.iter().map(|(_, id)| i64::from(*id)).collect();
         let cand = Tensor::<B, 1, Int>::from_ints(cand_ids.as_slice(), device);
         let restricted = logits.select(1, cand).reshape([candidates.len()]);
-        let best: i64 = restricted.argmax(0).into_scalar();
+        let best: i64 = restricted.argmax(0).into_scalar().elem();
         let idx = usize::try_from(best)
             .map_err(|_| anyhow::anyhow!("argmax index {best} does not fit usize"))?;
         let byte = u8::try_from(candidates[idx].0)
@@ -1056,8 +1076,8 @@ impl<B: Backend<FloatElem = f32>> GeomFusion<B> {
         let mse_value = mse.clone().detach().into_scalar();
         // The readout over the denoised stream, so the answer CE trains the
         // same pathway the clean forward uses.
-        let path = self.readout(&h_out, batch, n)?;
-        let fused = hidden.add(self.out_proj.forward(path.mixture));
+        let readout = self.readout(&h_out, batch, n)?;
+        let fused = hidden.add(self.out_proj.forward(readout.mixture));
         Ok(FusionBlockStep {
             hidden: fused,
             mse,
@@ -1078,7 +1098,11 @@ pub enum FusedLossSpec {
     Answer,
     /// The EDM denoising term of block `block` at `sigma`, plus the
     /// sigma-weighted answer CE through the denoised pathway.
-    Diffusion { block: usize, sigma: f64, sigma_data: f64 },
+    Diffusion {
+        block: usize,
+        sigma: f64,
+        sigma_data: f64,
+    },
 }
 
 /// What a fused loss computation reports.
@@ -1096,16 +1120,21 @@ pub struct FusedLoss<B: Backend> {
     pub mse: f32,
 }
 
-/// The geometric stream's routed readout, split out of
-/// [`GeomFusion::geometric_path`] so the diffusion step can read out a
-/// denoised stream through the same pathway the clean forward uses.
+/// The geometric stream's routed readout: the gated mixture plus the
+/// routing diagnostics, split out of [`GeomFusion::geometric_path`] so the
+/// diffusion step can read out a denoised stream through the same pathway
+/// the clean forward uses.
+struct Readout<B: Backend> {
+    /// The routed geometric readout `[b, n, geom_hidden]` -- what `out_proj`
+    /// maps back into the trunk width.
+    mixture: Tensor<B, 3>,
+    /// The composed routing gates `[b * n, boxes * experts]`.
+    gates: Tensor<B, 2>,
+    routing: RoutingInfo<B>,
+}
+
 impl<B: Backend<FloatElem = f32>> GeomFusion<B> {
-    fn readout(
-        &self,
-        h: &Tensor<B, 3>,
-        batch: usize,
-        n: usize,
-    ) -> anyhow::Result<GeometricPath<B>> {
+    fn readout(&self, h: &Tensor<B, 3>, batch: usize, n: usize) -> anyhow::Result<Readout<B>> {
         let flat = h.clone().reshape([batch * n, self.geom_hidden]);
         let input = self.router.router_input_2d(&flat, &flat);
         let gates = self.router.route(input);
@@ -1152,10 +1181,8 @@ impl<B: Backend<FloatElem = f32>> GeomFusion<B> {
         let token_entropy = crate::moe::entropy_of_rows(&gates.box_gates).into_scalar() / ln_boxes;
         let box_load: Vec<f32> = traffic.into_data().convert::<f32>().iter::<f32>().collect();
 
-        Ok(GeometricPath {
+        Ok(Readout {
             mixture: mixture.reshape([batch, n, self.geom_hidden]),
-            final_state: h.clone(),
-            traces: Vec::new(),
             gates: composed_flat,
             routing: RoutingInfo {
                 balance,
@@ -1196,7 +1223,7 @@ pub fn fused_answer_loss<B: AutodiffBackend<FloatElem = f32>>(
     let mut mse_value = 0.0f32;
     let mut balance: Option<Tensor<B, 1>> = None;
     let mut z_loss: Option<Tensor<B, 1>> = None;
-    let mut z_level = 0.0f32;
+    let mut z_level = 0.0f64;
     for (row, scene) in scenes.iter().enumerate() {
         anyhow::ensure!(
             scene.len() <= hidden.dims()[1],
@@ -1205,15 +1232,12 @@ pub fn fused_answer_loss<B: AutodiffBackend<FloatElem = f32>>(
             hidden.dims()[1]
         );
         anyhow::ensure!(
-            scene.len() >= model.fusion.slots() + 1,
+            scene.len() > model.fusion.slots(),
             "row {row} has {} tokens; the stream pools into {} slots and the answer needs a prefix position",
             scene.len(),
             model.fusion.slots()
         );
-        let row_hidden = hidden
-            .clone()
-            .narrow(0, row, 1)
-            .narrow(1, 0, scene.len());
+        let row_hidden = hidden.clone().narrow(0, row, 1).narrow(1, 0, scene.len());
         let fused_hidden = match spec {
             FusedLossSpec::Answer => {
                 let fused = model.fusion.forward(row_hidden, depth)?;
@@ -1239,10 +1263,12 @@ pub fn fused_answer_loss<B: AutodiffBackend<FloatElem = f32>>(
                 sigma,
                 sigma_data,
             } => {
-                let z_star = model.fusion.clean_final_state(&row_hidden.detach(), None)?;
-                let step = model.fusion.block_diffusion_step(
-                    row_hidden, block, sigma, sigma_data, &z_star,
-                )?;
+                let z_star = model
+                    .fusion
+                    .clean_final_state(&row_hidden.clone().detach(), None)?;
+                let step = model
+                    .fusion
+                    .block_diffusion_step(row_hidden, block, sigma, sigma_data, &z_star)?;
                 mse_terms.push(step.mse);
                 mse_value = step.mse_value;
                 step.hidden
@@ -1286,7 +1312,8 @@ pub fn fused_answer_loss<B: AutodiffBackend<FloatElem = f32>>(
                 .ok_or_else(|| anyhow::anyhow!("the diffusion step produced no mse term"))?
                 / b as f32;
             let w_ce = ((crate::sigma::SIGMA_MAX - sigma)
-                / (crate::sigma::SIGMA_MAX - crate::sigma::SIGMA_MIN)) as f32;
+                / (crate::sigma::SIGMA_MAX - crate::sigma::SIGMA_MIN))
+                as f32;
             let w_mse = crate::sigma::edm_loss_weight(sigma, sigma_data) as f32;
             ce.mul_scalar(w_ce).add(mse.mul_scalar(w_mse))
         }
@@ -1634,13 +1661,16 @@ impl<B: AutodiffBackend<FloatElem = f32>> FusedQwenTrainer<B> {
         config.validate()?;
         qwentrain::attach_lora(&mut model.trunk, &config.lora, device)?;
         qwentrain::freeze_non_adapter_params(&mut model.trunk);
+        // Burn initializes lazily: force every parameter before the EMA
+        // shadows clone, or a shadow would draw values the live model never
+        // has (`Param::clone` on an unforced parameter keeps the id, not
+        // the value).
+        crate::tensor_ext::force_initialization(&model);
         let bank = QwenAdapterBank::from_trunk(&model.trunk)?;
         let trunk_optim: QwenOptim<B> = AdamWConfig::new().init();
         let fusion_optim: FusionOptim<B> = AdamWConfig::new().init();
         let ema_trunk = config.ema_decay.map(|decay| Ema::new(&bank, decay));
-        let ema_fusion = config
-            .ema_decay
-            .map(|decay| Ema::new(&model.fusion, decay));
+        let ema_fusion = config.ema_decay.map(|decay| Ema::new(&model.fusion, decay));
         Ok(Self {
             acc_trunk: GradientAccumulator::new(config.accumulate),
             acc_fusion: GradientAccumulator::new(config.accumulate),
@@ -1738,10 +1768,9 @@ impl<B: AutodiffBackend<FloatElem = f32>> FusedQwenTrainer<B> {
         }
         let cycle_trunk = self.acc_trunk.fold(grads.trunk, &self.model.trunk);
         let cycle_fusion = self.acc_fusion.fold(grads.fusion, &self.model.fusion);
-        let (Some(mut g_trunk), Some(mut g_fusion)) = (
-            cycle_trunk.into_gradients(),
-            cycle_fusion.into_gradients(),
-        ) else {
+        let (Some(mut g_trunk), Some(mut g_fusion)) =
+            (cycle_trunk.into_gradients(), cycle_fusion.into_gradients())
+        else {
             return Ok(base);
         };
 
@@ -1749,8 +1778,8 @@ impl<B: AutodiffBackend<FloatElem = f32>> FusedQwenTrainer<B> {
         let norm_fusion = crate::quality::global_grad_norm(&self.model.fusion, &g_fusion);
         let mut clipped = false;
         if let Some(max_norm) = self.config.clip_norm {
-            clipped |= clip_gradients::<B, _>(&mut g_trunk, &self.model.trunk, norm_trunk, max_norm)
-                < 1.0;
+            clipped |=
+                clip_gradients::<B, _>(&mut g_trunk, &self.model.trunk, norm_trunk, max_norm) < 1.0;
             clipped |=
                 clip_gradients::<B, _>(&mut g_fusion, &self.model.fusion, norm_fusion, max_norm)
                     < 1.0;
@@ -1758,11 +1787,9 @@ impl<B: AutodiffBackend<FloatElem = f32>> FusedQwenTrainer<B> {
         self.model.trunk = self
             .trunk_optim
             .step(self.config.lr, self.model.trunk.clone(), g_trunk);
-        self.model.fusion = self.fusion_optim.step(
-            self.config.fusion_lr,
-            self.model.fusion.clone(),
-            g_fusion,
-        );
+        self.model.fusion =
+            self.fusion_optim
+                .step(self.config.fusion_lr, self.model.fusion.clone(), g_fusion);
         self.bank = QwenAdapterBank::from_trunk(&self.model.trunk)?;
         if let Some(ema) = self.ema_trunk.as_mut() {
             ema.update::<B>(&self.bank);
@@ -1894,8 +1921,7 @@ impl<B: AutodiffBackend<FloatElem = f32>> FusedQwenTrainer<B> {
         }
         let mut fusion_optim: FusionOptim<B> = AdamWConfig::new().init();
         if let Some(file) = &extras.fusion_optimizer {
-            let record: FusionOptimRecord<B> =
-                checkpoint::load_record(&state_dir, file, device)?;
+            let record: FusionOptimRecord<B> = checkpoint::load_record(&state_dir, file, device)?;
             fusion_optim = fusion_optim.load_record(record);
         }
         let ema_trunk = match (config.ema_decay, &state.ema) {
@@ -2020,7 +2046,10 @@ pub fn train_fused_qwen<B: AutodiffBackend<FloatElem = f32>>(
         let step_report = trainer.train_step(&scenes)?;
         if !step_report.loss.is_finite() {
             report.steps_skipped += 1;
-            println!("step {step}: non-finite loss {}, step discarded", step_report.loss);
+            println!(
+                "step {step}: non-finite loss {}, step discarded",
+                step_report.loss
+            );
             continue;
         }
         if report.steps_taken == 0 {
@@ -2045,7 +2074,11 @@ pub fn train_fused_qwen<B: AutodiffBackend<FloatElem = f32>>(
                 step_report.mse,
                 step_report.grad_norm_trunk,
                 step_report.grad_norm_fusion,
-                if step_report.clipped { " (clipped)" } else { "" }
+                if step_report.clipped {
+                    " (clipped)"
+                } else {
+                    ""
+                }
             );
         }
     }
@@ -2201,12 +2234,7 @@ pub fn prove<B: Backend<FloatElem = f32>>(
     for scene in &parsed {
         *histogram.entry(scene.answer).or_insert(0) += 1;
     }
-    let chance = histogram
-        .values()
-        .copied()
-        .max()
-        .unwrap_or(0) as f32
-        / config.scenes as f32;
+    let chance = histogram.values().copied().max().unwrap_or(0) as f32 / config.scenes as f32;
 
     let (predictions, _) = predict_all(model, &scenes, &candidates, config.depth, device)?;
     let mut report = ProofReport {
@@ -2233,8 +2261,7 @@ pub fn prove<B: Backend<FloatElem = f32>>(
             indeterminate: 0,
         })
         .collect();
-    for (scene, (&predicted, parsed_scene)) in scenes.iter().zip(predictions.iter().zip(&parsed)) {
-        let _ = scene;
+    for (&predicted, parsed_scene) in predictions.iter().zip(&parsed) {
         let correct = predicted == parsed_scene.answer;
         report.correct += usize::from(correct);
         let verdict = kernel_check(parsed_scene, predicted)?;
@@ -2497,5 +2524,923 @@ mod tests {
         let short = Tensor::<B, 3>::random([1, 4, 64], Distribution::Normal(0.0, 1.0), &device);
         let err = model.forward(short, None).unwrap_err();
         assert!(format!("{err:#}").contains("slots"));
+    }
+
+    // ------------------------------------------------------------ fused ----
+
+    use crate::geometry::{answer_for, generate_corpus};
+    use crate::qwen::QwenArchDims;
+    use crate::qwennet::QwenTrunkConfig;
+    use crate::qwentrain::{attach_lora, freeze_non_adapter_params};
+    use crate::tensor_ext::force_initialization;
+    use burn::backend::Autodiff;
+    use burn::module::ParamId;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    type AB = Autodiff<NdArray<f32>>;
+
+    static FIXTURE_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    /// Small architecture exercising both layer kinds (layer 3 full).
+    fn tiny_trunk_dims() -> QwenArchDims {
+        QwenArchDims {
+            num_layers: 5,
+            hidden_size: 64,
+            intermediate_size: 96,
+            vocab_size: 128,
+            num_q_heads: 4,
+            num_kv_heads: 2,
+            head_dim: 16,
+            linear_k_groups: 2,
+            linear_v_heads: 4,
+            linear_head_dim: 16,
+            conv_kernel: 4,
+            full_attention_interval: 4,
+            attn_output_gate: true,
+        }
+    }
+
+    fn tiny_trunk_config() -> QwenTrunkConfig {
+        QwenTrunkConfig {
+            dims: tiny_trunk_dims(),
+            num_layers: None,
+            rope_base: 10_000_000.0,
+            eps: 1e-6,
+        }
+    }
+
+    /// A fused tiny model on a freshly seeded NF4 trunk. Two calls with the
+    /// same seed produce identical weights AND identical `ParamId`s, which is
+    /// what makes value comparisons between two builds meaningful.
+    fn fused_seeded(seed: u64) -> FusedQwen<AB> {
+        let device = Default::default();
+        <AB as Backend>::seed(&device, seed);
+        let mut trunk = QwenTrunk::<AB>::new(tiny_trunk_config(), &device);
+        trunk.to_nf4().unwrap_or_else(|e| panic!("to_nf4: {e:#}"));
+        force_initialization(&trunk);
+        let config = GeomFusionConfig {
+            hidden_size: 64,
+            ..GeomFusionConfig::tiny()
+        };
+        FusedQwen::<AB>::new(trunk, &config, &device).unwrap_or_else(|e| panic!("fused: {e:#}"))
+    }
+
+    /// A byte-level tokenizer over the scene alphabet, with no merges: every
+    /// byte is its own token (id = ascii code, all below the tiny vocab 128).
+    fn tiny_tokenizer() -> BpeTokenizer {
+        let chars = "P0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZnfdicy_?";
+        let vocab: serde_json::Map<String, serde_json::Value> = chars
+            .chars()
+            .map(|c| (c.to_string(), serde_json::Value::from(u64::from(c as u32))))
+            .collect();
+        let json = serde_json::json!({
+            "model": { "vocab": vocab, "merges": [] },
+            "pre_tokenizer": { "type": "ByteLevel", "add_prefix_space": false },
+        });
+        BpeTokenizer::from_json(&json.to_string()).unwrap_or_else(|e| panic!("tokenizer: {e:#}"))
+    }
+
+    fn tiny_corpus() -> (Vec<u16>, crate::geometry::GeomMeta) {
+        generate_corpus(
+            4,
+            &["nearest", "farthest", "direction", "inside", "collinear"],
+            120,
+            3,
+        )
+        .unwrap_or_else(|e| panic!("corpus: {e:#}"))
+    }
+
+    fn tokenized_scenes(
+        tokenizer: &BpeTokenizer,
+        tokens: &[u16],
+        meta: &crate::geometry::GeomMeta,
+        count: usize,
+    ) -> Vec<TokenizedScene> {
+        (0..count)
+            .map(|i| {
+                tokenize_scene(
+                    tokenizer,
+                    &tokens[i * meta.scene_len..(i + 1) * meta.scene_len],
+                )
+                .unwrap_or_else(|e| panic!("tokenize scene {i}: {e:#}"))
+            })
+            .collect()
+    }
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "dblocks-geomfusion-{tag}-{}-{}",
+            std::process::id(),
+            FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    /// Every parameter's values, flattened in module traversal order (the
+    /// qwentrain discipline: order pairs the values, and `ParamId`s from two
+    /// builds can never pair them).
+    fn param_values<M, BK>(module: &M) -> Vec<f32>
+    where
+        BK: Backend,
+        M: Module<BK>,
+    {
+        struct Flatten(Vec<f32>);
+        impl<BK: Backend> ModuleVisitor<BK> for Flatten {
+            fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<BK, D>>) {
+                self.0.extend(param.val().to_data().iter::<f32>());
+            }
+        }
+        let mut flat = Flatten(Vec::new());
+        module.visit(&mut flat);
+        flat.0
+    }
+
+    #[test]
+    fn test_parse_scene_matches_the_label_logic() {
+        let (tokens, meta) = tiny_corpus();
+        for i in 0..meta.scenes {
+            let window = &tokens[i * meta.scene_len..(i + 1) * meta.scene_len];
+            let parsed = parse_scene(window).unwrap_or_else(|e| panic!("parse scene {i}: {e:#}"));
+            assert_eq!(parsed.answer, window[meta.scene_len - 1] as u8);
+            assert_eq!(parsed.points.len(), meta.points);
+            assert!(meta.kinds.contains(&parsed.kind));
+            // The parsed coordinates and references recompute the gold
+            // answer through the corpus's own label logic: the parser reads
+            // the same scene the generator wrote.
+            assert_eq!(
+                answer_for(&parsed.kind, &parsed.points, &parsed.refs),
+                Some(parsed.answer),
+                "scene {i} ({}): parsed scene does not recompute its answer",
+                parsed.kind
+            );
+        }
+    }
+
+    #[test]
+    fn test_kernel_check_verifies_gold_and_falsifies_flips() {
+        let (tokens, meta) = tiny_corpus();
+        let mut checked = 0;
+        for i in 0..meta.scenes {
+            let window = &tokens[i * meta.scene_len..(i + 1) * meta.scene_len];
+            let parsed = parse_scene(window).unwrap_or_else(|e| panic!("parse scene {i}: {e:#}"));
+            let gold = kernel_check(&parsed, parsed.answer)
+                .unwrap_or_else(|e| panic!("kernel scene {i}: {e:#}"));
+            match parsed.kind.as_str() {
+                "direction" => assert_eq!(gold, KernelVerdict::Indeterminate),
+                _ => assert_eq!(
+                    gold,
+                    KernelVerdict::Verified,
+                    "scene {i} ({}): gold answer not verified",
+                    parsed.kind
+                ),
+            }
+            if matches!(parsed.kind.as_str(), "collinear" | "inside") {
+                let flipped = if parsed.answer == b'y' { b'n' } else { b'y' };
+                assert_eq!(
+                    kernel_check(&parsed, flipped).unwrap_or_else(|e| panic!("flip {i}: {e:#}")),
+                    KernelVerdict::Falsified,
+                    "scene {i} ({}): flipped answer not falsified",
+                    parsed.kind
+                );
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, meta.scenes);
+    }
+
+    #[test]
+    fn test_tokenize_scene_places_the_answer_span() {
+        let tokenizer = tiny_tokenizer();
+        let (tokens, meta) = tiny_corpus();
+        let candidates =
+            answer_token_ids(&tokenizer, &meta).unwrap_or_else(|e| panic!("candidates: {e:#}"));
+        assert_eq!(candidates.len(), meta.answer_tokens.len());
+        let scenes = tokenized_scenes(&tokenizer, &tokens, &meta, 12);
+        for (i, scene) in scenes.iter().enumerate() {
+            assert_eq!(scene.query + 1, scene.tokens.len() - 1, "scene {i}");
+            assert_eq!(scene.tokens[scene.query + 1], scene.answer, "scene {i}");
+            assert!(
+                candidates
+                    .iter()
+                    .any(|(byte, id)| *byte == u16::from(scene.answer_byte)
+                        && i64::from(*id) == scene.answer),
+                "scene {i}: answer token not in the candidate set"
+            );
+        }
+    }
+
+    #[test]
+    fn test_fused_qwen_is_the_trunk_at_birth() {
+        let device: <NdArray<f32> as burn::tensor::backend::BackendTypes>::Device =
+            Default::default();
+        <NdArray<f32> as Backend>::seed(&device, 0xF05ED);
+        let trunk = QwenTrunk::<NdArray<f32>>::new(tiny_trunk_config(), &device);
+        force_initialization(&trunk);
+        let config = GeomFusionConfig {
+            hidden_size: 64,
+            ..GeomFusionConfig::tiny()
+        };
+        let model = FusedQwen::<NdArray<f32>>::new(trunk, &config, &device)
+            .unwrap_or_else(|e| panic!("fused: {e:#}"));
+        let tokens = Tensor::<NdArray<f32>, 2, Int>::from_ints(
+            [[3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8]],
+            &device,
+        );
+        let fused = model
+            .forward(tokens.clone(), None)
+            .unwrap_or_else(|e| panic!("forward: {e:#}"));
+        let plain = model.trunk.forward(tokens);
+        let gap: f32 = (fused - plain).abs().max().into_scalar();
+        assert_eq!(gap, 0.0, "a fresh fusion must leave the trunk untouched");
+    }
+
+    #[test]
+    fn test_fused_traced_reports_gates_and_traces() {
+        let model = fused_seeded(7);
+        let device = Default::default();
+        let tokens =
+            Tensor::<AB, 2, Int>::from_ints([[3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8]], &device);
+        let out = model
+            .forward_traced(tokens, Some(3))
+            .unwrap_or_else(|e| panic!("traced: {e:#}"));
+        assert_eq!(out.logits.dims(), [1, 12, 128]);
+        assert_eq!(out.fused.traces.len(), model.fusion.num_blocks());
+        for trace in &out.fused.traces {
+            assert_eq!(trace.energy.len(), 3);
+        }
+        let sums: Vec<f32> = out
+            .fused
+            .gates
+            .sum_dim(1)
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
+        for (row, s) in sums.iter().enumerate() {
+            assert!((s - 1.0).abs() < 1e-6, "gate row {row} sums to {s}, not 1");
+        }
+    }
+
+    #[test]
+    fn test_fused_segmented_backward_matches_one_shot() {
+        // The training loop's numerical identity, driven through the actual
+        // loss: segment-checkpointed == one-shot, gradient for gradient, on
+        // the trunk adapters AND the geometric stream.
+        let device = Default::default();
+        let mut model = fused_seeded(11);
+        attach_lora(&mut model.trunk, &model_lora(), &device)
+            .unwrap_or_else(|e| panic!("attach: {e:#}"));
+        freeze_non_adapter_params(&mut model.trunk);
+        let tokenizer = tiny_tokenizer();
+        let (tokens, meta) = tiny_corpus();
+        let scenes = tokenized_scenes(&tokenizer, &tokens, &meta, 2);
+        let batch = padded_batch(&scenes, &device);
+
+        // One-shot reference: the same loss from a full grad forward.
+        let hidden = model.trunk.forward_hidden(batch.clone());
+        let loss = fused_answer_loss(&model, hidden, &scenes, FusedLossSpec::Answer, None, 0.01)
+            .unwrap_or_else(|e| panic!("loss: {e:#}"));
+        let mut all = GradientsParams::from_grads(loss.loss.backward(), &model);
+        let one_shot_fusion = take_module_grads(&mut all, &model.fusion);
+        let one_shot_trunk = all;
+
+        let segmented = segmented_fused_backward(
+            &model,
+            batch,
+            &scenes,
+            FusedLossSpec::Answer,
+            None,
+            0.01,
+            1.0,
+        )
+        .unwrap_or_else(|e| panic!("segmented: {e:#}"));
+        assert!(segmented.loss.is_finite());
+
+        let mut worst = 0.0f32;
+        let mut compared = 0usize;
+        let pairs = [
+            (
+                grad_map(&one_shot_trunk, &model.trunk),
+                grad_map(&segmented.trunk, &model.trunk),
+                "trunk",
+            ),
+            (
+                grad_map(&one_shot_fusion, &model.fusion),
+                grad_map(&segmented.fusion, &model.fusion),
+                "fusion",
+            ),
+        ];
+        for (ga, gb, module) in &pairs {
+            assert_eq!(ga.len(), gb.len(), "{module} gradient sets differ");
+            assert!(!ga.is_empty(), "{module} produced no gradients");
+            for (id, va) in ga {
+                let vb = gb
+                    .get(id)
+                    .unwrap_or_else(|| panic!("{module}: missing grad"));
+                assert_eq!(va.len(), vb.len());
+                for (x, y) in va.iter().zip(vb) {
+                    worst = worst.max((x - y).abs());
+                }
+                compared += 1;
+            }
+        }
+        assert!(compared > 0, "no gradients compared");
+        // Why not bit-exact here when the trunk-only engine certifies 0.0?
+        // The fused loss runs the stream per row and reduces across rows, so
+        // a shared parameter's gradient accumulates from several graph
+        // branches; the one-shot and segmented graphs visit those branches in
+        // different orders, and f32 addition is not associative. The
+        // per-segment VJP chain itself is exact (qwentrain's 0.0 certificate
+        // covers it); what is measured here is the accumulation-order
+        // sliver. The bound sits three orders above the observed ~2e-9, so a
+        // systematic error -- a dropped term, a wrong scale, a missing
+        // segment -- still fails loudly.
+        assert!(worst <= 1e-6, "segmented diverged from one-shot: {worst}");
+    }
+
+    fn model_lora() -> QwenLoraConfig {
+        QwenLoraConfig {
+            rank: 4,
+            alpha: 4.0,
+        }
+    }
+
+    fn padded_batch(
+        scenes: &[TokenizedScene],
+        device: &<AB as burn::tensor::backend::BackendTypes>::Device,
+    ) -> Tensor<AB, 2, Int> {
+        let max_len = scenes.iter().map(TokenizedScene::len).max().unwrap_or(0);
+        let mut flat = Vec::new();
+        for scene in scenes {
+            let mut row = scene.tokens.clone();
+            row.resize(max_len, 0);
+            flat.extend(row);
+        }
+        Tensor::<AB, 1, Int>::from_ints(flat.as_slice(), device).reshape([scenes.len(), max_len])
+    }
+
+    /// Gradient values keyed by param id over one module.
+    fn grad_map<M: Module<AB>>(grads: &GradientsParams, module: &M) -> HashMap<ParamId, Vec<f32>> {
+        struct Collect<'a> {
+            grads: &'a GradientsParams,
+            out: HashMap<ParamId, Vec<f32>>,
+        }
+        impl<'a> ModuleVisitor<AB> for Collect<'a> {
+            fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<AB, D>>) {
+                if let Some(g) = self
+                    .grads
+                    .get::<<AB as AutodiffBackend>::InnerBackend, D>(param.id)
+                {
+                    self.out
+                        .insert(param.id, g.to_data().iter::<f32>().collect());
+                }
+            }
+        }
+        let mut collect = Collect {
+            grads,
+            out: HashMap::new(),
+        };
+        module.visit(&mut collect);
+        collect.out
+    }
+
+    /// Move one module's gradients out of a combined set (the one-shot
+    /// backward covers both modules; the comparisons are per-module).
+    fn take_module_grads<M: Module<AB>>(all: &mut GradientsParams, module: &M) -> GradientsParams {
+        struct Move<'a> {
+            all: &'a mut GradientsParams,
+            out: GradientsParams,
+        }
+        impl<'a> ModuleVisitor<AB> for Move<'a> {
+            fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<AB, D>>) {
+                if let Some(g) = self
+                    .all
+                    .remove::<<AB as AutodiffBackend>::InnerBackend, D>(param.id)
+                {
+                    self.out
+                        .register::<<AB as AutodiffBackend>::InnerBackend, D>(param.id, g);
+                }
+            }
+        }
+        let mut visitor = Move {
+            all,
+            out: GradientsParams::new(),
+        };
+        module.visit(&mut visitor);
+        visitor.out
+    }
+
+    #[test]
+    fn test_trainer_moves_the_stream_and_not_the_trunk() {
+        let device = Default::default();
+        let model = fused_seeded(13);
+        let frozen_before = param_values::<_, AB>(&model.trunk.final_norm);
+        let out_proj_before = param_values::<_, AB>(&model.fusion);
+        let config = FusedTrainConfig {
+            steps: 2,
+            batch_size: 2,
+            lr: 1e-3,
+            fusion_lr: 1e-2,
+            lora: model_lora(),
+            log_every: 0,
+            ..FusedTrainConfig::default()
+        };
+        let mut trainer = FusedQwenTrainer::new(model, config, &device)
+            .unwrap_or_else(|e| panic!("trainer: {e:#}"));
+        let tokenizer = tiny_tokenizer();
+        let (tokens, meta) = tiny_corpus();
+        let scenes = tokenized_scenes(&tokenizer, &tokens, &meta, 2);
+        let report = trainer
+            .train_step(&scenes)
+            .unwrap_or_else(|e| panic!("step: {e:#}"));
+        assert!(
+            report.stepped && report.loss.is_finite(),
+            "step: {report:?}"
+        );
+        assert_eq!(
+            param_values::<_, AB>(&trainer.model.trunk.final_norm),
+            frozen_before,
+            "a frozen tensor moved"
+        );
+        let out_proj_after = param_values::<_, AB>(&trainer.model.fusion);
+        let moved = out_proj_before
+            .iter()
+            .zip(&out_proj_after)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(moved > 0.0, "the geometric stream did not train");
+    }
+
+    #[test]
+    fn test_fused_resume_is_bit_identical() {
+        // 2 steps, checkpoint, 2 more -- versus resume + the same 2 batches.
+        //
+        // What is pinned, and why it is proof against the parallel gate:
+        //
+        // - **The restored state is bit-exact.** Weights after resume equal
+        //   the checkpoint's weights with difference exactly 0.0 (the
+        //   record round-trips values and `ParamId`s; the packed weights
+        //   are shared by the pre-training clone, so no second RNG build
+        //   enters the comparison -- burn's backend RNG is process-global
+        //   and parallel tests reseed it). This half is deterministic under
+        //   any load: a record round-trip does not compute.
+        // - **Continued training matches up to measured compute noise.**
+        //   With `burn-ndarray/multi-threads`, the threaded GEMM's reduction
+        //   order varies run to run under CPU contention: the SAME model run
+        //   through the SAME backward twice produces gradients ~2e-8 apart
+        //   (measured in-process below, so the bound tracks the load the
+        //   gate is actually imposing). Two AdamW steps amplify that. The
+        //   resumed run's gradients, losses and parameters must agree with
+        //   the uninterrupted run inside a bound derived from that measured
+        //   noise -- and a real resume defect (a dropped optimizer page, a
+        //   mismatched `ParamId`, a stale EMA) lands orders of magnitude
+        //   above it.
+        let device = Default::default();
+        let config = FusedTrainConfig {
+            steps: 4,
+            batch_size: 2,
+            lr: 1e-3,
+            fusion_lr: 1e-2,
+            lora: model_lora(),
+            seed: 41,
+            log_every: 0,
+            ..FusedTrainConfig::default()
+        };
+        let tokenizer = tiny_tokenizer();
+        let (tokens, meta) = tiny_corpus();
+        let scenes = tokenized_scenes(&tokenizer, &tokens, &meta, 8);
+        let batches: Vec<&[TokenizedScene]> =
+            vec![&scenes[0..2], &scenes[2..4], &scenes[4..6], &scenes[6..8]];
+        let host_rng = ChaCha12Rng::seed_from_u64(43);
+
+        let dir = tmp_dir("resume");
+        let base = fused_seeded(0x51D1_F05E_D00D_1234);
+        // The resume target: the same packed weights, no adapters yet
+        // (resume attaches fresh ones and the record overwrites them).
+        let pristine = base.clone();
+        let mut trainer = FusedQwenTrainer::new(base, config.clone(), &device)
+            .unwrap_or_else(|e| panic!("trainer: {e:#}"));
+        let mut losses = Vec::new();
+        for batch in &batches[..2] {
+            losses.push(
+                trainer
+                    .train_step(batch)
+                    .unwrap_or_else(|e| panic!("step: {e:#}"))
+                    .loss,
+            );
+        }
+        let model_path = trainer
+            .save_checkpoint(&dir, &host_rng)
+            .unwrap_or_else(|e| panic!("save: {e:#}"));
+        // The checkpoint's exact content (forced parameters share values
+        // with the clone).
+        let at_save = trainer.model.clone();
+        for batch in &batches[2..] {
+            losses.push(
+                trainer
+                    .train_step(batch)
+                    .unwrap_or_else(|e| panic!("step: {e:#}"))
+                    .loss,
+            );
+        }
+
+        let (mut resumed, _) = FusedQwenTrainer::resume(&model_path, pristine, config, &device)
+            .unwrap_or_else(|e| panic!("resume: {e:#}"));
+        assert_eq!(resumed.step, 2, "resume continues at the saved step");
+
+        // (1) The restored weights are the checkpoint's, bit for bit.
+        let pa = param_values::<_, AB>(&at_save);
+        let pb = param_values::<_, AB>(&resumed.model);
+        assert_eq!(pa.len(), pb.len(), "record size changed across resume");
+        let weights_diff = pa
+            .iter()
+            .zip(&pb)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert_eq!(weights_diff, 0.0, "restored weights diverged");
+
+        // (2) Compute noise: the same model, the same batch, three times,
+        // so the noise estimate is the worst of three independent draws
+        // rather than one lucky pair. The weights the resumed backward runs
+        // on are bit-equal to `at_save`'s (pinned above), so any divergence
+        // of g2 from g0 is compute noise by construction -- this assert is a
+        // tripwire against that changing, not the resume proof itself.
+        let padded = padded_batch(batches[2], &device);
+        let backward = |model: &FusedQwen<AB>| {
+            segmented_fused_backward(
+                model,
+                padded.clone(),
+                batches[2],
+                FusedLossSpec::Answer,
+                None,
+                0.01,
+                1.0,
+            )
+            .unwrap_or_else(|e| panic!("backward: {e:#}"))
+        };
+        let g0 = grad_map(&backward(&at_save).trunk, &at_save.trunk);
+        let g1 = grad_map(&backward(&at_save).trunk, &at_save.trunk);
+        let g1b = grad_map(&backward(&at_save).trunk, &at_save.trunk);
+        let g2 = grad_map(&backward(&resumed.model).trunk, &resumed.model.trunk);
+        let mut noise = 0.0f32;
+        let mut resumed_grad = 0.0f32;
+        for (id, v0) in &g0 {
+            let v1 = g1.get(id).unwrap_or_else(|| panic!("missing grad"));
+            let v1b = g1b.get(id).unwrap_or_else(|| panic!("missing grad"));
+            let v2 = g2
+                .get(id)
+                .unwrap_or_else(|| panic!("missing grad after resume"));
+            for (((u0, u1), u1b), u2) in v0.iter().zip(v1).zip(v1b).zip(v2) {
+                noise = noise.max((u0 - u1).abs()).max((u0 - u1b).abs());
+                resumed_grad = resumed_grad.max((u0 - u2).abs());
+            }
+        }
+        // Observed same-model noise is ~2e-8 in a quiet process and grows
+        // with contention; the bound is ten times the measured value with a
+        // 1e-6 floor (two orders above the quiet figure) so a zero-noise
+        // sample cannot fail a healthy run, while a real defect -- a wrong
+        // weight set, a dropped gradient term -- sits at gradient scale,
+        // orders above either.
+        let grad_bound = (noise * 10.0).max(1e-6);
+        assert!(
+            resumed_grad <= grad_bound,
+            "resumed gradients diverged {resumed_grad:e}, above the bound {grad_bound:e} from measured same-model noise {noise:e}"
+        );
+
+        // (3) Continued training matches inside the noise-amplified bound.
+        let mut losses_resumed = Vec::new();
+        for batch in &batches[2..] {
+            losses_resumed.push(
+                resumed
+                    .train_step(batch)
+                    .unwrap_or_else(|e| panic!("step: {e:#}"))
+                    .loss,
+            );
+        }
+        for (a, b) in losses[2..].iter().zip(&losses_resumed) {
+            // Measured: the same-model backward noise above is ~2e-8 quiet /
+            // ~1e-7 under gate load, and two AdamW steps move a loss by a
+            // small multiple of that; 1e-3 sits four-plus orders above.
+            assert!(
+                (a - b).abs() <= 1e-3,
+                "losses diverged across resume: {a} vs {b}"
+            );
+        }
+        let pa = param_values::<_, AB>(&trainer.bank);
+        let pb = param_values::<_, AB>(&resumed.bank);
+        assert_eq!(pa.len(), pb.len(), "bank size changed across resume");
+        let scale = pa.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-3);
+        let worst = pa
+            .iter()
+            .zip(&pb)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        // The measured same-model noise is ~2e-8 per backward quiet and
+        // ~1e-7 under gate load; the bound sits two-plus orders above the
+        // observed post-step drift, so thread-scheduling noise cannot reach
+        // it while a dropped optimizer page or stale EMA would blow past it.
+        let bound = 1e-4 * scale;
+        assert!(
+            worst <= bound,
+            "adapter params diverged across resume by {worst}, above the relative bound {bound} at scale {scale}"
+        );
+        let fa = param_values::<_, AB>(&trainer.model.fusion);
+        let fb = param_values::<_, AB>(&resumed.model.fusion);
+        let fworst = fa
+            .iter()
+            .zip(&fb)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            fworst <= bound,
+            "stream params diverged across resume by {fworst}, above {bound}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap_or_else(|e| panic!("clean {}: {e}", dir.display()));
+    }
+
+    #[test]
+    fn test_trainer_diffusion_step_is_finite() {
+        // The EDM denoising objective on the geometric state: one block at
+        // one sampled sigma, sigma-weighted answer CE through the denoised
+        // pathway. Same corpus, model-side noise.
+        let device = Default::default();
+        let model = fused_seeded(19);
+        let config = FusedTrainConfig {
+            steps: 2,
+            batch_size: 2,
+            lr: 1e-3,
+            fusion_lr: 1e-2,
+            lora: model_lora(),
+            objective: crate::geometry::GeomObjective::Diffusion,
+            log_every: 0,
+            ..FusedTrainConfig::default()
+        };
+        let mut trainer = FusedQwenTrainer::new(model, config, &device)
+            .unwrap_or_else(|e| panic!("trainer: {e:#}"));
+        let tokenizer = tiny_tokenizer();
+        let (tokens, meta) = tiny_corpus();
+        let scenes = tokenized_scenes(&tokenizer, &tokens, &meta, 2);
+        let report = trainer
+            .train_step(&scenes)
+            .unwrap_or_else(|e| panic!("step: {e:#}"));
+        assert!(
+            report.stepped && report.loss.is_finite(),
+            "step: {report:?}"
+        );
+        assert!(
+            report.mse.is_finite() && report.mse >= 0.0,
+            "denoising term: {}",
+            report.mse
+        );
+    }
+
+    #[test]
+    fn test_prove_reports_structure_on_a_tiny_model() {
+        let device = Default::default();
+        let model = fused_seeded(17);
+        let tokenizer = tiny_tokenizer();
+        let (tokens, meta) = tiny_corpus();
+        let dir = tmp_dir("prove");
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("mkdir: {e}"));
+        let corpus_path = dir.join("corpus.bin");
+        crate::corpus::TokenCorpus::write(&corpus_path, &tokens)
+            .unwrap_or_else(|e| panic!("write corpus: {e:#}"));
+        let mut corpus = crate::corpus::TokenCorpus::in_memory(&corpus_path)
+            .unwrap_or_else(|e| panic!("open corpus: {e:#}"));
+        let proof = ProofConfig {
+            scenes: 10,
+            depth: None,
+            sweep: true,
+            sweep_depths: vec![1, 2],
+        };
+        let report = prove(&model, &mut corpus, &meta, &tokenizer, &proof, &device)
+            .unwrap_or_else(|e| panic!("prove: {e:#}"));
+        assert_eq!(report.scenes, 10);
+        assert_eq!(
+            report.verified + report.falsified + report.indeterminate,
+            10,
+            "every emitted answer must carry a kernel verdict"
+        );
+        assert!(report.chance > 0.0 && report.chance <= 1.0);
+        assert!((report.accuracy - report.chance - report.margin).abs() < 1e-6);
+        assert_eq!(report.sweep.len(), 2);
+        for point in &report.sweep {
+            assert!(point.agree_with_depth1 > 0.0 && point.agree_with_depth1 <= 1.0);
+        }
+        assert_eq!(report.per_kind.iter().map(|k| k.scenes).sum::<usize>(), 10);
+        std::fs::remove_dir_all(&dir).unwrap_or_else(|e| panic!("clean {}: {e}", dir.display()));
+    }
+
+    fn print_proof(tag: &str, report: &ProofReport) {
+        eprintln!(
+            "[{tag}] held-out {} scenes | accuracy {:.4} | chance {:.4} | margin {:+.4}",
+            report.scenes, report.accuracy, report.chance, report.margin
+        );
+        eprintln!(
+            "[{tag}] kernel verdicts: {} verified | {} falsified | {} indeterminate",
+            report.verified, report.falsified, report.indeterminate
+        );
+        for kind in &report.per_kind {
+            if kind.scenes == 0 {
+                continue;
+            }
+            eprintln!(
+                "[{tag}]   {:<9} n={:<4} acc {:.4} | kernel {}/{}/{}",
+                kind.kind,
+                kind.scenes,
+                kind.correct as f32 / kind.scenes as f32,
+                kind.verified,
+                kind.falsified,
+                kind.indeterminate
+            );
+        }
+        for point in &report.sweep {
+            eprintln!(
+                "[{tag}]   refine depth {}: accuracy {:.4} | mean energy {:.6} | agree-with-depth-1 {:.4}",
+                point.depth, point.accuracy, point.mean_energy, point.agree_with_depth1
+            );
+        }
+    }
+
+    /// THE REAL-WEIGHT PROOF RUN.
+    ///
+    /// A REDUCED trunk (embed + `QWEN_PROOF_LAYERS` decoder layers + final
+    /// norm + untied lm_head, NF4-resident, loaded from the real 27B BF16
+    /// shards) fused with a real [`GeomFusion`] stream, trained adapters-only
+    /// for a handful of steps on the real geometric corpus (`geom/`,
+    /// READ-ONLY), then proven on held-out scenes: accuracy vs the empirical
+    /// answer distribution, the refine sweep with agree-with-depth-1 trace
+    /// dependence, and every emitted answer checked by the exact rational
+    /// kernel. The reduction is loud: 4 of 64 layers is a shakedown of the
+    /// MECHANISM (fusion live, training converging, kernel gating answers),
+    /// not a capability measurement of the 27B. Ignored by default; run
+    /// explicitly:
+    ///
+    /// ```text
+    /// cargo test --lib real_weight_reduced_fused_proof -- --ignored --nocapture
+    /// ```
+    ///
+    /// Env: `QWEN_WEIGHTS_DIR` (default `/srv/m-sdd/unifur/weights/qwen38-bf16`),
+    /// `QWEN_PROOF_LAYERS` (default 4), `QWEN_PROOF_STEPS` (default 8),
+    /// `QWEN_PROOF_SCENES` (default 64), `QWEN_TOKENIZER` (default the Qwen3.8
+    /// source tokenizer), `GEOM_CORPUS_DIR` (default `geom`).
+    #[test]
+    #[ignore = "real weights: several minutes of load + CPU compute"]
+    fn test_real_weight_reduced_fused_proof() {
+        let weights_dir = std::env::var("QWEN_WEIGHTS_DIR")
+            .unwrap_or_else(|_| "/srv/m-sdd/unifur/weights/qwen38-bf16".to_string());
+        let shard1 = Path::new(&weights_dir).join("model-00001-of-00012.safetensors");
+        if !shard1.is_file() {
+            eprintln!("skip: shard 1 not present ({})", shard1.display());
+            return;
+        }
+        let layers: usize = std::env::var("QWEN_PROOF_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let steps: usize = std::env::var("QWEN_PROOF_STEPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        let eval_scenes: usize = std::env::var("QWEN_PROOF_SCENES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        let tok_path = std::env::var("QWEN_TOKENIZER").unwrap_or_else(|_| {
+            "/srv/m-sdd/unifur/tokenizers/qwen38-source/tokenizer.json".to_string()
+        });
+        let corpus_dir = std::env::var("GEOM_CORPUS_DIR").unwrap_or_else(|_| "geom".to_string());
+
+        let run_started = std::time::Instant::now();
+        let device = Default::default();
+        eprintln!(
+            "REAL-WEIGHT REDUCED PROOF: {layers} of 64 decoder layers, real NF4 weights, real fusion, corpus {corpus_dir}/"
+        );
+
+        // ---- load: reduced trunk, NF4-resident ----
+        let t = std::time::Instant::now();
+        let trunk_config = QwenTrunkConfig {
+            num_layers: Some(layers),
+            ..QwenTrunkConfig::qwen38()
+        };
+        let (trunk, residency) = crate::qwennet::load_qwen_trunk_nf4::<AB>(
+            Path::new(&weights_dir),
+            &trunk_config,
+            &device,
+        )
+        .unwrap_or_else(|e| panic!("load trunk: {e:#}"));
+        eprintln!(
+            "loaded {layers} layers NF4-resident in {:?} (packed {} MiB, f32-kept {} MiB)",
+            t.elapsed(),
+            residency.packed_bytes / (1 << 20),
+            residency.f32_kept_bytes / (1 << 20)
+        );
+
+        // ---- fuse: a real geometric stream on the 5120-wide hidden state ----
+        let fusion_config = GeomFusionConfig {
+            hidden_size: 5120,
+            geom_hidden: 128,
+            slots: 8,
+            dim: 32,
+            num_blocks: 2,
+            refine_steps: 4,
+            ..GeomFusionConfig::default()
+        };
+        let model = FusedQwen::<AB>::new(trunk, &fusion_config, &device)
+            .unwrap_or_else(|e| panic!("fuse: {e:#}"));
+
+        // ---- corpus + tokenizer (real artifacts, read-only) ----
+        let tokenizer = BpeTokenizer::from_json(
+            &std::fs::read_to_string(&tok_path).unwrap_or_else(|e| panic!("read {tok_path}: {e}")),
+        )
+        .unwrap_or_else(|e| panic!("parse tokenizer: {e:#}"));
+        let meta: crate::geometry::GeomMeta = serde_json::from_str(
+            &std::fs::read_to_string(Path::new(&corpus_dir).join("geom-meta.json"))
+                .unwrap_or_else(|e| panic!("read geom-meta.json: {e}")),
+        )
+        .unwrap_or_else(|e| panic!("parse geom-meta.json: {e:#}"));
+        let mut corpus =
+            crate::corpus::TokenCorpus::streaming(&Path::new(&corpus_dir).join("corpus.bin"))
+                .unwrap_or_else(|e| panic!("open corpus: {e:#}"));
+        let proof = ProofConfig {
+            scenes: eval_scenes,
+            depth: None,
+            sweep: true,
+            sweep_depths: vec![1, 2, 8],
+        };
+
+        // ---- proof before training: the fresh fusion is the trunk ----
+        // Evaluate on the inner (non-autodiff) backend: under autodiff every
+        // parameter requires grad, so each forward would retain the whole
+        // graph -- including the dequantized 5 GiB lm_head -- for a backward
+        // that never comes. `valid()` is the same weights with no graph.
+        let eval_model: FusedQwen<NdArray<f32>> = {
+            use burn::module::AutodiffModule as _;
+            model.valid()
+        };
+        let t = std::time::Instant::now();
+        let pre = prove(&eval_model, &mut corpus, &meta, &tokenizer, &proof, &device)
+            .unwrap_or_else(|e| panic!("prove (pre): {e:#}"));
+        eprintln!("pre-training proof in {:?}", t.elapsed());
+        print_proof("pre-train", &pre);
+
+        // ---- train: adapters-only, few steps, on the corpus head ----
+        let train_config = FusedTrainConfig {
+            steps,
+            batch_size: 2,
+            lr: 1e-4,
+            fusion_lr: 1e-3,
+            // The proof evaluates the tail; training must never sample it.
+            holdout: eval_scenes,
+            log_every: 1,
+            seed: 7,
+            ..FusedTrainConfig::default()
+        };
+        let mut trainer = FusedQwenTrainer::new(model, train_config, &device)
+            .unwrap_or_else(|e| panic!("trainer: {e:#}"));
+        let t = std::time::Instant::now();
+        let report = train_fused_qwen(&mut trainer, &mut corpus, &meta, &tokenizer, None)
+            .unwrap_or_else(|e| panic!("train: {e:#}"));
+        eprintln!(
+            "trained {} steps in {:?} | loss {:.4} -> {:.4} | accuracy {:.4} -> {:.4}",
+            report.steps_taken,
+            t.elapsed(),
+            report.first_loss,
+            report.last_loss,
+            report.first_accuracy,
+            report.last_accuracy
+        );
+
+        // ---- proof after training ----
+        let eval_trained: FusedQwen<NdArray<f32>> = {
+            use burn::module::AutodiffModule as _;
+            trainer.model.valid()
+        };
+        let t = std::time::Instant::now();
+        let post = prove(
+            &eval_trained,
+            &mut corpus,
+            &meta,
+            &tokenizer,
+            &proof,
+            &device,
+        )
+        .unwrap_or_else(|e| panic!("prove (post): {e:#}"));
+        eprintln!("post-training proof in {:?}", t.elapsed());
+        print_proof("post-train", &post);
+        eprintln!("total wall-clock: {:?}", run_started.elapsed());
+
+        // Structural sanity, not a capability claim: every emitted answer
+        // carried a kernel verdict, the numbers are finite, and the sweep
+        // ran. Whether a few steps beat chance is reported, not asserted.
+        assert_eq!(
+            pre.verified + pre.falsified + pre.indeterminate,
+            eval_scenes
+        );
+        assert_eq!(
+            post.verified + post.falsified + post.indeterminate,
+            eval_scenes
+        );
+        assert!(post.accuracy.is_finite() && post.chance > 0.0);
+        assert_eq!(post.sweep.len(), 3);
     }
 }

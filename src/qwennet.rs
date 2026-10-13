@@ -296,8 +296,10 @@ impl Nf4Embedding {
 // The variants cannot be boxed: Burn's `Module` is not implemented for
 // `Box<T>`, so a module enum has to hold them inline (same as
 // `vit::FeedForward`).
-#[allow(clippy::large_enum_variant)]
 #[derive(Module, Debug)]
+// audit-allow: variants cannot be boxed — burn-core 0.21 implements Module for
+// no Box<T>, so an enum deriving Module has to hold them inline.
+#[allow(clippy::large_enum_variant)]
 pub enum QwenLinear<B: Backend> {
     F32(Linear<B>),
     Nf4(Nf4Linear<B>),
@@ -425,7 +427,6 @@ impl<B: Backend> QwenLinear<B> {
 }
 
 /// Residency switch for the embedding table.
-#[allow(clippy::large_enum_variant)]
 #[derive(Module, Debug)]
 pub enum QwenEmbed<B: Backend> {
     F32(Embedding<B>),
@@ -1000,8 +1001,10 @@ impl<B: Backend> QwenFullAttention<B> {
 // The variants cannot be boxed: Burn's `Module` is not implemented for
 // `Box<T>`, so a module enum has to hold them inline (same as
 // `vit::FeedForward`).
-#[allow(clippy::large_enum_variant)]
 #[derive(Module, Debug)]
+// audit-allow: variants cannot be boxed — burn-core 0.21 implements Module for
+// no Box<T>, so an enum deriving Module has to hold them inline.
+#[allow(clippy::large_enum_variant)]
 pub enum QwenMixer<B: Backend> {
     Linear(GatedDeltaHead<B>),
     Full(QwenFullAttention<B>),

@@ -47,8 +47,12 @@ pub const DEFAULT_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
 
 /// Default teacher model. This is a *default*, not an assumption: every
 /// request carries [`NimConfig::model`] and nothing in the module behaves
-/// differently per model name.
-pub const DEFAULT_MODEL: &str = "qwen/qwen3-coder-480b-a35b-instruct";
+/// differently per model name. (The previous default,
+/// `qwen/qwen3-coder-480b-a35b-instruct`, was end-of-lifed by the catalogue
+/// on 2026-06-11 and now answers HTTP 410; `NIM_MODEL` overrides this default
+/// without a rebuild — the catalogue retires models faster than crates
+/// release.)
+pub const DEFAULT_MODEL: &str = "moonshotai/kimi-k3";
 
 /// Environment variable [`NimClient::from_env`] reads the API key from, unless
 /// [`NimConfig::api_key_env`] says otherwise.
@@ -57,6 +61,11 @@ pub const DEFAULT_API_KEY_ENV: &str = "NVIDIA_API_KEY";
 /// Environment variable [`NimClient::from_env`] reads an endpoint override
 /// from (e.g. `http://localhost:8000/v1` for a local NIM container).
 pub const BASE_URL_ENV: &str = "NIM_BASE_URL";
+
+/// Environment variable [`NimClient::from_env`] reads a model override from.
+/// The hosted catalogue retires models (see [`DEFAULT_MODEL`]), so the model
+/// must be replaceable without editing the crate.
+pub const MODEL_ENV: &str = "NIM_MODEL";
 
 /// Where real trace-generation runs write by default. The path lives on an
 /// external drive; tests never touch it and use unique `/tmp` names instead.
@@ -250,6 +259,16 @@ pub struct TraceRecord {
     pub usage: Usage,
     /// Seed recorded for reproduction.
     pub seed: u64,
+    /// Where the line came from: `teacher` for NIM-generated traces,
+    /// `identity` for the identity corpus ([`crate::langdata`]). Files
+    /// written before this field existed are all teacher traces, so the
+    /// serde default is `teacher`.
+    #[serde(default = "default_trace_source")]
+    pub source: String,
+}
+
+fn default_trace_source() -> String {
+    "teacher".to_string()
 }
 
 /// Hard cap on how many teacher requests one [`NimClient::generate_traces`]
@@ -339,14 +358,20 @@ impl NimClient {
     }
 
     /// Build a client from the process environment. Reads the endpoint
-    /// override from `NIM_BASE_URL` when set, then the API key from
-    /// [`NimConfig::api_key_env`] (default `NVIDIA_API_KEY`). A missing key is
-    /// an error that says exactly how to fix it.
+    /// override from `NIM_BASE_URL` and the model override from `NIM_MODEL`
+    /// when set, then the API key from [`NimConfig::api_key_env`] (default
+    /// `NVIDIA_API_KEY`). A missing key is an error that says exactly how to
+    /// fix it.
     pub fn from_env() -> anyhow::Result<Self> {
         let mut config = NimConfig::default();
         if let Ok(base) = std::env::var(BASE_URL_ENV) {
             if !base.trim().is_empty() {
                 config.base_url = base;
+            }
+        }
+        if let Ok(model) = std::env::var(MODEL_ENV) {
+            if !model.trim().is_empty() {
+                config.model = model;
             }
         }
         let api_key = std::env::var(&config.api_key_env).map_err(|_| {
@@ -477,7 +502,9 @@ impl NimClient {
                 messages: vec![
                     ChatMessage::system(format!(
                         "You are an expert {} programmer. Answer the task with correct, idiomatic \
-                         {} code and a brief explanation.",
+                         {} code and its tests. Answer with code only: no prose, no commentary — \
+                         the answer is filtered as training data, and prose around the code gets \
+                         it rejected.",
                         prompt.language, prompt.language
                     )),
                     ChatMessage::user(prompt.prompt.clone()),
@@ -495,6 +522,7 @@ impl NimClient {
                         model: reply.model,
                         usage: reply.usage,
                         seed: prompt.seed,
+                        source: default_trace_source(),
                     };
                     let line = serde_json::to_string(&record).context("serialize trace record")?;
                     new_lines.push_str(&line);
@@ -669,11 +697,16 @@ struct RawResponse {
 #[derive(Deserialize)]
 struct RawChoice {
     message: RawMessage,
+    /// Why generation stopped; `length` with a null `content` is how a
+    /// reasoning model says the whole token budget went to thinking.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct RawMessage {
-    content: String,
+    /// Null when the endpoint produced no visible answer (see above).
+    content: Option<String>,
 }
 
 fn parse_reply(raw: &str, request: &ChatRequest) -> anyhow::Result<ChatReply> {
@@ -683,8 +716,16 @@ fn parse_reply(raw: &str, request: &ChatRequest) -> anyhow::Result<ChatReply> {
         .choices
         .first()
         .ok_or_else(|| anyhow!("NIM response contained no choices: {}", excerpt(raw)))?;
+    let content = choice.message.content.clone().ok_or_else(|| {
+        anyhow!(
+            "NIM response carried no content (finish_reason: {}): the model spent its {}-token \
+             cap without producing an answer — reasoning models need a larger max_tokens",
+            choice.finish_reason.as_deref().unwrap_or("unreported"),
+            request.max_tokens
+        )
+    })?;
     Ok(ChatReply {
-        content: choice.message.content.clone(),
+        content,
         usage: response.usage,
         model: response.model.unwrap_or_else(|| request.model.clone()),
     })
@@ -1146,6 +1187,31 @@ mod tests {
     }
 
     #[test]
+    fn null_content_names_the_token_cap() {
+        // A reasoning model that spends its whole budget thinking answers
+        // with `content: null` and `finish_reason: "length"`; the error must
+        // say so, not fail as a JSON parse.
+        let server = MockServer::spawn(|_| {
+            (
+                200,
+                "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":null},\
+                 \"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":3,\
+                 \"completion_tokens\":8,\"total_tokens\":11}}"
+                    .to_string(),
+            )
+        });
+        let client = test_client(&server.url());
+        let err = client.complete(&chat_request()).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("no content"), "names the shape: {message}");
+        assert!(message.contains("length"), "names the reason: {message}");
+        assert!(
+            message.contains("64"),
+            "names the cap that was too small: {message}"
+        );
+    }
+
+    #[test]
     fn budget_caps_requests_and_reports_skips() {
         let server = MockServer::spawn(|_| (200, ok_body("code")));
         let client = test_client(&server.url());
@@ -1301,6 +1367,7 @@ mod tests {
             model: "m".to_string(),
             usage: Usage::default(),
             seed: 0,
+            source: "teacher".to_string(),
         })
         .expect("serialize record");
         std::fs::write(&path, format!("{good}\ngarbage\n")).expect("write file");
@@ -1325,6 +1392,7 @@ mod tests {
             model: "m".to_string(),
             usage: Usage::default(),
             seed: 0,
+            source: "teacher".to_string(),
         };
         let line = serde_json::to_string(&record).expect("serialize record");
         std::fs::write(&path, format!("{line}\n{line}\n")).expect("write file");
@@ -1350,6 +1418,7 @@ mod tests {
                         total_tokens: prompt_tokens + completion_tokens,
                     },
                     seed: 0,
+                    source: "teacher".to_string(),
                 }
             };
         let records = vec![
@@ -1408,6 +1477,7 @@ mod tests {
                 model: "m".to_string(),
                 usage: Usage::default(),
                 seed: p.seed,
+                source: "teacher".to_string(),
             })
             .collect();
         let (train, val) = split_traces(records.clone(), 0).expect("split 0");
@@ -1436,7 +1506,8 @@ mod tests {
             model: client.config().model.clone(),
             messages: vec![ChatMessage::user("Reply with exactly the word: ok")],
             temperature: Some(0.0),
-            max_tokens: 8,
+            // Room for a reasoning model's hidden thinking plus the word.
+            max_tokens: 256,
         };
         let reply = client.complete(&request).expect("real completion");
         assert!(!reply.content.trim().is_empty());

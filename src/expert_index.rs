@@ -571,6 +571,45 @@ impl MosmeSpec {
         Ok(next)
     }
 
+    /// Append one routing box per field, after the existing boxes.
+    ///
+    /// This is how a spec gains boxes for *non-coding* specialists
+    /// (`field:pentest` next to `coding:rust`): the appended order is the
+    /// field list's order, so the existing boxes — and every checkpoint
+    /// keyed by their positions — are undisturbed. Each field box holds
+    /// `experts_per_box` micro experts named `field:{field}/micro_{i}`,
+    /// enabled from the start (unlike [`Self::extended_with`], which lands
+    /// experts disabled: a field box exists to be routed to, not staged).
+    pub fn with_field_boxes(
+        &self,
+        fields: &[String],
+        experts_per_box: usize,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            experts_per_box >= 1,
+            "experts_per_box must be at least 1, got {experts_per_box}"
+        );
+        validate_field_box_names(fields)?;
+        let mut next = self.clone();
+        for field in fields {
+            next.boxes.push(BoxSpec::new(
+                format!("field:{field}"),
+                format!("{field} specialist"),
+                (0..experts_per_box)
+                    .map(|i| {
+                        ExpertSpec::new(
+                            format!("field:{field}/micro_{i}"),
+                            format!("{field} micro expert {i}"),
+                        )
+                        .with_tags(&["field", field])
+                    })
+                    .collect(),
+            ));
+        }
+        next.validate()?;
+        Ok(next)
+    }
+
     /// Whether `self` extends `other`: same boxes in the same order, each with
     /// at least as many experts, and the shared prefix identical.
     pub fn is_superset_of(&self, other: &MosmeSpec) -> bool {
@@ -608,27 +647,96 @@ pub const CODING_LANGUAGES: [(&str, &str); 6] = [
     ("web", "Web (HTML/CSS/JS mixed)"),
 ];
 
-/// The rest of the top-10 language list, documented as **later** registry
-/// entries: no boxes exist for these yet. Adding one is
-/// `MosmeSpec::extended_with` on the matching `coding:<lang>` box after the
-/// box itself is added here — a bit-exact identity until the new expert is
-/// enabled, so an existing student checkpoint is undisturbed.
-pub const PLANNED_CODING_LANGUAGES: [&str; 10] = [
-    "go", "java", "csharp", "php", "ruby", "swift", "kotlin", "sql", "dart", "scala",
+/// The languages graduated from planning into [`crate::student::CodeLanguage`]
+/// after the shipped six: trainable whenever a config's
+/// [`crate::student::StudentConfig::coding_boxes`] lists them, but absent from
+/// the default box set, so a config that predates them still builds the model
+/// it described.
+pub const EXTENDED_CODING_LANGUAGES: [(&str, &str); 4] = [
+    ("go", "Go"),
+    ("java", "Java"),
+    ("csharp", "C#"),
+    ("php", "PHP"),
 ];
 
-/// The coding student's MoSME spec: one box per [`CODING_LANGUAGES`] entry,
-/// each holding `experts_per_box` micro experts named
-/// `coding:<lang>/micro_<i>`.
+/// The rest of the top-10 language list, documented as **later** registry
+/// entries: no [`crate::student::CodeLanguage`] variant exists for these yet.
+/// Adding one is a new `CodeLanguage` variant plus a move into
+/// [`EXTENDED_CODING_LANGUAGES`] — the box set itself is config-driven
+/// ([`crate::student::StudentConfig::coding_boxes`]), so an existing student
+/// checkpoint is undisturbed either way.
+pub const PLANNED_CODING_LANGUAGES: [&str; 6] = ["ruby", "swift", "kotlin", "sql", "dart", "scala"];
+
+/// The naming rule both box lists share: the same charset a registry field
+/// uses (lowercase letters, digits and dashes — see `crate::nina::validate_name`),
+/// non-empty and unique within the list. `kind` names the list in the error
+/// (`coding` or `field`) so a bad config names the field at fault.
+fn validate_box_names(kind: &str, names: &[String]) -> anyhow::Result<()> {
+    let mut seen = BTreeSet::new();
+    for name in names {
+        anyhow::ensure!(
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "{kind} box name '{name}' is invalid: lowercase letters, digits and dashes only"
+        );
+        anyhow::ensure!(
+            seen.insert(name.as_str()),
+            "duplicate {kind} box name '{name}'"
+        );
+    }
+    Ok(())
+}
+
+/// The naming rule for field boxes, kept as its own function because it is
+/// the contract [`MosmeSpec::with_field_boxes`] and the configs document.
+/// The box id is `field:{field}`, so a field name can never collide with a
+/// `coding:{lang}` box; what remains to refuse is a name that would make an
+/// unreadable id or a duplicate box.
+pub fn validate_field_box_names(fields: &[String]) -> anyhow::Result<()> {
+    validate_box_names("field", fields)
+}
+
+/// The naming rule for coding boxes ([`crate::student::StudentConfig`]'s
+/// `coding_boxes`): the shared box charset, plus non-empty — the router
+/// needs at least one box for `top_box` to mean anything.
+pub fn validate_coding_box_names(languages: &[String]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !languages.is_empty(),
+        "coding_boxes must name at least one language"
+    );
+    validate_box_names("coding", languages)
+}
+
+/// The label a coding box carries for `key`: the registry's label when the
+/// key is a known language, the key itself otherwise (a config may name a
+/// language this build does not know; the box is still well-formed).
+fn coding_label(key: &str) -> &str {
+    CODING_LANGUAGES
+        .iter()
+        .chain(EXTENDED_CODING_LANGUAGES.iter())
+        .find(|(k, _)| *k == key)
+        .map_or(key, |(_, label)| *label)
+}
+
+/// The coding student's MoSME spec for an explicit box list: one box per
+/// entry of `languages`, each holding `experts_per_box` micro experts named
+/// `coding:<lang>/micro_<i>`. [`coding_student_spec`] is this function at the
+/// default box set.
 ///
-/// Micro-expert sizing follows `docs/Mixture-of-Specialized-Micro-Experts.md`:
-/// many tiny experts beat a few large ones, so the *box* count per language
-/// stays small here and the expert *width* (the trunk's
-/// `intermediate_size`, FFN/4–FFN/8 of a dense feed-forward) is what makes
-/// each expert micro. Fallible for the same reason `validate` is: a spec
-/// with zero experts or an impossible top-k is a caller mistake that should
-/// name the argument at fault.
-pub fn coding_student_spec(
+/// The list order *is* the box order: box `i` of the router's output is
+/// `coding:{languages[i]}`, so a config's `coding_boxes` pins every
+/// checkpoint's routing layout. Micro-expert sizing follows
+/// `docs/Mixture-of-Specialized-Micro-Experts.md`: many tiny experts beat a
+/// few large ones, so the *box* count per language stays small here and the
+/// expert *width* (the trunk's `intermediate_size`, FFN/4–FFN/8 of a dense
+/// feed-forward) is what makes each expert micro. Fallible for the same
+/// reason `validate` is: a spec with zero experts, an unreadable name or an
+/// impossible top-k is a caller mistake that should name the argument at
+/// fault.
+pub fn coding_spec_for(
+    languages: &[String],
     experts_per_box: usize,
     top_box: usize,
     top_expert: usize,
@@ -637,19 +745,21 @@ pub fn coding_student_spec(
         experts_per_box >= 1,
         "experts_per_box must be at least 1, got {experts_per_box}"
     );
+    validate_coding_box_names(languages)?;
     anyhow::ensure!(
-        (1..=CODING_LANGUAGES.len()).contains(&top_box),
+        (1..=languages.len()).contains(&top_box),
         "top_box must be in [1, {}], got {top_box}",
-        CODING_LANGUAGES.len()
+        languages.len()
     );
     anyhow::ensure!(
         top_expert >= 1 && top_expert <= experts_per_box,
         "top_expert must be in [1, {experts_per_box}], got {top_expert}"
     );
     let spec = MosmeSpec {
-        boxes: CODING_LANGUAGES
+        boxes: languages
             .iter()
-            .map(|(key, label)| {
+            .map(|key| {
+                let label = coding_label(key);
                 BoxSpec::new(
                     format!("coding:{key}"),
                     format!("{label} specialist"),
@@ -672,6 +782,22 @@ pub fn coding_student_spec(
     };
     spec.validate()?;
     Ok(spec)
+}
+
+/// The coding student's MoSME spec at the default box set: one box per
+/// [`CODING_LANGUAGES`] entry. This is [`coding_spec_for`] with the six
+/// shipped keys; a [`crate::student::StudentConfig`] builds its spec from its
+/// own `coding_boxes` list instead, which defaults to exactly these.
+pub fn coding_student_spec(
+    experts_per_box: usize,
+    top_box: usize,
+    top_expert: usize,
+) -> anyhow::Result<MosmeSpec> {
+    let names: Vec<String> = CODING_LANGUAGES
+        .iter()
+        .map(|(key, _)| (*key).to_string())
+        .collect();
+    coding_spec_for(&names, experts_per_box, top_box, top_expert)
 }
 
 /// Per-box expert counts and enabled flags — the spec stripped of everything
@@ -1121,5 +1247,121 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("top_expert"));
+    }
+
+    #[test]
+    fn test_coding_spec_for_builds_a_configured_box_set() {
+        // The default builder is the explicit-list builder at the shipped
+        // six — same document, byte for byte.
+        let six: Vec<String> = CODING_LANGUAGES
+            .iter()
+            .map(|(key, _)| (*key).to_string())
+            .collect();
+        assert_eq!(
+            coding_student_spec(2, 1, 1).unwrap(),
+            coding_spec_for(&six, 2, 1, 1).unwrap()
+        );
+
+        // The ten-language set: the extended four land after the shipped
+        // six, with the registry's labels and the usual expert naming.
+        let ten: Vec<String> = six
+            .iter()
+            .cloned()
+            .chain(
+                EXTENDED_CODING_LANGUAGES
+                    .iter()
+                    .map(|(key, _)| (*key).to_string()),
+            )
+            .collect();
+        let spec = coding_spec_for(&ten, 2, 1, 1).unwrap();
+        assert_eq!(spec.boxes.len(), 10);
+        assert_eq!(spec.boxes[6].id, "coding:go");
+        assert_eq!(spec.boxes[6].label, "Go specialist");
+        assert_eq!(spec.boxes[9].id, "coding:php");
+        assert!(spec.position("coding:csharp/micro_1").is_some());
+        assert_eq!(spec.experts_per_box(), vec![2; 10]);
+        spec.validate().unwrap();
+
+        // A reordered list is a reordered router: the list order is the box
+        // order, so a config pins its checkpoints' layout.
+        let shuffled = coding_spec_for(&["go".to_string(), "rust".to_string()], 1, 1, 1).unwrap();
+        assert_eq!(shuffled.boxes[0].id, "coding:go");
+        assert_eq!(shuffled.boxes[1].id, "coding:rust");
+
+        // Bad lists are errors naming the argument at fault.
+        assert!(coding_spec_for(&[], 1, 1, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("at least one"));
+        assert!(coding_spec_for(&["Go".to_string()], 1, 1, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid"));
+        assert!(
+            coding_spec_for(&["rust".to_string(), "rust".to_string()], 1, 1, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate")
+        );
+        assert!(coding_spec_for(&six, 1, 7, 1)
+            .unwrap_err()
+            .to_string()
+            .contains("top_box"));
+
+        // The graduated four left the planned list; what remains is
+        // genuinely future work.
+        for graduated in ["go", "java", "csharp", "php"] {
+            assert!(!PLANNED_CODING_LANGUAGES.contains(&graduated));
+        }
+        assert_eq!(PLANNED_CODING_LANGUAGES.len(), 6);
+    }
+
+    #[test]
+    fn test_with_field_boxes_appends_after_the_coding_boxes() {
+        let base = coding_student_spec(2, 1, 1).unwrap();
+        let spec = base
+            .with_field_boxes(&["pentest".to_string(), "dfir".to_string()], 2)
+            .unwrap();
+        // The coding prefix is untouched: same boxes, same order, same experts.
+        assert_eq!(spec.boxes[..CODING_LANGUAGES.len()], base.boxes[..]);
+        assert_eq!(spec.boxes.len(), CODING_LANGUAGES.len() + 2);
+        assert_eq!(spec.boxes[6].id, "field:pentest");
+        assert_eq!(spec.boxes[7].id, "field:dfir");
+        assert_eq!(spec.experts_per_box(), vec![2; CODING_LANGUAGES.len() + 2]);
+        // Field experts are named under their box and enabled from the start.
+        let (bi, ei) = spec.position("field:pentest/micro_1").unwrap();
+        assert_eq!((bi, ei), (6, 1));
+        assert!(spec.boxes[6].experts.iter().all(|e| e.enabled));
+        // Deterministic, and the extended spec still validates.
+        assert_eq!(
+            spec,
+            base.with_field_boxes(&["pentest".to_string(), "dfir".to_string()], 2)
+                .unwrap()
+        );
+        spec.validate().unwrap();
+    }
+
+    #[test]
+    fn test_with_field_boxes_rejects_bad_names_and_duplicates() {
+        let base = coding_student_spec(1, 1, 1).unwrap();
+        for bad in ["", "Pentest", "pen test", "pentest/recon", "pentest_recon"] {
+            let err = base
+                .with_field_boxes(&[bad.to_string()], 1)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("invalid"), "{bad}: {err}");
+        }
+        let err = base
+            .with_field_boxes(&["pentest".to_string(), "pentest".to_string()], 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate"), "{err}");
+        assert!(base
+            .with_field_boxes(&["pentest".to_string()], 0)
+            .unwrap_err()
+            .to_string()
+            .contains("experts_per_box"));
+        // An empty field list is the identity, not an error.
+        assert_eq!(base.with_field_boxes(&[], 1).unwrap(), base);
     }
 }

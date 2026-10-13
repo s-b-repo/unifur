@@ -30,24 +30,24 @@
 //!   Many satisfying draws are evidence, never proof.
 //!
 //! Scope, stated plainly, because the audit was about claims outrunning
-//! machinery. This file is the kernel: exact objects, exact predicates, a rule
-//! library that carries its own side conditions, construction with exact
-//! coordinates, saturation that logs a dependency-bearing proof trace, and a
-//! premise-guided falsifier. Around it sit the pieces the audit named, each in
-//! its own module so the boundary stays honest: `geomproof` for construction
-//! beam search, machine-checkable certificates, the independent verifier and
-//! the Lean 4 export; `geomnegatives` for the false derivations a proof head
-//! has to learn to reject; `geomroute` for the MoSME-style
-//! expert-per-failure-mode controller that gates every proposal behind a
-//! verifier; `geomexercises` for the difficulty-ordered exercises that feed
-//! them; `geom3d` and `geomnonclid` for the incidence models outside the plane
-//! and outside Euclid; `geomvision` for diagram-to-graph grounding;
-//! `geomaugment` for structure-preserving transforms. What is still *not*
-//! here: a Gröbner-complete prover for construction *separation* (the falsifier
-//! solves most premises exactly and rejection-samples the rest), hyperbolic
-//! trigonometry, and a checked compilation of the exported Lean file. Those are
-//! declared where they bite — the sin the audit found was never the ambition,
-//! only the prose that ran ahead of it.
+//! machinery. This file is the kernel, and today it stands nearly alone:
+//! exact objects, exact predicates, a rule library that carries its own side
+//! conditions, construction with exact coordinates, saturation that logs a
+//! dependency-bearing proof trace, and a premise-guided falsifier. The sibling
+//! modules that exist are `geomnonclid` (the declared non-Euclidean
+//! environments and their exact incidence models), `geom3d` (incidence outside
+//! the plane), `geomvision` (diagram-to-graph grounding) and `geomaugment`
+//! (structure-preserving transforms). Planned but not built are `geomproof`
+//! (construction beam search with an independent verifier and Lean 4 export),
+//! `geomnegatives` (false-derivation training data), `geomroute` (a
+//! verifier-gated expert-per-failure-mode controller) and `geomexercises`
+//! (difficulty-ordered exercises) — no module of those names exists yet, and
+//! nothing here links against them. What is still *not* here: a
+//! Gröbner-complete prover for construction *separation* (the falsifier solves
+//! most premises exactly and rejection-samples the rest), hyperbolic
+//! trigonometry, and a checked compilation of the Lean file the planned
+//! `geomproof` would export. Those are declared where they bite — the sin the
+//! audit found was never the ambition, only the prose that ran ahead of it.
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};

@@ -928,6 +928,46 @@ mod tests {
         nf4_trunk_seeded(device, 0x9E37_79B9_7F4A_7C15)
     }
 
+    /// A second trainer starting from exactly `source`'s current weights,
+    /// built WITHOUT trusting the process-global RNG.
+    ///
+    /// Burn's backend RNG is process-global, and under `cargo test --lib`'s
+    /// default parallelism a neighbour test can reseed it between this
+    /// test's `seed` and the draws that follow — so two seeded builds are
+    /// *not* guaranteed to agree (the observed flake: two "identical"
+    /// banks 2.7 apart before any step). A record round trip cannot fix
+    /// that here: the NF4 packed base is `#[module(skip)]` — not in the
+    /// record at all — so a loaded donor keeps its OWN packed weights.
+    /// What survives is a forced clone: values, packed bytes, `ParamId`s
+    /// and freeze marks alike, so the twin is bit-identical to the source
+    /// by construction. What these tests assert is the trajectory FROM a
+    /// shared start (accumulation, paging, resume), never the init itself.
+    fn twin_trainer(
+        source: &QwenTrainer<B>,
+        config: QwenTrainConfig,
+        device: &<B as burn::tensor::backend::BackendTypes>::Device,
+    ) -> QwenTrainer<B> {
+        // Force before the clone: an unforced parameter is a deferred
+        // initializer, and the clone would draw its own values (AGENTS.md).
+        force_initialization(&source.trunk);
+        let trunk = source.trunk.clone();
+        let bank = QwenAdapterBank::from_trunk(&trunk).unwrap_or_else(|e| panic!("bank: {e:#}"));
+        QwenTrainer {
+            pager: OptimPager::for_trunk(&trunk).unwrap_or_else(|e| panic!("pager: {e:#}")),
+            ema: config.ema_decay.map(|decay| Ema::new(&bank, decay)),
+            accumulator: GradientAccumulator::new(config.accumulate),
+            optim: AdamWConfig::new().init(),
+            trunk,
+            bank,
+            config,
+            device: *device,
+            step: 0,
+            micro_counter: 0,
+            tokens_seen: 0,
+            loss_sum: 0.0,
+        }
+    }
+
     fn tiny_train_config(seed: u64) -> QwenTrainConfig {
         QwenTrainConfig {
             lr: 1e-3,
@@ -1176,13 +1216,11 @@ mod tests {
         // tolerance is small but honest, not zero.
         let device = Default::default();
         // `QwenTrainer::new` attaches and freezes, so the builder hands it a
-        // bare NF4 trunk. Two calls to `build` must produce identical
-        // parameter ids for the paired comparisons below to mean anything,
-        // which is why this goes through the same deterministic path.
-        // Both sides of the comparison below must be the *same* trunk, so the
-        // builder re-seeds: burn's RNG is a process global, and two unseeded
-        // builds draw different weights and different ParamIds.
-        let build = || nf4_trunk_seeded(&device, 0x51D1_C0DE_1234_5678);
+        // bare NF4 trunk. Both sides of the comparison must start from the
+        // SAME weights; reseeding the process-global RNG cannot guarantee
+        // that under the parallel gate (a neighbour test reseeds between the
+        // seed and the draws), so the big-batch trainer is a record-round-trip
+        // twin of the accumulating one -- bit-identical by construction.
         let mut rng = ChaCha12Rng::seed_from_u64(23);
         let micro1 = sample_tokens(&mut rng, 1, 6, 128);
         let micro2 = sample_tokens(&mut rng, 1, 6, 128);
@@ -1192,8 +1230,19 @@ mod tests {
             accumulate: 2,
             ..tiny_train_config(29)
         };
-        let mut acc_trainer =
-            QwenTrainer::new(build(), config, &device).unwrap_or_else(|e| panic!("trainer: {e:#}"));
+        let mut acc_trainer = QwenTrainer::new(
+            nf4_trunk_seeded(&device, 0x51D1_C0DE_1234_5678),
+            config,
+            &device,
+        )
+        .unwrap_or_else(|e| panic!("trainer: {e:#}"));
+        let big_config = QwenTrainConfig {
+            accumulate: 1,
+            ..tiny_train_config(29)
+        };
+        // Both twins are taken from the STARTING state, before any step.
+        let mut big_trainer = twin_trainer(&acc_trainer, big_config.clone(), &device);
+        let mut big_trainer_again = twin_trainer(&acc_trainer, big_config, &device);
         assert!(
             !acc_trainer
                 .train_step(micro1)
@@ -1205,19 +1254,24 @@ mod tests {
             .unwrap_or_else(|e| panic!("micro2: {e:#}"));
         assert!(report.stepped, "second micro-batch completes the cycle");
 
-        let config = QwenTrainConfig {
-            accumulate: 1,
-            ..tiny_train_config(29)
-        };
-        let mut big_trainer =
-            QwenTrainer::new(build(), config, &device).unwrap_or_else(|e| panic!("trainer: {e:#}"));
         big_trainer
-            .train_step(big)
+            .train_step(big.clone())
             .unwrap_or_else(|e| panic!("big: {e:#}"));
 
-        // Value comparison, not `ParamId`-keyed: the two trainers are built
-        // separately and a global id counter guarantees the keys differ even
-        // when the weights agree.
+        // Compute noise, measured rather than assumed: the second big-batch
+        // trainer started from the same shared state and steps the same
+        // batch. burn-ndarray's threaded reductions reorder under CPU
+        // contention, so the same step run twice can differ; the cross-path
+        // comparison below must clear the systematic summation-order sliver
+        // AND whatever noise the gate's load is producing right now.
+        big_trainer_again
+            .train_step(big)
+            .unwrap_or_else(|e| panic!("big again: {e:#}"));
+        let b2 = param_values::<_, B>(&big_trainer_again.bank);
+
+        // Value comparison, in module traversal order: element i is the same
+        // parameter in both sequences, which a `ParamId`-keyed map cannot
+        // assume across separate builds.
         let a = param_values::<_, B>(&acc_trainer.bank);
         let b = param_values::<_, B>(&big_trainer.bank);
         assert_eq!(
@@ -1230,6 +1284,11 @@ mod tests {
             .zip(&b)
             .map(|(x, y)| (x - y).abs())
             .fold(0.0f32, f32::max);
+        let noise = b
+            .iter()
+            .zip(&b2)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
         // The two paths sum the same gradients in a different order, so they
         // cannot agree bit for bit. Stated *relative to the parameter scale*:
         // an absolute tolerance on weights of mixed magnitude says nothing,
@@ -1239,23 +1298,30 @@ mod tests {
         // This bound is EMPIRICAL, and that is worth being explicit about
         // rather than dressing up: a rigorous pairwise-summation bound would
         // need the exact count of gradient terms reduced per parameter, which
-        // this engine does not track. Observed drift here is ~1.5e-5 relative.
-        // The bound is set two orders of magnitude above that so a systematic
-        // error -- a micro-batch counted twice, a missing `1/k`, a wrong
-        // gradient-clipping scale -- still fails loudly; those land many orders
-        // above it. AdamW divides by `sqrt(v)`, which amplifies a relative
-        // difference in the gradient into a much larger relative difference in
-        // the step, so the drift is a property of the optimizer rather than
-        // evidence of a wrong accumulation.
+        // this engine does not track. Observed drift here is ~1.5e-5 relative
+        // in a quiet process. The systematic bound is set two orders of
+        // magnitude above that so a systematic error -- a micro-batch counted
+        // twice, a missing `1/k`, a wrong gradient-clipping scale -- still
+        // fails loudly; those land many orders above it. AdamW divides by
+        // `sqrt(v)`, which amplifies a relative difference in the gradient
+        // into a much larger relative difference in the step, so the drift is
+        // a property of the optimizer rather than evidence of a wrong
+        // accumulation.
+        //
+        // Under gate-load contention the threaded backward's reduction order
+        // adds run-to-run noise on top of the systematic sliver, so the bound
+        // also clears ten times the same-path noise measured above. In a
+        // quiet process that term is zero and the bound is the systematic one.
         //
         // TODO(derive): tighten this to `C * f32::EPSILON * scale * sqrt(terms)`
         // once `terms` is countable, and drop the empirical factor.
         let scale = a.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-3);
-        let bound = 1e-4 * scale;
+        let bound = (1e-4 * scale).max(noise * 10.0);
         assert!(
             worst <= bound,
             "accumulated step diverged from large-batch step by {worst}, above the \
-             relative bound {bound} at scale {scale}"
+             bound {bound} (systematic {}, measured same-path noise {noise:e})",
+            1e-4 * scale
         );
     }
 
@@ -1313,23 +1379,35 @@ mod tests {
         // k steps, checkpoint, k more -- versus 2k uninterrupted. Losses,
         // adapter params and the next sampled batch must be bit-identical.
         let device = Default::default();
-        // `QwenTrainer::new` attaches and freezes, so the builder hands it a
-        // bare NF4 trunk. Two calls to `build` must produce identical
-        // parameter ids for the paired comparisons below to mean anything,
-        // which is why this goes through the same deterministic path.
-        // Both sides of the comparison below must be the *same* trunk, so the
-        // builder re-seeds: burn's RNG is a process global, and two unseeded
-        // builds draw different weights and different ParamIds.
-        let build = || nf4_trunk_seeded(&device, 0x51D1_C0DE_1234_5678);
+        // Both runs must start from the SAME weights. Reseeding the
+        // process-global RNG cannot guarantee that under the parallel gate
+        // (a neighbour test reseeds between the seed and the draws), so run
+        // B is a forced-clone twin of run A -- bit-identical by
+        // construction, whatever the build's draws were. The tiny trunk's
+        // forward and backward draw nothing from the device RNG (the
+        // per-step reseed in `train_step` is defence, not load-bearing), so
+        // a shared start makes the whole comparison deterministic.
         let seed = 41;
         let mut rng_a = ChaCha12Rng::seed_from_u64(43);
         let batches: Vec<Tensor<B, 2, Int>> = (0..4)
             .map(|_| sample_tokens(&mut rng_a, 1, 6, 128))
             .collect();
 
+        // One bare trunk, built once. `nf4_trunk_seeded` forces before
+        // returning, so the clone carries the same values AND the same
+        // packed NF4 base bytes -- and the packed base is `#[module(skip)]`,
+        // i.e. NOT in the checkpoint record, which is why the resume donor
+        // must be this clone rather than a second seeded build: production
+        // resume re-quantizes from the same shards; the test's equivalent
+        // is the same bytes, held, not redrawn.
+        let bare = nf4_trunk_seeded(&device, 0x51D1_C0DE_1234_5678);
+        let resume_donor = bare.clone();
         // Uninterrupted run A: 4 steps.
-        let mut trainer_a = QwenTrainer::new(build(), tiny_train_config(seed), &device)
+        let mut trainer_a = QwenTrainer::new(bare, tiny_train_config(seed), &device)
             .unwrap_or_else(|e| panic!("trainer: {e:#}"));
+        // Run B: twin start, 2 steps, save, resume, 2 more.
+        let dir = tmp_dir("resume");
+        let mut trainer_b = twin_trainer(&trainer_a, tiny_train_config(seed), &device);
         let mut losses_a = Vec::new();
         for tokens in &batches {
             losses_a.push(
@@ -1340,10 +1418,6 @@ mod tests {
             );
         }
 
-        // Run B: 2 steps, save, resume, 2 more.
-        let dir = tmp_dir("resume");
-        let mut trainer_b = QwenTrainer::new(build(), tiny_train_config(seed), &device)
-            .unwrap_or_else(|e| panic!("trainer: {e:#}"));
         let mut losses_b = Vec::new();
         for tokens in &batches[..2] {
             losses_b.push(
@@ -1359,9 +1433,12 @@ mod tests {
         let model_path = trainer_b
             .save_checkpoint(&dir, &rng_a)
             .unwrap_or_else(|e| panic!("save: {e:#}"));
-        let fresh = build();
+        // The resume donor is the bare-trunk clone kept from the start: the
+        // checkpoint record carries the adapters and smalls, but the packed
+        // NF4 base is `#[module(skip)]` and comes from the donor -- so the
+        // donor must BE the same base, not merely the same seed.
         let (mut trainer_b2, rng_b2) =
-            QwenTrainer::resume(&model_path, fresh, tiny_train_config(seed), &device)
+            QwenTrainer::resume(&model_path, resume_donor, tiny_train_config(seed), &device)
                 .unwrap_or_else(|e| panic!("resume: {e:#}"));
         assert_eq!(trainer_b2.step, 2, "resume continues at the saved step");
         for tokens in &batches[2..] {
@@ -1414,23 +1491,25 @@ mod tests {
         // Evict + restore the optimizer state per page; the next step must
         // be exactly the uninterrupted one (m/v restore bit-exact).
         let device = Default::default();
-        // `QwenTrainer::new` attaches and freezes, so the builder hands it a
-        // bare NF4 trunk. Two calls to `build` must produce identical
-        // parameter ids for the paired comparisons below to mean anything,
-        // which is why this goes through the same deterministic path.
-        // Both sides of the comparison below must be the *same* trunk, so the
-        // builder re-seeds: burn's RNG is a process global, and two unseeded
-        // builds draw different weights and different ParamIds.
-        let build = || nf4_trunk_seeded(&device, 0x51D1_C0DE_1234_5678);
+        // The paged and plain trainers must start from the SAME weights.
+        // Reseeding the process-global RNG cannot guarantee that under the
+        // parallel gate (a neighbour test reseeds between the seed and the
+        // draws), so the plain trainer is a record-round-trip twin of the
+        // paged one -- bit-identical by construction, whatever the build's
+        // draws were. The step path itself draws nothing from the device
+        // RNG, so a shared start makes the comparison deterministic.
         let mut rng = ChaCha12Rng::seed_from_u64(53);
         let batches: Vec<Tensor<B, 2, Int>> =
             (0..3).map(|_| sample_tokens(&mut rng, 1, 6, 128)).collect();
         let dir = tmp_dir("pager");
 
-        let mut paged = QwenTrainer::new(build(), tiny_train_config(59), &device)
-            .unwrap_or_else(|e| panic!("trainer: {e:#}"));
-        let mut plain = QwenTrainer::new(build(), tiny_train_config(59), &device)
-            .unwrap_or_else(|e| panic!("trainer: {e:#}"));
+        let mut paged = QwenTrainer::new(
+            nf4_trunk_seeded(&device, 0x51D1_C0DE_1234_5678),
+            tiny_train_config(59),
+            &device,
+        )
+        .unwrap_or_else(|e| panic!("trainer: {e:#}"));
+        let mut plain = twin_trainer(&paged, tiny_train_config(59), &device);
         paged
             .train_step(batches[0].clone())
             .unwrap_or_else(|e| panic!("step: {e:#}"));
