@@ -401,8 +401,24 @@ pub fn build_seeds(
         });
     }
 
+    // The template bank holds exactly one `(body, reference)` per
+    // [`TaskKind`], so it can express `TaskKind::ALL.len()` distinct
+    // completions and no more. `TWISTS` makes the *prompts* differ, which is
+    // what keeps ids unique — it does not make the answers differ.
+    //
+    // So the loop stops when the kind cycle wraps. Emitting `count` template
+    // seeds regardless produced rows that all carried the same four answers:
+    // asked for 3000 tasks, `coding/c`, `coding/go` and `coding/web` (none of
+    // which magicoder covers) each got 3000 rows over 4 distinct completions.
+    // The model memorised four strings, its held-out fold was drawn from the
+    // same four, and it registered 0.848 — a number measuring the template
+    // bank, not the language.
+    //
+    // A language magicoder covers still gets its full complement; only the
+    // padding is gone, and the report says so (`magicoder_seeds` vs
+    // `template_seeds` are reported per language).
     let mut template_n = 0usize;
-    while seeds.len() < count {
+    while seeds.len() < count && template_n < TaskKind::ALL.len() {
         let kind = TaskKind::ALL[template_n % TaskKind::ALL.len()];
         let (body, reference) = template(language, kind);
         let twist = TWISTS[(template_n / TaskKind::ALL.len()) % TWISTS.len()];
@@ -3558,7 +3574,22 @@ mod tests {
         let missing = Path::new("/definitely/not/a/real/corpus.jsonl");
         for lang in CodeLanguage::KNOWN {
             let seeds = build_seeds(lang, 8, 1, missing, 2_000).expect("seeds");
-            assert_eq!(seeds.len(), 8);
+            // With no Magicoder corpus the template bank is the only source,
+            // and it holds one reference per [`TaskKind`]. Asking for 8 gets
+            // what the bank can actually express, not 8 rows over 4 answers.
+            assert!(
+                seeds.len() <= 8,
+                "never more than the requested count: {} for {lang:?}",
+                seeds.len()
+            );
+            let distinct: std::collections::HashSet<&str> =
+                seeds.iter().map(|s| s.reference.as_str()).collect();
+            assert_eq!(
+                distinct.len(),
+                seeds.len(),
+                "{lang:?}: every seed must carry a distinct reference answer — this is the \\
+                 invariant that stops 3000 tasks over 4 completions"
+            );
             for seed in &seeds {
                 assert_eq!(seed.language, lang);
                 assert!(
@@ -3587,12 +3618,27 @@ mod tests {
                 );
                 assert!(!seed.reference.is_empty(), "offline reference exists");
             }
-            // With no Magicoder rows, eight template seeds are exactly two
-            // full rotations of the four task kinds.
+            // With no Magicoder rows the seeds come from the template bank
+            // alone, and the bank holds one reference per kind — so each kind
+            // appears at most once. A kind appearing twice would mean two
+            // seeds sharing a reference, which is the 3000-rows-over-4-answers
+            // defect in miniature.
             for kind in TaskKind::ALL {
                 let n = seeds.iter().filter(|s| s.kind == kind).count();
-                assert_eq!(n, 2, "{} kind {:?} appears twice", lang.name(), kind);
+                assert!(
+                    n <= 1,
+                    "{} kind {:?} appears {n} times; each template reference must be used once",
+                    lang.name(),
+                    kind
+                );
             }
+            assert_eq!(
+                seeds.len(),
+                TaskKind::ALL.len(),
+                "{}: with no corpus the bank supplies exactly its {} references",
+                lang.name(),
+                TaskKind::ALL.len()
+            );
         }
     }
 
@@ -3813,33 +3859,52 @@ mod tests {
         assert!(!first.teacher);
         for lang in &first.languages {
             assert!(!lang.resumed);
-            assert_eq!(
-                lang.kept, 6,
-                "{}: clean slice keeps everything",
+            // Whatever the fixture corpus contributes plus the template bank —
+            // never more than the six asked for, and every row a distinct
+            // answer. The count itself is the corpus's business; the invariant
+            // is that the bank does not pad.
+            assert!(
+                lang.kept <= 6,
+                "{}: a clean slice keeps everything",
                 lang.language
             );
-            assert_eq!(lang.source_mix.get("offline"), Some(&6));
-            assert_eq!(lang.decontam_hits, 0);
             let train = read_train(&lang.train_path);
-            assert_eq!(train.len(), 6);
+            assert_eq!(train.len(), lang.kept);
+            let distinct: std::collections::HashSet<&str> =
+                train.iter().map(|t| t.completion.as_str()).collect();
+            assert_eq!(
+                distinct.len(),
+                train.len(),
+                "{}: every kept row must carry a distinct answer",
+                lang.language
+            );
+            assert!(lang.decontam_hits == 0);
             assert!(train.iter().all(|t| t.language == lang.language));
             assert!(train.iter().all(|t| t.model.starts_with("offline-")));
             // Ids are unique and stable.
             let ids: HashSet<&str> = train.iter().map(|t| t.id.as_str()).collect();
-            assert_eq!(ids.len(), 6);
+            assert_eq!(ids.len(), train.len(), "ids must be unique");
         }
         let top: PipelineReport = serde_json::from_str(
             &std::fs::read_to_string(dir.join("out/report.json")).expect("read top report"),
         )
         .expect("top report parses");
-        assert_eq!(top.total_kept(), 12);
+        assert_eq!(
+            top.total_kept(),
+            first.languages.iter().map(|l| l.kept).sum::<usize>(),
+            "the top report totals the per-language counts"
+        );
 
         // A rerun must not touch completed languages: same files, resumed flags.
         let rust_train_before =
             std::fs::read_to_string(dir.join("out/rust/train.jsonl")).expect("read rust train");
         let second = run_pipeline(None, &config).expect("second run");
         assert!(second.languages.iter().all(|l| l.resumed));
-        assert_eq!(second.total_kept(), 12);
+        assert_eq!(
+            second.total_kept(),
+            first.total_kept(),
+            "a resume reports the same kept total it reported the first time"
+        );
         let rust_train_after = std::fs::read_to_string(dir.join("out/rust/train.jsonl"))
             .expect("read rust train again");
         assert_eq!(rust_train_before, rust_train_after);

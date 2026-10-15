@@ -160,6 +160,7 @@ pub mod audit;
 pub mod blockexec;
 pub mod bpe;
 pub mod cheat;
+pub mod cheatharness;
 pub mod checkpoint;
 pub mod cifar;
 pub mod codegen_eval;

@@ -275,8 +275,8 @@ The development loop that exercises all three levels:
 cargo test --all              # certificates + unit + integration
 
 # The gate that scores the trainer is itself attackable, so it is scanned:
-dblocks cheat --root .         # suppressions, test evasion, gate tampering
-dblocks cheat --root . --all   # every finding, not just the worst
+dblocks cheat scan --root .    # suppressions, test evasion, gate tampering
+dblocks cheat scan --root . --all   # every finding, not just the worst
 cargo clippy --all-targets
 dblocks verify                # the gate, standalone
 dblocks train --verify-every 100 --steps 2000

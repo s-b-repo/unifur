@@ -79,7 +79,7 @@
 //! [`SchedulerConfig::margin`] (default 0.0). A tie is a rejection: an
 //! equal candidate has not measurably beaten the incumbent.
 
-use crate::cheat::{scan_snippet, CheatClass, Severity, SnippetLanguage};
+use crate::cheat::SnippetLanguage;
 use crate::langdata::snippet_language;
 use crate::student::{
     train_language_specialist, CodeLanguage, GeometricStudent, LanguageBatch,
@@ -419,6 +419,48 @@ impl ChainedLog {
             last_ts,
         })
     }
+}
+
+/// Sum the language-mixing tallies every `queue.done` in `path` recorded.
+///
+/// The chain is verified first: a tally read out of an edited log would
+/// calibrate the filter on evidence that no longer exists, and the whole
+/// point of counting scans into a Merkle chain is that the counts cannot be
+/// revised after the fact. A `queue.done` written before the mixing fields
+/// existed contributes nothing — its tally defaults to empty — so a chain
+/// spanning the change sums the drains that could speak.
+///
+/// Records that are not `queue.done`, and `queue.done` records whose
+/// `cheat_mixing` is not a tally, are skipped rather than refused: the chain
+/// is an audit log that accumulates other events by design.
+pub fn mixing_tally_from_chain(path: &Path) -> Result<crate::cheat::MixingTally> {
+    let report = ChainedLog::verify(path)?;
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read chained log {}", path.display()))?;
+    let mut total = crate::cheat::MixingTally::default();
+    for raw in text.lines() {
+        let record: Value = serde_json::from_str(raw)
+            .with_context(|| format!("parse chained log {}", path.display()))?;
+        let Some(payload) = record.get("payload") else {
+            continue;
+        };
+        if payload.get("event").and_then(Value::as_str) != Some("queue.done") {
+            continue;
+        }
+        let Some(entry) = payload.get("cheat_mixing") else {
+            continue;
+        };
+        let tally: crate::cheat::MixingTally = match serde_json::from_value(entry.clone()) {
+            Ok(tally) => tally,
+            Err(err) => anyhow::bail!(
+                "record {}: 'cheat_mixing' is not a mixing tally ({err}) — the chain is intact, so \
+                 this was written that way",
+                report.lines
+            ),
+        };
+        total.absorb(&tally);
+    }
+    Ok(total)
 }
 
 // ---------------------------------------------------------------------------
@@ -1142,6 +1184,29 @@ pub struct SchedulerConfig {
     /// it. Default false, so existing configs keep their backend semantics.
     #[serde(default)]
     pub gpu_checkpointing: bool,
+    /// A [`crate::cheat::MixingPolicy`] profile to run the language-mixing
+    /// check under, as written by `dblocks cheat adapt`. `None` runs the
+    /// uncalibrated defaults, so a config written before calibration existed
+    /// parses and behaves unchanged.
+    #[serde(default)]
+    pub mixing_policy: Option<PathBuf>,
+    /// A trained [`crate::mlcheat::MlCheatModel`] to stack behind the pattern
+    /// scan. `None` (the default) leaves the pattern scan deciding alone. The
+    /// model generalizes the pattern scanner's own verdicts to snippets whose
+    /// patterns do not fire; it cannot discover a class the patterns have
+    /// never seen, and it never overrides a pattern finding.
+    #[serde(default)]
+    pub ml_cheat_model: Option<PathBuf>,
+    /// Score at or above which a trace the pattern scan passed is dropped
+    /// anyway. Only consulted when [`Self::ml_cheat_model`] is set. The default
+    /// is deliberately high: this layer is trained on roughly fifty labeled
+    /// samples and is a second opinion, not a verdict.
+    #[serde(default = "default_ml_cheat_threshold")]
+    pub ml_cheat_threshold: f64,
+}
+
+fn default_ml_cheat_threshold() -> f64 {
+    0.9
 }
 
 fn default_batch_size() -> usize {
@@ -1174,6 +1239,9 @@ impl Default for SchedulerConfig {
             field_boxes: Vec::new(),
             micro_batch: 0,
             gpu_checkpointing: false,
+            mixing_policy: None,
+            ml_cheat_model: None,
+            ml_cheat_threshold: default_ml_cheat_threshold(),
         }
     }
 }
@@ -1214,29 +1282,47 @@ impl SchedulerConfig {
         }
         student
     }
+
+    /// The language-mixing profile this run scans under.
+    ///
+    /// Falls back to [`crate::cheat::MixingPolicy::default`] when
+    /// [`Self::mixing_policy`] is unset, so a config written before
+    /// calibration existed runs the rule exactly as it always did. A path that
+    /// is set but unreadable is an error rather than a silent fallback: a run
+    /// that quietly ignored the profile it was pointed at would produce a
+    /// corpus filtered by different rules than its log claims.
+    pub fn mixing_policy(&self) -> Result<crate::cheat::MixingPolicy> {
+        match &self.mixing_policy {
+            Some(path) => crate::cheat::MixingPolicy::load(path),
+            None => Ok(crate::cheat::MixingPolicy::default()),
+        }
+    }
+
+    /// The learned second opinion, when one is configured: the model and the
+    /// score at or above which a trace the pattern scan *passed* is dropped
+    /// anyway.
+    ///
+    /// `None` when [`Self::ml_cheat_model`] is unset, which is the default —
+    /// the pattern scan alone decides, as it always has. An unreadable model
+    /// path is an error on the same reasoning as [`Self::mixing_policy`]: a
+    /// scan that quietly fell back to patterns would log counts that say
+    /// nothing about which rules produced them.
+    pub fn ml_cheat(&self) -> Result<Option<(crate::mlcheat::MlCheatModel, f64)>> {
+        let Some(path) = &self.ml_cheat_model else {
+            return Ok(None);
+        };
+        let model = crate::mlcheat::MlCheatModel::load(path)?;
+        Ok(Some((model, self.ml_cheat_threshold)))
+    }
 }
 
-/// What the pre-training cheat scan of one queue dataset did, counted so the
-/// `queue.done` payload and the [`QueueEntryOutcome`] JSON carry exactly what
-/// was removed and why. Every field defaults, so a record written before the
-/// scan existed still deserializes.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CheatScanSummary {
-    /// Dataset lines the scan checked (language-matching, non-empty).
-    #[serde(default)]
-    pub scanned: usize,
-    /// Lines that passed and went on to the fold split.
-    #[serde(default)]
-    pub kept: usize,
-    /// Lines the scan dropped.
-    #[serde(default)]
-    pub dropped: usize,
-    /// Dropped lines per cheat class, keyed by the class's stable name
-    /// ([`crate::cheat::CheatClass::as_str`]). A line counts once per class it
-    /// tripped, however many findings of that class it earned.
-    #[serde(default)]
-    pub dropped_by_class: std::collections::BTreeMap<String, usize>,
-}
+/// What the pre-training cheat gate did to one queue dataset.
+///
+/// A re-export, not a second type: the queue scanner and
+/// [`crate::student::LanguageBatch::load`] run the same
+/// [`crate::cheat::CheatGate`], and two summary structs for one gate would be
+/// two places for the stacking order to drift.
+pub use crate::cheat::ScanSummary as CheatScanSummary;
 
 /// What happened to one queue entry.
 #[derive(Debug, Clone, Serialize)]
@@ -1266,6 +1352,13 @@ pub struct QueueEntryOutcome {
     /// What the pre-training cheat scan removed from the entry's dataset
     /// before the split. Zeroed on a failed entry.
     pub cheat_scan: CheatScanSummary,
+    /// The autodiff backend type this entry trained on, as
+    /// `std::any::type_name`. Recorded because the two are not
+    /// interchangeable: reduction orders differ, so an accuracy produced on
+    /// `Autodiff<Wgpu<f32>>` and one produced on `Autodiff<NdArray<f32>>`
+    /// are measurements of different computations, and a registry that
+    /// cannot say which produced a number cannot be compared across entries.
+    pub backend: String,
     /// Why the entry failed, when it did. The queue continues past it.
     pub error: Option<String>,
 }
@@ -1472,6 +1565,8 @@ fn split_dataset(
 fn scan_dataset_cheats(
     path: &Path,
     language: Option<CodeLanguage>,
+    policy: &crate::cheat::MixingPolicy,
+    learned: Option<&(crate::mlcheat::MlCheatModel, f64)>,
     work_dir: &Path,
 ) -> Result<(PathBuf, CheatScanSummary)> {
     let file =
@@ -1483,6 +1578,20 @@ fn scan_dataset_cheats(
             .with_context(|| format!("create {}", cleaned_path.display()))?,
     );
     let mut summary = CheatScanSummary::default();
+    // Distinct *completion* text among the rows that survive the gate. Kept as
+    // a set of whole strings: the degeneracy this catches is verbatim reuse,
+    // and a cheap normalisation here would miss the case that matters (the same
+    // answer with different whitespace still teaches one answer).
+    let mut distinct_completions: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    // The one gate every text training path in this crate shares. Building it
+    // here from the same policy and model the other loaders use is what keeps
+    // the stacking order — patterns first, learned score only where they are
+    // silent — from being re-derived per call site.
+    let gate = crate::cheat::CheatGate {
+        policy: policy.clone(),
+        learned: learned.cloned(),
+    };
     for (index, raw) in BufReader::new(file).lines().enumerate() {
         let raw = raw.with_context(|| format!("read dataset {}", path.display()))?;
         let line = raw.trim();
@@ -1521,80 +1630,69 @@ fn scan_dataset_cheats(
             Some(lang) => snippet_language(lang),
             None => SnippetLanguage::Other,
         };
-        summary.scanned += 1;
         // The completion is the training signal, so the completion is what
-        // is scanned — the same unit `langdata` filters at build time. The
-        // prompt is deliberately not scanned: real task statements enumerate
-        // the forbidden idioms ("no `todo!()`, no `# type: ignore`") and show
-        // fenced buggy code, and a scanner reading instructions as code
-        // false-positives on every one of them.
-        let single = scan_snippet(completion, snippet_lang);
-        let mut offending: Vec<&'static str> = single
-            .findings
-            .iter()
-            .filter(|f| f.severity >= Severity::Evasion)
-            .map(|f| f.class.as_str())
-            .collect();
-        // Fragment completions are first-class in the queue contract (the
-        // prompt opens the construct the completion closes), and brokenness
-        // is the one class the full trained unit can absolve: a completion
-        // that is unbalanced alone but balanced behind its prompt is a
-        // fragment, not corruption. Joined with a newline, so the seam
-        // itself cannot merge two lines into a fake one.
-        if !offending.is_empty()
-            && single
-                .findings
-                .iter()
-                .all(|f| f.class == CheatClass::DataBroken || f.severity < Severity::Evasion)
-        {
-            let joined = scan_snippet(&format!("{prompt}\n{completion}"), snippet_lang);
-            let still_broken = joined
-                .findings
-                .iter()
-                .any(|f| f.class == CheatClass::DataBroken && f.severity >= Severity::Evasion);
-            if !still_broken {
-                offending.clear();
-            }
-        }
-        offending.sort_unstable();
-        offending.dedup();
+        // is gated — the same unit `langdata` filters at build time. The
+        // prompt is passed for the fragment rule and is not itself gated:
+        // real task statements enumerate the forbidden idioms ("no
+        // `todo!()`, no `# type: ignore`") and show fenced buggy code, and a
+        // scanner reading instructions as code false-positives on every one.
+        let offending = gate.inspect(Some(prompt), completion, snippet_lang, &mut summary);
+        summary.observe(&offending);
         if offending.is_empty() {
-            summary.kept += 1;
+            distinct_completions.insert(completion.to_string());
             cleaned
                 .write_all(line.as_bytes())
                 .with_context(|| format!("write {}", cleaned_path.display()))?;
             cleaned
                 .write_all(b"\n")
                 .with_context(|| format!("write {}", cleaned_path.display()))?;
-        } else {
-            summary.dropped += 1;
-            for class in offending {
-                *summary
-                    .dropped_by_class
-                    .entry(class.to_string())
-                    .or_default() += 1;
-            }
         }
     }
     cleaned
         .flush()
         .with_context(|| format!("write {}", cleaned_path.display()))?;
     if summary.scanned > 0 && summary.kept == 0 {
-        let classes = summary
-            .dropped_by_class
-            .iter()
-            .map(|(class, n)| format!("{class}:{n}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        anyhow::bail!(
-            "{}: the pre-training cheat scan dropped every one of its {} lines ({classes}); \
-             training on an empty dataset is refused",
-            path.display(),
-            summary.scanned,
-        );
+        return Err(summary.refusal(path));
+    }
+    // A dataset that is mostly one answer repeated is not a dataset, and no
+    // cheat class describes it: every row can be individually clean. The
+    // offline pipeline produced exactly this for the three coding languages
+    // magicoder does not cover — 3000 rows over the template bank's four
+    // references — and the specialist registered 0.848 by memorising four
+    // strings against a held-out fold drawn from the same four.
+    //
+    // The ratio is the discriminator, not a count: real corpora sit at
+    // 0.95–1.00 distinct completions, and a floor has to clear a *duplicate*
+    // run without clearing a *degenerate* one. 0.10 is the line, and it is
+    // reported on refusal so the operator can see how far off the data was
+    // rather than being told only "refused".
+    if summary.kept > 0 {
+        let distinct = distinct_completions.len();
+        let ratio = distinct as f64 / summary.kept as f64;
+        if ratio < MIN_DISTINCT_COMPLETION_RATIO {
+            return Err(anyhow::anyhow!(
+                "{}: {distinct} of {} kept rows carry distinct completions \
+                 ({:.2}% distinct, floor {:.0}%) — this is one answer repeated, not a \
+                 dataset, and a model trained on it memorises the repetition rather than \
+                 learning the language. Retrain on a corpus with real per-row answers, or \
+                 accept a specialist trained on the {distinct} real example(s) this data \
+                 actually holds.",
+                path.display(),
+                summary.kept,
+                100.0 * ratio,
+                100.0 * MIN_DISTINCT_COMPLETION_RATIO,
+            ));
+        }
     }
     Ok((cleaned_path, summary))
 }
+
+/// The floor on distinct completions, as a fraction of kept rows.
+///
+/// Real corpora sit at 0.95–1.00; the template-bank fallback that produced a
+/// fake 0.848 sat at 0.0013. Anything between those is a duplicate run, not a
+/// degenerate one, and clearing it would reject data that trains fine.
+const MIN_DISTINCT_COMPLETION_RATIO: f64 = 0.10;
 
 /// Held-out eval, defined exactly:
 ///
@@ -1720,7 +1818,10 @@ fn eval_from_checkpoint(
     let work_dir = scratch_dir("eval");
     // The same pre-training scan run_entry applied, so the re-derived
     // numbers come from the same clean folds the run trained on.
-    let (cleaned, _) = scan_dataset_cheats(dataset, language, &work_dir)?;
+    let policy = config.mixing_policy()?;
+    let learned = config.ml_cheat()?;
+    let (cleaned, _) =
+        scan_dataset_cheats(dataset, language, &policy, learned.as_ref(), &work_dir)?;
     let folds = split_dataset(&cleaned, language, config.holdout_percent, &work_dir)?;
     let holdout = LanguageBatch::load(
         &folds.holdout,
@@ -1790,6 +1891,44 @@ pub fn pending_queue_entries(paths: &NinaPaths) -> Result<Vec<(u64, Value)>> {
         .collect())
 }
 
+/// Write the deployment sidecar (`config.json`) a model directory is served
+/// from: the checkpoint file name, the architecture it was trained with, and
+/// enough provenance to say where both came from.
+///
+/// Rewritten on every successful training run rather than once by the trace
+/// pipeline, because the checkpoint it names is content-addressed and a
+/// retrain replaces it. See the call site for what went wrong when it did not.
+fn write_deployment_sidecar(
+    model_dir: &Path,
+    name: &str,
+    checkpoint: &Path,
+    config: &SchedulerConfig,
+) -> Result<()> {
+    let file_name = checkpoint
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "checkpoint {} has no file name to record in the sidecar",
+                checkpoint.display()
+            )
+        })?
+        .to_string();
+    let manifest = serde_json::json!({
+        "name": name,
+        "checkpoint": file_name,
+        "checkpoint_sha256": crate::checkpoint::file_sha256_hex(checkpoint)?,
+        "student_config": serde_json::to_value(&config.student)?,
+        "build": crate::checkpoint::BuildInfo::current(),
+        "refreshed_utc": crate::checkpoint::unix_now(),
+    });
+    std::fs::create_dir_all(model_dir)
+        .with_context(|| format!("create model directory {}", model_dir.display()))?;
+    std::fs::write(model_dir.join("config.json"), manifest.to_string())
+        .with_context(|| format!("write the sidecar in {}", model_dir.display()))?;
+    Ok(())
+}
+
 /// The training half of one queue entry. Errors are returned; the caller
 /// (`execute_entry`) turns them into a `queue.failed` record and moves on.
 /// Generic over the autodiff backend: [`train_tick`] instantiates it with
@@ -1835,7 +1974,15 @@ fn run_entry<B: burn::tensor::backend::AutodiffBackend<FloatElem = f32>>(
     // The dataset is cheat-scanned first: the folds are split from the lines
     // that survive the scan, never from the raw file.
     let work_dir = scratch_dir("queue");
-    let (cleaned, cheat_scan) = scan_dataset_cheats(Path::new(dataset), language, &work_dir)?;
+    let policy = config.mixing_policy()?;
+    let learned = config.ml_cheat()?;
+    let (cleaned, cheat_scan) = scan_dataset_cheats(
+        Path::new(dataset),
+        language,
+        &policy,
+        learned.as_ref(),
+        &work_dir,
+    )?;
     let folds = split_dataset(&cleaned, language, config.holdout_percent, &work_dir)?;
     let train_fold =
         LanguageBatch::load(&folds.train, language, student_config.context, config.seed)?;
@@ -1857,7 +2004,7 @@ fn run_entry<B: burn::tensor::backend::AutodiffBackend<FloatElem = f32>>(
         lr: config.lr,
         seed: config.seed,
         log_every: config.log_every,
-        out_dir: Some(model_dir),
+        out_dir: Some(model_dir.clone()),
         checkpoint_every: 0,
         resume: None,
         language,
@@ -1916,6 +2063,29 @@ fn run_entry<B: burn::tensor::backend::AutodiffBackend<FloatElem = f32>>(
             bytes,
         })?;
     }
+    // Refresh the deployment sidecar so it names *this* checkpoint and *this*
+    // architecture.
+    //
+    // The sidecar is written by the trace pipeline, once, for the first
+    // checkpoint a model directory ever received. A retrain writes a new
+    // content-addressed `.mpk` and a new registry entry, and used to leave the
+    // sidecar alone — so it went on naming a checkpoint that had been replaced,
+    // and carrying the `student_config` of *that* run. Six deployed
+    // specialists were unservable that way, and `student think` on any of them
+    // failed on a shape mismatch (6 routing boxes against a checkpoint
+    // trained with 10) rather than saying which config it wanted.
+    //
+    // Written after the registry entry, so a failure here cannot leave the
+    // registry claiming weights that are not on disk. A failure to write it
+    // is reported rather than swallowed: the model still trains and is still
+    // registered, but the operator should know the sidecar is stale.
+    if let Err(err) = write_deployment_sidecar(&model_dir, name, &checkpoint, config) {
+        eprintln!(
+            "note: {name} trained and registered, but its deployment sidecar could not be \
+             refreshed: {err:#} — `nina chat` will fall back to resolving the checkpoint from \
+             the registry hash, and `student think` needs --config"
+        );
+    }
     Ok(QueueEntryOutcome {
         queue_seq,
         name: name.to_string(),
@@ -1928,6 +2098,7 @@ fn run_entry<B: burn::tensor::backend::AutodiffBackend<FloatElem = f32>>(
         train_lines,
         holdout_lines,
         cheat_scan,
+        backend: std::any::type_name::<B>().to_string(),
         error: None,
     })
 }
@@ -1953,6 +2124,11 @@ fn execute_entry<B: burn::tensor::backend::AutodiffBackend<FloatElem = f32>>(
             "event": "queue.start",
             "queue_seq": queue_seq,
             "name": name,
+            // Recorded at start, not only at the end: a run that crashes
+            // mid-entry writes no `queue.done`, and without this the one
+            // record that could attribute the partial work is the one that
+            // is missing.
+            "backend": std::any::type_name::<B>(),
         }))?;
     }
     match run_entry::<B>(paths, config, queue_seq, payload) {
@@ -1971,6 +2147,9 @@ fn execute_entry<B: burn::tensor::backend::AutodiffBackend<FloatElem = f32>>(
                 "holdout_lines": outcome.holdout_lines,
                 "cheat_scanned": outcome.cheat_scan.scanned,
                 "cheat_dropped": outcome.cheat_scan.dropped_by_class,
+                "cheat_mixing": outcome.cheat_scan.mixing,
+                "cheat_ml": outcome.cheat_scan.learned,
+                "backend": outcome.backend,
             }))?;
             Ok(outcome)
         }
@@ -1995,6 +2174,7 @@ fn execute_entry<B: burn::tensor::backend::AutodiffBackend<FloatElem = f32>>(
                 train_lines: 0,
                 holdout_lines: 0,
                 cheat_scan: CheatScanSummary::default(),
+                backend: std::any::type_name::<B>().to_string(),
                 error: Some(error),
             })
         }
@@ -2173,6 +2353,24 @@ pub fn tool_table() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {"entry": {"type": "object", "description": "a ModelEntry"}},
                 "required": ["entry"],
+            }),
+            available: true,
+            unavailable_reason: None,
+        },
+        ToolSpec {
+            name: "nina.registry.retire",
+            description: "Withdraw a model: flips its status to `retired`, keeping the entry \
+                          addressable for provenance. Use it when a registered accuracy cannot be \
+                          trusted — a number measured against data that was later found \
+                          degenerate is a claim, and leaving it standing is worse than withdrawing \
+                          it.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "reason": {"type": "string", "description": "why the evidence is withdrawn"},
+                },
+                "required": ["name", "reason"],
             }),
             available: true,
             unavailable_reason: None,
@@ -2438,6 +2636,7 @@ impl McpServer {
             "nina.queue.list" => self.tool_queue_list(),
             "nina.route" => self.tool_route(args),
             "nina.register" => self.tool_register(args),
+            "nina.registry.retire" => self.tool_registry_retire(args),
             "nina.registry.get" => self.tool_registry_get(args),
             "nina.registry.list" => self.tool_registry_list(args),
             "nina.log.verify" => Self::tool_log_verify(args),
@@ -2592,6 +2791,27 @@ impl McpServer {
             "status": ModelStatus::Candidate.as_str(),
             "seq": record.seq,
         }))
+    }
+
+    fn tool_registry_retire(&self, args: &Value) -> Result<Value> {
+        let name = arg_str(args, "name")?;
+        let reason = arg_str(args, "reason")?;
+        let mut registry = Registry::open(self.paths.registry_json(), self.paths.registry_log())?;
+        let before = registry
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("no model named '{name}' in the registry"))?;
+        // The reason travels in the chain, next to the flip, so a reader of the
+        // log learns *why* an accuracy was withdrawn rather than only that it
+        // was. `retire` itself records the status change; this records the
+        // justification as its own event.
+        registry.log_event(json!({
+            "event": "retire.reason",
+            "name": name,
+            "reason": reason,
+            "withdrawn_accuracy": before.eval.accuracy,
+        }))?;
+        let record = registry.retire(name)?;
+        Ok(json!({"retired": name, "seq": record.seq, "reason": reason}))
     }
 
     fn tool_registry_get(&self, args: &Value) -> Result<Value> {
@@ -3080,6 +3300,7 @@ mod tests {
                     "nina.queue.list",
                     "nina.route",
                     "nina.register",
+                    "nina.registry.retire",
                     "nina.registry.get",
                     "nina.registry.list",
                     "nina.log.verify",
@@ -3242,6 +3463,75 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Retiring withdraws a claim and says why, in the chain.
+    ///
+    /// The reason matters as much as the flip: `coding/c` sat in the registry
+    /// at 0.848, measured against 3000 rows carrying four distinct
+    /// completions. A status change with no recorded justification leaves a
+    /// reader unable to tell a withdrawn false claim from a routine
+    /// housekeeping retirement.
+    #[test]
+    fn retiring_a_model_records_the_withdrawn_accuracy_and_the_reason() {
+        let dir = scratch("mcp-retire");
+        let server = McpServer::new(NinaPaths::new(dir.clone()));
+        server
+            .handle_message(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":
+                "nina.register","arguments":{"entry":{"name":"coding/c","field":"coding",
+                "subfield":"c","box_id":"coding:c","checkpoint_hash":"aa","bytes":1,
+                "eval":{"accuracy":0.848125340599455,"router_top1":1.0,"date":"2026-10-14"}}}}}"#,
+            )
+            .unwrap();
+
+        let out = server
+            .handle_message(
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":
+                "nina.registry.retire","arguments":{"name":"coding/c",
+                "reason":"measured against four distinct completions"}}}"#,
+            )
+            .unwrap();
+        assert!(out["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("retired"));
+
+        let file = RegistryFile::load(&NinaPaths::new(dir.clone()).registry_json()).unwrap();
+        let entry = file.models.iter().find(|m| m.name == "coding/c").unwrap();
+        assert_eq!(entry.status, ModelStatus::Retired);
+        assert!(
+            entry.eval.accuracy.is_some(),
+            "retiring withdraws the model, not the record of what was measured"
+        );
+
+        // The chain carries both the flip and the justification.
+        let log = std::fs::read_to_string(dir.join("logs").join("registry.jsonl")).unwrap();
+        assert!(log.contains("retire.reason"), "{log}");
+        assert!(log.contains("four distinct completions"), "{log}");
+        assert!(log.contains("0.848125340599455"), "{log}");
+
+        // Retiring twice is refused rather than silently accepted.
+        let again = server
+            .handle_message(
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":
+                "nina.registry.retire","arguments":{"name":"coding/c","reason":"again"}}}"#,
+            )
+            .unwrap();
+        // MCP reports a refused tool call as a result carrying `isError`, not
+        // as a JSON-RPC error — so the refusal to look for is there.
+        assert_eq!(
+            again["result"]["isError"], true,
+            "a second retirement must not pass: {again}"
+        );
+        assert!(
+            again["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("already retired"),
+            "{again}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn mcp_tools_list_is_exactly_the_v1_set() {
         let dir = scratch("mcp-tools");
@@ -3250,7 +3540,10 @@ mod tests {
             .handle_message(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
             .unwrap();
         let tools = response["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        // 11: `nina.registry.retire` joined the ten. The count is asserted
+        // rather than left open so a tool cannot appear or vanish unnoticed —
+        // this list is the server's published contract.
+        assert_eq!(tools.len(), 11);
         let available: Vec<&str> = tools
             .iter()
             .filter(|t| t["available"] == true)
@@ -3263,6 +3556,7 @@ mod tests {
                 "nina.queue.list",
                 "nina.route",
                 "nina.register",
+                "nina.registry.retire",
                 "nina.registry.get",
                 "nina.registry.list",
                 "nina.log.verify",
@@ -3405,6 +3699,28 @@ mod tests {
         assert!((0.0..=1.0).contains(&accuracy), "{accuracy}");
         let router_top1 = outcome.router_top1.unwrap();
         assert!((0.0..=1.0).contains(&router_top1), "{router_top1}");
+
+        // The deployment sidecar names *this* checkpoint and *this*
+        // architecture. It used to be written once by the trace pipeline, so a
+        // retrain left it naming a checkpoint that had been replaced — which is
+        // what made six deployed specialists unservable, and left
+        // `student think` failing on a routing-box shape mismatch.
+        let sidecar = checkpoint.parent().unwrap().join("config.json");
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+        assert_eq!(
+            manifest.get("checkpoint").and_then(|v| v.as_str()),
+            checkpoint.file_name().and_then(|n| n.to_str()),
+            "the sidecar must name the checkpoint that was just written"
+        );
+        assert_eq!(
+            manifest
+                .get("student_config")
+                .and_then(|c| c.get("hidden_size"))
+                .and_then(|v| v.as_u64()),
+            Some(tiny_scheduler().student.hidden_size as u64),
+            "the sidecar must carry the architecture this run trained"
+        );
 
         // Registration: a Candidate carrying the measured evidence.
         let paths = NinaPaths::new(&root);
@@ -3735,11 +4051,13 @@ mod tests {
         assert!(!outcome.ok);
         let error = outcome.error.as_ref().unwrap();
         assert!(error.contains("poisoned.jsonl"), "{error}");
-        assert!(error.contains("cheat scan"), "{error}");
-        assert!(
-            error.contains("dropped every one of its 3 lines"),
-            "{error}"
-        );
+        // The refusal names the gate and every reason it gave. Naming the
+        // detector it used to be ("cheat scan") is not enough now that the
+        // same refusal can also come from the loader, and a message that
+        // pointed at only one of the two would send the reader to the wrong
+        // file when the other one was what emptied it.
+        assert!(error.contains("cheat gate"), "{error}");
+        assert!(error.contains("dropped every one of its 3 rows"), "{error}");
         assert!(outcome.checkpoint.is_none());
 
         // The failure is in the chain, and the chain verifies.
@@ -4299,6 +4617,352 @@ mod tests {
         );
         ChainedLog::verify(&paths.mcp_log()).unwrap();
         ChainedLog::verify(&paths.registry_log()).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The calibration loop, end to end: a drain counts what the mixing rule
+    /// did, the count survives in the chain, and the profile derived from it
+    /// changes what the next drain drops. Each link is the whole point —
+    /// a tally that never reached the log, or a profile that never reached
+    /// the scanner, would leave the loop closed at one end.
+    #[test]
+    fn a_drain_counts_its_mixing_pairs_the_chain_keeps_and_the_profile_changes_the_next_drain() {
+        let root = scratch("mixing-loop");
+        let paths = NinaPaths::new(&root);
+
+        // A dataset of prose: `Other`-declared, so nothing fires, and the
+        // tally still records how many documents it looked at.
+        let dataset = root.join("prose.jsonl");
+        let mut lines: Vec<String> = Vec::new();
+        for i in 0..260 {
+            lines.push(
+                serde_json::to_string(&serde_json::json!({
+                    "instruction": format!("Explain item {i}."),
+                    "response": format!("Item {i} takes a self parameter and returns None.\n"),
+                }))
+                .unwrap(),
+            );
+        }
+        std::fs::write(&dataset, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let config = SchedulerConfig::default();
+        let (cleaned, summary) = scan_dataset_cheats(
+            &dataset,
+            None,
+            &config.mixing_policy().unwrap(),
+            config.ml_cheat().unwrap().as_ref(),
+            &root,
+        )
+        .unwrap();
+        assert_eq!(summary.scanned, 260);
+        assert_eq!(summary.mixing.scanned_total(), 260);
+        assert!(
+            summary.mixing.fired.is_empty(),
+            "prose reported a language switch: {:?}",
+            summary.mixing.fired
+        );
+        // The whole corpus survived: the filter that used to take 97% of it
+        // takes none of it, and says so in the counts rather than in prose.
+        assert_eq!(summary.dropped, 0);
+        assert!(cleaned.exists());
+
+        // Into the chain, as a queue.done would carry it.
+        let mut log = ChainedLog::open(paths.queue_log()).unwrap();
+        log.append(&json!({
+            "event": "queue.done",
+            "queue_seq": 0,
+            "name": "prose/prose",
+            "cheat_scanned": summary.scanned,
+            "cheat_mixing": summary.mixing,
+        }))
+        .unwrap();
+        ChainedLog::verify(&paths.queue_log()).unwrap();
+
+        let tally = mixing_tally_from_chain(&paths.queue_log()).unwrap();
+        assert_eq!(tally.scanned_total(), 260);
+
+        // A tally below the floor is refused rather than turned into a rate.
+        let thin = crate::cheat::MixingTally {
+            scanned_by_declared: std::collections::BTreeMap::from([("other".to_string(), 12usize)]),
+            fired: std::collections::BTreeMap::from([("other->python".to_string(), 9usize)]),
+        };
+        let err = crate::cheat::calibrate_mixing(&thin, 0.5).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("at least 200 scanned documents"),
+            "unhelpful refusal: {err:#}"
+        );
+
+        // With the floor satisfied, the evidence supports a profile, and the
+        // profile is what the next scan runs under.
+        let tallied = crate::cheat::MixingTally {
+            scanned_by_declared: tally.scanned_by_declared.clone(),
+            fired: std::collections::BTreeMap::from([("other->python".to_string(), 258usize)]),
+        };
+        let adaptation = crate::cheat::calibrate_mixing(&tallied, 0.5).unwrap();
+        assert_eq!(adaptation.policy.admitted_pairs.len(), 1);
+
+        // A profile naming `other` is the one calibration can never produce —
+        // `Other` is not a candidate language — so the struck pair here is a
+        // hypothetical one, and the round trip is what is under test.
+        let profile = root.join("policy.json");
+        crate::cheat::MixingPolicy {
+            admitted_pairs: adaptation.policy.admitted_pairs.clone(),
+            ..crate::cheat::MixingPolicy::default()
+        }
+        .save(&profile)
+        .unwrap();
+        let with_profile = SchedulerConfig {
+            mixing_policy: Some(profile),
+            ..SchedulerConfig::default()
+        };
+        assert_eq!(
+            with_profile.mixing_policy().unwrap().admitted_pairs.len(),
+            1
+        );
+
+        // A configured-but-unreadable profile is an error, not a silent
+        // fallback to the defaults: a run that ignored the profile it was
+        // pointed at would log counts produced by different rules.
+        let missing = SchedulerConfig {
+            mixing_policy: Some(root.join("absent.json")),
+            ..SchedulerConfig::default()
+        };
+        assert!(missing.mixing_policy().is_err());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The stacking order the whole learned layer rests on, at the place it
+    /// actually runs: a reject-grade pattern finding drops the line whatever
+    /// the model says, and the model's score is never even computed for it.
+    ///
+    /// The two halves are asserted separately because they can fail
+    /// independently. A learned filter that quietly overrode a stated rule
+    /// would be the worst of both — the rule stops meaning anything, and
+    /// nothing records that it stopped meaning anything.
+    #[test]
+    fn the_learned_layer_is_consulted_only_where_the_pattern_scan_found_nothing() {
+        let root = scratch("ml-stacking");
+        let dataset = root.join("mixed.jsonl");
+        // Three lines: clean, pattern-cheating (a Rust `todo!()`), and clean.
+        let rows = [
+            (
+                "Clean work.",
+                "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+            ),
+            (
+                "Leave it for later.",
+                "fn add(a: i32, b: i32) -> i32 {\n    todo!()\n}\n",
+            ),
+            (
+                "Also clean.",
+                "fn sub(a: i32, b: i32) -> i32 {\n    a - b\n}\n",
+            ),
+        ];
+        let text = rows
+            .iter()
+            .map(|(instruction, response)| {
+                serde_json::to_string(&json!({
+                    "instruction": instruction,
+                    "response": response,
+                    "language": "rust",
+                }))
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&dataset, format!("{text}\n")).unwrap();
+
+        let mut model =
+            crate::mlcheat::MlCheatModel::new(crate::mlcheat::MlCheatConfig::default()).unwrap();
+        let samples = vec![
+            (
+                "fn add(a: i32, b: i32) -> i32 { todo!() }\n".to_string(),
+                SnippetLanguage::Rust,
+                true,
+            ),
+            (
+                "fn add(a: i32, b: i32) -> i32 { a + b }\n".to_string(),
+                SnippetLanguage::Rust,
+                false,
+            ),
+        ];
+        model.train(&samples).unwrap();
+        let model_path = root.join("ml-cheat.json");
+        model.save(&model_path).unwrap();
+
+        // Patterns alone: the `todo!()` line goes, and the model is never
+        // configured, so the summary must say so rather than reporting zero
+        // learned drops.
+        let (cleaned, patterns_only) = scan_dataset_cheats(
+            &dataset,
+            None,
+            &crate::cheat::MixingPolicy::default(),
+            None,
+            &root,
+        )
+        .unwrap();
+        assert_eq!(patterns_only.dropped, 1);
+        assert!(patterns_only.learned.is_none());
+        assert_eq!(
+            std::fs::read_to_string(&cleaned).unwrap().lines().count(),
+            2
+        );
+
+        // With the model at a threshold no snippet can reach, the pattern
+        // verdict stands and the clean lines survive untouched.
+        let (_, with_model) = scan_dataset_cheats(
+            &dataset,
+            None,
+            &crate::cheat::MixingPolicy::default(),
+            Some(&(model.clone(), 2.0)),
+            &root,
+        )
+        .unwrap();
+        assert_eq!(with_model.dropped, 1, "the model changed a pattern verdict");
+        let ml = with_model
+            .learned
+            .expect("a configured layer must report itself");
+        assert_eq!(ml.scored, 2, "the pattern-rejected line must not be scored");
+        assert_eq!(ml.dropped, 0);
+        assert!((ml.threshold - 2.0).abs() < f64::EPSILON);
+
+        // At a threshold every score clears, the learned layer drops the two
+        // lines the patterns passed — which empties the dataset, so the
+        // refusal is the observable outcome. It has to name the learned drops:
+        // a refusal that reported only `data-stub:1` for three dropped lines
+        // would send whoever reads it looking at the wrong filter.
+        let err = scan_dataset_cheats(
+            &dataset,
+            None,
+            &crate::cheat::MixingPolicy::default(),
+            Some(&(model, 0.0)),
+            &root,
+        )
+        .expect_err("an emptied dataset is refused");
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("learned-second-opinion:2"),
+            "the refusal under-reports the learned drops: {err}"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A dataset that is one answer repeated is refused, even though every row
+    /// in it is individually clean.
+    ///
+    /// This is the defect that registered `coding/c` at 0.848: the offline
+    /// template bank holds one reference per task kind, the pipeline was asked
+    /// for 3000 tasks, and it emitted 3000 rows over 4 completions. No cheat
+    /// class describes that — every row passes every pattern — so the scan
+    /// reported `dropped: {}` and the specialist memorised four strings
+    /// against a held-out fold drawn from the same four. The refusal names the
+    /// ratio, because "refused" alone would send whoever reads it looking for
+    /// a filter that fired.
+    #[test]
+    fn a_dataset_that_is_one_answer_repeated_is_refused() {
+        let root = scratch("degenerate-dataset");
+        let dataset = root.join("train.jsonl");
+        let answer = "fn add(a: i32, b: i32) -> i32 { a + b }\n";
+        let mut body = String::new();
+        for i in 0..200 {
+            body.push_str(
+                &serde_json::json!({
+                    "id": format!("t{i}"),
+                    "language": "rust",
+                    "prompt": format!("write a function that adds two numbers (variant {i})"),
+                    "completion": answer,
+                })
+                .to_string(),
+            );
+            body.push('\n');
+        }
+        std::fs::write(&dataset, body).unwrap();
+
+        let err = scan_dataset_cheats(
+            &dataset,
+            None,
+            &crate::cheat::MixingPolicy::default(),
+            None,
+            &root.join("work"),
+        )
+        .expect_err("a dataset with one distinct answer must be refused");
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("distinct completion"),
+            "the refusal must name what is wrong: {err}"
+        );
+        assert!(
+            err.contains("1 of 200 kept rows"),
+            "the refusal must carry the numbers: {err}"
+        );
+
+        // The same dataset with real per-row answers passes, so the guard is
+        // about degeneracy and not about size.
+        let mut varied = String::new();
+        for i in 0..200 {
+            varied.push_str(
+                &serde_json::json!({
+                    "id": format!("v{i}"),
+                    "language": "rust",
+                    "prompt": format!("write function {i}"),
+                    "completion": format!("fn f{i}() -> i32 {{ {i} }}\n"),
+                })
+                .to_string(),
+            );
+            varied.push('\n');
+        }
+        let varied_path = root.join("varied.jsonl");
+        std::fs::write(&varied_path, varied).unwrap();
+        let (cleaned, summary) = scan_dataset_cheats(
+            &varied_path,
+            None,
+            &crate::cheat::MixingPolicy::default(),
+            None,
+            &root.join("work2"),
+        )
+        .expect("200 distinct answers is a dataset");
+        assert_eq!(summary.kept, 200);
+        assert!(cleaned.exists());
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Four real examples are a small dataset, not a degenerate one.
+    ///
+    /// The template bank legitimately holds this many for a language no
+    /// corpus covers. Refusing it would refuse an honest "we have four
+    /// examples", and the distinction matters: a duplicate run is a defect,
+    /// a small dataset is a fact.
+    #[test]
+    fn a_small_but_distinct_dataset_is_not_refused_as_degenerate() {
+        let root = scratch("small-distinct");
+        let dataset = root.join("train.jsonl");
+        let mut body = String::new();
+        for i in 0..4 {
+            body.push_str(
+                &serde_json::json!({
+                    "id": format!("s{i}"),
+                    "language": "rust",
+                    "prompt": format!("write function {i}"),
+                    "completion": format!("fn f{i}() -> i32 {{ {i} }}\n"),
+                })
+                .to_string(),
+            );
+            body.push('\n');
+        }
+        std::fs::write(&dataset, body).unwrap();
+
+        let (_, summary) = scan_dataset_cheats(
+            &dataset,
+            None,
+            &crate::cheat::MixingPolicy::default(),
+            None,
+            &root.join("work"),
+        )
+        .expect("four distinct answers is a small dataset, not a degenerate one");
+        assert_eq!(summary.kept, 4);
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

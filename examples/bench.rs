@@ -387,7 +387,13 @@ fn run<B: Backend<FloatElem = f32>>(
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                let out = greedy(&model, &format!("{q}\nAnswer:"), a.maxnew, &["\n\n"], &device)?;
+                let out = greedy(
+                    &model,
+                    &format!("{q}\nAnswer:"),
+                    a.maxnew,
+                    &["\n\n"],
+                    &device,
+                )?;
                 let pred: String = out
                     .chars()
                     .rev()

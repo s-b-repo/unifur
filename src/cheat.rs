@@ -3332,11 +3332,14 @@ const LANGUAGE_MARKERS: &[(SnippetLanguage, &str, u32)] = &[
     (SnippetLanguage::C, "int main", 2),
     (SnippetLanguage::C, "malloc(", 2),
     (SnippetLanguage::C, "sizeof(", 1),
-    // Go, declared through `CodeLanguage::Go => SnippetLanguage::C`.
+    // Go, declared through `CodeLanguage::Go => SnippetLanguage::C`. Every
+    // marker here is one no other mapped language writes: `:=` was tried and
+    // removed, because it is also Python's walrus operator and a Python trace
+    // using `x := 1` scored six on this slot against its own zero.
     (SnippetLanguage::C, "func ", 2),
     (SnippetLanguage::C, "package ", 2),
-    (SnippetLanguage::C, ":=", 2),
     (SnippetLanguage::C, "go func", 2),
+    (SnippetLanguage::C, "defer ", 2),
     (SnippetLanguage::C, "chan ", 1),
     (SnippetLanguage::Cpp, "std::", 2),
     (SnippetLanguage::Cpp, "cout", 2),
@@ -3377,15 +3380,8 @@ pub const MIX_MIN_MARGIN: u32 = 3;
 /// Every name [`SnippetLanguage::as_str`] can produce, for error messages and
 /// profile validation. Spelled out rather than collected so a new variant
 /// cannot join the enum without appearing here.
-pub const KNOWN_LANGUAGE_NAMES: [&str; 7] = [
-    "rust",
-    "python",
-    "c",
-    "cpp",
-    "jsts",
-    "htmlcss",
-    "other",
-];
+pub const KNOWN_LANGUAGE_NAMES: [&str; 7] =
+    ["rust", "python", "c", "cpp", "jsts", "htmlcss", "other"];
 
 /// The operating point of the language-mixing check, as data rather than as
 /// two `const`s.
@@ -3398,7 +3394,7 @@ pub const KNOWN_LANGUAGE_NAMES: [&str; 7] = [
 /// differ are the ones that matter. Markdown prose declared
 /// [`SnippetLanguage::Other`] fired on 97% of documents in the field corpora,
 /// because `Other` has no markers of its own and therefore a declared score of
-/// *zero* — see [`scan_snippet_language_mixing`]. The rule was not detecting
+/// *zero* — see [`scan_snippet`], which never reports a mismatch for it. The rule was not detecting
 /// evasion; it was detecting prose. [`dblocks cheat adapt`](crate) writes a
 /// policy from the scan log, and [`MixingPolicy::admitted_pairs`] is how the
 /// calibrated run refuses to repeat that class of mistake.
@@ -3442,10 +3438,9 @@ impl Default for MixingPolicy {
 impl MixingPolicy {
     /// Whether this `(declared, scored)` pair is still allowed to fire.
     fn admits(&self, declared: SnippetLanguage, scored: SnippetLanguage) -> bool {
-        !self.admitted_pairs.contains(&(
-            declared.as_str().to_string(),
-            scored.as_str().to_string(),
-        ))
+        !self
+            .admitted_pairs
+            .contains(&(declared.as_str().to_string(), scored.as_str().to_string()))
     }
 
     /// Save the profile. Serialization only — [`MixingPolicy::load`] is where
@@ -3458,10 +3453,10 @@ impl MixingPolicy {
 
     /// Load a profile written by [`MixingPolicy::save`].
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
-        let policy: Self = serde_json::from_str(&text)
-            .with_context(|| format!("parse {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let policy: Self =
+            serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
         if policy.min_score == 0 && policy.min_margin == 0 {
             anyhow::bail!(
                 "{}: min_score and min_margin are both zero, so no pair can ever outscore the \
@@ -3822,7 +3817,7 @@ pub struct PairVerdict {
     /// pair nobody has observed is never removed on the strength of a `NaN`.
     pub fire_rate: f64,
     /// `true` when the pair is struck from the profile: it fired on at least
-    /// [`max_fire_rate`] of everything declared as its declared language, so
+    /// `max_fire_rate` of everything declared as its declared language, so
     /// it carries no information about any individual document.
     pub removed: bool,
 }
@@ -3887,19 +3882,18 @@ pub fn calibrate_mixing(tally: &MixingTally, max_fire_rate: f64) -> Result<Adapt
     let mut policy = MixingPolicy::default();
     let mut pairs = Vec::new();
     for (key, fired) in &tally.fired {
-        let (declared_name, scored_name) = key
-            .split_once("->")
-            .ok_or_else(|| anyhow::anyhow!("tally key '{key}' is not in 'declared->scored' form"))?;
+        let (declared_name, scored_name) = key.split_once("->").ok_or_else(|| {
+            anyhow::anyhow!("tally key '{key}' is not in 'declared->scored' form")
+        })?;
         let declared = declared_name.parse::<DeclaredName>()?.0;
         let scored = scored_name.parse::<DeclaredName>()?.0;
         let declared_scanned = tally.scanned_of(declared);
         let fire_rate = *fired as f64 / declared_scanned.max(1) as f64;
         let removed = fire_rate >= max_fire_rate;
         if removed {
-            policy.admitted_pairs.insert((
-                declared.as_str().to_string(),
-                scored.as_str().to_string(),
-            ));
+            policy
+                .admitted_pairs
+                .insert((declared.as_str().to_string(), scored.as_str().to_string()));
         }
         pairs.push(PairVerdict {
             pair: key.clone(),
@@ -3937,12 +3931,260 @@ impl std::str::FromStr for DeclaredName {
     fn from_str(s: &str) -> Result<Self> {
         let lang = SnippetLanguage::from_name(s);
         if lang.as_str() != s {
-            anyhow::bail!(
-                "'{s}' is not one of {}",
-                KNOWN_LANGUAGE_NAMES.join(", ")
-            );
+            anyhow::bail!("'{s}' is not one of {}", KNOWN_LANGUAGE_NAMES.join(", "));
         }
         Ok(Self(lang))
+    }
+}
+
+/// The data-side gate every training path runs its rows through.
+///
+/// # Why one type and not five call sites
+///
+/// The gate is three decisions that only make sense together: the pattern
+/// scan, the language-mixing operating point, and the learned second opinion
+/// *stacked behind* the patterns. Each of those has been re-derived by hand at
+/// every loader it was added to, and each derivation is a chance to get the
+/// stacking order backwards — which is the one mistake that makes a learned
+/// score override a stated rule. [`LanguageBatch::load`](crate::student),
+/// [`filter_traces`], the corpus builder and the queue scanner all go through
+/// this type instead, so the order is written down once.
+///
+/// # Dropping is not the same as reporting
+///
+/// A gate that quietly removed rows would make a corpus smaller for reasons
+/// nobody could see. Every path that uses a gate is expected to carry
+/// [`ScanSummary`] out of it and print or log it;
+/// [`LanguageBatch::load`](crate::student::LanguageBatch::load) keeps one
+/// on itself for exactly that reason.
+#[derive(Debug, Clone, Default)]
+pub struct CheatGate {
+    /// The language-mixing operating point. The default is uncalibrated:
+    /// `MIX_MIN_SCORE`/`MIX_MIN_MARGIN` with every pair live, so a gate with
+    /// no profile behaves exactly as the rule always has.
+    pub policy: MixingPolicy,
+    /// The learned second opinion, and the score at or above which a trace the
+    /// pattern scan *passed* is dropped anyway.
+    pub learned: Option<(crate::mlcheat::MlCheatModel, f64)>,
+}
+
+impl CheatGate {
+    /// A gate running the patterns alone, which is what every path used
+    /// before the learned layer existed.
+    pub fn patterns_only() -> Self {
+        Self::default()
+    }
+
+    /// A gate with the learned layer stacked behind the patterns.
+    pub fn with_learned(model: crate::mlcheat::MlCheatModel, threshold: f64) -> Self {
+        Self {
+            policy: MixingPolicy::default(),
+            learned: Some((model, threshold)),
+        }
+    }
+
+    /// A gate running a calibrated profile.
+    pub fn with_policy(policy: MixingPolicy) -> Self {
+        Self {
+            policy,
+            learned: None,
+        }
+    }
+
+    /// What the gate concluded about one row.
+    ///
+    /// `prompt` is the instruction the row trains against, and is not itself
+    /// gated: real task statements enumerate the forbidden idioms ("no
+    /// `todo!()`") and show fenced buggy code, and a scanner reading
+    /// instructions as code false-positives on every one of them. It is passed
+    /// for the fragment rule below and for nothing else.
+    ///
+    /// `offending` is empty when the row survives. It holds the class names of
+    /// every finding at quarantine grade or above, plus the sentinel
+    /// [`LEARNED_REJECT`] when it was the learned score that decided — because
+    /// a score is not a class, and a caller that tallied classes would
+    /// otherwise under-report why it dropped the row.
+    ///
+    /// # The fragment rule
+    ///
+    /// Brokenness is the one class the trained unit can absolve. A loader that
+    /// tokenizes `prompt + completion` together legitimately holds rows whose
+    /// completion is unbalanced on its own and balanced behind its prompt — a
+    /// suffix fragment is a first-class shape, not corruption. When that is the
+    /// *only* reason the row was rejected, the joined text is re-scanned and
+    /// the row is kept if it is whole.
+    ///
+    /// The rule lives here rather than in the queue scanner because it is a
+    /// property of the training unit, not of one pipeline: every loader that
+    /// trains prompt + completion together owes it, and a loader that had to
+    /// remember its own copy would eventually not.
+    pub fn inspect(
+        &self,
+        prompt: Option<&str>,
+        completion: &str,
+        lang: SnippetLanguage,
+        summary: &mut ScanSummary,
+    ) -> Vec<String> {
+        let (report, scored) = scan_snippet_verdict(completion, lang, &self.policy);
+        summary.mixing.observe(lang, scored);
+        let mut offending: Vec<String> = report
+            .findings
+            .iter()
+            .filter(|f| f.severity >= Severity::Evasion)
+            .map(|f| f.class.as_str().to_string())
+            .collect();
+        offending.sort_unstable();
+        offending.dedup();
+        let fragment = offending.len() == 1 && offending[0] == CheatClass::DataBroken.as_str();
+        if fragment {
+            if let Some(prompt) = prompt {
+                // Joined with a newline, so the seam itself cannot merge two
+                // lines into a balanced one that never was.
+                let joined =
+                    scan_snippet_with(&format!("{prompt}\n{completion}"), lang, &self.policy);
+                let still_broken = joined
+                    .findings
+                    .iter()
+                    .any(|f| f.class == CheatClass::DataBroken && f.severity >= Severity::Evasion);
+                if !still_broken {
+                    offending.clear();
+                }
+            }
+        }
+        // Stacked behind, never in front of: a reject-grade pattern finding is
+        // a stated rule with evidence, so the learned score is not even
+        // computed for a row the patterns already rejected.
+        if offending.is_empty() {
+            if let Some((model, threshold)) = &self.learned {
+                let stats = summary.learned.get_or_insert(LearnedStats {
+                    threshold: *threshold,
+                    ..LearnedStats::default()
+                });
+                let score = model.score(completion, lang);
+                stats.scored += 1;
+                stats.max_score = stats.max_score.max(score);
+                if score >= *threshold {
+                    stats.dropped += 1;
+                    offending.push(LEARNED_REJECT.to_string());
+                }
+            }
+        }
+        offending
+    }
+}
+
+/// The class-name stand-in a learned rejection is counted under. It is not a
+/// [`CheatClass`] because the learned layer produces a score, not a class, and
+/// inventing a variant for it would let it be pattern-scanned.
+pub const LEARNED_REJECT: &str = "learned-second-opinion";
+
+/// What the learned layer scored and dropped, and at what operating point.
+/// `None` on a [`ScanSummary`] means *no learned layer ran*, which is a
+/// different claim from "a learned layer ran and dropped nothing" — so the
+/// option is load-bearing rather than cosmetic.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LearnedStats {
+    /// Rows the learned layer scored (rows the patterns rejected are not
+    /// scored, and so do not appear here).
+    pub scored: usize,
+    /// Rows it dropped.
+    pub dropped: usize,
+    /// The score at or above which a row was dropped. Travels with the count
+    /// because a drop rate without its threshold is not a measurement.
+    pub threshold: f64,
+    /// Highest score seen, cleared or not: the margin to the operating point,
+    /// which is what says whether the threshold is anywhere near the data.
+    pub max_score: f64,
+}
+
+/// What a gate removed, and enough about the evidence to reproduce the
+/// decision. Every field defaults, so a record written before the gate existed
+/// still deserializes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ScanSummary {
+    /// Rows the gate looked at.
+    pub scanned: usize,
+    /// Rows that passed.
+    pub kept: usize,
+    /// Rows the gate removed.
+    pub dropped: usize,
+    /// Dropped rows per reason, keyed by [`CheatClass::as_str`] or
+    /// [`LEARNED_REJECT`]. A row counts once per reason it tripped, however
+    /// many findings of that reason it earned.
+    pub dropped_by_class: std::collections::BTreeMap<String, usize>,
+    /// What the language-mixing check saw, for [`calibrate_mixing`] to read
+    /// back out of a log.
+    pub mixing: MixingTally,
+    /// The learned layer's own counts, when one ran.
+    pub learned: Option<LearnedStats>,
+}
+
+impl ScanSummary {
+    /// Fold one [`CheatGate::inspect`] verdict in.
+    pub fn observe(&mut self, offending: &[String]) {
+        self.scanned += 1;
+        if offending.is_empty() {
+            self.kept += 1;
+            return;
+        }
+        self.dropped += 1;
+        for class in offending {
+            *self.dropped_by_class.entry(class.clone()).or_default() += 1;
+        }
+    }
+
+    /// Undo one [`Self::observe`] for a row that was counted as dropped and
+    /// then absolved.
+    ///
+    /// Only the per-reason counts move. `scanned` stays: the gate really did
+    /// look at the row, and a tally that shrank because a later check reversed
+    /// an earlier one would be a tally of what the gate decided rather than
+    /// what it saw. The learned layer's counters are likewise untouched —
+    /// `inspect` does not score a row the patterns rejected, so there is
+    /// nothing of its own to walk back.
+    pub fn rolled_back(&mut self, offending: &[String]) {
+        for class in offending {
+            if let Some(n) = self.dropped_by_class.get_mut(class) {
+                *n = n.saturating_sub(1);
+            }
+        }
+        self.dropped = self.dropped.saturating_sub(1);
+    }
+
+    /// The refusal every gated loader makes when a gate empties a dataset: the
+    /// path, how many rows it had, and every reason the gate gave.
+    ///
+    /// The learned layer's drops ride in `dropped_by_class` under
+    /// [`LEARNED_REJECT`] — they are a reason like any other — so what is added
+    /// here is only the threshold they were judged at, which is the one thing a
+    /// count alone cannot tell you.
+    pub fn refusal(&self, path: &Path) -> anyhow::Error {
+        let reasons = self
+            .dropped_by_class
+            .iter()
+            .map(|(class, n)| format!("{class}:{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let threshold = self
+            .learned
+            .as_ref()
+            .map(|l| {
+                format!(
+                    "; the learned layer scored {}/{} rows at threshold {}",
+                    l.scored,
+                    l.dropped + l.scored,
+                    l.threshold
+                )
+            })
+            .unwrap_or_default();
+        anyhow::anyhow!(
+            "{}: the cheat gate dropped every one of its {} rows ({reasons}{threshold}); \
+             training on an empty dataset is refused",
+            path.display(),
+            self.scanned,
+        )
     }
 }
 
@@ -4013,7 +4255,11 @@ pub struct MixingTally {
 
 impl MixingTally {
     /// Fold one scan's verdict into the tally.
-    fn observe(&mut self, declared: SnippetLanguage, scored: Option<SnippetLanguage>) {
+    ///
+    /// Public because the queue scan tallies line by line as it streams,
+    /// where batching a whole dataset into [`filter_traces_with`] would mean
+    /// holding every completion in memory to produce the same counts.
+    pub fn observe(&mut self, declared: SnippetLanguage, scored: Option<SnippetLanguage>) {
         *self
             .scanned_by_declared
             .entry(declared.as_str().to_string())
@@ -6330,7 +6576,10 @@ mod snippet_tests {
         // per-language suppression arms are empty for `Other` by design, so
         // the classes that still speak are the language-independent ones —
         // secrets among them.
-        let report = findings("client = Client(api_key=\"ghp_0123456789abcdef0123\")\n", SnippetLanguage::Other);
+        let report = findings(
+            "client = Client(api_key=\"ghp_0123456789abcdef0123\")\n",
+            SnippetLanguage::Other,
+        );
         assert!(
             report.count(CheatClass::DataSecrets) >= 1,
             "declared-Other filters went quiet: {:?}",
@@ -6384,11 +6633,32 @@ mod snippet_tests {
     }
 
     #[test]
+    fn a_python_trace_using_the_walrus_operator_is_not_read_as_go() {
+        // `:=` was a Go marker until it was not. Python 3.8 has a walrus
+        // operator spelled the same way, and a Python trace that used it
+        // scored six on the `c` slot against a declared score of zero — so
+        // ordinary modern Python was being quarantined as a language switch.
+        let walrus =
+            "def f(items):\n    if (n := len(items)) > 0:\n        print(n)\n    return n\n";
+        let report = findings(walrus, SnippetLanguage::Python);
+        assert_eq!(
+            report.count(CheatClass::DataLanguageMixing),
+            0,
+            "a walrus expression read as Go: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
     fn the_marker_table_gives_every_mapped_slot_its_own_coverage() {
         // The invariant that makes the test above a property rather than a
         // coincidence: adding a language to a slot without giving it markers
         // is what broke it, and nothing else would have said so.
-        for lang in [SnippetLanguage::C, SnippetLanguage::Cpp, SnippetLanguage::JsTs] {
+        for lang in [
+            SnippetLanguage::C,
+            SnippetLanguage::Cpp,
+            SnippetLanguage::JsTs,
+        ] {
             let markers = LANGUAGE_MARKERS
                 .iter()
                 .filter(|(l, _, _)| *l == lang)
@@ -6449,26 +6719,22 @@ mod snippet_tests {
             "def other(x):\n    if x is None:\n        print(x)\n        return None\n    return x\n"
                 .to_string(),
         ];
-        let (_, _, tally) = filter_traces_with(&traces, SnippetLanguage::Rust, &MixingPolicy::default());
+        let (_, _, tally) =
+            filter_traces_with(&traces, SnippetLanguage::Rust, &MixingPolicy::default());
         assert_eq!(tally.scanned_of(SnippetLanguage::Rust), 4);
         assert_eq!(tally.scanned_total(), 4);
-        assert_eq!(tally.fired_on(SnippetLanguage::Rust, SnippetLanguage::Python), 2);
+        assert_eq!(
+            tally.fired_on(SnippetLanguage::Rust, SnippetLanguage::Python),
+            2
+        );
     }
 
     #[test]
     fn calibration_strikes_a_pair_that_fires_on_almost_everything() {
         let mut tally = MixingTally::default();
-        tally
-            .scanned_by_declared
-            .insert("c".to_string(), 1_000);
-        *tally
-            .fired
-            .entry("c->python".to_string())
-            .or_default() += 970;
-        *tally
-            .fired
-            .entry("c->jsts".to_string())
-            .or_default() += 12;
+        tally.scanned_by_declared.insert("c".to_string(), 1_000);
+        *tally.fired.entry("c->python".to_string()).or_default() += 970;
+        *tally.fired.entry("c->jsts".to_string()).or_default() += 12;
         let adaptation = calibrate_mixing(&tally, 0.5).expect("calibratable");
         let python = adaptation
             .pairs
@@ -6496,13 +6762,8 @@ mod snippet_tests {
     #[test]
     fn calibration_never_adds_a_pair() {
         let mut tally = MixingTally::default();
-        tally
-            .scanned_by_declared
-            .insert("rust".to_string(), 500);
-        *tally
-            .fired
-            .entry("rust->python".to_string())
-            .or_default() += 1;
+        tally.scanned_by_declared.insert("rust".to_string(), 500);
+        *tally.fired.entry("rust->python".to_string()).or_default() += 1;
         let adaptation = calibrate_mixing(&tally, 0.5).expect("calibratable");
         assert!(
             adaptation.policy.admitted_pairs.is_empty(),
@@ -6515,9 +6776,7 @@ mod snippet_tests {
     fn calibration_refuses_to_derive_a_rate_from_a_handful_of_documents() {
         let mut tally = MixingTally::default();
         tally.scanned_by_declared.insert("rust".to_string(), 12);
-        tally
-            .fired
-            .insert("rust->python".to_string(), 9);
+        tally.fired.insert("rust->python".to_string(), 9);
         let err = calibrate_mixing(&tally, 0.5).expect_err("12 documents is not a rate");
         assert!(
             format!("{err:#}").contains("at least 200 scanned documents"),
@@ -6541,9 +6800,7 @@ mod snippet_tests {
     fn a_tally_key_naming_an_unknown_language_is_refused_not_reinterpreted() {
         let mut tally = MixingTally::default();
         tally.scanned_by_declared.insert("rust".to_string(), 400);
-        tally
-            .fired
-            .insert("rust->klingon".to_string(), 300);
+        tally.fired.insert("rust->klingon".to_string(), 300);
         let err = calibrate_mixing(&tally, 0.5).expect_err("klingon is not a language");
         assert!(
             format!("{err:#}").contains("klingon"),
@@ -6554,10 +6811,9 @@ mod snippet_tests {
     #[test]
     fn a_policy_round_trips_through_disk_and_a_broken_one_is_refused() {
         let mut policy = MixingPolicy::default();
-        policy.admitted_pairs.insert((
-            "htmlcss".to_string(),
-            "jsts".to_string(),
-        ));
+        policy
+            .admitted_pairs
+            .insert(("htmlcss".to_string(), "jsts".to_string()));
         let path = std::env::temp_dir().join(format!(
             "mixing-policy-{}-{:?}.json",
             std::process::id(),

@@ -38,6 +38,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, ensure, Context};
 use serde::{Deserialize, Serialize};
+
+use crate::cheat::SnippetLanguage;
+use crate::student::CodeLanguage;
 use sha2::{Digest, Sha256};
 
 /// Default endpoint for NVIDIA's hosted NIM catalogue. A local NIM container
@@ -310,6 +313,17 @@ pub struct TraceReport {
     /// Prompts whose request failed after retries. A failure consumes budget
     /// but never aborts the run; the error is logged to stderr.
     pub failed: usize,
+    /// What the data-side gate removed from the teacher's own output, counted
+    /// per reason. The teacher is the last point where a contaminated answer
+    /// can be caught before it becomes training data: everything downstream
+    /// reads this file, so a suppression or a smuggled key the teacher emitted
+    /// would otherwise be read as a training signal.
+    ///
+    /// [`crate::cheat::ScanSummary::dropped`] counts every trace served in this run that the
+    /// gate rejected. Traces already in the file from an earlier run are not
+    /// re-gated here — they are gated by the loader that reads them, and
+    /// re-running this command must not rewrite or renumber them.
+    pub cheat_scan: crate::cheat::ScanSummary,
 }
 
 /// Why one HTTP attempt did not produce a parseable body. Internal: the
@@ -468,6 +482,34 @@ impl NimClient {
         out_dir: &Path,
         budget: TraceBudget,
     ) -> anyhow::Result<TraceReport> {
+        self.generate_traces_gated(
+            prompts,
+            out_dir,
+            budget,
+            &crate::cheat::CheatGate::patterns_only(),
+        )
+    }
+
+    /// [`Self::generate_traces`] with the data-side gate applied to the
+    /// teacher's output before it is written.
+    ///
+    /// This is the upstream half of "the filter runs in every training
+    /// method": [`crate::student::LanguageBatch::load`] gates what a trainer
+    /// reads, and this gates what the teacher produced. A reply carrying a
+    /// `todo!()`, a suppression or a key is refused here — counted in
+    /// [`TraceReport::cheat_scan`], never written — rather than sitting in a
+    /// traces file for a later loader to discover.
+    ///
+    /// The gate reads the completion alone: the prompt is a task statement
+    /// that *says* the forbidden idioms, and scanning it would reject the
+    /// prompt that asks for correct code most often.
+    pub fn generate_traces_gated(
+        &self,
+        prompts: &[TracePrompt],
+        out_dir: &Path,
+        budget: TraceBudget,
+        gate: &crate::cheat::CheatGate,
+    ) -> anyhow::Result<TraceReport> {
         std::fs::create_dir_all(out_dir)
             .with_context(|| format!("create trace output directory {}", out_dir.display()))?;
         let out_path = out_dir.join("traces.jsonl");
@@ -514,6 +556,28 @@ impl NimClient {
             };
             match self.complete(&request) {
                 Ok(reply) => {
+                    // The gate runs before the record exists: a rejected reply
+                    // never reaches the file, so `served` stays a count of
+                    // traces that are actually there.
+                    // A language the registry does not know still gets every
+                    // language-independent class (secrets, encoding, blobs,
+                    // brokenness); it just cannot get a language-mixing
+                    // verdict, because there is no declared language to
+                    // contradict.
+                    let snippet_lang = CodeLanguage::parse(&prompt.language)
+                        .map_or(SnippetLanguage::Other, |l| {
+                            crate::langdata::snippet_language(l)
+                        });
+                    let offending =
+                        gate.inspect(None, &reply.content, snippet_lang, &mut report.cheat_scan);
+                    report.cheat_scan.observe(&offending);
+                    if !offending.is_empty() {
+                        eprintln!(
+                            "[nim] trace {id} rejected by the cheat gate: {}",
+                            offending.join(", ")
+                        );
+                        continue;
+                    }
                     let record = TraceRecord {
                         id,
                         language: prompt.language.clone(),
@@ -1433,6 +1497,71 @@ mod tests {
         assert_eq!(stats.prompt_tokens, 60);
         assert_eq!(stats.completion_tokens, 12);
         assert_eq!(stats.empty_completions, 1);
+    }
+
+    /// The teacher side of the gate: a contaminated reply is refused before
+    /// it is written, not left in the traces file for a loader to find.
+    ///
+    /// The mock answers the first request with a `todo!()` and the second with
+    /// correct code, so the assertion is about *which* one reaches disk, not
+    /// about the gate rejecting everything.
+    #[test]
+    fn a_contaminated_teacher_reply_is_never_written() {
+        let server = MockServer::spawn(|n| {
+            if n == 1 {
+                (200, ok_body("fn add(a: i32, b: i32) -> i32 { todo!() }"))
+            } else {
+                (200, ok_body("fn add(a: i32, b: i32) -> i32 { a + b }"))
+            }
+        });
+        let client = test_client(&server.url());
+        let dir = unique_tmp_dir("gate");
+        let prompts = sample_prompts(3);
+        let report = client
+            .generate_traces(&prompts, &dir, TraceBudget { max_requests: 3 })
+            .expect("generate traces");
+
+        // Three replies came back; one was refused, so two are on disk and
+        // `served` counts only what is actually there.
+        assert_eq!(server.request_count(), 3);
+        assert_eq!(report.served, 2);
+        assert_eq!(report.cheat_scan.scanned, 3);
+        assert_eq!(report.cheat_scan.dropped, 1);
+        assert_eq!(report.cheat_scan.kept, 2);
+        assert_eq!(
+            report
+                .cheat_scan
+                .dropped_by_class
+                .get(crate::cheat::CheatClass::DataStub.as_str())
+                .copied(),
+            Some(1)
+        );
+
+        let records = read_traces(&report.out_path).expect("read traces");
+        assert_eq!(records.len(), 2, "one reply must never reach the file");
+        assert!(
+            records.iter().all(|r| !r.completion.contains("todo!")),
+            "a refused reply was written: {:?}",
+            records.iter().map(|r| &r.completion).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_gate_that_rejects_every_reply_leaves_no_traces_and_says_so() {
+        let server = MockServer::spawn(|_| (200, ok_body("fn f() { todo!() }")));
+        let client = test_client(&server.url());
+        let dir = unique_tmp_dir("gate-all");
+        let report = client
+            .generate_traces(&sample_prompts(2), &dir, TraceBudget { max_requests: 2 })
+            .expect("generate traces");
+        assert_eq!(report.served, 0);
+        assert_eq!(report.cheat_scan.dropped, 2);
+        let records = read_traces(&report.out_path).expect("read traces");
+        assert!(
+            records.is_empty(),
+            "an all-rejected run left {} traces behind",
+            records.len()
+        );
     }
 
     #[test]

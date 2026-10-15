@@ -29,7 +29,7 @@ Two documents are authoritative about what is and is not implemented:
 ```bash
 cargo build --release
 ./target/release/dblocks verify        # 227 certificates, non-zero exit on failure
-./target/release/dblocks cheat --root .  # attempts to defeat the gate, not satisfy it
+./target/release/dblocks cheat scan --root .  # attempts to defeat the gate, not satisfy it
 ./target/release/dblocks train --steps 200
 ./target/release/dblocks sample --planned --plan-depth 2   # plan the trajectory
 ./target/release/dblocks lm generate --lookahead 2         # plan the tokens
@@ -100,9 +100,9 @@ exactly the wrong behaviour.
 > `examples/evalgen.rs` writing `repo-native-eval.jsonl`.
 
 ```bash
-dblocks cheat --root .            # exits non-zero on any finding
-dblocks cheat --root . --all      # every finding, not just the worst
-dblocks cheat --root . --json     # machine-readable, for a training log
+dblocks cheat scan --root .       # exits non-zero on any finding
+dblocks cheat scan --root . --all  # every finding, not just the worst
+dblocks cheat scan --root . --json  # machine-readable, for a training log
 ```
 
 | Severity | Class | Example |

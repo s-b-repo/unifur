@@ -1384,6 +1384,10 @@ pub struct LanguageBatch {
     /// `(raw language string or "unknown", count)` over every line read,
     /// before filtering — what the "no examples" error reports.
     languages_seen: Vec<(String, usize)>,
+    /// What the cheat gate removed, kept on the batch rather than printed and
+    /// discarded: a drop count that only existed on the terminal is a count
+    /// nobody can check against the file.
+    cheat_scan: crate::cheat::ScanSummary,
 }
 
 impl LanguageBatch {
@@ -1401,6 +1405,30 @@ impl LanguageBatch {
         context: usize,
         shuffle_seed: u64,
     ) -> anyhow::Result<Self> {
+        Self::load_gated(
+            path,
+            filter,
+            context,
+            shuffle_seed,
+            &crate::cheat::CheatGate::patterns_only(),
+        )
+    }
+
+    /// [`Self::load`] under an explicit [`crate::cheat::CheatGate`]: a
+    /// calibrated language-mixing profile, the learned layer, or both.
+    ///
+    /// The gate is not opt-in. Every text training path in this crate reaches
+    /// its rows through this function, so gating *here* is what makes the
+    /// filter impossible to route around — a caller that forgets to scan gets
+    /// the patterns anyway, because there is no path to the tokenizer that
+    /// does not pass through them.
+    pub fn load_gated(
+        path: &Path,
+        filter: Option<CodeLanguage>,
+        context: usize,
+        shuffle_seed: u64,
+        gate: &crate::cheat::CheatGate,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             context >= 2,
             "context must cover at least 2 positions, got {context}"
@@ -1412,6 +1440,7 @@ impl LanguageBatch {
         let mut examples = Vec::new();
         let mut lines_read = 0usize;
         let mut skipped_no_target = 0usize;
+        let mut cheat_scan = crate::cheat::ScanSummary::default();
         for (idx, raw) in text.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() {
@@ -1454,6 +1483,26 @@ impl LanguageBatch {
                 }
             }
 
+            // The gate reads the completion — the training signal, and the
+            // same unit `langdata` filters at build time. The prompt is not
+            // scanned: real task statements enumerate the forbidden idioms
+            // ("no `todo!()`") and show fenced buggy code, and a scanner
+            // reading instructions as code false-positives on every one.
+            //
+            // Only rows this run will actually train on are gated: a row the
+            // language filter excludes never reaches the tokenizer, and
+            // scanning it would only inflate the counts with rows whose fate
+            // was already decided.
+            let snippet_lang = match language {
+                Some(lang) => crate::langdata::snippet_language(lang),
+                None => crate::cheat::SnippetLanguage::Other,
+            };
+            let offending = gate.inspect(Some(prompt), completion, snippet_lang, &mut cheat_scan);
+            cheat_scan.observe(&offending);
+            if !offending.is_empty() {
+                continue;
+            }
+
             let prompt_tokens = tokenizer.encode(prompt);
             let completion_tokens = tokenizer.encode(completion);
             let mut tokens = Vec::with_capacity(
@@ -1486,14 +1535,21 @@ impl LanguageBatch {
             });
         }
         let languages_seen: Vec<(String, usize)> = seen.into_iter().collect();
+        // The gate emptied the file. Naming the gate's own reasons is the
+        // point: "no usable examples" would send whoever reads it looking at
+        // the tokenizer, when the rows were removed before it ever saw one.
+        if cheat_scan.scanned > 0 && cheat_scan.kept == 0 {
+            return Err(cheat_scan.refusal(path));
+        }
         anyhow::ensure!(
             !examples.is_empty(),
             "{} holds no usable {}examples ({} lines read, {} skipped with no supervised \
-             completion token; languages seen: {})",
+             completion token, {} dropped by the cheat gate; languages seen: {})",
             path.display(),
             filter.map_or(String::new(), |l| format!("'{}' ", l.name())),
             lines_read,
             skipped_no_target,
+            cheat_scan.dropped,
             languages_seen
                 .iter()
                 .map(|(l, n)| format!("{l}:{n}"))
@@ -1512,7 +1568,17 @@ impl LanguageBatch {
             lines_read,
             skipped_no_target,
             languages_seen,
+            cheat_scan,
         })
+    }
+
+    /// What the cheat gate removed from this batch, and why. `None` never:
+    /// [`Self::load`] always runs the patterns, so a batch always has a
+    /// summary — it is the *count* that can be zero, and a zero count on a
+    /// summary that exists is the claim "nothing was removed", which is what
+    /// makes the absence of a drop visible rather than assumed.
+    pub fn cheat_scan(&self) -> &crate::cheat::ScanSummary {
+        &self.cheat_scan
     }
 
     pub fn len(&self) -> usize {
@@ -2779,10 +2845,21 @@ mod tests {
     /// honest mechanism proof at toy scale — the router can only learn the
     /// mapping because the signal exists, which is exactly the property the
     /// real traces provide by being code in one language.
+    /// A distinct 24-character marker per language, so the router has separable
+    /// per-language signal to learn from.
+    ///
+    /// Alphanumeric by construction, and not by accident: an earlier version drew
+    /// from a shifting ASCII window, so some languages' markers were strings
+    /// of `[]^_` — unbalanced delimiters and high-entropy non-code, which is
+    /// exactly what the data-side cheat gate is built to refuse. The gate was
+    /// right about those rows and the fixture was wrong, so the alphabet moved
+    /// rather than the filter.
     fn marker_completion(language: CodeLanguage, len: usize, salt: usize) -> String {
-        let base = 48 + 8 * language.index() as u8;
+        const ALPHABET: &[u8; 62] =
+            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        let base = (8 * language.index()) % ALPHABET.len();
         (0..len)
-            .map(|k| (base + ((k * 3 + salt) % 8) as u8) as char)
+            .map(|k| ALPHABET[(base + (k * 3 + salt) % 8) % ALPHABET.len()] as char)
             .collect()
     }
 
@@ -2800,6 +2877,78 @@ mod tests {
             }
         }
         write_lines(dir, "train.jsonl", &lines)
+    }
+
+    /// The data-side gate is on the loader, not on the callers, so a
+    /// training path that never heard of it still gets it. This is the test
+    /// that would fail if someone made the gate opt-in.
+    #[test]
+    fn test_language_batch_drops_a_planted_cheat_without_being_asked_to() {
+        let dir = unique_tmp("gate");
+        let lines = vec![
+            trace_line(
+                "rust",
+                "add ",
+                "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+            ),
+            trace_line(
+                "rust",
+                "stub ",
+                "fn add(a: i32, b: i32) -> i32 {\n    todo!()\n}\n",
+            ),
+            trace_line("python", "quiet ", "def f(x):\n    return x\n"),
+        ];
+        let path = write_lines(&dir, "train.jsonl", &lines);
+
+        let batch = LanguageBatch::load(&path, None, 64, 7).unwrap();
+        let scan = batch.cheat_scan();
+        assert_eq!(scan.scanned, 3, "every row is gated, none skipped silently");
+        assert_eq!(scan.dropped, 1);
+        assert_eq!(scan.kept, 2);
+        assert_eq!(
+            scan.dropped_by_class.get("data-stub").copied(),
+            Some(1),
+            "the count names the class: {:?}",
+            scan.dropped_by_class
+        );
+        assert_eq!(scan.kept + scan.dropped, scan.scanned);
+        // Nothing gated, but the claim is still made: a zero on a summary that
+        // exists is "checked and clean", which a missing summary is not.
+        assert!(scan.learned.is_none(), "no learned layer was configured");
+    }
+
+    #[test]
+    fn test_language_batch_refuses_a_file_the_gate_empties() {
+        let dir = unique_tmp("gate-empty");
+        let lines = vec![trace_line(
+            "rust",
+            "stub ",
+            "fn add() -> i32 {\n    todo!()\n}\n",
+        )];
+        let path = write_lines(&dir, "train.jsonl", &lines);
+        let err = LanguageBatch::load(&path, None, 64, 7).expect_err("emptied by the gate");
+        let message = format!("{err:#}");
+        assert!(message.contains("cheat gate"), "{message}");
+        assert!(message.contains("data-stub"), "names the reason: {message}");
+    }
+
+    /// A completion that is only balanced behind its prompt is a suffix
+    /// fragment, not corruption — the loader trains prompt + completion as one
+    /// unit, so it gates the unit.
+    #[test]
+    fn test_language_batch_keeps_a_fragment_balanced_by_its_prompt() {
+        let dir = unique_tmp("gate-fragment");
+        let prompt = "fn compute(x: i32) -> i32 {\n    if x > 0 {\n";
+        let completion = "        x * 2\n    }\n    0\n}";
+        let lines = vec![trace_line("rust", prompt, completion)];
+        let path = write_lines(&dir, "train.jsonl", &lines);
+        let batch = LanguageBatch::load(&path, None, 96, 7).unwrap();
+        assert_eq!(
+            batch.cheat_scan().dropped,
+            0,
+            "a balanced fragment was read as broken: {:?}",
+            batch.cheat_scan().dropped_by_class
+        );
     }
 
     #[test]

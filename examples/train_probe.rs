@@ -44,6 +44,29 @@
 //! `--save-init <dir>` writes the scheduler's student built on CPU at the
 //! scheduler's seed into `<dir>` and exits — the checkpoint every `--init`
 //! cross-check starts from.
+//!
+//! Re-measured 2026-10-15 against the production coding shape
+//! (`scheduler-coding-gpu.json`, `pipeline-gpu/rust`, 1812 examples x 4096),
+//! from one CPU-built init checkpoint, 8 steps on each backend:
+//!
+//! ```text
+//!   step   wgpu-ckpt    ndarray      diff
+//!      0      5.9913     5.9913     0.0000
+//!      1      4.8981     4.8983     0.0002
+//!      3      4.1384     4.1391     0.0007
+//!      4      4.2040     4.2019     0.0021   <- worst
+//!      7      3.8949     3.8952     0.0003
+//! ```
+//!
+//! Step 0 — the one that cannot be explained by accumulation — agrees to four
+//! decimals, and the worst divergence over the run is 2.1e-3 on a loss of 4.2
+//! (5e-4 relative). That is float32 reduction-order noise between backends and
+//! nothing else, so a wgpu drain's numbers are comparable to a CPU drain's.
+//!
+//! Marginal step time was 14.671 s against 139.281 s: **9.5x**. The figures
+//! above it in this file (6.2 s vs 93.3 s) were taken on an idle box; the ones
+//! here ran alongside a full-corpus ingest holding a core, which inflates the
+//! ndarray side and so makes the ratio a conservative one.
 
 use anyhow::{Context, Result};
 use burn::tensor::backend::{AutodiffBackend, Backend, BackendTypes};

@@ -19,6 +19,7 @@ use diffusionblocks::{
     hybrid::{AttentionMode, AttentionSchedule, PositionKind},
     infer::{InferenceConfig, InferenceEngine},
     lm::{LanguageModel, LmConfig, Sampling, Unlikelihood},
+    mlcheat,
     multi_block::{Gated, MultiBlockConfig, PlannedConfig, Strategy},
     nina, ninagui,
     planner::Budget,
@@ -1603,15 +1604,16 @@ enum Command {
     /// Exits non-zero on any finding. Findings already accepted in the
     /// repository baseline are not reported; only the delta is.
     Cheat {
-        /// Tree to scan. Defaults to the current directory.
-        #[arg(long, default_value = ".")]
-        root: PathBuf,
-        /// Also print findings as JSON.
-        #[arg(long)]
-        json: bool,
-        /// Print every finding, not just the most severe.
-        #[arg(long)]
-        all: bool,
+        /// Scan a tree for attempts to defeat the quality gate rather than
+        /// satisfy it: lint suppression, weakened or disabled tests, and edits
+        /// to the gate script, certificate registry, or manifest.
+        ///
+        /// Subcommands, not flags, because this tree now has four shapes of
+        /// thing to do and a flat flag list for all of them puts every one of
+        /// their options on the root `Cli` — which clap materialises, whole, on
+        /// the stack of whatever parses it.
+        #[command(subcommand)]
+        action: CheatAction,
     },
     /// Language-model paths: tokenize a corpus, generate text, and compare
     /// the decoding strategies (roadmap Phases 19 and 21b).
@@ -2382,7 +2384,32 @@ fn main() -> Result<()> {
         Command::Nina { action } => cmd_nina(action),
         Command::Corpus { action } => cmd_corpus(action),
         Command::Verify { group } => cmd_verify(group.as_deref()),
-        Command::Cheat { root, json, all } => cmd_cheat(&root, json, all),
+        Command::Cheat { action } => match action {
+            CheatAction::Scan { root, json, all } => cmd_cheat_scan(&root, json, all),
+            CheatAction::Adapt {
+                log,
+                max_fire_rate,
+                out,
+            } => cmd_cheat_adapt(&log, max_fire_rate, out.as_deref()),
+            CheatAction::Policy { profile } => cmd_cheat_policy(profile.as_deref()),
+            CheatAction::Ml { model } => cmd_cheat_ml(model.as_deref()),
+            CheatAction::Harness { action } => match action {
+                CheatHarnessAction::Round {
+                    corpus,
+                    registry,
+                    candidates,
+                    json,
+                } => cmd_cheat_harness_round(&corpus, &registry, candidates, json),
+                CheatHarnessAction::Commit {
+                    corpus,
+                    registry,
+                    candidates,
+                    provenance,
+                } => cmd_cheat_harness_commit(&corpus, &registry, candidates, &provenance),
+                CheatHarnessAction::Rollback { registry } => cmd_cheat_harness_rollback(&registry),
+                CheatHarnessAction::Status { registry } => cmd_cheat_harness_status(&registry),
+            },
+        },
         command @ Command::Train { .. } => cmd_train(command),
         command @ Command::Sample { .. } => cmd_sample(command),
         Command::Bench {
@@ -5182,6 +5209,25 @@ fn cmd_student_train(args: &StudentTrainArgs) -> Result<()> {
         data.skipped_no_target(),
         language.map_or("none".to_string(), |l| l.name().to_string())
     );
+    // The gate's verdict is printed whether or not it dropped anything. A
+    // silent zero is indistinguishable from a gate that did not run, and
+    // "nothing was removed" is only a claim worth making when something
+    // checked.
+    let scan = data.cheat_scan();
+    if scan.dropped == 0 {
+        println!("cheat gate: {} row(s) checked, none dropped", scan.scanned);
+    } else {
+        let reasons = scan
+            .dropped_by_class
+            .iter()
+            .map(|(class, n)| format!("{class}:{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "cheat gate: {} of {} row(s) dropped ({reasons})",
+            scan.dropped, scan.scanned
+        );
+    }
     if language.is_none() {
         println!("language=unknown: the routing auxiliary is off (no box to supervise)");
     }
@@ -5248,7 +5294,237 @@ fn cmd_sigmas(num_blocks: usize, gamma: f64) -> Result<()> {
     Ok(())
 }
 
-fn cmd_cheat(root: &Path, json: bool, all: bool) -> Result<()> {
+#[derive(clap::Subcommand, Clone, Debug)]
+enum CheatAction {
+    /// Scan a tree for suppressions, test evasion and gate tampering. Exits
+    /// non-zero on any finding; findings already accepted in the repository
+    /// baseline are not reported, only the delta.
+    Scan {
+        /// Tree to scan. Defaults to the current directory.
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Also print findings as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Print every finding, not just the most severe.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Calibrate the language-mixing rule from the scan tallies a queue log
+    /// recorded, and write the profile the evidence justifies.
+    Adapt {
+        /// The Merkle-chained queue log. Verified before it is read.
+        #[arg(long, default_value = "logs/queue.jsonl")]
+        log: PathBuf,
+        /// Strike a declared/scored pair once it has fired on this fraction of
+        /// its declared language. 0.5 by default: a rule that fires on half of
+        /// what it is shown is a constant, not a detector.
+        #[arg(long, default_value_t = 0.5)]
+        max_fire_rate: f64,
+        /// Where to write the profile. Required.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Load a profile and report what it changes. A profile naming a language
+    /// the parser does not know, or one whose thresholds are both zero, is
+    /// refused rather than described.
+    Policy {
+        /// The profile `adapt --out` wrote.
+        #[arg(long)]
+        profile: Option<PathBuf>,
+    },
+    /// The learned second-opinion filter: score a snippet on stdin with a
+    /// trained model. A pattern finding outranks the score either way.
+    Ml {
+        /// The trained model.
+        #[arg(long)]
+        model: Option<PathBuf>,
+    },
+    /// The outcome-grounded adaptation loop: mine the scanner's misses and
+    /// false alarms from a labeled corpus, propose tightening edits, and accept
+    /// one only if a rerun of the *same* corpus shows it helps.
+    ///
+    /// The scanner's rules are frozen; only its operating point moves. Every
+    /// edit this loop can make is a tightening one — see
+    /// [`diffusionblocks::cheatharness`].
+    Harness {
+        #[command(subcommand)]
+        action: CheatHarnessAction,
+    },
+}
+
+/// The adaptation loop's steps.
+#[derive(Subcommand, Clone, Debug)]
+enum CheatHarnessAction {
+    /// Run one round: mine the packet, propose the candidate group, and score
+    /// every candidate by rerun. Nothing is committed.
+    Round {
+        /// Labeled corpus, one `{"code","lang","cheat"}` JSON object per line.
+        #[arg(long, default_value = "logs/cheat-corpus.jsonl")]
+        corpus: PathBuf,
+        /// The chain of accepted profiles.
+        #[arg(long, default_value = "logs/cheat-harness.json")]
+        registry: PathBuf,
+        /// Candidates to propose per round.
+        #[arg(long, default_value_t = 8)]
+        candidates: usize,
+        /// Also write the round as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Take the best accepted candidate from a round and append it to the chain.
+    /// Refuses when nothing was accepted, so an empty round cannot quietly
+    /// advance the version.
+    Commit {
+        #[arg(long, default_value = "logs/cheat-corpus.jsonl")]
+        corpus: PathBuf,
+        #[arg(long, default_value = "logs/cheat-harness.json")]
+        registry: PathBuf,
+        #[arg(long, default_value_t = 8)]
+        candidates: usize,
+        /// Recorded on the entry next to the measured reward, so a profile is
+        /// never in force without a statement of what it was measured against.
+        #[arg(long)]
+        provenance: String,
+    },
+    /// Withdraw the most recent accepted profile.
+    Rollback {
+        #[arg(long, default_value = "logs/cheat-harness.json")]
+        registry: PathBuf,
+    },
+    /// Report the profile in force and the chain behind it.
+    Status {
+        #[arg(long, default_value = "logs/cheat-harness.json")]
+        registry: PathBuf,
+    },
+}
+
+/// Load the chain, or start one when the file does not exist yet.
+fn cheat_harness_registry(path: &Path) -> Result<diffusionblocks::cheatharness::Registry> {
+    if path.exists() {
+        return diffusionblocks::cheatharness::Registry::load(path);
+    }
+    Ok(diffusionblocks::cheatharness::Registry::default_registry())
+}
+
+fn cmd_cheat_harness_round(
+    corpus: &Path,
+    registry_path: &Path,
+    candidates: usize,
+    json: bool,
+) -> Result<()> {
+    let items = diffusionblocks::cheatharness::load_corpus(corpus)?;
+    let registry = cheat_harness_registry(registry_path)?;
+    let baseline = registry.current().clone();
+    let round = diffusionblocks::cheatharness::run_round(&items, &registry, candidates)?;
+
+    if json {
+        println!("{}", diffusionblocks::cheatharness::round_json(&round)?);
+    }
+    print!(
+        "{}",
+        diffusionblocks::cheatharness::render_round(&round, &baseline)
+    );
+    match round.best() {
+        Some(c) => println!(
+            "best: {} (version {} would follow)",
+            c.summary(&baseline),
+            registry.entries.len()
+        ),
+        None => {
+            println!("best: none accepted — the corpus did not show a tightening edit that helps")
+        }
+    }
+    Ok(())
+}
+
+fn cmd_cheat_harness_commit(
+    corpus: &Path,
+    registry_path: &Path,
+    candidates: usize,
+    provenance: &str,
+) -> Result<()> {
+    let items = diffusionblocks::cheatharness::load_corpus(corpus)?;
+    let mut registry = cheat_harness_registry(registry_path)?;
+    let baseline = registry.current().clone();
+    let round = diffusionblocks::cheatharness::run_round(&items, &registry, candidates)?;
+
+    let best = round.best().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no candidate was accepted, so there is nothing to commit; the round's refusals are \
+             the answer here — run `dblocks cheat harness round` to read them"
+        )
+    })?;
+    // `commit` is the only writer, so the entry it appended is the last one.
+    // The borrow it returns is dropped here: `save` needs `&registry`, and
+    // holding the reference across it would not compile.
+    registry.commit(&baseline, best, provenance)?;
+    registry.save(registry_path)?;
+    let entry = registry
+        .entries
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("committed an entry, but the chain reports empty"))?;
+    // `commit` only lands a profile the acceptance test passed, and that test
+    // requires a positive delta, so this prints a number with no sign.
+    println!(
+        "committed version {}: {} (delta +{}, caught {}/{} -> {}/{}, false-drops {} -> {})",
+        entry.version,
+        entry.summary,
+        entry.reward.delta(),
+        entry.reward.baseline.caught,
+        entry.reward.baseline.cheats,
+        entry.reward.candidate.caught,
+        entry.reward.candidate.cheats,
+        entry.reward.baseline.false_drops,
+        entry.reward.candidate.false_drops,
+    );
+    Ok(())
+}
+
+fn cmd_cheat_harness_rollback(registry_path: &Path) -> Result<()> {
+    let mut registry = cheat_harness_registry(registry_path)?;
+    let entry = registry.rollback()?;
+    registry.save(registry_path)?;
+    // The chain's version, not `HarnessProfile::version` — that field is the
+    // schema version, and printing it here would report the schema as though
+    // it were the position in the chain.
+    let now = registry.entries.last().map_or(0, |e| e.version);
+    println!(
+        "withdrew version {}: {}; version {now} is in force",
+        entry.version, entry.summary
+    );
+    Ok(())
+}
+
+fn cmd_cheat_harness_status(registry_path: &Path) -> Result<()> {
+    let registry = cheat_harness_registry(registry_path)?;
+    let current = registry.current();
+    println!(
+        "in force: version {} — {}",
+        registry.entries.last().map_or(0, |e| e.version),
+        current.provenance
+    );
+    println!(
+        "  mixing: min_score={} min_margin={} admitted_pairs={}",
+        current.mixing.min_score,
+        current.mixing.min_margin,
+        current.mixing.admitted_pairs.len()
+    );
+    if current.gates.is_empty() {
+        println!("  class gates: none (the scanner's own severities are in force)");
+    } else {
+        for (class, gate) in &current.gates {
+            println!("  {class}: {:?}", gate);
+        }
+    }
+    println!("chain: {} entries", registry.entries.len());
+    for entry in &registry.entries {
+        println!("  v{} {}", entry.version, entry.summary,);
+    }
+    Ok(())
+}
+
+fn cmd_cheat_scan(root: &Path, json: bool, all: bool) -> Result<()> {
     let candidate = cheat::load_from_dir(root)
         .with_context(|| format!("loading candidate tree {}", root.display()))?;
     let report = cheat::scan(&candidate);
@@ -5291,6 +5567,107 @@ fn cmd_cheat(root: &Path, json: bool, all: bool) -> Result<()> {
         "{} finding(s), worst {worst}; the gate would be satisfied by defeating it, not by obeying it",
         report.findings.len()
     );
+}
+
+/// `dblocks cheat adapt` — read the scan tallies a queue log recorded and
+/// write the language-mixing profile they justify.
+///
+/// The chain is verified before it is read, so the profile is derived from
+/// counts that cannot have been edited afterwards, and the rule it applies can
+/// only strike pairs: it cannot add a finding the filter did not already
+/// make. The output says which pairs were struck and at what rate, because a
+/// profile that changes what gets dropped has to be readable by whoever the
+/// next drop count surprises.
+fn cmd_cheat_adapt(log: &Path, max_fire_rate: f64, out: Option<&Path>) -> Result<()> {
+    let Some(out) = out else {
+        anyhow::bail!(
+            "--out is required: calibration writes a profile that changes which rows are \
+             dropped, so the old behaviour has to stay recoverable by not overwriting it"
+        );
+    };
+    let tally = nina::mixing_tally_from_chain(log)?;
+    println!(
+        "calibrating from {}: {} scanned document(s), {} firing pair(s)",
+        log.display(),
+        tally.scanned_total(),
+        tally.fired.len()
+    );
+    let adaptation = cheat::calibrate_mixing(&tally, max_fire_rate)?;
+    for pair in &adaptation.pairs {
+        println!(
+            "  {:<24} {:>6}/{:<6} {:>7.2}%  {}",
+            pair.pair,
+            pair.fired,
+            pair.scanned,
+            100.0 * pair.fire_rate,
+            if pair.removed { "struck" } else { "kept" }
+        );
+    }
+    adaptation.policy.save(out)?;
+    println!(
+        "\nwrote {} — {} pair(s) struck at max_fire_rate {max_fire_rate}\n{}",
+        out.display(),
+        adaptation.policy.admitted_pairs.len(),
+        adaptation.policy.provenance
+    );
+    Ok(())
+}
+
+/// `dblocks cheat policy` — load a profile and report what it changes.
+///
+/// Loading is the check: a profile naming a language the parser does not know,
+/// or one whose thresholds are both zero, is refused rather than described.
+fn cmd_cheat_policy(profile: Option<&Path>) -> Result<()> {
+    let Some(path) = profile else {
+        anyhow::bail!("--profile is required: pass the file `dblocks cheat adapt --out` wrote")
+    };
+    let policy = cheat::MixingPolicy::load(path)?;
+    println!("{path:?}");
+    println!("  min_score   {}", policy.min_score);
+    println!("  min_margin  {}", policy.min_margin);
+    println!("  struck      {} pair(s)", policy.admitted_pairs.len());
+    for (declared, scored) in &policy.admitted_pairs {
+        println!("    {declared} -> {scored}");
+    }
+    println!("  provenance  {}", policy.provenance);
+    Ok(())
+}
+
+/// `dblocks cheat ml` — the learned second-opinion filter.
+///
+/// With `--model`, score one snippet read from stdin and print the model's
+/// answer, so a score can be inspected against the text that produced it.
+/// Without one, report what the layer is and where a model would live, rather
+/// than training one from nothing: the labels are the pattern scanner's
+/// verdicts, and a run that silently invented them would be the circularity
+/// the module documents.
+fn cmd_cheat_ml(model: Option<&Path>) -> Result<()> {
+    let Some(path) = model else {
+        println!("cheat ml: the learned layer generalizes cheat.rs verdicts to snippets whose");
+        println!(
+            "patterns do not fire. It does not invent ground truth (see mlcheat::LABEL_SOURCE)."
+        );
+        println!();
+        println!("usage: dblocks cheat ml --model <ml-cheat-model.json> < snippet");
+        println!("       the trained model is loaded and scores stdin as one snippet");
+        return Ok(());
+    };
+    let model = mlcheat::MlCheatModel::load(path)?;
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+        .with_context(|| format!("read snippet from stdin for {}", path.display()))?;
+    let lang = cheat::SnippetLanguage::Other;
+    let score = model.score(&text, lang);
+    println!("score        {score:.6}");
+    println!("declared     {}", lang.as_str());
+    println!("model        {}", path.display());
+    println!("labels       {}", mlcheat::LABEL_SOURCE);
+    println!();
+    println!(
+        "A score is a second opinion, not a verdict: a pattern finding at quarantine grade or \
+         above still rejects the trace whatever this number says."
+    );
+    Ok(())
 }
 
 fn cmd_verify(group: Option<&str>) -> Result<()> {
@@ -6655,6 +7032,14 @@ const CHAT_RETRIEVAL_K: usize = 8;
 /// checkpoint file and the `StudentConfig` it was trained with; without one,
 /// the content-addressed `student-*.mpk` files are the candidates, and more
 /// than one is disambiguated by the registry's checkpoint hash.
+///
+/// A sidecar that names a checkpoint which is **not on disk** is stale, not
+/// authoritative: retraining writes a new content-addressed file and the
+/// registry entry with it, and nothing rewrites the pipeline's sidecar. The
+/// registry is what names the live checkpoint, so resolution falls through to
+/// the candidates rather than refusing to serve a model that is present. A
+/// sidecar naming a file that *does* exist is still obeyed — that is the case
+/// where two checkpoints are on disk and only the sidecar can say which.
 fn resolve_specialist(
     model_dir: &Path,
     entry: &nina::ModelEntry,
@@ -6677,20 +7062,27 @@ fn resolve_specialist(
             sidecar.display()
         );
         let checkpoint = model_dir.join(file);
-        anyhow::ensure!(
-            checkpoint.is_file(),
-            "{} names checkpoint '{file}' but {} does not exist",
+        if checkpoint.is_file() {
+            let config = value
+                .get("student_config")
+                .map(|v| {
+                    serde_json::from_value(v.clone()).with_context(|| {
+                        format!("parse the student_config in {}", sidecar.display())
+                    })
+                })
+                .transpose()?;
+            return Ok((checkpoint, config));
+        }
+        // Stale sidecar: say so and let the registry decide below. The
+        // student_config is dropped with it — it described the checkpoint
+        // that is gone, and serving the live one under the dead one's
+        // config is a shape mismatch waiting to happen.
+        eprintln!(
+            "note: {} names checkpoint '{file}', which is not on disk; resolving '{}' from \
+             the registry's checkpoint hash instead",
             sidecar.display(),
-            checkpoint.display()
+            entry.name
         );
-        let config = value
-            .get("student_config")
-            .map(|v| {
-                serde_json::from_value(v.clone())
-                    .with_context(|| format!("parse the student_config in {}", sidecar.display()))
-            })
-            .transpose()?;
-        return Ok((checkpoint, config));
     }
     let mut candidates: Vec<PathBuf> = Vec::new();
     for dir_entry in std::fs::read_dir(model_dir)
@@ -6714,26 +7106,44 @@ fn resolve_specialist(
     if candidates.len() == 1 {
         return Ok((candidates.remove(0), None));
     }
-    let hash16: String = entry.checkpoint_hash.chars().take(16).collect();
-    let mut matching = candidates.iter().filter(|p| {
-        p.file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| !hash16.is_empty() && n.contains(&hash16))
-    });
-    let (Some(first), None) = (matching.next(), matching.next()) else {
+    // Two or more checkpoints: the registry's `checkpoint_hash` is the sha256
+    // of the *file bytes*, which is a different digest from the one in the
+    // file name — `save_content_addressed` names a file after a canonical
+    // hash of the module record, so the registry hash never appears in the
+    // name and matching on it there can never succeed. Hash the candidates.
+    //
+    // This costs a pass over each file (a few hundred ms for a 200 MB
+    // checkpoint), which is the right trade against refusing to serve a
+    // model that is present and whose identity the registry states exactly.
+    let mut matching = Vec::new();
+    let mut hashed = Vec::new();
+    for path in &candidates {
+        let digest = checkpoint::file_sha256_hex(path)
+            .with_context(|| format!("hash the candidate checkpoint {}", path.display()))?;
+        hashed.push((path.clone(), digest.clone()));
+        if !entry.checkpoint_hash.is_empty() && digest == entry.checkpoint_hash {
+            matching.push(path.clone());
+        }
+    }
+    let (Some(first), None) = (matching.first().cloned(), matching.get(1).cloned()) else {
         anyhow::bail!(
-            "{} checkpoints in {} and the registry hash '{}' does not disambiguate them: {}",
+            "{} checkpoints in {} and the registry hash '{}' {} of them: {}",
             candidates.len(),
             model_dir.display(),
             entry.checkpoint_hash,
-            candidates
+            if matching.is_empty() {
+                "matches none"
+            } else {
+                "matches more than one"
+            },
+            hashed
                 .iter()
-                .map(|p| p.display().to_string())
+                .map(|(p, d)| format!("{} (sha256 {d})", p.display()))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
     };
-    Ok((first.clone(), None))
+    Ok((first, None))
 }
 
 /// Recover the `StudentConfig` a checkpoint was trained with from its
@@ -7713,5 +8123,395 @@ mod nina_cli_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("bare prompt"), "{err}");
+    }
+
+    /// Two checkpoints on disk are disambiguated by **hashing the files**,
+    /// not by matching the registry hash against their names.
+    ///
+    /// Those are two different digests: `save_content_addressed` names a file
+    /// after a canonical hash of the module record, while the registry stores
+    /// the sha256 of the file's bytes, so the registry hash never appears in
+    /// the name. The name-based match could therefore never succeed, and a
+    /// second training run in a model directory made the model unservable —
+    /// which is what happened to every coding specialist that was retrained.
+    #[test]
+    fn two_checkpoints_are_disambiguated_by_content_hash_not_by_name() {
+        let dir = scratch("two-checkpoints");
+        let model_dir = dir.join("models").join("coding").join("rust");
+        std::fs::create_dir_all(&model_dir).unwrap();
+
+        // Same stem, different bytes: the names differ, the digests differ.
+        let live = model_dir.join("student-aaaaaaaaaaaaaaaa.mpk");
+        let dead = model_dir.join("student-bbbbbbbbbbbbbbbb.mpk");
+        std::fs::write(&live, b"the live checkpoint").unwrap();
+        std::fs::write(&dead, b"the superseded one").unwrap();
+        let live_hash = checkpoint::file_sha256_hex(&live).unwrap();
+
+        let entry = nina::ModelEntry {
+            name: "coding/rust".into(),
+            field: "coding".into(),
+            subfield: "rust".into(),
+            box_id: "coding:rust".into(),
+            checkpoint_hash: live_hash.clone(),
+            status: nina::ModelStatus::Candidate,
+            eval: Default::default(),
+            datasets: Vec::new(),
+            teacher: None,
+            bytes: 19,
+        };
+
+        let (resolved, _) = resolve_specialist(&model_dir, &entry).unwrap();
+        assert_eq!(
+            resolved, live,
+            "the registry names the live checkpoint by content, and that is what is served"
+        );
+
+        // A registry hash matching neither candidate is still refused, and the
+        // error names both digests so the operator can see what is there.
+        let entry = nina::ModelEntry {
+            checkpoint_hash: "0".repeat(64),
+            ..entry
+        };
+        let err = resolve_specialist(&model_dir, &entry)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("matches none"), "{err}");
+        assert!(
+            err.contains(&live_hash[..16]),
+            "the error names what is there: {err}"
+        );
+    }
+
+    /// A model directory whose `config.json` names a checkpoint that is no
+    /// longer on disk is a *stale sidecar*, not a broken model.
+    ///
+    /// Retraining writes a new content-addressed `.mpk` and the registry entry
+    /// that names it; nothing rewrites the pipeline's provenance sidecar. Six
+    /// of the deployed coding specialists were unservable for exactly this
+    /// reason — the sidecar named an older checkpoint that had been replaced,
+    /// and `resolve_specialist` refused rather than falling through to the
+    /// registry, which is what actually names the live checkpoint.
+    #[test]
+    fn a_stale_sidecar_falls_through_to_the_registry_instead_of_refusing() {
+        let dir = scratch("stale-sidecar");
+        let model_dir = dir.join("models").join("coding").join("rust");
+        std::fs::create_dir_all(&model_dir).unwrap();
+
+        // The live checkpoint is the only .mpk present.
+        let live = model_dir.join("student-aaaaaaaaaaaaaaaa.mpk");
+        std::fs::write(&live, b"not really a checkpoint").unwrap();
+        // The sidecar names a different one, which is gone.
+        std::fs::write(
+            model_dir.join("config.json"),
+            serde_json::json!({
+                "name": "coding/rust",
+                "checkpoint": "student-bbbbbbbbbbbbbbbb.mpk",
+                "student_config": {"hidden_size": 999},
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let entry = nina::ModelEntry {
+            name: "coding/rust".into(),
+            field: "coding".into(),
+            subfield: "rust".into(),
+            box_id: "coding:rust".into(),
+            checkpoint_hash: "abcdef0123456789".into(),
+            status: nina::ModelStatus::Candidate,
+            eval: Default::default(),
+            datasets: Vec::new(),
+            teacher: None,
+            bytes: 21,
+        };
+
+        let (resolved, config) = resolve_specialist(&model_dir, &entry).unwrap();
+        assert_eq!(resolved, live, "the live checkpoint is the one served");
+        assert!(
+            config.is_none(),
+            "the dead sidecar's student_config described a checkpoint that is gone; serving \
+             the live one under it would be a shape mismatch"
+        );
+    }
+
+    /// A sidecar naming a checkpoint that *is* present is still obeyed: that is
+    /// the case where two checkpoints are on disk and only the sidecar knows
+    /// which one the model directory is deployed with.
+    #[test]
+    fn a_sidecar_naming_a_present_checkpoint_still_wins() {
+        let dir = scratch("fresh-sidecar");
+        let model_dir = dir.join("models").join("coding").join("go");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("student-aaaaaaaaaaaaaaaa.mpk"), b"a").unwrap();
+        std::fs::write(model_dir.join("student-bbbbbbbbbbbbbbbb.mpk"), b"b").unwrap();
+        std::fs::write(
+            model_dir.join("config.json"),
+            serde_json::json!({
+                "name": "coding/go",
+                "checkpoint": "student-bbbbbbbbbbbbbbbb.mpk",
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let entry = nina::ModelEntry {
+            name: "coding/go".into(),
+            field: "coding".into(),
+            subfield: "go".into(),
+            box_id: "coding:go".into(),
+            // A hash matching neither file: the registry must not override a
+            // sidecar that found its checkpoint.
+            checkpoint_hash: "0000000000000000".into(),
+            status: nina::ModelStatus::Candidate,
+            eval: Default::default(),
+            datasets: Vec::new(),
+            teacher: None,
+            bytes: 1,
+        };
+
+        let (resolved, _) = resolve_specialist(&model_dir, &entry).unwrap();
+        assert_eq!(
+            resolved,
+            model_dir.join("student-bbbbbbbbbbbbbbbb.mpk"),
+            "the sidecar found its checkpoint, so it is authoritative"
+        );
+    }
+
+    /// A sidecar naming nothing usable at all is still refused — the fallback
+    /// is for a *stale* name, not for a broken directory.
+    #[test]
+    fn an_empty_model_directory_is_still_refused() {
+        let dir = scratch("empty-model-dir");
+        let model_dir = dir.join("models").join("coding").join("jsts");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        let entry = nina::ModelEntry {
+            name: "coding/jsts".into(),
+            field: "coding".into(),
+            subfield: "jsts".into(),
+            box_id: "coding:jsts".into(),
+            checkpoint_hash: "0000000000000000".into(),
+            status: nina::ModelStatus::Candidate,
+            eval: Default::default(),
+            datasets: Vec::new(),
+            teacher: None,
+            bytes: 0,
+        };
+        let err = resolve_specialist(&model_dir, &entry)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no specialist checkpoint"), "{err}");
+    }
+}
+
+#[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right thing
+// for a test to say. The grant is scoped to this module; production code in
+// the same file is still denied it (see the `[lints]` table in `Cargo.toml`
+// and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+mod cheat_cli_tests {
+    use super::*;
+
+    /// Every `dblocks cheat` subcommand parses, with its defaults and with
+    /// its flags.
+    ///
+    /// These subcommands exist as a shape, not just as a fix: while the four
+    /// of them were one flat flag list, every option landed on the root `Cli`,
+    /// which clap materialises whole on the stack of whatever parses it — and
+    /// that pushed the test threads in this very binary past 2 MB. A parse
+    /// test is what notices the next time the root command grows.
+    /// The adaptation loop's steps must parse, and their defaults must be the
+    /// ones the documentation quotes. A subcommand that cannot be reached from
+    /// the command line is a module that is not wired, whatever its tests say.
+    #[test]
+    fn cheat_harness_subcommands_parse() {
+        let cli = Cli::try_parse_from(["dblocks", "cheat", "harness", "round"]).unwrap();
+        let Command::Cheat {
+            action:
+                CheatAction::Harness {
+                    action:
+                        CheatHarnessAction::Round {
+                            corpus,
+                            registry,
+                            candidates,
+                            json,
+                        },
+                },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(corpus, PathBuf::from("logs/cheat-corpus.jsonl"));
+        assert_eq!(registry, PathBuf::from("logs/cheat-harness.json"));
+        assert_eq!(candidates, 8);
+        assert!(!json);
+
+        let cli = Cli::try_parse_from([
+            "dblocks",
+            "cheat",
+            "harness",
+            "commit",
+            "--candidates",
+            "3",
+            "--provenance",
+            "a labeled rerun",
+        ])
+        .unwrap();
+        let Command::Cheat {
+            action:
+                CheatAction::Harness {
+                    action:
+                        CheatHarnessAction::Commit {
+                            candidates,
+                            provenance,
+                            ..
+                        },
+                },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(candidates, 3);
+        assert_eq!(provenance, "a labeled rerun");
+
+        // `provenance` is required on commit: an entry without a statement of
+        // what it was measured against is a profile nobody can audit.
+        assert!(
+            Cli::try_parse_from(["dblocks", "cheat", "harness", "commit"]).is_err(),
+            "commit must refuse to run without --provenance"
+        );
+
+        let cli = Cli::try_parse_from(["dblocks", "cheat", "harness", "rollback"]).unwrap();
+        let Command::Cheat {
+            action:
+                CheatAction::Harness {
+                    action: CheatHarnessAction::Rollback { registry },
+                },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(registry, PathBuf::from("logs/cheat-harness.json"));
+
+        let cli = Cli::try_parse_from(["dblocks", "cheat", "harness", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Cheat {
+                action: CheatAction::Harness {
+                    action: CheatHarnessAction::Status { .. }
+                }
+            }
+        ));
+    }
+
+    /// The `cheat scan` / `adapt` / `policy` / `ml` leaves all parse, with the
+    /// defaults their help text quotes. A leaf that stops parsing is the kind
+    /// of break a doc comment is supposed to notice.
+    #[test]
+    fn cheat_subcommands_parse() {
+        let cli = Cli::try_parse_from(["dblocks", "cheat", "scan"]).unwrap();
+        let Command::Cheat {
+            action: CheatAction::Scan { root, json, all },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(root, PathBuf::from("."));
+        assert!(!json && !all);
+
+        let cli = Cli::try_parse_from([
+            "dblocks", "cheat", "scan", "--root", "/tmp/t", "--json", "--all",
+        ])
+        .unwrap();
+        let Command::Cheat {
+            action: CheatAction::Scan { root, json, all },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(root, PathBuf::from("/tmp/t"));
+        assert!(json && all);
+
+        let cli = Cli::try_parse_from(["dblocks", "cheat", "adapt"]).unwrap();
+        let Command::Cheat {
+            action:
+                CheatAction::Adapt {
+                    log,
+                    max_fire_rate,
+                    out,
+                },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(log, PathBuf::from("logs/queue.jsonl"));
+        assert!((max_fire_rate - 0.5).abs() < f64::EPSILON);
+        assert!(out.is_none());
+
+        let cli = Cli::try_parse_from([
+            "dblocks",
+            "cheat",
+            "adapt",
+            "--out",
+            "p.json",
+            "--max-fire-rate",
+            "0.9",
+        ])
+        .unwrap();
+        let Command::Cheat {
+            action: CheatAction::Adapt {
+                max_fire_rate, out, ..
+            },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert!((max_fire_rate - 0.9).abs() < f64::EPSILON);
+        assert_eq!(out, Some(PathBuf::from("p.json")));
+
+        let cli =
+            Cli::try_parse_from(["dblocks", "cheat", "policy", "--profile", "p.json"]).unwrap();
+        let Command::Cheat {
+            action: CheatAction::Policy { profile },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(profile, Some(PathBuf::from("p.json")));
+
+        let cli = Cli::try_parse_from(["dblocks", "cheat", "ml", "--model", "m.json"]).unwrap();
+        let Command::Cheat {
+            action: CheatAction::Ml { model },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(model, Some(PathBuf::from("m.json")));
+    }
+
+    /// A bare `dblocks cheat` names no action, because "scan" is not a safe
+    /// guess: the other three write files or read logs, and a mistyped
+    /// subcommand that silently scanned instead would read as a clean run.
+    #[test]
+    fn cheat_without_a_subcommand_is_refused() {
+        let err = match Cli::try_parse_from(["dblocks", "cheat"]) {
+            Ok(_) => panic!("a bare `dblocks cheat` parsed; it must not"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("subcommand"), "{err}");
     }
 }

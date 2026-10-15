@@ -4236,10 +4236,378 @@ fn cheat_checks() -> anyhow::Result<Vec<Certificate>> {
     Ok(certificates)
 }
 
+/// Certificates for the data-side cheat gate's reach.
+///
+/// The gate is only worth having if it cannot be walked around, and the way a
+/// filter gets walked around is not by defeating it — the patterns are
+/// deterministic — but by finding a loader nobody remembered to route through
+/// it. Two of this crate's loaders did exactly that: the universal text loader
+/// behind `dblocks student train`, and the teacher-trace generator upstream of
+/// it.
+///
+/// So the claim here is about *coverage*, not accuracy: for every text entry
+/// point the crate exposes, a planted cheat never reaches training. The
+/// residual counts loaders that let one through, and it is zero or the
+/// certificate fails.
+fn cheat_gate_coverage_checks() -> anyhow::Result<Vec<Certificate>> {
+    use crate::cheat::{filter_traces, scan_snippet, CheatClass, SnippetLanguage};
+    use crate::student::LanguageBatch;
+    use std::path::PathBuf;
+
+    let mut certificates = Vec::new();
+
+    // A completion carrying a `todo!()` — a hole presented as an
+    // implementation, and the cheapest cheat to plant because it needs no
+    // subtlety to work.
+    const CHEAT: &str = "fn add(a: i32, b: i32) -> i32 {\n    todo!()\n}\n";
+    const CLEAN: &str = "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
+
+    // --- 1. The universal text loader --------------------------------------
+
+    // `LanguageBatch::load` is what every text training path reads through,
+    // including `dblocks student train` calling it directly. If a row can
+    // reach a token tensor from here, it can reach training from anywhere.
+    let dir = std::env::temp_dir().join(format!("dblocks-gate-coverage-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).map_err(|e| anyhow::anyhow!("create {}: {e}", dir.display()))?;
+    let fixture: PathBuf = dir.join("gate-coverage.jsonl");
+    let line = |completion: &str| {
+        serde_json::to_string(&serde_json::json!({
+            "instruction": "add two integers",
+            "response": completion,
+            "language": "rust",
+        }))
+    };
+    let mut text = line(CHEAT).map_err(|e| anyhow::anyhow!("{e}"))?;
+    text.push('\n');
+    for _ in 0..3 {
+        text.push_str(&line(CLEAN).map_err(|e| anyhow::anyhow!("{e}"))?);
+        text.push('\n');
+    }
+    std::fs::write(&fixture, &text).map_err(|e| anyhow::anyhow!("write fixture: {e}"))?;
+
+    let batch = LanguageBatch::load(&fixture, None, 64, 7)
+        .map_err(|e| anyhow::anyhow!("LanguageBatch::load refused the mixed fixture: {e:#}"))?;
+    let scan = batch.cheat_scan();
+    // Four rows in, one of them the cheat. Three out means the planted row is
+    // not among them, and the gate's own count says which class removed it.
+    let survivors_correct = batch.len() == 3;
+    let stub_counted = scan
+        .dropped_by_class
+        .get(CheatClass::DataStub.as_str())
+        .copied()
+        .unwrap_or(0);
+    certificates.push(cert(
+        "cheat",
+        "the_universal_text_loader_drops_a_planted_cheat",
+        "A `todo!()` planted in a traces file does not reach a token tensor through \
+         `LanguageBatch::load`, the loader behind every text training path, and the batch carries \
+         the count naming the class that removed it.",
+        f64::from(!survivors_correct) + f64::from(stub_counted != 1),
+        0.0,
+    ));
+
+    // The refusal has to be loud. A loader that quietly returned an empty
+    // batch would train on nothing and report a loss curve that looks like
+    // convergence.
+    let poisoned = dir.join("gate-coverage-all-cheat.jsonl");
+    std::fs::write(
+        &poisoned,
+        format!("{}\n", line(CHEAT).map_err(|e| anyhow::anyhow!("{e}"))?),
+    )
+    .map_err(|e| anyhow::anyhow!("write poisoned fixture: {e}"))?;
+    let refused = LanguageBatch::load(&poisoned, None, 64, 7);
+    let refusal_text = match &refused {
+        Ok(_) => String::new(),
+        Err(err) => format!("{err:#}"),
+    };
+    certificates.push(cert(
+        "cheat",
+        "a_loader_the_gate_empties_refuses_rather_than_training_on_nothing",
+        "A file whose every row the gate rejects is an error naming the file and the reasons, \
+         not an empty batch: a zero-length training run produces a loss curve indistinguishable \
+         from convergence.",
+        (refused.is_ok() || !refusal_text.contains("cheat gate")) as i32 as f64,
+        0.0,
+    ));
+
+    // --- 2. The batch filter the corpus builders use ------------------------
+
+    let traces = vec![CHEAT.to_string(), CLEAN.to_string()];
+    let (kept, report) = filter_traces(&traces, SnippetLanguage::Rust);
+    certificates.push(cert(
+        "cheat",
+        "the_corpus_builders_filter_drops_a_planted_cheat",
+        "The batch filter behind the corpus builders drops the same planted `todo!()` and keeps \
+         the clean row beside it.",
+        (kept != vec![1] || report.count(CheatClass::DataStub) != 1) as i32 as f64,
+        0.0,
+    ));
+
+    // --- 3. The gate stacks, and does not lose rows on the way -------------
+
+    // Every row is accounted for exactly once: kept plus dropped is what the
+    // gate saw. A summary whose parts do not sum is a count nobody can trust,
+    // and the count is the whole evidence the gate leaves behind.
+    let total = scan.scanned;
+    let accounted = scan.kept + scan.dropped;
+    certificates.push(cert(
+        "cheat",
+        "every_row_the_gate_saw_is_either_kept_or_dropped_exactly_once",
+        "`kept + dropped == scanned` on a real load, so the report the gate leaves behind loses \
+         nothing and double-counts nothing.",
+        (total.saturating_sub(accounted)) as f64,
+        0.0,
+    ));
+
+    // --- 4. Scoping: the gate is not the reward -----------------------------
+
+    // A row the gate cannot read as cheating is kept — the gate narrows, it
+    // does not claim to catch everything, and a certificate that asserted
+    // otherwise would be a claim no detector could keep.
+    let clean = scan_snippet(CLEAN, SnippetLanguage::Rust);
+    certificates.push(cert(
+        "cheat",
+        "the_gate_keeps_what_it_cannot_call_a_cheat",
+        "A correct `add` carries no finding at quarantine grade, so a gate that dropped it would \
+         be reporting a detection rate it has not earned.",
+        clean
+            .findings
+            .iter()
+            .filter(|f| f.severity >= crate::cheat::Severity::Evasion)
+            .count() as f64,
+        0.0,
+    ));
+
+    drop(std::fs::remove_dir_all(&dir));
+    Ok(certificates)
+}
+
 fn cheat_certificates() -> Vec<Certificate> {
     let mut certificates = checks_or_failed("cheat", cheat_checks);
     certificates.extend(checks_or_failed("cheat", mixing_calibration_checks));
+    certificates.extend(checks_or_failed("cheat", cheat_gate_coverage_checks));
+    certificates.extend(checks_or_failed("cheat", cheatharness_adaptation_checks));
     certificates
+}
+
+/// Certificates for the Harness-R1-style adaptation loop.
+///
+/// [`crate::cheat::calibrate_mixing`] is allowed to *subtract*, on a batch
+/// tally, under a document floor. This module is a second, continuously-measured
+/// channel that is allowed to *add*. A loop with two directions is only safe
+/// while the tighter one cannot be used to smuggle the looser one through, so
+/// the claims here are stated over a grid of profiles rather than over one
+/// example: across every baseline/candidate pair the proposer can construct,
+/// an accepted profile is (a) never weaker than its baseline and (b) never
+/// worse to clean data than the baseline it replaces.
+///
+/// Both are exact integer identities over an exhaustively enumerated grid, so
+/// the tolerance is `0.0` — a nonzero residual here would mean the invariant
+/// is false, not that it is approximate.
+fn cheatharness_adaptation_checks() -> anyhow::Result<Vec<Certificate>> {
+    use crate::cheat::{CheatClass, Severity, SnippetLanguage};
+    use crate::cheatharness::{
+        accept, Acceptance, ClassGate, FailurePacket, HarnessProfile, Labeled, Registry, Reward,
+        Tally, DEFAULT_CANDIDATES,
+    };
+
+    let mut out = Vec::new();
+
+    /// One profile per monotone step, plus the deliberately-loosened ones a
+    /// caller could construct by another route. The loosened profiles are in the
+    /// grid on purpose: the claim is about what the *acceptance test* does with
+    /// them, not about what the proposer emits.
+    fn grid() -> Vec<HarnessProfile> {
+        let mut v = Vec::new();
+        let base = HarnessProfile::default();
+        v.push(base.clone());
+
+        for class in [
+            CheatClass::DataStub,
+            CheatClass::DataSuppression,
+            CheatClass::DataBehavioral,
+        ] {
+            for sev in [Severity::Evasion, Severity::Suppression, Severity::Fraud] {
+                let mut p = base.clone();
+                p.gates.insert(
+                    crate::cheatharness::class_key_for(class).to_string(),
+                    ClassGate {
+                        severity: Some(sev),
+                        enabled: true,
+                    },
+                );
+                v.push(p);
+            }
+        }
+        // A raised mixing threshold is the other tightening axis.
+        for bump in [1u32, 2] {
+            let mut p = base.clone();
+            p.mixing.min_score += bump;
+            p.mixing.min_margin += bump;
+            v.push(p);
+        }
+        // And the loosening shapes, which must never be accepted.
+        let mut lowered = base.clone();
+        lowered.mixing.min_score = lowered.mixing.min_score.saturating_sub(1);
+        v.push(lowered);
+
+        let mut disabled = base.clone();
+        disabled.gates.insert(
+            crate::cheatharness::class_key_for(CheatClass::DataStub).to_string(),
+            ClassGate {
+                severity: None,
+                enabled: false,
+            },
+        );
+        v.push(disabled);
+
+        let mut demoted = base.clone();
+        demoted.gates.insert(
+            crate::cheatharness::class_key_for(CheatClass::DataStub).to_string(),
+            ClassGate {
+                severity: Some(Severity::Fraud),
+                enabled: true,
+            },
+        );
+        let mut weaker = demoted.clone();
+        weaker.gates.insert(
+            crate::cheatharness::class_key_for(CheatClass::DataStub).to_string(),
+            ClassGate {
+                severity: Some(Severity::Note),
+                enabled: true,
+            },
+        );
+        v.push(weaker);
+
+        // A profile that re-admits a pair calibration struck.
+        let mut readmitted = base.clone();
+        readmitted
+            .mixing
+            .admitted_pairs
+            .insert(("rust".to_string(), "python".to_string()));
+        v.push(readmitted);
+
+        v
+    }
+
+    // The claim: acceptance implies monotonicity, over every pair in the grid.
+    // Stated as a residual over the count of violations rather than a boolean,
+    // so a regression reports *how many* pairs broke the invariant.
+    let profiles = grid();
+    let mut violations = 0usize;
+    for baseline in &profiles {
+        for candidate in &profiles {
+            // A reward that would otherwise be a large, clean win.
+            let reward = Reward {
+                baseline: Tally {
+                    caught: 0,
+                    false_drops: 0,
+                    cheats: 64,
+                    cleans: 64,
+                },
+                candidate: Tally {
+                    caught: 64,
+                    false_drops: 0,
+                    cheats: 64,
+                    cleans: 64,
+                },
+            };
+            if let Acceptance::Accepted { .. } = accept(baseline, candidate, &reward) {
+                if !candidate.is_monotone_over(baseline) {
+                    violations += 1;
+                }
+            }
+        }
+    }
+    out.push(cert(
+        "cheat",
+        "an_accepted_profile_is_never_weaker_than_its_baseline",
+        "Over every baseline/candidate pair in the adaptation grid, an accepted profile is \
+         monotone-tightening over the profile it replaces: no threshold lowered, no class \
+         disabled, no severity reduced, no calibrated pair re-admitted.",
+        violations as f64,
+        0.0,
+    ));
+    // The claim above is only worth reading if the grid actually contains
+    // profiles that *would* break it; over an all-strengthening set the check
+    // would pass no matter what `accept` did.
+    let tightening = profiles
+        .iter()
+        .filter(|p| {
+            p.is_monotone_over(&HarnessProfile::default()) && *p != &HarnessProfile::default()
+        })
+        .count();
+    let loosening = profiles
+        .iter()
+        .filter(|p| !p.is_monotone_over(&HarnessProfile::default()))
+        .count();
+    out.push(cert(
+        "cheat",
+        "the_monotonicity_grid_is_actually_exercised",
+        "The grid the claim above is stated over holds both tightening and loosening \
+         profiles, so the check is not vacuously true over an all-strengthening set.",
+        if tightening > 0 && loosening > 0 {
+            0.0
+        } else {
+            1.0
+        },
+        0.0,
+    ));
+
+    // ---- the regression guard, on a real corpus ----
+    let corpus: Vec<Labeled> = (0..40)
+        .map(|_| Labeled {
+            code: "pub fn add(a: i64, b: i64) -> i64 {\n    a + b\n}".to_string(),
+            lang: SnippetLanguage::Rust,
+            cheat: false,
+        })
+        .chain((0..40).map(|_| Labeled {
+            code: "fn g() { todo!() }".to_string(),
+            lang: SnippetLanguage::Rust,
+            cheat: true,
+        }))
+        .collect();
+
+    let registry = Registry::default_registry();
+    let baseline = registry.current().clone();
+    let round = crate::cheatharness::run_round(&corpus, &registry, DEFAULT_CANDIDATES)?;
+
+    let mut drops_added = 0usize;
+    for cand in &round.candidates {
+        if let Acceptance::Accepted { .. } = cand.acceptance {
+            if cand.reward.false_drops_added() > 0 {
+                drops_added += 1;
+            }
+        }
+    }
+    out.push(cert(
+        "cheat",
+        "an_accepted_profile_never_drops_a_clean_trace_the_baseline_kept",
+        "Regression protection: across the whole group of candidates scored by rerun on a \
+         labeled corpus, no accepted profile drops a clean trace the baseline kept, even \
+         when the net delta is positive.",
+        drops_added as f64,
+        0.0,
+    ));
+
+    // ---- the packet is mined, not assumed ----
+    let packet = FailurePacket::mine(&corpus, &baseline);
+    let disjoint = packet.missed.iter().all(|m| {
+        !packet
+            .false_drops
+            .iter()
+            .any(|f| f.code == m.code && f.lang == m.lang)
+    });
+    out.push(cert(
+        "cheat",
+        "a_missed_cheat_is_never_also_a_false_drop",
+        "The two halves of the failure packet are disjoint by construction: an item is one or \
+         the other according to its label and the baseline's verdict, never both.",
+        if disjoint { 0.0 } else { 1.0 },
+        0.0,
+    ));
+
+    Ok(out)
 }
 
 /// Certificates for the language-mixing calibration.
@@ -4282,10 +4650,7 @@ fn mixing_calibration_checks() -> anyhow::Result<Vec<Certificate>> {
     ];
     let fires = prose
         .iter()
-        .map(|doc| {
-            scan_snippet(doc, SnippetLanguage::Other)
-                .count(CheatClass::DataLanguageMixing)
-        })
+        .map(|doc| scan_snippet(doc, SnippetLanguage::Other).count(CheatClass::DataLanguageMixing))
         .sum::<usize>();
     certificates.push(cert(
         "cheat",
@@ -4300,8 +4665,8 @@ fn mixing_calibration_checks() -> anyhow::Result<Vec<Certificate>> {
     // The narrowing must not have muted the rule it kept: the same documents
     // declared as a code language still have to fire. Index 6 is the fenced
     // Python block — the shape the 97% fire rate was made of.
-    let switched = scan_snippet(&prose[6], SnippetLanguage::Rust)
-        .count(CheatClass::DataLanguageMixing);
+    let switched =
+        scan_snippet(&prose[6], SnippetLanguage::Rust).count(CheatClass::DataLanguageMixing);
     certificates.push(cert(
         "cheat",
         "a_declared_language_still_reports_the_mismatch_the_same_content_produces",
@@ -4380,9 +4745,7 @@ fn mixing_calibration_checks() -> anyhow::Result<Vec<Certificate>> {
         "a_near_universal_pair_is_struck_and_a_selective_one_is_kept",
         "At max_fire_rate 0.5 a pair that fired on 97% of its declared language is struck as a \
          constant, and one that fired on 1.2% is kept because it discriminates.",
-        f64::from(!python.removed)
-            + f64::from(selective_fires)
-            + f64::from(jsts.removed),
+        f64::from(!python.removed) + f64::from(selective_fires) + f64::from(jsts.removed),
         0.0,
     ));
 
@@ -7635,20 +7998,20 @@ fn vecread_checks() -> anyhow::Result<Vec<Certificate>> {
     );
 
     // The lens report itself — the artifact a human reads — must show the
-    // change: a different top-1 token or a moved top-1 probability.
+    // change. Measured as the total-variation distance between the two
+    // reports' decode distributions, not as an argmax: see
+    // `lens_report_distance` for why a token-identity test here is both a
+    // flake and the wrong question.
     let lens_shallow = reader.read_student_thinking(&writing, causal_tokens.clone(), &[2])?;
     let lens_deep = reader.read_student_thinking(&writing, causal_tokens.clone(), &[4])?;
-    let top_of = |t: &crate::vecread::ThoughtTrace| -> Option<(u16, f32)> {
-        t.depths
-            .first()
-            .and_then(|d| d.decodes.first())
-            .and_then(|dec| dec.top.first())
-            .map(|c| (c.id, c.probability))
+    fn report_at(t: &crate::vecread::ThoughtTrace) -> Option<&crate::vecread::LensReport> {
+        t.depths.first().and_then(|d| d.decodes.first())
+    }
+    let tv_lens = match (report_at(&lens_shallow), report_at(&lens_deep)) {
+        (Some(a), Some(b)) => lens_report_distance(a, b),
+        _ => f64::NAN,
     };
-    let lens_sees_truncation = match (top_of(&lens_shallow), top_of(&lens_deep)) {
-        (Some(a), Some(b)) => a.0 != b.0 || (a.1 - b.1).abs() > 1e-6,
-        _ => false,
-    };
+    let lens_sees_truncation = tv_lens.is_finite() && tv_lens > LENS_REPORT_MOVE;
 
     // Bounded-offset intervention: add a fixed pattern at 25% of the last
     // position's RMS to the depth-2 hidden state; the decode must move.
@@ -7692,7 +8055,13 @@ fn vecread_checks() -> anyhow::Result<Vec<Certificate>> {
         }
     }
     if !lens_sees_truncation {
-        eprintln!("verify: vecread: the lens report's top-1 did not change between depths 2 and 4");
+        // The numbers, not just the verdict: a certificate that can fail has
+        // to say by how much it missed, or the next person to see it has to
+        // re-instrument to find out whether it is a near miss or a real one.
+        eprintln!(
+            "verify: vecread: the lens report's decode did not move between depths 2 and 4 \
+             (top-k TV {tv_lens:.3e} vs threshold {LENS_REPORT_MOVE:.1e}; truncation KL              {kl_truncation:.3e}, offset KL {kl_offset:.3e})"
+        );
         trajectory_residual += 1.0;
     }
 
@@ -7786,6 +8155,88 @@ fn kl_between_logit_rows(a: &[f32], b: &[f32]) -> f64 {
         .zip(q.iter())
         .map(|(pi, qi)| pi * (pi / qi).ln())
         .sum()
+}
+
+/// How far apart two lens reports are, as a total-variation distance over
+/// the union of the token ids they name.
+///
+/// # Why not a KL, and why not the argmax
+///
+/// Two lens reports are **truncated**: each carries the top-k of a 259-token
+/// softmax row, so the ids they name differ between depths. Those differences
+/// are an artefact of the cut, not evidence that one decode has zero mass
+/// where the other has some — and both ways of ignoring that are wrong:
+///
+/// - a KL that treats a missing id as zero probability is infinite whenever
+///   the top-k sets are not identical, which on this model is most of the
+///   time, so it certifies nothing;
+/// - a KL that skips the zero terms instead reads two reports with *no*
+///   tokens in common as identical, which is the one answer it must never
+///   give.
+///
+/// Total variation over the zero-filled union has neither failure: it is
+/// defined for any pair, bounded in 0..=1, zero only when the two agree on
+/// every token they name, and largest exactly when they disagree most. And
+/// unlike the argmax comparison it replaces, it moves when the distribution
+/// moves under an unchanged top-1 — the case where a student refines without
+/// changing its mind about the next token.
+///
+/// The asymmetry is deliberate and worth stating: a token leaving the top-k
+/// contributes its probability to the distance even though it may still be
+/// just below the cut. That over-counts slightly by construction and errs
+/// toward *seeing* a change, which is the right direction for a check whose
+/// job is to notice that the readout moved.
+/// The smallest total-variation distance between two depth-2 and depth-4
+/// lens reports that counts as "the readout moved".
+///
+/// Set from measurement, not taste. Sweeping 24 independent weight draws
+/// through the certificate's exact setup — two students per seed, a fresh
+/// `set_geom_readout` on the second, the causal document — the distance runs
+/// from 3.4e-3 to 5.9e-1. This threshold sits ~34x below the smallest
+/// observed value, and that headroom is the point: Burn's RNG is a
+/// process-wide `static Mutex<Option<Rng>>`, so a parallel test run hands this
+/// certificate weights nobody chose, and the number it sees is a sample from
+/// exactly that sweep.
+///
+/// For contrast, the argmax test this replaced passed all 24 of those draws
+/// too — but with a top-1 probability delta of only ~1e-5 against a 1e-6
+/// threshold. That is a factor of ten, and a concurrent draw crosses it,
+/// which is the flake. A measure whose floor is 34x clear of its threshold
+/// does not depend on winning that race.
+const LENS_REPORT_MOVE: f64 = 1e-4;
+
+fn lens_report_distance(a: &crate::vecread::LensReport, b: &crate::vecread::LensReport) -> f64 {
+    let ids: std::collections::BTreeSet<u16> =
+        a.top.iter().chain(b.top.iter()).map(|c| c.id).collect();
+    // A report with no candidates decoded nothing, so there is no shape to
+    // compare and the distance is undefined. Callers treat that as "cannot
+    // confirm", which for a certificate means fail.
+    if ids.is_empty() || a.top.is_empty() || b.top.is_empty() {
+        return f64::NAN;
+    }
+    let mass = |report: &crate::vecread::LensReport| -> Vec<f64> {
+        ids.iter()
+            .map(|id| {
+                f64::from(
+                    report
+                        .top
+                        .iter()
+                        .find(|c| c.id == *id)
+                        .map_or(0.0, |c| c.probability),
+                )
+            })
+            .collect()
+    };
+    let (p, q) = (mass(a), mass(b));
+    let (p_sum, q_sum): (f64, f64) = (
+        p.iter().sum::<f64>().max(f64::MIN_POSITIVE),
+        q.iter().sum::<f64>().max(f64::MIN_POSITIVE),
+    );
+    0.5 * p
+        .iter()
+        .zip(q.iter())
+        .map(|(pi, qi)| (pi / p_sum - qi / q_sum).abs())
+        .sum::<f64>()
 }
 
 #[cfg(test)]
@@ -7893,5 +8344,175 @@ mod tests {
             certificates: vec![cert("g", "nan", "n/a", f64::NAN, 1.0)],
         };
         assert!(!nan.passed());
+    }
+
+    fn report(depth: usize, top: &[(u16, f32)]) -> crate::vecread::LensReport {
+        crate::vecread::LensReport {
+            depth,
+            position: 0,
+            rms: 1.0,
+            energy: 1.0,
+            displacement: 0.0,
+            prob_sum: 1.0,
+            top: top
+                .iter()
+                .map(|(id, probability)| crate::vecread::TokenCandidate {
+                    id: *id,
+                    text: String::new(),
+                    probability: *probability,
+                })
+                .collect(),
+        }
+    }
+
+    /// The property the flake was about, asserted where it can be seen.
+    ///
+    /// The lens-truncation certificate used to fail about one run in three,
+    /// because Burn's backend RNG is a process-wide `static Mutex<Option<Rng>>`:
+    /// a test running alongside it changes which weights the certificate gets,
+    /// and the claim was resting on a top-1 probability delta of ~1e-5
+    /// against a 1e-6 threshold. A test that only ever sees one draw cannot
+    /// notice that, so this sweeps several — through the certificate's exact
+    /// setup, since the fresh `set_geom_readout` is what makes the readout
+    /// depth-dependent at all — and requires the distance to clear its
+    /// threshold with room on every one of them.
+    ///
+    /// Four seeds rather than the 24 the threshold's comment quotes: enough
+    /// to catch a regression that moves the floor, cheap enough to keep in the
+    /// default suite. The comment records the full sweep.
+    #[test]
+    fn the_lens_truncation_claim_holds_across_weight_draws() {
+        use crate::student::{GeometricStudent, StudentConfig};
+        use crate::tokenizer::ByteTokenizer;
+        use crate::vecread::{PositionSelection, VecReader};
+
+        let device: <B as burn::tensor::backend::BackendTypes>::Device = Default::default();
+        let config = StudentConfig {
+            hidden_size: 32,
+            num_layers: 2,
+            num_heads: 2,
+            num_kv_heads: 1,
+            context: 24,
+            intermediate_size: 16,
+            cond_hidden_size: 8,
+            frequency_embedding_size: 8,
+            attention: "dense".into(),
+            experts_per_box: 1,
+            geom_slots: 2,
+            geom_dim: 4,
+            geom_refine_steps: 2,
+            geom_cond_hidden: 8,
+            geom_frequency: 4,
+            ..StudentConfig::default()
+        };
+        let ids = ByteTokenizer::new().encode_document("fn main() { return; }");
+        let n = ids.len();
+        let tokens = Tensor::<B, 1, Int>::from_ints(
+            ids.iter()
+                .map(|t| i64::from(*t))
+                .collect::<Vec<_>>()
+                .as_slice(),
+            &device,
+        )
+        .reshape([1, n]);
+        let reader = VecReader {
+            top_k: 5,
+            positions: PositionSelection::All,
+            ..VecReader::default()
+        };
+        fn first_of(t: &crate::vecread::ThoughtTrace) -> Option<&crate::vecread::LensReport> {
+            t.depths.first().and_then(|d| d.decodes.first())
+        }
+
+        let mut worst = f64::INFINITY;
+        for seed in 0..4u64 {
+            <B as burn::tensor::backend::Backend>::seed(&device, seed);
+            let _first = GeometricStudent::<B>::new(&config, &device).unwrap();
+            crate::tensor_ext::force_initialization(&_first);
+            let mut writing = GeometricStudent::<B>::new(&config, &device).unwrap();
+            crate::tensor_ext::force_initialization(&writing);
+            writing.set_geom_readout(
+                burn::nn::LinearConfig::new(config.geom_dim, config.hidden_size)
+                    .with_bias(true)
+                    .init(&device),
+            );
+            let shallow = reader
+                .read_student_thinking(&writing, tokens.clone(), &[2])
+                .unwrap();
+            let deep = reader
+                .read_student_thinking(&writing, tokens.clone(), &[4])
+                .unwrap();
+            let (a, b) = (
+                first_of(&shallow).expect("a depth-2 decode"),
+                first_of(&deep).expect("a depth-4 decode"),
+            );
+            let tv = lens_report_distance(a, b);
+            assert!(
+                tv.is_finite(),
+                "seed {seed}: the readout distance is undefined, so the report shows nothing"
+            );
+            worst = worst.min(tv);
+        }
+        assert!(
+            worst > LENS_REPORT_MOVE,
+            "the weakest of four weight draws moved the readout by only {worst:.3e}, against a \
+             threshold of {LENS_REPORT_MOVE:.1e}; the margin this measure was chosen for is gone"
+        );
+    }
+
+    /// The lens-report distance is a distance: zero against itself, non-zero
+    /// whenever the distribution moves, and — the case the argmax test could
+    /// not express — non-zero when the top-1 token id is unchanged and only
+    /// the mass beneath it moved.
+    ///
+    /// The truncated-support cases matter as much as the easy ones. A token
+    /// leaving the top-k between depths is the ordinary case on a real model,
+    /// and the measure has to score it as a change: neither as an infinite
+    /// divergence nor as nothing at all.
+    #[test]
+    fn lens_report_distance_measures_the_distribution_not_the_argmax() {
+        let same = report(2, &[(7, 0.6), (9, 0.4)]);
+        assert!(
+            lens_report_distance(&same, &same) < 1e-12,
+            "a report compared with itself is not a change"
+        );
+
+        // Top-1 unchanged, mass redistributed underneath it.
+        let shallow = report(2, &[(7, 0.6), (9, 0.4)]);
+        let deep = report(4, &[(7, 0.55), (9, 0.45)]);
+        assert!(
+            lens_report_distance(&shallow, &deep) > LENS_REPORT_MOVE,
+            "a moved distribution under an unmoved argmax is still a change"
+        );
+
+        // Same top-1 and the same probability for it, different token in the
+        // cut below. The argmax test was blind to exactly this.
+        let shallow = report(2, &[(7, 0.5), (9, 0.5)]);
+        let deep = report(4, &[(7, 0.5), (11, 0.5)]);
+        assert!(lens_report_distance(&shallow, &deep) > 0.0);
+
+        // A token dropping out of the cut is a change, not a divergence.
+        let dropped = report(4, &[(7, 0.9), (11, 0.1)]);
+        let admitted = lens_report_distance(&shallow, &dropped);
+        assert!(
+            admitted.is_finite() && admitted > 0.0,
+            "a token dropping out of the top-k is a change: {admitted}"
+        );
+
+        // Disjoint reports are the largest distance there is, and it stays a
+        // number rather than becoming infinite.
+        let left = report(2, &[(1, 1.0)]);
+        let right = report(4, &[(2, 1.0)]);
+        let disjoint = lens_report_distance(&left, &right);
+        assert!(disjoint.is_finite(), "disjoint decodes stay measurable");
+        assert!(
+            (disjoint - 1.0).abs() < 1e-9,
+            "disjoint decodes are maximally apart: {disjoint}"
+        );
+
+        // An empty top-k decoded nothing: undefined, and undefined must not
+        // read as agreement.
+        let empty = report(2, &[]);
+        assert!(lens_report_distance(&empty, &same).is_nan());
     }
 }
