@@ -4,9 +4,11 @@ use anyhow::{ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
+use burn::module::AutodiffModule as _;
 use diffusionblocks::{
     accuracy::{Ensemble, Guidance, LogitNorm, ScalingCurve, ScalingPoint},
     antipattern::{Labeler, RuleSet},
+    bpe::BpeTokenizer,
     cheat, checkpoint,
     corpus::{self, TokenCorpus},
     data::{SyntheticDataset, TrainDataset},
@@ -15,6 +17,7 @@ use diffusionblocks::{
     fieldnorm,
     geombaseline::{self, GeomBaseline, GeomBaselineConfig},
     geometry::{self, GeomConfig, GeomMeta, GeomObjective, GeometricReasoner},
+    geomfusion::{self, FusedQwen, FusedTrainConfig, GeomFusionConfig, ProofConfig},
     geomkernel,
     hybrid::{AttentionMode, AttentionSchedule, PositionKind},
     infer::{InferenceConfig, InferenceEngine},
@@ -26,9 +29,11 @@ use diffusionblocks::{
     precision::{Precision, PrecisionPolicy},
     profile::{format_duration, Profiler},
     quality::{LayerGates, QualityGateConfig, TrainingChecks},
+    qwennet::{self, QwenTrunkConfig},
     schedule::LrSchedule,
     sigma,
     solver::SolverKind,
+    tokenblocks::{self as tb, TbConfig, TbTrainParams},
     tokenizer::ByteTokenizer,
     train::{self, DatasetChoice, Objective, TrainConfig},
     verify,
@@ -1621,6 +1626,15 @@ enum Command {
         #[command(subcommand)]
         action: LmAction,
     },
+    /// Token-block diffusion substrate (plan items 1-2): a BD3-LM-style
+    /// semi-autoregressive byte LM with block-causal attention, per-block KV
+    /// caching, entropy-adaptive block sizing, an entropy-gated halo, and a
+    /// bounded routine revision pass. This is the subject those items
+    /// modify; it is a substrate, not a result.
+    Tblock {
+        #[command(subcommand)]
+        action: TblockAction,
+    },
     /// Geometric reasoning (roadmap Phase 33): a dual-stream reasoner over a
     /// learned Riemannian scene geometry with a MoSME expert readout, a
     /// deterministic exact kernel beside it, and the block-diffusion
@@ -2205,6 +2219,165 @@ enum GeomAction {
         #[arg(long, default_value_t = 4)]
         seed: u64,
     },
+    /// The trunk-fused geometric stream: Qwen trunk + GeomFusion vector stream
+    /// + MoSME readout. Adapters-only training; every emitted answer is
+    ///
+    /// kernel-checked by `prove`.
+    Fused {
+        #[command(subcommand)]
+        action: Box<FusedAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum FusedAction {
+    /// Train the fused model (adapters-only) on a geometric corpus.
+    Train {
+        #[arg(long)]
+        corpus: PathBuf,
+        #[arg(long)]
+        meta: PathBuf,
+        #[arg(long)]
+        weights: PathBuf,
+        #[arg(
+            long,
+            default_value = "/srv/m-sdd/unifur/tokenizers/qwen38-source/tokenizer.json"
+        )]
+        tokenizer: PathBuf,
+        #[arg(long, default_value_t = 100)]
+        steps: usize,
+        #[arg(long, default_value_t = 4)]
+        batch_size: usize,
+        #[arg(long, default_value_t = 1e-4)]
+        lr: f64,
+        #[arg(long, default_value_t = 1e-3)]
+        fusion_lr: f64,
+        #[arg(long, default_value_t = 1, value_parser = parse_positive_usize)]
+        accumulate: usize,
+        #[arg(long)]
+        ema_decay: Option<f64>,
+        #[arg(long, default_value_t = 10)]
+        log_every: usize,
+        #[arg(long, default_value = "checkpoints")]
+        out_dir: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        holdout: usize,
+        #[arg(long, default_value_t = 7)]
+        seed: u64,
+        /// answer | diffusion.
+        #[arg(long, default_value = "answer")]
+        objective: String,
+        #[arg(long, default_value_t = 0.5)]
+        sigma_data: f64,
+        #[arg(long, default_value_t = 0.01)]
+        moe_balance_weight: f64,
+        #[arg(long, default_value_t = 0.05)]
+        gamma: f64,
+        #[arg(long)]
+        depth: Option<usize>,
+        #[arg(long, default_value_t = 4)]
+        lora_rank: usize,
+        #[arg(long, default_value_t = 4.0)]
+        lora_alpha: f64,
+        #[arg(long, default_value_t = 5120)]
+        hidden_size: usize,
+        #[arg(long, default_value_t = 128)]
+        geom_hidden: usize,
+        #[arg(long, default_value_t = 8)]
+        slots: usize,
+        #[arg(long, default_value_t = 32)]
+        dim: usize,
+        #[arg(long, default_value_t = 2)]
+        num_blocks: usize,
+        #[arg(long, default_value_t = 4)]
+        refine_steps: usize,
+        #[command(flatten)]
+        runtime: LmRuntimeArgs,
+    },
+    /// Evaluate a fused checkpoint on held-out scenes.
+    Eval {
+        #[arg(long)]
+        checkpoint: PathBuf,
+        #[arg(long)]
+        corpus: PathBuf,
+        #[arg(long)]
+        meta: PathBuf,
+        #[arg(long)]
+        weights: PathBuf,
+        #[arg(
+            long,
+            default_value = "/srv/m-sdd/unifur/tokenizers/qwen38-source/tokenizer.json"
+        )]
+        tokenizer: PathBuf,
+        #[arg(long, default_value_t = 16)]
+        batches: usize,
+        #[arg(long, default_value_t = 64)]
+        batch_size: usize,
+        #[arg(long, default_value_t = 5120)]
+        hidden_size: usize,
+        #[arg(long, default_value_t = 128)]
+        geom_hidden: usize,
+        #[arg(long, default_value_t = 8)]
+        slots: usize,
+        #[arg(long, default_value_t = 32)]
+        dim: usize,
+        #[arg(long, default_value_t = 2)]
+        num_blocks: usize,
+        #[arg(long, default_value_t = 4)]
+        refine_steps: usize,
+        #[arg(long, default_value_t = 4)]
+        lora_rank: usize,
+        #[arg(long, default_value_t = 4.0)]
+        lora_alpha: f64,
+        #[arg(long, default_value_t = 0.5)]
+        sigma_data: f64,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        #[command(flatten)]
+        runtime: LmRuntimeArgs,
+    },
+    /// Kernel-check a fused checkpoint on held-out scenes.
+    Prove {
+        #[arg(long)]
+        checkpoint: Option<PathBuf>,
+        #[arg(long)]
+        corpus: PathBuf,
+        #[arg(long)]
+        meta: PathBuf,
+        #[arg(long)]
+        weights: PathBuf,
+        #[arg(
+            long,
+            default_value = "/srv/m-sdd/unifur/tokenizers/qwen38-source/tokenizer.json"
+        )]
+        tokenizer: PathBuf,
+        #[arg(long, default_value_t = 256)]
+        scenes: usize,
+        #[arg(long)]
+        depth: Option<usize>,
+        #[arg(long, default_value_t = true)]
+        sweep: bool,
+        #[arg(long, default_value_t = 5120)]
+        hidden_size: usize,
+        #[arg(long, default_value_t = 128)]
+        geom_hidden: usize,
+        #[arg(long, default_value_t = 8)]
+        slots: usize,
+        #[arg(long, default_value_t = 32)]
+        dim: usize,
+        #[arg(long, default_value_t = 2)]
+        num_blocks: usize,
+        #[arg(long, default_value_t = 4)]
+        refine_steps: usize,
+        #[arg(long, default_value_t = 4)]
+        lora_rank: usize,
+        #[arg(long, default_value_t = 4.0)]
+        lora_alpha: f64,
+        #[arg(long, default_value_t = 0.5)]
+        sigma_data: f64,
+        #[command(flatten)]
+        runtime: LmRuntimeArgs,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2378,6 +2551,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Sigmas { num_blocks, gamma } => cmd_sigmas(num_blocks, gamma),
         Command::Lm { action } => cmd_lm(action),
+        Command::Tblock { action } => cmd_tblock(action),
         Command::Geom { action } => cmd_geom(action),
         Command::Experts { action } => cmd_experts(action),
         Command::Student { action } => cmd_student(action),
@@ -2936,6 +3110,11 @@ fn cmd_geom(action: GeomAction) -> Result<()> {
         | GeomAction::Baseline { runtime, .. }
         | GeomAction::Eval { runtime, .. }
         | GeomAction::Generate { runtime, .. } => Some(runtime),
+        GeomAction::Fused { action } => match action.as_ref() {
+            FusedAction::Train { runtime, .. }
+            | FusedAction::Eval { runtime, .. }
+            | FusedAction::Prove { runtime, .. } => Some(runtime),
+        },
     };
     let Some(runtime) = runtime else {
         return match action {
@@ -3648,7 +3827,443 @@ fn cmd_geom_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
             );
             Ok(())
         }
+        GeomAction::Fused { action } => match *action {
+            FusedAction::Train {
+                corpus,
+                meta,
+                weights,
+                tokenizer,
+                steps,
+                batch_size,
+                lr,
+                fusion_lr,
+                accumulate,
+                ema_decay,
+                log_every,
+                out_dir,
+                holdout,
+                seed,
+                objective,
+                sigma_data,
+                moe_balance_weight,
+                gamma,
+                depth,
+                lora_rank,
+                lora_alpha,
+                hidden_size,
+                geom_hidden,
+                slots,
+                dim,
+                num_blocks,
+                refine_steps,
+                runtime: _,
+            } => {
+                let meta = load_geom_meta(&meta)?;
+                let fusion_config = GeomFusionConfig {
+                    hidden_size,
+                    geom_hidden,
+                    slots,
+                    dim,
+                    num_blocks,
+                    refine_steps,
+                    ..GeomFusionConfig::default()
+                };
+                fusion_config.validate()?;
+                let trunk_config = QwenTrunkConfig {
+                    num_layers: None,
+                    ..QwenTrunkConfig::qwen38()
+                };
+                let trunk =
+                    qwennet::load_qwen_trunk_nf4::<Train<B>>(&weights, &trunk_config, &device)?.0;
+                let model = FusedQwen::<Train<B>>::new(trunk, &fusion_config, &device)?;
+                let tok_text = std::fs::read_to_string(&tokenizer)
+                    .with_context(|| format!("read {}", tokenizer.display()))?;
+                let tokenizer = BpeTokenizer::from_json(&tok_text)?;
+                let mut corpus = TokenCorpus::streaming(&corpus)?;
+                let objective = GeomObjective::parse(&objective)?;
+                let lora = qwennet::QwenLoraConfig {
+                    rank: lora_rank,
+                    alpha: lora_alpha,
+                };
+                if let Some(d) = ema_decay {
+                    anyhow::ensure!(d > 0.0 && d < 1.0, "--ema-decay must be in (0, 1), got {d}");
+                }
+                let train_config = FusedTrainConfig {
+                    steps,
+                    batch_size,
+                    lr,
+                    fusion_lr,
+                    clip_norm: Some(1.0),
+                    accumulate,
+                    ema_decay,
+                    lora,
+                    seed,
+                    objective,
+                    gamma,
+                    sigma_data,
+                    moe_balance_weight,
+                    depth,
+                    holdout,
+                    log_every,
+                };
+                train_config.validate()?;
+                let mut trainer = geomfusion::FusedQwenTrainer::new(model, train_config, &device)?;
+                let report = geomfusion::train_fused_qwen(
+                    &mut trainer,
+                    &mut corpus,
+                    &meta,
+                    &tokenizer,
+                    Some(&out_dir),
+                )?;
+                println!(
+                    "fused train: {} steps | loss {:.4} -> {:.4} | accuracy {:.4} -> {:.4}",
+                    report.steps_taken,
+                    report.first_loss,
+                    report.last_loss,
+                    report.first_accuracy,
+                    report.last_accuracy
+                );
+                if let Some(path) = &report.checkpoint {
+                    println!("checkpoint {}", path.display());
+                }
+                Ok(())
+            }
+            FusedAction::Eval {
+                checkpoint,
+                corpus,
+                meta,
+                weights,
+                tokenizer,
+                batches: _batches,
+                batch_size: _batch_size,
+                hidden_size,
+                geom_hidden,
+                slots,
+                dim,
+                num_blocks,
+                refine_steps,
+                lora_rank: _lora_rank,
+                lora_alpha: _lora_alpha,
+                sigma_data: _sigma_data,
+                seed: _seed,
+                runtime: _,
+            } => {
+                let meta = load_geom_meta(&meta)?;
+                let fusion_config = GeomFusionConfig {
+                    hidden_size,
+                    geom_hidden,
+                    slots,
+                    dim,
+                    num_blocks,
+                    refine_steps,
+                    ..GeomFusionConfig::default()
+                };
+                fusion_config.validate()?;
+                let trunk_config = QwenTrunkConfig {
+                    num_layers: None,
+                    ..QwenTrunkConfig::qwen38()
+                };
+                let trunk = qwennet::load_qwen_trunk_nf4::<B>(&weights, &trunk_config, &device)?.0;
+                let model = FusedQwen::<B>::new(trunk, &fusion_config, &device)?;
+                let model = checkpoint::load(model, &checkpoint, &device)?;
+                let tok_text = std::fs::read_to_string(&tokenizer)?;
+                let tokenizer = BpeTokenizer::from_json(&tok_text)?;
+                let mut corpus = TokenCorpus::streaming(&corpus)?;
+                let proof = ProofConfig {
+                    scenes: 256.min(corpus.len() / meta.scene_len).max(1),
+                    ..ProofConfig::default()
+                };
+                proof.validate()?;
+                let report = geomfusion::prove::<B>(
+                    &model,
+                    &mut corpus,
+                    &meta,
+                    &tokenizer,
+                    &proof,
+                    &device,
+                )?;
+                println!(
+                    "fused eval: scenes {} | accuracy {:.4} (chance {:.4}) | margin {:.4} | verified {} falsified {} indeterminate {}",
+                    report.scenes,
+                    report.accuracy,
+                    report.chance,
+                    report.margin,
+                    report.verified,
+                    report.falsified,
+                    report.indeterminate
+                );
+                Ok(())
+            }
+            FusedAction::Prove {
+                checkpoint,
+                corpus,
+                meta,
+                weights,
+                tokenizer,
+                scenes,
+                depth,
+                sweep,
+                hidden_size,
+                geom_hidden,
+                slots,
+                dim,
+                num_blocks,
+                refine_steps,
+                lora_rank: _lora_rank,
+                lora_alpha: _lora_alpha,
+                sigma_data: _sigma_data,
+                runtime: _,
+            } => {
+                let meta = load_geom_meta(&meta)?;
+                let fusion_config = GeomFusionConfig {
+                    hidden_size,
+                    geom_hidden,
+                    slots,
+                    dim,
+                    num_blocks,
+                    refine_steps,
+                    ..GeomFusionConfig::default()
+                };
+                fusion_config.validate()?;
+                let trunk_config = QwenTrunkConfig {
+                    num_layers: None,
+                    ..QwenTrunkConfig::qwen38()
+                };
+                let trunk = qwennet::load_qwen_trunk_nf4::<B>(&weights, &trunk_config, &device)?.0;
+                let mut model = FusedQwen::<B>::new(trunk, &fusion_config, &device)?;
+                if let Some(path) = &checkpoint {
+                    model = checkpoint::load(model, path, &device)?;
+                }
+                let tok_text = std::fs::read_to_string(&tokenizer)?;
+                let tokenizer = BpeTokenizer::from_json(&tok_text)?;
+                let mut corpus = TokenCorpus::streaming(&corpus)?;
+                let proof = ProofConfig {
+                    scenes,
+                    depth,
+                    sweep,
+                    ..ProofConfig::default()
+                };
+                proof.validate()?;
+                let report = geomfusion::prove::<B>(
+                    &model,
+                    &mut corpus,
+                    &meta,
+                    &tokenizer,
+                    &proof,
+                    &device,
+                )?;
+                println!(
+                    "fused prove: scenes {} | accuracy {:.4} (chance {:.4}) | margin {:.4} | verified {} falsified {} indeterminate {}",
+                    report.scenes,
+                    report.accuracy,
+                    report.chance,
+                    report.margin,
+                    report.verified,
+                    report.falsified,
+                    report.indeterminate
+                );
+                for p in &report.sweep {
+                    println!(
+                        "  depth {} | accuracy {:.4} | energy {:.4} | agree_with_depth1 {:.3}",
+                        p.depth, p.accuracy, p.mean_energy, p.agree_with_depth1
+                    );
+                }
+                for k in &report.per_kind {
+                    println!(
+                        "  kind {} | {}/{} | verified {} falsified {} indeterminate {}",
+                        k.kind, k.correct, k.scenes, k.verified, k.falsified, k.indeterminate
+                    );
+                }
+                Ok(())
+            }
+        },
     }
+}
+/// Subcommands of the token-block substrate.
+#[derive(clap::Subcommand)]
+enum TblockAction {
+    /// Train the substrate on a byte stream and save a checkpoint.
+    #[command(about = "train the token-block substrate on a byte stream")]
+    Train {
+        /// Text or JSONL file; the first --bytes feed the training stream.
+        #[arg(long, default_value = "/srv/m-sda/unifur/pairs/pentest-full.jsonl")]
+        data: PathBuf,
+        #[arg(long, default_value_t = 1_000_000)]
+        bytes: usize,
+        #[arg(long, default_value_t = 192)]
+        context: usize,
+        #[arg(long, default_value_t = 64)]
+        hidden: usize,
+        #[arg(long, default_value_t = 3)]
+        layers: usize,
+        #[arg(long, default_value_t = 300)]
+        steps: usize,
+        #[arg(long, default_value_t = 8)]
+        batch: usize,
+        #[arg(long, default_value_t = 1e-3)]
+        lr: f64,
+        #[arg(long, default_value_t = 25)]
+        eval_every: usize,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        #[arg(long, default_value = "target/tblock-checkpoint.mpk")]
+        out: PathBuf,
+        #[arg(long, default_value = "target/tblock-train.json")]
+        report: PathBuf,
+    },
+    /// Benchmark the decode plans against each other on one checkpoint.
+    #[command(about = "compare fixed, adaptive, halo and revision decode plans")]
+    Bench {
+        #[arg(long, default_value = "target/tblock-checkpoint.mpk")]
+        checkpoint: PathBuf,
+        #[arg(long, default_value = "/srv/m-sda/unifur/pairs/pentest-full.jsonl")]
+        data: PathBuf,
+        #[arg(long, default_value_t = 1_000_000)]
+        bytes: usize,
+        #[arg(long, default_value_t = 20)]
+        prompts: usize,
+        #[arg(long, default_value_t = 128)]
+        gen_len: usize,
+        #[arg(long, default_value = "target/tblock-bench.json")]
+        out: PathBuf,
+    },
+}
+
+fn cmd_tblock(action: TblockAction) -> Result<()> {
+    match action {
+        TblockAction::Train {
+            data,
+            bytes,
+            context,
+            hidden,
+            layers,
+            steps,
+            batch,
+            lr,
+            eval_every,
+            seed,
+            out,
+            report,
+        } => {
+            let config = TbConfig {
+                context,
+                hidden_size: hidden,
+                num_layers: layers,
+                num_heads: 4,
+                intermediate_size: hidden * 2,
+                ..TbConfig::default()
+            };
+            config.validate()?;
+            let splits = tb::load_stream(&data, bytes, context)?;
+            // A fixed subsample: the val estimator is a curve, not a record,
+            // and 24 windows bound each eval pass to seconds on CPU.
+            let val_sample: Vec<Vec<u16>> = splits.val.iter().take(24).cloned().collect();
+            let (train_windows, val_windows) = (&splits.train, &val_sample);
+            println!(
+                "tokenblocks train: {} train windows, {} val windows, config {config:?}",
+                train_windows.len(),
+                val_windows.len()
+            );
+            type Ad = burn::backend::Autodiff<burn::backend::NdArray<f32>>;
+            let device = Default::default();
+            let params = TbTrainParams {
+                steps,
+                batch_size: batch,
+                lr,
+                eval_every,
+                seed,
+            };
+            let (model, training) =
+                tb::train_model::<Ad>(&config, &device, train_windows, val_windows, &params)?;
+            println!(
+                "final val loss {:.4} ({:.4} bpb), {} steps in {:.1}s",
+                training.final_val_loss, training.final_val_bpb, steps, training.seconds
+            );
+            for (step, val) in &training.val_curve {
+                println!("  step {step:>5}  val loss {val:.4}");
+            }
+            let inference = model.valid();
+            tb::save_checkpoint(inference, &out)?;
+            println!("checkpoint saved to {}", out.display());
+            let json =
+                serde_json::to_string_pretty(&training).context("serialize training report")?;
+            std::fs::write(&report, json).with_context(|| format!("write {}", report.display()))?;
+        }
+        TblockAction::Bench {
+            checkpoint,
+            data,
+            bytes,
+            prompts,
+            gen_len,
+            out,
+        } => {
+            let config = TbConfig {
+                context: 192,
+                hidden_size: 64,
+                num_layers: 3,
+                num_heads: 4,
+                intermediate_size: 128,
+                ..TbConfig::default()
+            };
+            let device = Default::default();
+            let model = tb::load_checkpoint(&checkpoint, &config, &device)?;
+            let splits = tb::load_stream(&data, bytes, config.context)?;
+            let test = &splits.test;
+            anyhow::ensure!(
+                test.len() >= prompts,
+                "want {prompts} prompts, the test split has {} windows",
+                test.len()
+            );
+            // The prompt is the front of each held-out window; the model
+            // generates the rest.
+            let prompt_len = config.context.saturating_sub(gen_len).max(8);
+            let seeds: Vec<Vec<u16>> = test
+                .iter()
+                .take(prompts)
+                .map(|w| w[..prompt_len].to_vec())
+                .collect();
+            println!(
+                "tokenblocks bench: {} prompts x {} tokens, from {}",
+                seeds.len(),
+                gen_len,
+                checkpoint.display()
+            );
+            let mut results = Vec::new();
+            for (name, plan) in tb::benchmark_plans(&config) {
+                let r = tb::run_plan(&name, &model, &config, &device, &plan, &seeds, gen_len)?;
+                println!(
+                    "{name:<24} {seconds:>7.2}s  fw={fw:>5} (sizing {sz:>3}, revision {rev:>3})  conf {conf:.3}  nll {nll:.4} ({bpb:.3} bpb)  edits {edits:>4} thrash {thrash}",
+                    seconds = r.seconds,
+                    fw = r.forwards,
+                    sz = r.sizing_forwards,
+                    rev = r.revision_forwards,
+                    conf = r.mean_confidence,
+                    nll = r.continuation_nll,
+                    bpb = r.continuation_bpb,
+                    edits = r.edits_total,
+                    thrash = r.thrashed_positions,
+                );
+                let sizes: Vec<String> = r
+                    .sizes
+                    .iter()
+                    .map(|(size, count)| format!("{size}x{count}"))
+                    .collect();
+                println!("    sizes: {}", sizes.join(" "));
+                let curve: Vec<String> = r
+                    .confidence_by_offset
+                    .iter()
+                    .step_by((r.confidence_by_offset.len() / 12).max(1))
+                    .map(|(offset, conf)| format!("{offset}:{conf:.3}"))
+                    .collect();
+                println!("    conf@offset: {}", curve.join(" "));
+                results.push(r);
+            }
+            let json = serde_json::to_string_pretty(&results).context("serialize bench report")?;
+            std::fs::write(&out, json).with_context(|| format!("write {}", out.display()))?;
+            println!("report written to {}", out.display());
+        }
+    }
+    Ok(())
 }
 
 fn cmd_lm(action: LmAction) -> Result<()> {
@@ -8158,6 +8773,7 @@ mod nina_cli_tests {
             datasets: Vec::new(),
             teacher: None,
             bytes: 19,
+            alias_of: None,
         };
 
         let (resolved, _) = resolve_specialist(&model_dir, &entry).unwrap();
@@ -8223,6 +8839,7 @@ mod nina_cli_tests {
             datasets: Vec::new(),
             teacher: None,
             bytes: 21,
+            alias_of: None,
         };
 
         let (resolved, config) = resolve_specialist(&model_dir, &entry).unwrap();
@@ -8267,6 +8884,7 @@ mod nina_cli_tests {
             datasets: Vec::new(),
             teacher: None,
             bytes: 1,
+            alias_of: None,
         };
 
         let (resolved, _) = resolve_specialist(&model_dir, &entry).unwrap();
@@ -8295,6 +8913,7 @@ mod nina_cli_tests {
             datasets: Vec::new(),
             teacher: None,
             bytes: 0,
+            alias_of: None,
         };
         let err = resolve_specialist(&model_dir, &entry)
             .unwrap_err()

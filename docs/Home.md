@@ -28,7 +28,7 @@ Two documents are authoritative about what is and is not implemented:
 
 ```bash
 cargo build --release
-./target/release/dblocks verify        # 227 certificates, non-zero exit on failure
+./target/release/dblocks verify        # 255 certificates, non-zero exit on failure
 ./target/release/dblocks cheat scan --root .  # attempts to defeat the gate, not satisfy it
 ./target/release/dblocks train --steps 200
 ./target/release/dblocks sample --planned --plan-depth 2   # plan the trajectory
@@ -93,10 +93,10 @@ exactly the wrong behaviour.
 
 > **In this repository.** `src/cheat.rs` (`CheatReport`, `Finding`, `Severity`,
 > `CheatClass`, `GateReport`, `scan`, `load_from_dir`, `gate`), wired as
-> `dblocks cheat`. Certificates: the `cheat` group (26). Tests: 38 in-module.
+> `dblocks cheat`. Certificates: the `cheat` group (51). Tests: 201 in-module.
 > The paired half is `src/codegen_eval.rs` (`CorpusIndex`, `decontaminate`,
 > `admit`, `split`, `TaskOutcome`, `Scorecard`), certificates in the
-> `codegen_eval` group (22), and the task generator
+> `codegen_eval` group (19), and the task generator
 > `examples/evalgen.rs` writing `repo-native-eval.jsonl`.
 
 ```bash

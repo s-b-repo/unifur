@@ -17,7 +17,7 @@ the one the issue states: an optimization hypothesis does not become a fact
 without a measurement.
 
 > **In this repository.** Certificates: `src/verify.rs` (`dblocks verify`,
-> 26 groups). Measurements: the `Status` paragraphs of `TODO.md`. Harnesses:
+> 31 groups). Measurements: the `Status` paragraphs of `TODO.md`. Harnesses:
 > `dblocks sweep`, `dblocks bench --json`, `dblocks audit propagation`,
 > `dblocks lm bench`, `dblocks experiment compare`.
 
@@ -123,7 +123,10 @@ raw trials.
 | A 3:1 (or any) linear/dense schedule, a sliding window, or retrieval attention at `k` keys matches dense attention's quality at lower cost | `dblocks lm bench --axis attention`, then a GPU run long enough to converge |
 | Rotary positions generalize a model trained at one length to longer sequences | a GPU run; the mechanism decodes past the context, nothing here says how well |
 | A routing state raises layer agreement or expert specialization; routing locality justifies expert residency (issue #4, B7) | `dblocks lm bench --axis routing`; the `stability` and `agreement` columns of the routing log |
-
+| Rotating-cohort MoE: cohort plan covers every expert, replay schedule covers every expert, gatekeeping reinits redundant experts, redundancy requires dual-method agreement, load imbalance zero for uniform usage, calibration touches only the router when all experts are frozen | VERIFIED (mechanism) | `cohort` group (7 certs); `src/cohort.rs`. Training loops that consume these decisions are GPU-blocked |
+| The fused Qwen trunk + `GeomFusion` vector stream + MoSME readout beats the matched-depth transformer baseline on held-out geometric scenes and Geometry3K/GeoQA, with every emitted answer kernel-checked by `geomkernel` | UNKNOWN | `dblocks geom fused train ...` then `dblocks geom fused prove --checkpoint ...` (accuracy, margin vs chance, verified/falsified/indeterminate, refine sweep, per-kind accuracy) and `dblocks geom eval --baseline` for the side-by-side. Harness exists (`geomfusion::train_fused_qwen`, `geomfusion::prove`); no run recorded yet |
+| Rotating-cohort MoE training (shared expert, rotating groups, dual-method fingerprinting, early gatekeeping, cross-cohort replay, resident router, load balancing, light calibration) produces genuinely distinct expert specialization vs. training the same experts fully resident together | UNKNOWN | Stage 9 pilot: run the full pipeline on 3–4 experts + a small held-out task and compare specialization to the naive baseline. Strategy documented; no implementation or measurement yet |
+ 
 ## Out of scope, and why
 
 Distributed training (needs a cluster), native bf16 (backend), hosted W&B and

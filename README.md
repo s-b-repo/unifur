@@ -24,7 +24,12 @@ Original code: [SakanaAI/DiffusionBlocks](https://github.com/SakanaAI/DiffusionB
 
 ---
 
-## Implementation status — read this first
+## Research-backed pipeline
+
+See [`docs/research-pipeline.md`](docs/research-pipeline.md) for the consolidated 6-stage
+research-backed pipeline (shared vector space, scene graph, generation, training
+efficiency, optional RL, output translation) and references (DoT, CoT
+distillation, GDPO).
 
 **This repository is a Rust crate built on [Burn](https://burn.dev), not a
 Python package.** The Python snippets throughout this document are the original
@@ -44,7 +49,7 @@ with an accurate "In this repository" block naming the module, types and flags
 that implement it.
 
 ```bash
-# Build and run the quality gate: 227 numerical certificates, non-zero exit on
+# Build and run the quality gate: 255 numerical certificates, non-zero exit on
 # any failure.
 cargo build --release
 ./target/release/dblocks verify

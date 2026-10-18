@@ -301,6 +301,27 @@ the counter the "model is its own verifier" claim rests on. Its checkpoint
 predates the rewire and no longer loads; rerun with `--objective diffusion`
 for current weights.
 
+## Fused model: Qwen trunk + `GeomFusion` + MoSME readout (unmeasured)
+
+The fused stack (`src/geomfusion.rs`: `GeomFusion`, `FusedQwen`, `FusedQwenTrainer`,
+`train_fused_qwen`, `prove`) attaches the geometric stream to a Qwen3.8 trunk
+via adapters-only training, reads out through MoSME boxes named for reasoning
+kinds (math, logic, proof, code) reusing the certified `HierarchicalRouter`,
+and kernel-checks every emitted answer via `geomkernel`. CLI:
+`dblocks geom fused train|eval|prove` (Phase 1 wiring).
+
+Status: **unmeasured.** No fused run has been recorded; the stack sits at the
+identity at birth. The harness is in place and the configs validate
+(`GeomFusionConfig::validate`, `FusedTrainConfig::validate`,
+`ProofConfig::validate`); the anti-cheat gates (decontaminated stratified
+corpus, cheat scan, policy gate, audit propagation) must pass before a run is
+trusted. When a run lands, record here: checkpoint hash, held-out accuracy,
+margin vs chance (`report.margin`), kernel verified/falsified/indeterminate
+counts, refine sweep (depth / accuracy / energy / agree-with-depth-1), and
+per-kind accuracy — and update the matching rows in `docs/Claims.md`.
+
+---
+
 ## Field notes: trained geometric models (what ports, what does not)
 
 - **Stratify the corpus, don't just scale it.** AlphaGeometry generated 1B

@@ -1326,8 +1326,8 @@ See [`docs/Quality-Gate.md`](docs/Quality-Gate.md).
 
 ## Test inventory
 
-658 unit + 38 integration tests, all passing; `cargo clippy --all-targets`
-clean; `cargo doc` warning-free. 169 numerical certificates in 26 groups, plus
+1201 unit + 38 integration tests, all passing; `cargo clippy --all-targets`
+clean; `cargo doc` warning-free. 255 numerical certificates in 29 groups, plus
 five-phase verification inside every training run and a bit-identity test
 for resumed training.
 

@@ -604,6 +604,11 @@ pub struct GeomBlock<B: Backend> {
 }
 
 impl<B: Backend<FloatElem = f32>> GeomBlock<B> {
+    /// Expose the learned metric.
+    pub fn metric(&self) -> &MetricField<B> {
+        &self.metric
+    }
+
     pub fn new(config: &GeomConfig, device: &B::Device) -> Self {
         let raw_repulsion = ((config.repulsion as f32).exp() - 1.0).ln();
         Self {

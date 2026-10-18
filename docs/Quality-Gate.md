@@ -36,7 +36,7 @@ A claim that cannot be reduced to a residual is not listed.
 ### Running it
 
 ```bash
-dblocks verify                 # all 227 certificates; exits non-zero on failure
+dblocks verify                 # all 255 certificates; exits non-zero on failure
 dblocks verify --group solver  # one group
 ```
 
@@ -48,7 +48,7 @@ schedule       boundary_endpoints                       1.038e-11    1.000e-8   
                window_tiling                              0.000e0     0.000e0       -  ok
                block_routing_involution                   0.000e0     0.000e0       -  ok
 ...
-227 / 227 certificates passed
+255 / 255 certificates passed
 ```
 
 The **margin** column is residual ÷ tolerance. A certificate drifting toward

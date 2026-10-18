@@ -902,6 +902,10 @@ pub struct FusedQwen<B: Backend> {
 }
 
 impl<B: Backend<FloatElem = f32>> FusedQwen<B> {
+    /// Expose the learned metric for downstream readout (e.g. vecread).
+    pub fn metric(&self) -> &crate::geometry::MetricField<B> {
+        self.fusion.blocks[0].metric()
+    }
     /// Compose a trunk and a fresh geometric stream. Fallible: the stream's
     /// `hidden_size` must be the trunk's, or the residual would silently add
     /// mismatched widths.
@@ -1574,10 +1578,22 @@ impl FusedTrainConfig {
             );
         }
         anyhow::ensure!(
-            self.sigma_data.is_finite() && self.sigma_data > 0.0,
-            "sigma_data must be positive and finite, not {}",
-            self.sigma_data
+            self.gamma.is_finite() && self.gamma >= 0.0,
+            "gamma must be non-negative and finite, not {}",
+            self.gamma
         );
+        anyhow::ensure!(
+            self.moe_balance_weight.is_finite() && self.moe_balance_weight >= 0.0,
+            "moe_balance_weight must be non-negative and finite, not {}",
+            self.moe_balance_weight
+        );
+        if let Some(depth) = self.depth {
+            anyhow::ensure!(depth >= 1, "depth must be positive, not {depth}");
+        }
+        if self.log_every != 0 {
+            anyhow::ensure!(self.log_every >= 1, "log_every must be positive or zero");
+        }
+        self.lora.validate()?;
         Ok(())
     }
 }
@@ -2094,7 +2110,8 @@ pub fn train_fused_qwen<B: AutodiffBackend<FloatElem = f32>>(
 // ------------------------------------------------------------------ proof ---
 
 /// What a proof run evaluates.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ProofConfig {
     /// Held-out scenes, read from the corpus TAIL (the region
     /// [`train_fused_qwen`]'s `holdout` keeps out of training).
@@ -2115,6 +2132,23 @@ impl Default for ProofConfig {
             sweep: true,
             sweep_depths: Vec::new(),
         }
+    }
+}
+
+impl ProofConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.scenes >= 1,
+            "scenes must be positive, not {}",
+            self.scenes
+        );
+        if let Some(depth) = self.depth {
+            anyhow::ensure!(depth >= 1, "depth must be positive, not {depth}");
+        }
+        for (i, d) in self.sweep_depths.iter().enumerate() {
+            anyhow::ensure!(*d >= 1, "sweep_depths[{i}] must be positive, not {d}");
+        }
+        Ok(())
     }
 }
 

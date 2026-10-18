@@ -228,7 +228,7 @@ impl Report {
 }
 
 /// Names of every certificate group, in the order [`run_all`] emits them.
-pub const GROUPS: [&str; 29] = [
+pub const GROUPS: [&str; 31] = [
     "schedule",
     "preconditioning",
     "stats",
@@ -258,6 +258,8 @@ pub const GROUPS: [&str; 29] = [
     "cheat",
     "codegen_eval",
     "vecread",
+    "tokenblocks",
+    "cohort",
 ];
 
 /// Run only the certificates in `group`.
@@ -316,6 +318,8 @@ pub fn run_all() -> Report {
     certificates.extend(cheat_certificates());
     certificates.extend(codegen_eval_certificates());
     certificates.extend(checks_or_failed("vecread", vecread_checks));
+    certificates.extend(crate::tokenblocks::certificates());
+    certificates.extend(crate::cohort::certificates());
     Report { certificates }
 }
 
@@ -8285,6 +8289,7 @@ mod tests {
                 "autodiff",
                 "cheat",
                 "codegen_eval",
+                "cohort",
                 "codequality",
                 "deltanet",
                 "experiment",
@@ -8307,6 +8312,7 @@ mod tests {
                 "schedule",
                 "solver",
                 "stats",
+                "tokenblocks",
                 "vecread",
             ]
         );

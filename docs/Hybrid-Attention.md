@@ -17,7 +17,7 @@ diagnostics a multi-axis router needs (roadmap Phase 25).
 > `RoutingStats::stability | agreement | kind`). CLI: `dblocks lm train |
 > generate | merge --attention --positions --routing-state --window
 > --retrieval-k`, `dblocks lm bench --axis attention | positions | routing`.
-> Certificates: the `hybrid` group (9).
+> Certificates: the `hybrid` group (16).
 
 ---
 
