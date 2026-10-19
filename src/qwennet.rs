@@ -722,6 +722,22 @@ impl Default for QwenLoraConfig {
     }
 }
 
+impl QwenLoraConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.rank >= 1,
+            "lora rank must be positive, not {}",
+            self.rank
+        );
+        anyhow::ensure!(
+            self.alpha.is_finite() && self.alpha > 0.0,
+            "lora alpha must be positive and finite, not {}",
+            self.alpha
+        );
+        Ok(())
+    }
+}
+
 /// Trunk-level configuration: the architecture dims plus the knobs a run
 /// may legitimately vary. Every field carries a serde default so sidecars
 /// written before a field existed still parse.
@@ -1126,6 +1142,12 @@ fn placeholder_linear<B: Backend>(device: &B::Device) -> QwenLinear<B> {
 }
 
 impl<B: Backend> QwenTrunk<B> {
+    /// Logits from a hidden state: final norm + untied lm_head. Mirrors
+    /// `LanguageModel::logits_from_hidden` so vecread can decode fused states.
+    pub fn logits_from_hidden(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
+        let normed = self.final_norm.forward(hidden);
+        self.lm_head.forward(normed)
+    }
     /// Quantize every projection in the trunk to NF4 residency.
     ///
     /// The from-scratch counterpart to [`load_qwen_trunk_nf4`]: that one reads

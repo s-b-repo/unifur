@@ -535,6 +535,12 @@ pub struct ModelEntry {
     /// The teacher that generated traces, when one did.
     #[serde(default)]
     pub teacher: Option<String>,
+    /// Set only when this entry is a deliberate alias: the name of the entry
+    /// that already holds these weights. Registration refuses a checkpoint
+    /// hash that is already registered under another name unless this names
+    /// that holder — five names for one model is not five specialists.
+    #[serde(default)]
+    pub alias_of: Option<String>,
     /// Checkpoint size in bytes.
     #[serde(default)]
     pub bytes: u64,
@@ -702,6 +708,41 @@ impl Registry {
                  promote or retire the existing entry, or register under a new name",
                 entry.name,
                 existing.status.as_str()
+            );
+        }
+        // Duplicate-weight guard: the same checkpoint registered under a new
+        // name is a duplicate registration, not a new capability. Different
+        // routing labels do not create different learned capabilities — only
+        // different weights (or an explicit, recorded alias) do.
+        if !entry.checkpoint_hash.is_empty() {
+            let twins: Vec<&str> = self
+                .file
+                .models
+                .iter()
+                .filter(|m| m.checkpoint_hash == entry.checkpoint_hash)
+                .map(|m| m.name.as_str())
+                .collect();
+            if let Some(holder) = twins.first() {
+                let declared = entry.alias_of.as_deref();
+                let shown: String = entry.checkpoint_hash.chars().take(16).collect();
+                ensure!(
+                    declared.is_some_and(|origin| twins.contains(&origin)),
+                    "checkpoint {} is already registered as '{}' ({} entr{} hold these \
+                     weights); registering '{}' is a duplicate, not a specialist. If the \
+                     alias is intended, set alias_of to the holding entry's name",
+                    shown,
+                    holder,
+                    twins.len(),
+                    if twins.len() == 1 { "y" } else { "ies" },
+                    entry.name,
+                );
+            }
+        }
+        if let Some(origin) = &entry.alias_of {
+            ensure!(
+                self.get(origin).is_some(),
+                "alias_of names '{origin}', which is not in the registry — an alias must \
+                 point at the entry that holds the weights"
             );
         }
         let record = self.log_event(json!({ "event": "register", "entry": &entry }))?;
@@ -2061,6 +2102,7 @@ fn run_entry<B: burn::tensor::backend::AutodiffBackend<FloatElem = f32>>(
             datasets: vec![dataset.to_string()],
             teacher: None,
             bytes,
+            alias_of: None,
         })?;
     }
     // Refresh the deployment sidecar so it names *this* checkpoint and *this*
@@ -3099,6 +3141,60 @@ mod tests {
         // The truth: two register records, chain intact.
         let report = ChainedLog::verify(&log_path).unwrap();
         assert_eq!(report.lines, 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn registry_refuses_duplicate_weights_without_an_explicit_alias() {
+        // The measured failure this guard exists for: one checkpoint file
+        // registered under five pentest subfield names, each carrying the
+        // same accuracy to 17 digits. Different routing labels do not create
+        // different learned capabilities.
+        let dir = scratch("registry-duplicate-weights");
+        let mut registry = Registry::open(
+            dir.join("registry.json"),
+            dir.join("logs").join("registry.jsonl"),
+        )
+        .unwrap();
+        let mut first = entry("pentest/recon", "pentest", "recon");
+        first.checkpoint_hash = "aa11".repeat(8);
+        registry.register(first).unwrap();
+
+        // Same weights, new name, no alias declared: refused, naming the
+        // holder.
+        let mut twin = entry("pentest/bugfinding", "pentest", "bugfinding");
+        twin.checkpoint_hash = "aa11".repeat(8);
+        let err = registry.register(twin).unwrap_err().to_string();
+        assert!(
+            err.contains("already registered as 'pentest/recon'"),
+            "{err}"
+        );
+        assert!(err.contains("alias_of"), "{err}");
+        assert!(registry.get("pentest/bugfinding").is_none());
+
+        // The same weights with the alias declared: accepted, and the entry
+        // records the alias.
+        let mut alias = entry("pentest/bugfinding", "pentest", "bugfinding");
+        alias.checkpoint_hash = "aa11".repeat(8);
+        alias.alias_of = Some("pentest/recon".to_string());
+        registry.register(alias).unwrap();
+        assert_eq!(
+            registry.get("pentest/bugfinding").unwrap().alias_of,
+            Some("pentest/recon".to_string())
+        );
+
+        // An alias pointing at nothing is refused even with unique weights.
+        let mut stray = entry("pentest/research", "pentest", "research");
+        stray.checkpoint_hash = "bb22".repeat(8);
+        stray.alias_of = Some("pentest/nonexistent".to_string());
+        let err = registry.register(stray).unwrap_err().to_string();
+        assert!(err.contains("not in the registry"), "{err}");
+
+        // Distinct weights still register freely.
+        let mut other = entry("pentest/research", "pentest", "research");
+        other.checkpoint_hash = "cc33".repeat(8);
+        registry.register(other).unwrap();
+        assert_eq!(registry.list(Some("pentest")).len(), 3);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

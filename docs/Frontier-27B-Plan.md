@@ -71,19 +71,20 @@ runs green against it in-suite.
   literal-Replace/Sequence; NFC-family + regex-Replace stay loud errors —
   decomposition tables are infeasible `std`-only), `"a b"` + `["a","b"]`
   merge forms, `#version` skip, added ids past vocab range, merge-rank
-  fidelity. 12 tests green incl. real-file validation (154K vocab / 321K
+  fidelity. 16 tests green incl. real-file validation (154K vocab / 321K
   merges / 36 added tokens load; diverse round-trips; merges fire; added
   bypass), clippy-clean, audit-clean (remaining hits: in-test asserts per
-  repo culture, one intentional `#[ignore]` gate, guarded indexing).
-  Real-file parity gate is the ignored test
-  `qwen_tokenizer_parity_against_reference` (`QWEN_TOKENIZER_JSON` env).
+  repo culture, guarded indexing).
+  Real-file parity gate is the test
+  `qwen_tokenizer_parity_against_reference` (`QWEN_TOKENIZER_JSON` env), which
+  skips with a note when no reference file is present.
 
 ### Phase C — Qwen3.8 arch, DeltaNet core DONE → `src/deltanet.rs`
 - Gated delta rule (Yang et al. Eq. 10, verified against the paper text +
   vLLM's `QwenGatedDeltaNetAttention` splits): per-pair recurrence,
   L2-normalized q/k, causal depthwise conv (kernel 4), Qwen3.8 grouping
   (16 groups × 1Q/1K dim-128 + 3V dim-128, α/β per V head), config +
-  cost helpers. 6 unit tests + 5 gate certs (`deltanet` group) green.
+  cost helpers. 8 unit tests + 7 gate certs (`deltanet` group) green.
 - REMAINING: chunkwise/WY training form (paper §3.3), `GatedDeltaHead`
   module with projections + decode state, full `src/qwen.rs` 64-layer
   wiring (awaits Phase B remap against real shard names).
@@ -146,7 +147,31 @@ runs green against it in-suite.
 - **Long-run stability** (driver timeouts, OOM creep, power loss): checkpoint-every-N + verified resume (already repo discipline).
 - **Scope guardrails**: vision encoder out (text-only coder); 256K context out (start 8–32K); Muon/speculative-MTP out (separate projects).
 
+## Status update (fused stack)
+
+The fused geometric stack (`src/geomfusion.rs`: `GeomFusion`, `FusedQwen`,
+`FusedQwenTrainer`, `train_fused_qwen`, `prove`) and its CLI
+(`dblocks geom fused train|eval|prove`) are wired, with validated configs
+(`GeomFusionConfig::validate`, `FusedTrainConfig::validate`,
+`ProofConfig::validate`) and `serde(default)` on every config field. The trunk
+loads through the NF4 path (`qwennet::load_qwen_trunk_nf4`). Adapters-only
+training, accumulation, EMA and verified resume are reused from
+`src/qwentrain.rs`. No fused run has been recorded yet; the stack sits at the
+identity at birth and is unmeasured. See `docs/Geometric-Reasoning.md` (Fused
+section) and `docs/Claims.md` for the UNKNOWN row and its harness.
 ## 4. Open inputs (blocking Phase 0)
+
 - [ ] Other-drive mount path + `df -h` showing ≥70 GB free
 - [ ] Dataset confirm (default §1 table) or replacements
 - [ ] Go-ahead to start Phase A
+
+## Hardware solution: rotating-cohort MoE training
+
+For MoE specialists on a single 12 GB card, the rotating-cohort strategy (shared
+expert, rotating 2–3 expert groups, dual-method fingerprinting with agreement
+gate, early gatekeeping, cross-cohort replay, continuously resident router,
+load balancing, light calibration, cheap pilot) keeps only a cohort resident at
+once while the router learns the full population over time. Documented in
+`.kilo/plans/1792339877955-geometric-reasoning-frontier-plan.md`. Status:
+mechanism implemented in `src/cohort.rs` (pure logic + `cohort` cert group);
+GPU training loops that consume it remain blocked on weights/compute.

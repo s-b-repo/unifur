@@ -332,6 +332,107 @@ impl VecReader {
             translators_used,
         })
     }
+
+    /// Read a fused model's hidden states through the lens. Mirrors
+    /// [`Self::read_student_thinking`] but decodes `FusedQwen::forward_traced`
+    /// hidden states through the trunk's final norm + lm_head.
+    pub fn read_fused_thinking<B: Backend<FloatElem = f32>>(
+        &self,
+        model: &crate::geomfusion::FusedQwen<B>,
+        tokens: Tensor<B, 2, Int>,
+        depth_sweep: &[usize],
+    ) -> anyhow::Result<ThoughtTrace> {
+        self.validate()?;
+        anyhow::ensure!(
+            !depth_sweep.is_empty(),
+            "the depth sweep must request at least one refine depth"
+        );
+        for depth in depth_sweep {
+            anyhow::ensure!(
+                *depth >= 1,
+                "a refine depth must be at least 1, got {depth}"
+            );
+        }
+        let [b, n] = tokens.dims();
+        anyhow::ensure!(
+            b == 1,
+            "the lens reads one prompt at a time, got a batch of {b}"
+        );
+        anyhow::ensure!(n >= 1, "the prompt must hold at least one token");
+        let positions = self.selected_positions(n)?;
+        let depths: Vec<usize> = if self.per_step {
+            depth_sweep.to_vec()
+        } else {
+            let deepest = depth_sweep.iter().copied().max().ok_or_else(|| {
+                anyhow::anyhow!("the depth sweep must request at least one refine depth")
+            })?;
+            vec![deepest]
+        };
+        let mut traces = Vec::with_capacity(depths.len());
+        let translators_used = Vec::new();
+        for depth in depths {
+            let pass = model.forward_traced(tokens.clone(), Some(depth))?;
+            let energy = pass
+                .fused
+                .traces
+                .last()
+                .and_then(|t| t.energy.last().copied())
+                .unwrap_or(0.0);
+            let displacement = pass
+                .fused
+                .traces
+                .last()
+                .and_then(|t| t.displacement.last().copied())
+                .unwrap_or(0.0);
+            let metric = model.metric();
+            let geometry = slot_geometry(metric, &pass.fused.final_state)?;
+            let decodes = decode_qwen_hidden(
+                &model.trunk,
+                &pass.fused.hidden,
+                &positions,
+                self.top_k,
+                DecodeSite {
+                    depth,
+                    energy,
+                    displacement,
+                    translator: None,
+                },
+            )?;
+            traces.push(DepthTrace {
+                depth,
+                energy: pass
+                    .fused
+                    .traces
+                    .last()
+                    .map(|t| t.energy.clone())
+                    .unwrap_or_default(),
+                displacement: pass
+                    .fused
+                    .traces
+                    .last()
+                    .map(|t| t.displacement.clone())
+                    .unwrap_or_default(),
+                decodes,
+                geometry,
+            });
+        }
+        Ok(ThoughtTrace {
+            n_tokens: n,
+            positions,
+            top_k: self.top_k,
+            depths: traces,
+            translators_used,
+        })
+    }
+}
+
+/// [`VecReader::read_fused_thinking`] with the default reader.
+pub fn read_fused_thinking<B: Backend<FloatElem = f32>>(
+    model: &crate::geomfusion::FusedQwen<B>,
+    tokens: Tensor<B, 2, Int>,
+    depth_sweep: &[usize],
+) -> anyhow::Result<ThoughtTrace> {
+    VecReader::default().read_fused_thinking(model, tokens, depth_sweep)
 }
 
 /// [`VecReader::read_student_thinking`] with the default reader (top-5, last
@@ -342,6 +443,84 @@ pub fn read_student_thinking<B: Backend<FloatElem = f32>>(
     depth_sweep: &[usize],
 ) -> anyhow::Result<ThoughtTrace> {
     VecReader::default().read_student_thinking(student, tokens, depth_sweep)
+}
+
+/// Decode `positions` of `hidden` (`[1, n, hidden]`) through a Qwen trunk's
+/// own readout: final norm + untied lm_head, softmax, top-k. Mirrors
+/// [`decode_hidden`] for the fused path.
+fn decode_qwen_hidden<B: Backend<FloatElem = f32>>(
+    trunk: &crate::qwennet::QwenTrunk<B>,
+    hidden: &Tensor<B, 3>,
+    positions: &[usize],
+    top_k: usize,
+    site: DecodeSite<'_>,
+) -> anyhow::Result<Vec<LensReport>> {
+    let [b, n, h] = hidden.dims();
+    anyhow::ensure!(
+        b == 1,
+        "the lens reads one prompt at a time, got a batch of {b}"
+    );
+    let hidden = hidden.clone();
+    let logits = trunk.logits_from_hidden(hidden.clone());
+    let vocab = logits.dims()[2];
+    let probs = softmax(logits.clone(), 2);
+    let logits_host: Vec<f32> = logits
+        .reshape([n, vocab])
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect();
+    let probs_host: Vec<f32> = probs
+        .reshape([n, vocab])
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect();
+    let hidden_host: Vec<f32> = hidden
+        .reshape([n, h])
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .collect();
+
+    let mut reports = Vec::with_capacity(positions.len());
+    for &position in positions {
+        anyhow::ensure!(
+            position < n,
+            "position {position} is out of range for a sequence of {n}"
+        );
+        let logits_row = &logits_host[position * vocab..(position + 1) * vocab];
+        let probs_row = &probs_host[position * vocab..(position + 1) * vocab];
+        let hidden_row = &hidden_host[position * h..(position + 1) * h];
+        let rms = (hidden_row.iter().map(|v| v * v).sum::<f32>() / h as f32).sqrt();
+        let prob_sum: f32 = probs_row.iter().sum();
+
+        let mut order: Vec<usize> = (0..vocab).collect();
+        order.sort_by(|a, b| {
+            logits_row[*b]
+                .total_cmp(&logits_row[*a])
+                .then_with(|| a.cmp(b))
+        });
+        let mut top = Vec::with_capacity(top_k.min(vocab));
+        for idx in order.into_iter().take(top_k) {
+            top.push(TokenCandidate {
+                id: u16::try_from(idx).unwrap_or(u16::MAX),
+                text: token_text(idx as u16),
+                probability: probs_row[idx],
+            });
+        }
+        reports.push(LensReport {
+            position,
+            depth: site.depth,
+            energy: site.energy,
+            displacement: site.displacement,
+            top,
+            rms,
+            prob_sum,
+        });
+    }
+    let _ = site;
+    Ok(reports)
 }
 
 /// One decoded token candidate: the id, its printable text and its

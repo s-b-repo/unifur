@@ -175,12 +175,14 @@ Three metrics, each measured on a held-out split of each source:
    score and no new dimension regresses below 0.5. *Target: > 80%
    of patches improve or hold every dimension.*
 
-3. **`test_preserved`.** When the SWE-bench-style "test command"
-   input is provided, the patch is applied and the test command is
-   run. A patch that breaks previously-passing tests has removed
-   functionality, which is the failure mode the task exists to
-   prevent. *Target: > 95% of patches preserve previously-passing
-   tests.*
+3. **`test_preserved`.** A patch that breaks previously-passing tests
+   has removed functionality, which is the failure mode the task exists
+   to prevent. *Target: > 95% of patches preserve previously-passing
+   tests.* As built (`quality_coder::eval`), this is a **proxy**: the
+   patch touches only lines inside a reported defect span. The harness
+   does not invoke the test command — it is deterministic and
+   model-free by design, and running a real command arrives with the
+   trained model.
 
 A composite score `quality_coder_v1 = 0.1 * apply + 0.5 * lint + 0.4
 * test` is the headline number reported on each eval run. Numbers

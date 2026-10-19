@@ -10,9 +10,9 @@ You are continuing Path 2 of `docs/Frontier-27B-Plan.md` in `/home/cortix/Downlo
 
 ## Step 0 — confirm the baseline before touching anything
 
-1. `cargo test --lib` must show **659 passed, 0 failed** (includes the shard-audit tests that read `/srv`; they skip cleanly if files are absent).
+1. `cargo test --lib` must show **1176 passed, 0 failed** (1183 collected, 7 `#[ignore]`d; includes the shard-audit tests that read `/srv`; they skip cleanly if files are absent).
 2. `cargo clippy --all-targets` must show no errors.
-3. `./target/release/dblocks verify` → 167/167 certificates (rebuild release first if stale: `cargo build --release`).
+3. `./target/release/dblocks verify` → 255/255 certificates (rebuild release first if stale: `cargo build --release`).
 4. Weights must be present: `/srv/m-sdd/unifur/weights/qwen38-bf16/` should hold `model-00001..00012-of-00012.safetensors` + `model-mtp-restored.safetensors` (~55.7 GB total). If shards are missing, the background retry loop is `/srv/m-sdd/unifur/dl-loop.sh` — check `download-qwen38.log` beside it, do NOT start a second downloader.
 5. Tokenizer + data already on disk: `/srv/m-sdd/unifur/tokenizers/qwen38-source/tokenizer.json`, `/srv/m-sdd/unifur/datasets/sft-12k.jsonl` (+ `subset-report.txt`, `build_subset.py`).
 
@@ -28,7 +28,7 @@ You are continuing Path 2 of `docs/Frontier-27B-Plan.md` in `/home/cortix/Downlo
 
 - `src/bpe.rs` — HF `tokenizer.json` loader (vocab/merges/added, 3 GPT-2 split dialects incl. Qwen's exact pattern, byte alphabet, NFC, `u32` ids). Parity-tested against the real Qwen3.8 file.
 - `src/import.rs` — safetensors header index + ranged `f32` decode (never loads whole shards), exact F16/BF16 conversion, corrupt-header refusal.
-- `src/deltanet.rs` — Gated DeltaNet **reference core** (recurrent math only): `gated_delta_step`, `gated_delta_recurrent`, causal depthwise conv, L2 norm, Qwen3.8 grouping preset (16 groups × 1Q/1K + 3V, dim 128). 6 unit tests + 5 `deltanet` gate certs.
+- `src/deltanet.rs` — Gated DeltaNet **reference core** (recurrent math only): `gated_delta_step`, `gated_delta_recurrent`, causal depthwise conv, L2 norm, Qwen3.8 grouping preset (16 groups × 1Q/1K + 3V, dim 128). 8 unit tests + 7 `deltanet` gate certs.
 - `src/qwen.rs` — architecture dims + **tensor-name remap validated against all 1,199 real names** (851 text = 48×14 + 16×11 + 3; 15 MTP + 333 vision allow-listed). `QwenPart::expected_shape` gives file-side shapes; `audit_tensors` validates a shard index.
 - `examples/tokcount.rs` — token counter used for the 6.53M-token measurement.
 - Full spec: `docs/Frontier-27B-Plan.md` (read it first).
