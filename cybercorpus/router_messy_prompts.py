@@ -209,6 +209,154 @@ MESSY_COMBOS: list[tuple[str, list[tuple[str, float]], list[str]]] = [
     ("isolation forest on auth logs to catch weird logins", [("cyber-data", 0.55), ("ai-ml", 0.45)], ["cyber-data/anomaly-detection", "ai-ml/ml"]),
 ]
 
+# Round-2 deepening: more messy rows for the six still-weak-on-v2.test categories
+# (cyber-appsec, systems, cyber-offensive, cloud, cyber-specialized, coding).
+# Fresh topics again, authored independently, deduped by the generator.
+MESSY_SHORT += [
+    # cyber-appsec
+    ("my code review keeps missing bugs, whats a systematic way to look", [("cyber-appsec", 1.0)], ["cyber-appsec/code-audit"]),
+    ("how do i set up continuous fuzzing in ci so it runs every pr", [("cyber-appsec", 1.0)], ["cyber-appsec/fuzzing"]),
+    ("whats the difference between a vuln and just a weakness in code", [("cyber-appsec", 1.0)], ["cyber-appsec/bug-finding"]),
+    ("found a deserialization sink, how do i tell how bad it is", [("cyber-appsec", 1.0)], ["cyber-appsec/code-audit"]),
+    ("how do i write a decent fuzz harness for a protocol parser", [("cyber-appsec", 1.0)], ["cyber-appsec/fuzzing"]),
+    ("sast says tainted input reaches exec(), is that always rce", [("cyber-appsec", 1.0)], ["cyber-appsec/sast"]),
+    ("how do i audit crypto usage across a whole codebase", [("cyber-appsec", 1.0)], ["cyber-appsec/code-audit"]),
+    ("my dast scan found nothing, is the app clean or the scan weak", [("cyber-appsec", 1.0)], ["cyber-appsec/dast"]),
+    ("how do i find logic bugs that the scanners never catch", [("cyber-appsec", 1.0)], ["cyber-appsec/bug-finding"]),
+    ("whats a good way to triage which sast findings to fix first", [("cyber-appsec", 1.0)], ["cyber-appsec/sast"]),
+    # systems
+    ("my program pins one core at 100% how do i spread the work", [("systems", 1.0)], ["systems/concurrency"]),
+    ("whats the page cache, my free mem looks scary low but isnt", [("systems", 1.0)], ["systems/linux"]),
+    ("how do i profile where my c program actually spends time", [("systems", 1.0)], ["systems/linux"]),
+    ("mmap vs plain read for a huge file, which is faster and why", [("systems", 1.0)], ["systems/linux"]),
+    ("my daemon leaves zombie children, how do i reap them", [("systems", 1.0)], ["systems/linux"]),
+    ("whats the actual difference between fork and exec", [("systems", 1.0)], ["systems/linux"]),
+    ("how do i pin a thread to a specific cpu core", [("systems", 1.0)], ["systems/concurrency"]),
+    ("my embedded board resets at random, is it the watchdog", [("systems", 1.0)], ["systems/embedded"]),
+    ("whats a memory barrier and when do i actually need one", [("systems", 1.0)], ["systems/concurrency"]),
+    ("how do i even start debugging a kernel oops", [("systems", 1.0)], ["systems/kernel"]),
+    # cyber-offensive
+    ("how do i pivot through a compromised host into the internal net", [("cyber-offensive", 1.0)], ["cyber-offensive/lateral-movement"]),
+    ("whats a solid wordlist for brute forcing web directories", [("cyber-offensive", 1.0)], ["cyber-offensive/recon"]),
+    ("how do i get past a waf thats blocking my sqli", [("cyber-offensive", 1.0)], ["cyber-offensive/web-exploitation"]),
+    ("theres a file upload, how do i turn it into code execution", [("cyber-offensive", 1.0)], ["cyber-offensive/web-exploitation"]),
+    ("whats ret2libc and when do i reach for it", [("cyber-offensive", 1.0)], ["cyber-offensive/binary-exploitation"]),
+    ("found a writable /etc/passwd, how do i escalate with it", [("cyber-offensive", 1.0)], ["cyber-offensive/privesc"]),
+    ("whats token impersonation on windows and how do i abuse it", [("cyber-offensive", 1.0)], ["cyber-offensive/privesc"]),
+    ("how do i enumerate domain users once i can reach ldap", [("cyber-offensive", 1.0)], ["cyber-offensive/enumeration"]),
+    ("whats a golden ticket and why is it so bad", [("cyber-offensive", 1.0)], ["cyber-offensive/lateral-movement"]),
+    ("how do i keep access after a reboot without being obvious", [("cyber-offensive", 1.0)], ["cyber-offensive/c2"]),
+    # cloud
+    ("my ecs task cant pull the image, is it a perms thing", [("cloud", 1.0)], ["cloud/aws"]),
+    ("how do i let a pod read an s3 bucket without hardcoding keys", [("cloud", 1.0)], ["cloud/kubernetes"]),
+    ("nodeport vs loadbalancer service, which do i want", [("cloud", 1.0)], ["cloud/kubernetes"]),
+    ("terraform recreates my resource every apply, how do i stop it", [("cloud", 1.0)], ["cloud/terraform-iac"]),
+    ("how do i cache docker layers in github actions properly", [("cloud", 1.0)], ["cloud/ci-cd"]),
+    ("whats a sane autoscaling policy for bursty traffic", [("cloud", 1.0)], ["cloud/kubernetes"]),
+    ("my helm upgrade died halfway, how do i recover the release", [("cloud", 1.0)], ["cloud/kubernetes"]),
+    ("how do i rotate db secrets with no downtime", [("cloud", 1.0)], ["cloud/sre"]),
+    ("fargate vs ec2 for ecs, whats the tradeoff", [("cloud", 1.0)], ["cloud/aws"]),
+    ("theres a mystery charge on my cloud bill, how do i find it", [("cloud", 1.0)], ["cloud/observability"]),
+    # cyber-specialized
+    ("how would i test an iot doorbell for vulns", [("cyber-specialized", 1.0)], ["cyber-specialized/iot-ics-scada"]),
+    ("whats a good approach for auditing a cloud config", [("cyber-specialized", 1.0)], ["cyber-specialized/cloud-sec"]),
+    ("how do i map a companys exposed assets with just osint", [("cyber-specialized", 1.0)], ["cyber-specialized/osint"]),
+    ("how do i get past the biometric lock on a test phone", [("cyber-specialized", 1.0)], ["cyber-specialized/mobile-sec"]),
+    ("whats actually involved in a physical pentest", [("cyber-specialized", 1.0)], ["cyber-specialized/methodology"]),
+    ("how do i sniff zigbee traffic from a smart home", [("cyber-specialized", 1.0)], ["cyber-specialized/wireless-sec"]),
+    ("how do i build a phishing landing page for an authorized test", [("cyber-specialized", 1.0)], ["cyber-specialized/social-engineering"]),
+    ("how do i safely assess a scada hmi without breaking it", [("cyber-specialized", 1.0)], ["cyber-specialized/iot-ics-scada"]),
+    ("whats the real risk with default creds on ip cameras", [("cyber-specialized", 1.0)], ["cyber-specialized/iot-ics-scada"]),
+    ("how do i pull and analyze the firmware off a home router", [("cyber-specialized", 1.0)], ["cyber-specialized/iot-ics-scada"]),
+    # coding
+    ("my recursive fn blows the stack, how do i make it iterative", [("coding", 1.0)], ["coding/python"]),
+    ("whats the idiomatic way to handle errors in rust, Result everywhere?", [("coding", 1.0)], ["coding/rust"]),
+    ("how do i parse json in c without pulling a library", [("coding", 1.0)], ["coding/c"]),
+    ("does the python gil mean threads are pointless for cpu work", [("coding", 1.0)], ["coding/python"]),
+    ("how do i write a generic function in go now that we have them", [("coding", 1.0)], ["coding/go"]),
+    ("trait object vs generic in rust, when which", [("coding", 1.0)], ["coding/rust"]),
+    ("my regex does catastrophic backtracking, how do i rewrite it", [("coding", 1.0)], ["coding/python"]),
+    ("whats a clean way to do dependency injection in java", [("coding", 1.0)], ["coding/java"]),
+    ("shallow vs deep copy, i keep getting bitten by this", [("coding", 1.0)], ["coding/python"]),
+    ("how do i memoize a function in python, functools?", [("coding", 1.0)], ["coding/python"]),
+]
+
+# Near-miss combos for the confusable pairs d9 flagged: appsec vs offensive,
+# and systems vs coding vs cloud. Each spans the pair deliberately so the router
+# learns the boundary instead of collapsing one into the other.
+MESSY_COMBOS += [
+    # appsec <-> offensive (the audit/exploit boundary)
+    ("fuzz this image parser and write a poc for whatever crash it finds", [("cyber-appsec", 0.55), ("cyber-offensive", 0.45)], ["cyber-appsec/fuzzing", "cyber-offensive/binary-exploitation"]),
+    ("audit the auth code then actually try to bypass it to prove it", [("cyber-appsec", 0.5), ("cyber-offensive", 0.5)], ["cyber-appsec/code-audit", "cyber-offensive/web-exploitation"]),
+    ("sast flagged an sqli, confirm it by exploiting the endpoint", [("cyber-appsec", 0.45), ("cyber-offensive", 0.55)], ["cyber-appsec/sast", "cyber-offensive/web-exploitation"]),
+    ("review this binary for bugs and check which are exploitable", [("cyber-appsec", 0.55), ("cyber-offensive", 0.45)], ["cyber-appsec/bug-finding", "cyber-offensive/binary-exploitation"]),
+    ("found a use-after-free while fuzzing, turn it into code exec", [("cyber-appsec", 0.45), ("cyber-offensive", 0.55)], ["cyber-appsec/fuzzing", "cyber-offensive/exploit-dev"]),
+    ("static-analyze the parser then build a crashing input for the worst finding", [("cyber-appsec", 0.5), ("cyber-offensive", 0.5)], ["cyber-appsec/sast", "cyber-offensive/zeroday"]),
+    # systems <-> coding (write low-level systems code)
+    ("write a lock-free ring buffer in rust for my audio thread", [("systems", 0.5), ("coding", 0.5)], ["systems/concurrency", "coding/rust"]),
+    ("implement an epoll-based event loop in c", [("systems", 0.5), ("coding", 0.5)], ["systems/linux", "coding/c"]),
+    ("code a work-stealing thread pool in cpp", [("systems", 0.5), ("coding", 0.5)], ["systems/concurrency", "coding/cpp"]),
+    ("write a custom bump allocator in c and explain the alignment", [("systems", 0.5), ("coding", 0.5)], ["systems/linux", "coding/c"]),
+    # systems <-> cloud (kernel/host tuning for cloud infra)
+    ("tune linux tcp buffers and ulimits on my k8s worker nodes", [("systems", 0.5), ("cloud", 0.5)], ["systems/linux", "cloud/kubernetes"]),
+    ("my container cant use hugepages, is it a kernel or k8s config", [("systems", 0.5), ("cloud", 0.5)], ["systems/kernel", "cloud/kubernetes"]),
+    # coding <-> cloud (write code that drives cloud)
+    ("write a go microservice and containerize it for k8s", [("coding", 0.5), ("cloud", 0.5)], ["coding/go", "cloud/kubernetes"]),
+    ("python script to auto-scale my ec2 fleet on a metric", [("coding", 0.5), ("cloud", 0.5)], ["coding/python", "cloud/aws"]),
+    # systems <-> coding <-> cloud (triple near-miss)
+    ("profile my rust service, fix the hot path, then ship it to k8s", [("systems", 0.34), ("coding", 0.33), ("cloud", 0.33)], ["systems/linux", "coding/rust", "cloud/kubernetes"]),
+]
+
+# Round-3: anchor the offensive category away from appsec with prompts that are
+# UNAMBIGUOUSLY offensive action (exploit / post-exploit / C2 / evasion), using
+# no audit/review verbs that lean appsec. Plus fresh coding + web-mobile. These
+# are red-team routing labels (one-line questions a pentester asks), not exploit
+# code. Fresh topics, deduped, authored independently.
+MESSY_SHORT += [
+    # cyber-offensive — exploitation (act, don't audit)
+    ("i have this sqli, how do i actually pop a shell with it not just detect", [("cyber-offensive", 1.0)], ["cyber-offensive/web-exploitation"]),
+    ("got an rce on a box, how do i upgrade it to an interactive tty", [("cyber-offensive", 1.0)], ["cyber-offensive/exploit-dev"]),
+    ("how do i weaponize this deserialization bug into code exec", [("cyber-offensive", 1.0)], ["cyber-offensive/exploit-dev"]),
+    ("xss on an admin panel, how do i steal the session and take it over", [("cyber-offensive", 1.0)], ["cyber-offensive/web-exploitation"]),
+    ("how do i chain this ssrf into hitting the cloud metadata endpoint", [("cyber-offensive", 1.0)], ["cyber-offensive/web-exploitation"]),
+    # cyber-offensive — post-exploitation
+    ("low-priv shell on windows, how do i dump lsass for creds", [("cyber-offensive", 1.0)], ["cyber-offensive/privesc"]),
+    ("how do i harvest cached credentials after landing on a host", [("cyber-offensive", 1.0)], ["cyber-offensive/privesc"]),
+    ("whats the fastest path to domain admin from a single foothold", [("cyber-offensive", 1.0)], ["cyber-offensive/lateral-movement"]),
+    ("how do i pivot into the next subnet through this compromised host", [("cyber-offensive", 1.0)], ["cyber-offensive/lateral-movement"]),
+    ("how do i exfil a database quietly so it doesnt look like a spike", [("cyber-offensive", 1.0)], ["cyber-offensive/c2"]),
+    # cyber-offensive — C2 and evasion
+    ("how do i set up a c2 beacon with sane sleep and jitter", [("cyber-offensive", 1.0)], ["cyber-offensive/c2"]),
+    ("whats a good c2 channel that blends in with normal https traffic", [("cyber-offensive", 1.0)], ["cyber-offensive/c2"]),
+    ("how do i stage my payload so the first-stage dropper stays tiny", [("cyber-offensive", 1.0)], ["cyber-offensive/c2"]),
+    ("how do i set up persistence that survives a reboot on the target", [("cyber-offensive", 1.0)], ["cyber-offensive/c2"]),
+    ("how do i get my implant past defender on a red team engagement", [("cyber-offensive", 1.0)], ["cyber-offensive/c2"]),
+    ("whats a reasonable way to evade edr during post-ex", [("cyber-offensive", 1.0)], ["cyber-offensive/c2"]),
+    ("how do i bypass amsi so my script actually runs", [("cyber-offensive", 1.0)], ["cyber-offensive/c2"]),
+    # coding — fresh
+    ("whats the borrow checker on about with 'cannot borrow as mutable'", [("coding", 1.0)], ["coding/rust"]),
+    ("how do i reverse a string in place in c", [("coding", 1.0)], ["coding/c"]),
+    ("python whats the clean way to flatten a nested list", [("coding", 1.0)], ["coding/python"]),
+    ("tuple vs list in python, is one actually faster", [("coding", 1.0)], ["coding/python"]),
+    ("kotlin how do i handle a nullable without it crashing", [("coding", 1.0)], ["coding/kotlin"]),
+    ("go why does my map access panic sometimes", [("coding", 1.0)], ["coding/go"]),
+    ("how do i write a python decorator that takes arguments", [("coding", 1.0)], ["coding/python"]),
+    ("pointer vs reference in cpp, when do i use which", [("coding", 1.0)], ["coding/cpp"]),
+    ("how do i pattern match on an enum in rust", [("coding", 1.0)], ["coding/rust"]),
+    ("my js promise never resolves, did i forget to return it", [("coding", 1.0)], ["coding/js-ts"]),
+    # web-mobile — fresh
+    ("my fetch gets an opaque response, is this cors again", [("web-mobile", 1.0)], ["web-mobile/frontend"]),
+    ("how do i lazy load images so the page paints sooner", [("web-mobile", 1.0)], ["web-mobile/frontend"]),
+    ("react state wont update when i mutate the array in place", [("web-mobile", 1.0)], ["web-mobile/frontend"]),
+    ("how do i keep a user logged in across page refreshes", [("web-mobile", 1.0)], ["web-mobile/backend"]),
+    ("my recyclerview scrolls janky on android, whats the fix", [("web-mobile", 1.0)], ["web-mobile/android"]),
+    ("how do i handle deep links into specific screens in an ios app", [("web-mobile", 1.0)], ["web-mobile/ios"]),
+    ("whats the right status code to return for a failed validation", [("web-mobile", 1.0)], ["web-mobile/api-design"]),
+    ("how do i debounce autosave in my web form so it doesnt spam", [("web-mobile", 1.0)], ["web-mobile/frontend"]),
+    ("my service worker keeps serving stale content, how do i bust it", [("web-mobile", 1.0)], ["web-mobile/frontend"]),
+    ("how do i upload a big file from the browser without timing out", [("web-mobile", 1.0)], ["web-mobile/api-design"]),
+]
+
 # A few messy OOS, fresh.
 MESSY_OOS: list[str] = [
     "whats a good marinade for chicken thighs",

@@ -1,0 +1,24 @@
+{
+  "coding": [
+    {"id": "google-research-datasets/mbpp", "config": "full", "split": "train", "text_fields": ["text", "code"], "limit": 2000},
+    {"id": "glaiveai/glaive-code-assistant", "split": "train", "text_fields": ["question", "answer"], "limit": 8000},
+    {"id": "theblackcat102/evol-codealpaca-v1", "split": "train", "text_fields": ["instruction", "output"], "limit": 8000},
+    {"id": "m-a-p/CodeFeedback-Filtered-Instruction", "split": "train", "text_fields": ["query", "answer"], "limit": 8000}
+  ],
+  "math": [
+    {"id": "meta-math/MetaMathQA", "split": "train", "text_fields": ["query", "response"], "limit": 30000},
+    {"id": "AI-MO/NuminaMath-CoT", "split": "train", "text_fields": ["problem", "solution"], "limit": 20000},
+    {"id": "microsoft/orca-math-word-problems-200k", "split": "train", "text_fields": ["question", "answer"], "limit": 60000}
+  ],
+  "cyber": [
+    {"id": "Trendyol/Trendyol-Cybersecurity-Instruction-Tuning-dataset", "split": "train", "text_fields": ["system", "user", "assistant"], "limit": 20000},
+    {"id": "clouditera/security-paper-datasets", "split": "train", "text_fields": ["text"], "limit": 40}
+  ],
+  "science": [
+    {"id": "allenai/sciq", "split": "train", "text_fields": ["question", "support", "correct_answer"], "limit": 13000},
+    {"id": "millawell/wikipedia_field_of_science", "split": "train", "text_fields": ["text"], "limit": 24000}
+  ],
+  "tech": [
+    {"id": "gretelai/synthetic_text_to_sql", "split": "train", "text_fields": ["sql_prompt", "sql_context", "sql", "sql_explanation"], "limit": 55000}
+  ]
+}

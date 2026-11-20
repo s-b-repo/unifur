@@ -1,0 +1,8 @@
+{
+  "coding": [
+    {"id": "google-research-datasets/mbpp", "config": "full", "split": "train", "text_fields": ["text", "code"]},
+    {"id": "glaiveai/glaive-code-assistant", "split": "train", "text_fields": ["question", "answer"]},
+    {"id": "theblackcat102/evol-codealpaca-v1", "split": "train", "text_fields": ["instruction", "output"]},
+    {"id": "m-a-p/CodeFeedback-Filtered-Instruction", "split": "train", "text_fields": ["query", "answer"]}
+  ]
+}

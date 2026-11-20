@@ -340,10 +340,14 @@ def main() -> int:
         # HF streaming mode.
         for spec in specs:
             slug = slugify(spec["id"])
+            # A spec may carry its own "limit" to balance sources within a field
+            # (e.g. few rows of a 1MB/row corpus, many of a small-row one);
+            # falls back to the global --limit.
+            lim = int(spec.get("limit", args.limit))
             try:
-                rows = iter_hf_rows(spec, args.limit)
+                rows = iter_hf_rows(spec, lim)
                 total += write_documents(rows, field, slug, out_root,
-                                         spec.get("text_fields"), args.limit)
+                                         spec.get("text_fields"), lim)
             except Exception as exc:  # network / missing dataset / schema
                 print(f"  {field:16s} {slug:40s}  SKIPPED "
                       f"({exc.__class__.__name__}: {exc})", file=sys.stderr)
