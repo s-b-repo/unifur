@@ -133,9 +133,15 @@ impl Predictions {
 }
 
 /// Numerically stable softmax of one logit row.
+///
+/// A row with no well-defined distribution (a non-finite maximum, or any NaN)
+/// maps to all zeros. The NaN check is not redundant with the maximum check:
+/// `f32::max` skips NaN, so `[1.0, NaN]` has a finite maximum, a NaN sum, and
+/// -- without the check -- a "probability" of `1 / f32::MIN_POSITIVE` ≈ 8.5e37
+/// for class 0.
 fn softmax_row(row: &[f32]) -> Vec<f32> {
     let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    if !max.is_finite() {
+    if !max.is_finite() || row.iter().any(|v| v.is_nan()) {
         return vec![0.0; row.len()];
     }
     let exps: Vec<f32> = row.iter().map(|v| (v - max).exp()).collect();
@@ -242,6 +248,8 @@ fn merge_stats(acc: &mut SamplingStats, batch: SamplingStats) {
     acc.gated_samples += batch.gated_samples;
     acc.layers_executed += batch.layers_executed;
     acc.reduced_precision_windows += batch.reduced_precision_windows;
+    acc.planning_calls += batch.planning_calls;
+    acc.planning_layers += batch.planning_layers;
     // Spans are identical across batches under a deterministic policy, but an
     // adaptive one can differ, so keep them all.
     acc.spans.extend(batch.spans);
@@ -377,6 +385,44 @@ mod tests {
         let mass: f32 = probs.iter().sum();
         assert!((mass - 1.0).abs() < 1e-6);
         assert!(probs[0] > probs[1] && probs[1] > probs[2]);
+    }
+
+    #[test]
+    fn test_softmax_row_with_a_nan_is_not_a_huge_probability() {
+        // `f32::max` skips the NaN, so the maximum is finite while the sum is
+        // NaN; clamping that sum used to report 1 / MIN_POSITIVE for class 0.
+        let probs = softmax_row(&[1.0, f32::NAN, 0.0]);
+        assert!(
+            probs.iter().all(|p| (0.0..=1.0).contains(p)),
+            "probabilities out of range: {probs:?}"
+        );
+    }
+
+    #[test]
+    fn test_merge_stats_accumulates_every_counter() {
+        let batch = || SamplingStats {
+            model_calls: 2,
+            gated_samples: 1,
+            layers_executed: 10,
+            reduced_precision_windows: 1,
+            planning_calls: 3,
+            planning_layers: 4,
+            spans: vec![0..2, 2..4],
+            ..SamplingStats::default()
+        };
+        let mut acc = SamplingStats::default();
+        merge_stats(&mut acc, batch());
+        merge_stats(&mut acc, batch());
+        assert_eq!(acc.model_calls, 4);
+        assert_eq!(acc.gated_samples, 2);
+        assert_eq!(acc.layers_executed, 20);
+        assert_eq!(acc.reduced_precision_windows, 2);
+        assert_eq!(acc.planning_calls, 6, "planning calls dropped by the merge");
+        assert_eq!(
+            acc.planning_layers, 8,
+            "planning layers dropped by the merge"
+        );
+        assert_eq!(acc.spans.len(), 4);
     }
 
     #[test]

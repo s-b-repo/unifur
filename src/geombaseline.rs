@@ -8,7 +8,21 @@
 //!
 //! - the same scene tokens and the same token embedding (same initializer),
 //! - **no position table** -- the reasoner uses none ("the fixed scene layout
-//!   is the position system"), so the baseline gets none either,
+//!   is the position system"), so the baseline gets none either.
+//!   **Caveat: this is not a match.** The reasoner is not position-blind: its
+//!   geometric slots are initialised by pooling *contiguous chunks* of the
+//!   scene (`GeometricReasoner::init_slots`), so which tokens share a region
+//!   of the scene reaches its answer. This baseline has no such path. A
+//!   non-causal transformer with no positions, read at the `?` token (the
+//!   same token in every scene), computes a function of the *multiset* of
+//!   scene tokens: it cannot tell `x` from `y`, a tens digit from a units
+//!   digit, or which point owns which coordinate, so most questions are
+//!   unanswerable for it by construction. A win of the reasoner over this
+//!   arm is therefore not evidence for the attractor-relaxation claim.
+//!   Giving the baseline positions changes its parameter layout (old
+//!   `geom-baseline` checkpoints would not load) or its outputs (they would
+//!   load and compute something else), so it is left to a deliberate re-run
+//!   rather than patched in silently,
 //! - the same `hidden_size`, and a **matched sequential depth**: the
 //!   reasoner's forward answer path runs `num_blocks` refinement blocks, each
 //!   applying `refine_steps` relaxation iterations, and every iteration
@@ -446,24 +460,29 @@ pub fn train_geom_baseline<B: AutodiffBackend<FloatElem = f32>>(
         let tokens_full = Tensor::<B, 1, Int>::from_ints(flat.as_slice(), device)
             .reshape([config.batch_size, meta.scene_len]);
         let (loss, metrics) = model.answer_step(tokens_full);
-        if !metrics.loss.is_finite() {
+        let skipped = !metrics.loss.is_finite();
+        let cycle = if skipped {
             report.steps_skipped += 1;
-            accumulator.skip();
             println!(
                 "step {step}: non-finite loss {}, step discarded",
                 metrics.loss
             );
-            continue;
-        }
-        let scaled = if accumulator.every() > 1 {
-            loss.mul_scalar(accumulator.loss_scale() as f32)
+            // A skip that completes the cycle carries the gradients the
+            // earlier micro-batches folded; dropping it lost the whole step.
+            accumulator.skip()
         } else {
-            loss
+            let scaled = if accumulator.every() > 1 {
+                loss.mul_scalar(accumulator.loss_scale() as f32)
+            } else {
+                loss
+            };
+            let grads = GradientsParams::from_grads(scaled.backward(), &model);
+            accumulator.fold(grads, &model)
         };
-        let grads = GradientsParams::from_grads(scaled.backward(), &model);
-        let cycle = accumulator.fold(grads, &model);
         let Some(summed) = cycle.into_gradients() else {
-            report.steps_accumulated += 1;
+            if !skipped {
+                report.steps_accumulated += 1;
+            }
             continue;
         };
         let mut grads = summed;
@@ -482,6 +501,11 @@ pub fn train_geom_baseline<B: AutodiffBackend<FloatElem = f32>>(
         model = optim.step(lr_schedule.at(step), model, grads);
         if let Some(ema) = ema.as_mut() {
             ema.update::<B>(&model);
+        }
+        if skipped {
+            // The step applied the earlier micro-batches' gradients; this
+            // micro-batch's own metrics are non-finite and are not recorded.
+            continue;
         }
 
         if report.steps_taken == 0 {

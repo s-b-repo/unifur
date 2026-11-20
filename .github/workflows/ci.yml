@@ -5,11 +5,7 @@
 # easier to satisfy than the local one, so "it passed on my machine" and "it
 # passed here" cannot drift apart.
 #
-# The one thing CI does that a laptop does not is check the *declared* minimum
-# Rust version. `Cargo.toml` says `rust-version = "1.85"` while
-# `rust-toolchain.toml` pins 1.96 for development; if the two disagree, either the
-# declared MSRV is a lie or the pin is unnecessary, and the `msrv` job below is
-# what turns that from an argument into a build failure.
+# CI also checks the minimum Rust version declared in `Cargo.toml`.
 
 name: gate
 
@@ -102,21 +98,26 @@ jobs:
   # without anyone updating `rust-version`.
   # --------------------------------------------------------------------------
   msrv:
-    name: MSRV (1.85)
+    name: MSRV
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
+
+      - name: Install the minimum Rust version from Cargo.toml
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"])')
+          rustup toolchain install "$version" --profile minimal --component clippy --no-self-update
+          # Give the minimum version precedence over the development toolchain file.
+          echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
 
       - name: Build at the declared MSRV
-        run: cargo check --all-targets --locked
+        run: |
+          rustc --version
+          cargo check --all-targets --locked
 
-      # The `[lints]` table can name a lint a 1.85 clippy does not have, which
-      # the compiler reports as an unknown-lint *warning*. `-D warnings` turns
-      # that into a failure here rather than in a developer's face six months
-      # later.
+      # Treat an unknown lint at the minimum version as an error.
       - name: The lint table is valid at the MSRV
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
   # --------------------------------------------------------------------------
   # MSRV is a claim; this is the check that the dependency tree can actually
@@ -137,12 +138,11 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: No duplicate dependency versions
+      - name: Report duplicate dependency versions
         run: cargo tree --duplicates
 
-      # Not a failure: a report of what is stale, so the upgrade is a decision
-      # someone makes on purpose rather than an accident of a `cargo update`.
       - name: Outdated dependencies (informational)
+        continue-on-error: true
         run: |
           cargo install cargo-outdated --locked
-          cargo outdated || true
+          cargo outdated

@@ -33,6 +33,9 @@ use std::path::Path;
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
 
+/// Largest JSON header accepted, the reference implementation's limit.
+const MAX_HEADER_BYTES: u64 = 100_000_000;
+
 /// Dtypes this reader decodes. Everything else errors loudly at header time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportDtype {
@@ -136,6 +139,14 @@ pub fn open_index(path: &Path) -> Result<SafetensorsIndex> {
     file.read_exact(&mut len_buf)
         .context("read header length")?;
     let header_len = u64::from_le_bytes(len_buf);
+    // The reference implementation refuses headers over 100 MB
+    // (`HeaderTooLarge`); without a cap, a corrupt length word on a 50 GB
+    // shard is a 50 GB allocation before the JSON parser sees one byte.
+    ensure!(
+        header_len <= MAX_HEADER_BYTES,
+        "header of {} claims {header_len} bytes, over the format's {MAX_HEADER_BYTES}-byte limit",
+        path.display()
+    );
     let data_start = 8u64
         .checked_add(header_len)
         .context("header length overflows u64")?;
@@ -188,6 +199,31 @@ pub fn open_index(path: &Path) -> Result<SafetensorsIndex> {
         tensors.push(meta);
     }
     ensure!(!tensors.is_empty(), "no tensors in {}", path.display());
+    // The format requires the ranges to tile the data section exactly: no
+    // overlap (two names silently aliasing the same bytes, which is also what
+    // a duplicated JSON key collapses into) and no hole or trailing garbage.
+    // Per-tensor bounds checks above cannot see either.
+    let mut ranges: Vec<(u64, u64, &str)> = tensors
+        .iter()
+        .map(|t| (t.start, t.end, t.name.as_str()))
+        .collect();
+    ranges.sort_unstable();
+    let mut cursor = 0u64;
+    for (start, end, name) in &ranges {
+        ensure!(
+            *start == cursor,
+            "tensor {name:?} starts at {start}, but the previous range ends at {cursor} \
+             (overlapping or non-contiguous offsets in {})",
+            path.display()
+        );
+        cursor = *end;
+    }
+    ensure!(
+        data_start.checked_add(cursor) == Some(file_len),
+        "tensor data ends at byte {} of {}, which is {file_len} bytes long",
+        data_start.saturating_add(cursor),
+        path.display()
+    );
     Ok(SafetensorsIndex {
         tensors,
         data_start,
@@ -452,5 +488,84 @@ mod tests {
         assert!(open_index(&cut).is_err());
         std::fs::remove_file(&full).unwrap();
         std::fs::remove_file(&cut).unwrap();
+    }
+
+    /// Write a file from a hand-built header (offsets as given, not derived).
+    fn write_raw(header: serde_json::Value, data: &[u8]) -> std::path::PathBuf {
+        let header_str = serde_json::to_string(&header).unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "dblocks-import-raw-{}-{}.st",
+            std::process::id(),
+            FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&(header_str.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(header_str.as_bytes()).unwrap();
+        file.write_all(data).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_ranges_must_tile_the_data_section() {
+        let data = f32le(&[1.0, 2.0, 3.0, 4.0]);
+        // Exact tiling is accepted (the control case).
+        let ok = write_raw(
+            serde_json::json!({
+                "a": {"dtype": "F32", "shape": [2], "data_offsets": [0, 8]},
+                "b": {"dtype": "F32", "shape": [2], "data_offsets": [8, 16]},
+            }),
+            &data,
+        );
+        assert_eq!(open_index(&ok).unwrap().len(), 2);
+        std::fs::remove_file(&ok).unwrap();
+        // Two names aliasing overlapping bytes: each range is in bounds and
+        // matches its shape, so only the tiling check can refuse it.
+        let overlap = write_raw(
+            serde_json::json!({
+                "a": {"dtype": "F32", "shape": [3], "data_offsets": [0, 12]},
+                "b": {"dtype": "F32", "shape": [2], "data_offsets": [8, 16]},
+            }),
+            &data,
+        );
+        assert!(open_index(&overlap).is_err(), "overlapping ranges accepted");
+        std::fs::remove_file(&overlap).unwrap();
+        // A hole between ranges.
+        let hole = write_raw(
+            serde_json::json!({
+                "a": {"dtype": "F32", "shape": [1], "data_offsets": [0, 4]},
+                "b": {"dtype": "F32", "shape": [2], "data_offsets": [8, 16]},
+            }),
+            &data,
+        );
+        assert!(
+            open_index(&hole).is_err(),
+            "a hole in the data was accepted"
+        );
+        std::fs::remove_file(&hole).unwrap();
+        // Trailing bytes no tensor claims.
+        let trailing = write_raw(
+            serde_json::json!({
+                "a": {"dtype": "F32", "shape": [3], "data_offsets": [0, 12]},
+            }),
+            &data,
+        );
+        assert!(open_index(&trailing).is_err(), "trailing bytes accepted");
+        std::fs::remove_file(&trailing).unwrap();
+    }
+
+    #[test]
+    fn test_oversized_header_length_is_refused_before_allocating() {
+        // A length word claiming more than the format's 100 MB header cap
+        // is refused outright (here it also exceeds the file).
+        let path = std::env::temp_dir().join(format!(
+            "dblocks-import-huge-{}-{}.st",
+            std::process::id(),
+            FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, (MAX_HEADER_BYTES + 1).to_le_bytes()).unwrap();
+        let err = format!("{:#}", open_index(&path).unwrap_err());
+        assert!(err.contains("limit"), "unexpected error: {err}");
+        std::fs::remove_file(&path).unwrap();
     }
 }

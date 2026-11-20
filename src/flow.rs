@@ -86,7 +86,11 @@ where
     let block_idx = rng.random_range(0..model.num_blocks());
     let span = model.layer_range(block_idx);
 
-    // Feed scaled time so its magnitude resembles EDM c_noise magnitudes.
+    // DiT's timestep convention, t in [0, 1000]. This is NOT the EDM
+    // `c_noise = ln(sigma) / 4` range (~[-1.6, 1.1]) the dblock objectives
+    // feed the same embedder, so a trunk trained under one objective sees
+    // out-of-range time inputs under the other. `flow_sample` uses the same
+    // x1000 scale, so flow training and flow sampling agree.
     let timesteps = t * 1000.0;
     let v_pred = model
         .model()

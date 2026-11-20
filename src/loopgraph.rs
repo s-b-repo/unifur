@@ -21,7 +21,9 @@
 //!
 //! 1. it never authorizes more than `budget` block executions,
 //! 2. it always terminates within `max_iterations` iterations,
-//! 3. the ACT mixture weights it produces sum to exactly `1`.
+//! 3. the ACT mixture weights it produces sum to exactly `1` once the run's
+//!    leftover mass is settled onto the last executed block
+//!    ([`LoopPlanner::settle`]; needed when a run ends on a skip).
 //!
 //! Invariant 3 is what makes the output a genuine convex combination of block
 //! outputs: it is the "remainder" rule of Graves (2016), where the final step
@@ -250,6 +252,23 @@ impl LoopPlanner {
             w
         }
     }
+
+    /// Hand over whatever probability mass is still unspent once the run has
+    /// stopped, and zero it.
+    ///
+    /// [`Self::charge`] spends the remainder on the last *execution* it can
+    /// see coming, but a run can also end on a skip -- a trailing block
+    /// judged converged, or a skip on the last allowed iteration -- after a
+    /// non-terminal charge. The leftover then belongs to the last block that
+    /// actually ran (the ACT remainder rule), and the caller adds it to that
+    /// block's weight; without this the weights would sum to less than one
+    /// and the mixture would be a shrunken estimate.
+    pub fn settle(&mut self) -> f32 {
+        let rest = self.remainder;
+        self.remainder = 0.0;
+        self.finished = true;
+        rest
+    }
 }
 
 /// Confidence of an estimate at noise level `sigma`, from its
@@ -385,8 +404,21 @@ impl<B: Backend<FloatElem = f32>> LoopGraph<B> {
 
         trace.iterations = trace.blocks_run.len() + trace.skipped.len();
 
-        let device = z.device();
-        let mut out = mixture.unwrap_or_else(|| Tensor::zeros(z.dims(), &device));
+        // Mass left unspent because the run ended on a skip goes to the last
+        // block that ran, so the weights stay a partition of unity.
+        let rest = planner.settle();
+        if rest > 0.0 {
+            if let (Some((_, last)), Some(w)) = (&last_output, trace.weights.last_mut()) {
+                *w += rest;
+                mixture = mixture.map(|acc| acc + last.clone().mul_scalar(rest));
+            }
+        }
+
+        // Every block skipped means every block judged its input already
+        // converged: the network is the identity on `z`. Returning zeros here
+        // would hand the solver a fabricated estimate pulling toward the
+        // origin.
+        let mut out = mixture.unwrap_or_else(|| z.clone());
         if let Some(skip) = skip_accum {
             out = out + skip;
         }
@@ -451,7 +483,35 @@ mod tests {
                 break;
             }
         }
+        let rest = planner.settle();
+        if let Some(w) = weights.last_mut() {
+            *w += rest;
+        }
         (run, weights, iterations)
+    }
+
+    #[test]
+    fn test_a_run_ending_on_a_skip_still_spends_all_the_mass() {
+        // Run, run, then the last block is judged converged and skipped. The
+        // two charges were non-terminal, so without settling the weights
+        // would sum to 0.51 and the mixture would be a shrunken estimate.
+        let config = LoopGraphConfig {
+            skip_threshold: 0.5,
+            loopback_threshold: f32::NEG_INFINITY,
+            exit_threshold: f32::INFINITY,
+            ..LoopGraphConfig::default()
+        };
+        let mut planner = LoopPlanner::new(config, 3);
+        assert_eq!(planner.next(0.1), Decision::Run(0));
+        let w0 = planner.charge(0.3);
+        assert_eq!(planner.next(0.1), Decision::Run(1));
+        let w1 = planner.charge(0.3);
+        assert_eq!(planner.next(0.9), Decision::Skip(2));
+        assert_eq!(planner.next(0.9), Decision::Stop);
+        assert!((w0 + w1 - 0.51).abs() < 1e-6, "{w0} + {w1}");
+        let rest = planner.settle();
+        assert!((w0 + w1 + rest - 1.0).abs() < 1e-6, "mass {}", w0 + w1 + rest);
+        assert_eq!(planner.settle(), 0.0, "settling twice spends nothing more");
     }
 
     #[test]
@@ -672,5 +732,18 @@ mod tests {
             got <= bound + 1e-5,
             "a convex mixture cannot exceed its inputs: {got} > {bound}"
         );
+
+        // Every block skipped: the input passes through unchanged instead of
+        // being replaced by a fabricated all-zero estimate.
+        let skip_all = LoopGraphConfig {
+            skip_threshold: f32::NEG_INFINITY,
+            loopback_threshold: f32::NEG_INFINITY,
+            ..LoopGraphConfig::default()
+        };
+        let (x0, trace) = graph.x0_estimate(&model, &pixels, &z, 1.0, &skip_all);
+        assert!(trace.blocks_run.is_empty());
+        assert_eq!(trace.skipped, vec![0, 1]);
+        let gap = (x0 - z.clone()).abs().max().into_scalar();
+        assert_eq!(gap, 0.0, "a fully skipped graph must be the identity on z");
     }
 }

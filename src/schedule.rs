@@ -695,15 +695,16 @@ impl<B: Backend<FloatElem = f32>> ModuleMapper<B> for EmaMapper<B> {
         );
 
         let live = Tensor::<B, D>::from_data(data.clone(), &current.device());
-        // `decay` weights the NEW value, not the retained one. Its own warm-up
-        // formula fixes the convention: `effective_decay` starts near 0.1 and
-        // ramps toward `decay`, and that ramp only means "start out tracking
-        // the live weights slowly, then speed up" if a small `decay` is a
-        // small pull toward the live value. Blending it the other way makes the
-        // ramp an acceleration toward the *old* shadow, which is the opposite
-        // of the documented warm-up and leaves the early average pinned to
-        // its initialization.
-        let blended = current.mul_scalar(1.0 - self.decay) + live.mul_scalar(self.decay);
+        // `shadow <- decay * shadow + (1 - decay) * live`, exactly as the type
+        // documents: `decay` weights the RETAINED shadow. That is the only
+        // reading under which the warm-up in `effective_decay` is a bias
+        // correction -- early on the effective decay is ~0.1, so the shadow
+        // mostly follows the live weights instead of staying pinned to its
+        // initialization, and it ramps toward the nominal decay (e.g. 0.999)
+        // as the history becomes trustworthy. Weighting the *live* value by
+        // `decay` instead (an earlier version did) makes a 0.999 "average" a
+        // 0.1% lag behind the live weights -- no averaging at all.
+        let blended = current.mul_scalar(self.decay) + live.mul_scalar(1.0 - self.decay);
         Param::from_tensor(blended.detach()).set_require_grad(false)
     }
 }
@@ -1224,6 +1225,61 @@ mod tests {
         assert!(
             converged < gap_to_new,
             "the shadow must approach the live weights"
+        );
+    }
+
+    #[test]
+    fn test_ema_decay_weights_the_retained_shadow() {
+        // `shadow <- d * shadow + (1 - d) * live`. Pinned numerically because
+        // the inverted blend (`(1 - d) * shadow + d * live`) passes every
+        // "lies between the two" check while turning a 0.999 average into a
+        // copy of the live weights.
+        use crate::dblock::{DblockClassifier, DblockConfig};
+        use crate::vit::ViTDiTConfig;
+        use burn::backend::NdArray;
+
+        type N = NdArray<f32>;
+        let device = Default::default();
+        let cfg = ViTDiTConfig::tiny(10);
+        let db = DblockConfig {
+            num_blocks: 2,
+            ..DblockConfig::default()
+        };
+        let model = DblockClassifier::<N>::new(&cfg, &db, &device).unwrap();
+        crate::tensor_ext::force_initialization(&model);
+        let mut rec = model.clone().into_record();
+        let shifted = rec.model.vit.embeddings.label_embeddings.weight.val() + 1.0;
+        rec.model.vit.embeddings.label_embeddings.weight =
+            burn::module::Param::from_tensor(shifted.detach());
+        let moved = DblockClassifier::<N>::new(&cfg, &db, &device)
+            .unwrap()
+            .load_record(rec);
+        let table = |m: &DblockClassifier<N>| m.model().label_embedding_weight();
+        // How far the shadow moved toward `moved`, as a fraction of the unit gap.
+        let pulled = |ema: &Ema<DblockClassifier<N>>| -> f32 {
+            (table(ema.shadow()) - table(&model)).mean().into_scalar()
+        };
+
+        // First update: effective decay min(0.99, 1/10) = 0.1, so the shadow
+        // keeps 10% of its history and takes 90% of the live value.
+        let mut fresh = Ema::new(&model, 0.99);
+        assert!((fresh.effective_decay() - 0.1).abs() < 1e-12);
+        fresh.update::<N>(&moved);
+        assert!(
+            (pulled(&fresh) - 0.9).abs() < 1e-4,
+            "first update must take 1 - 0.1 of the gap, took {}",
+            pulled(&fresh)
+        );
+
+        // Warmed up: the nominal decay rules, and one update moves the shadow
+        // by only (1 - 0.99) of the gap -- that lag is what an average is.
+        let mut warm = Ema::from_parts(model.clone(), 0.99, 1_000_000);
+        assert!((warm.effective_decay() - 0.99).abs() < 1e-12);
+        warm.update::<N>(&moved);
+        assert!(
+            (pulled(&warm) - 0.01).abs() < 1e-4,
+            "a warmed-up 0.99 EMA must take 1% of the gap, took {}",
+            pulled(&warm)
         );
     }
 

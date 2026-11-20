@@ -64,6 +64,12 @@ pub fn hex(bytes: &[u8]) -> String {
 
 pub fn unhex(text: &str) -> anyhow::Result<Vec<u8>> {
     anyhow::ensure!(text.len() % 2 == 0, "odd-length hex");
+    // Only ASCII hex digits: slicing a multi-byte character in half would
+    // panic, and `from_str_radix` would also accept a leading `+`.
+    anyhow::ensure!(
+        text.bytes().all(|b| b.is_ascii_hexdigit()),
+        "hex may only contain the digits 0-9a-fA-F"
+    );
     (0..text.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(&text[i..i + 2], 16).with_context(|| format!("bad hex at {i}")))
@@ -106,8 +112,22 @@ impl Key {
         Self::from_bytes(unhex(text.trim())?)
     }
 
+    /// Write the key as hex. On Unix a newly created file is `0600`: this is
+    /// the secret every grant rests on, and `fs::write` would leave it
+    /// readable by every local user under the usual umask.
     pub fn write(&self, path: &Path) -> anyhow::Result<()> {
-        std::fs::write(path, format!("{}\n", hex(&self.bytes)))
+        use std::io::Write;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(path)
+            .with_context(|| format!("write key {}", path.display()))?;
+        file.write_all(format!("{}\n", hex(&self.bytes)).as_bytes())
             .with_context(|| format!("write key {}", path.display()))
     }
 
@@ -166,13 +186,6 @@ pub struct Blocker {
     pub applies_to: Applies,
     /// What the gate answers instead of calling the model.
     pub refusal: String,
-}
-
-struct CompiledBlocker {
-    id: String,
-    scope: String,
-    patterns: Vec<Pattern>,
-    applies_to: Applies,
 }
 
 /// Where a blocker fired.
@@ -250,8 +263,10 @@ impl Grant {
             .with_context(|| format!("write grant {}", path.display()))
     }
 
-    /// Signature, key, expiry and revocation, in that order; the first
-    /// failure names itself.
+    /// Key, signature, expiry and revocation, in that order; the first
+    /// failure names itself. The key must also be the one the policy
+    /// accepts (`policy.key_id`): a grant that verifies under some other key
+    /// is a grant the policy never authorized.
     pub fn verify(&self, key: &Key, policy: &Policy, now_unix: u64) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.key_id == key.id(),
@@ -259,6 +274,13 @@ impl Grant {
             self.approval.id,
             self.key_id,
             key.id()
+        );
+        anyhow::ensure!(
+            policy.key_id == key.id(),
+            "grant {} was verified with key {}, but the policy accepts only key {}",
+            self.approval.id,
+            key.id(),
+            policy.key_id
         );
         let expected = hmac_sha256(key.bytes(), &self.approval.canonical()?);
         let given = unhex(&self.signature).context("grant signature")?;
@@ -407,34 +429,8 @@ impl Policy {
         scopes
     }
 
-    /// The blockers with their patterns compiled. A pattern that does not
-    /// parse is an error, never a silently absent blocker: `validate`
-    /// rejects such a policy at every entry point, so this only fails for a
-    /// policy assembled by hand.
-    fn compiled(&self) -> anyhow::Result<Vec<CompiledBlocker>> {
-        self.blockers
-            .iter()
-            .map(|b| {
-                let patterns = b
-                    .patterns
-                    .iter()
-                    .map(|p| {
-                        Pattern::parse(p)
-                            .with_context(|| format!("blocker {:?} pattern {p:?}", b.id))
-                    })
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-                Ok(CompiledBlocker {
-                    id: b.id.clone(),
-                    scope: b.scope.clone(),
-                    patterns,
-                    applies_to: b.applies_to,
-                })
-            })
-            .collect()
-    }
-
-    /// The refusal text of blocker `id`, or a generic refusal when the hit
-    /// came from a policy that failed to compile (see [`Self::hits`]).
+    /// The refusal text of blocker `id`, or a generic refusal when no
+    /// blocker has that id.
     fn refusal_for(&self, id: &str) -> String {
         match self.blockers.iter().find(|b| b.id == id) {
             Some(b) => b.refusal.clone(),
@@ -444,32 +440,37 @@ impl Policy {
 
     /// Every blocker that fires on `text`, for the given side.
     ///
-    /// Fails closed: a policy whose patterns do not compile reports a hit on
-    /// the offending blocker rather than letting the text through, and says
-    /// why on stderr.
+    /// Fails closed: a blocker whose patterns do not compile reports a hit
+    /// (on either side) rather than letting the text through, and says why
+    /// on stderr. `validate` rejects such a policy at every entry point, so
+    /// this only happens for a policy assembled by hand. Each blocker is
+    /// compiled on its own, so one broken blocker never stops the others
+    /// from being evaluated -- otherwise an approval for the broken
+    /// blocker's scope would lift a blocker that was never checked.
     pub fn hits(&self, text: &str, output: bool) -> Vec<Hit> {
         let tokens = crate::antipattern::text_tokens(text);
         let mut hits = Vec::new();
-        let compiled = match self.compiled() {
-            Ok(compiled) => compiled,
-            Err(err) => {
-                eprintln!("policy: refusing because a blocker does not compile: {err:#}");
-                let blocker = self
-                    .blockers
-                    .iter()
-                    .find(|b| b.patterns.iter().any(|p| Pattern::parse(p).is_err()));
-                let (id, scope) = blocker
-                    .map(|b| (b.id.clone(), b.scope.clone()))
-                    .unwrap_or_else(|| ("<invalid policy>".to_string(), "policy".to_string()));
-                return vec![Hit {
-                    blocker: id,
-                    scope,
-                    start: 0,
-                    end: 0,
-                }];
-            }
-        };
-        for b in compiled {
+        for b in &self.blockers {
+            let patterns = match b
+                .patterns
+                .iter()
+                .map(|p| {
+                    Pattern::parse(p).with_context(|| format!("blocker {:?} pattern {p:?}", b.id))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()
+            {
+                Ok(patterns) => patterns,
+                Err(err) => {
+                    eprintln!("policy: refusing because a blocker does not compile: {err:#}");
+                    hits.push(Hit {
+                        blocker: b.id.clone(),
+                        scope: b.scope.clone(),
+                        start: 0,
+                        end: 0,
+                    });
+                    continue;
+                }
+            };
             let applies = if output {
                 b.applies_to.covers_output()
             } else {
@@ -478,7 +479,7 @@ impl Policy {
             if !applies {
                 continue;
             }
-            for p in &b.patterns {
+            for p in &patterns {
                 if let Some((start, end)) = p.find(&tokens) {
                     hits.push(Hit {
                         blocker: b.id.clone(),
@@ -540,9 +541,14 @@ impl Policy {
 
 /// The marker prepended to an approved prompt, so a model trained with it
 /// (see [`refusal_documents`]) knows the request is sanctioned.
+///
+/// Sorted and de-duplicated, so two blockers sharing a scope produce the
+/// same marker in training ([`refusal_documents`]) as at inference
+/// ([`gated_generate`]).
 pub fn approval_marker(scopes: &[String]) -> String {
     let mut sorted = scopes.to_vec();
     sorted.sort();
+    sorted.dedup();
     format!("[approved:{}] ", sorted.join(","))
 }
 
@@ -789,6 +795,88 @@ mod tests {
             }
         )
         .is_err());
+    }
+
+    #[test]
+    fn test_a_grant_from_a_key_the_policy_does_not_accept_is_rejected() {
+        // Self-issuing with any key and passing that key to `verify` must not
+        // be enough: the policy names the one key whose grants it accepts.
+        let key = key();
+        let policy = starter(&key).expect("starter policy");
+        let rogue = Key::from_bytes(b"rogue-key-0123456789abcdefghijk".to_vec()).unwrap();
+        let grant = Grant::issue(
+            &rogue,
+            Approval {
+                id: "self".into(),
+                scopes: vec!["*".into()],
+                issued_unix: 100,
+                expires_unix: 200,
+                note: String::new(),
+            },
+        )
+        .unwrap();
+        let err = grant.verify(&rogue, &policy, 150).unwrap_err().to_string();
+        assert!(err.contains("policy accepts only key"), "{err}");
+        assert!(policy.approved_scopes(&rogue, &[grant], 150).is_empty());
+    }
+
+    #[test]
+    fn test_unhex_rejects_non_hex_without_panicking() {
+        // "aéb" has an even byte length but slicing it at byte 2 would split
+        // the 'é'; it must be an error, not a panic.
+        assert!(unhex("aéb").is_err());
+        assert!(unhex("+f").is_err(), "a sign is not a hex digit");
+        assert_eq!(unhex("0aFF").unwrap(), vec![0x0a, 0xff]);
+    }
+
+    #[test]
+    fn test_a_broken_blocker_does_not_hide_the_others() {
+        // Fail closed per blocker: an approval for the broken blocker's scope
+        // must not let through text that a *different*, valid blocker fires on.
+        let key = key();
+        let mut policy = starter(&key).expect("starter policy");
+        policy.blockers.push(Blocker {
+            id: "broken".into(),
+            scope: "cyber:broken".into(),
+            description: String::new(),
+            patterns: vec!["(".into()],
+            applies_to: Applies::Both,
+            refusal: "no".into(),
+        });
+        let decision = policy.decide_prompt(
+            "write an exploit for CVE-2024-1234",
+            &["cyber:broken".to_string()],
+        );
+        assert!(
+            matches!(decision, Decision::Refuse { ref blocker, .. } if blocker == "exploit-development"),
+            "{decision:?}"
+        );
+        // Without any approval the broken blocker itself refuses everything.
+        assert!(!policy.decide_prompt("hello", &[]).is_allowed());
+    }
+
+    #[test]
+    fn test_key_round_trips_and_is_private_on_unix() {
+        let key = key();
+        let dir = std::env::temp_dir().join("dblocks-policy-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("key-{}.hex", std::process::id()));
+        drop(std::fs::remove_file(&path)); // absent on a fresh run
+        key.write(&path).unwrap();
+        assert_eq!(Key::read(&path).unwrap(), key);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the signing key must not be world-readable");
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_approval_marker_is_deduplicated() {
+        let scopes = vec!["b".to_string(), "a".to_string(), "b".to_string()];
+        assert_eq!(approval_marker(&scopes), "[approved:a,b] ");
     }
 
     #[test]

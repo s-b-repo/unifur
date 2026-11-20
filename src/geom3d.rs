@@ -676,7 +676,7 @@ fn plane_shares_a_point(first: &Plane3, second: &Plane3) -> anyhow::Result<bool>
 }
 
 /// The exact line where two planes meet: direction `d = n1 x n2`, and the point
-/// `(d2 (n1 x d) + d1 (d x n2)) / |d|^2`, which satisfies both plane equations
+/// `(d1 (n2 x d) + d2 (d x n1)) / |d|^2`, which satisfies both plane equations
 /// identically -- the two cross products are perpendicular to one of the normals
 /// each, so the formula is checkable by re-deriving rather than by trust.
 ///
@@ -696,10 +696,11 @@ pub fn intersect_plane_plane(first: &Plane3, second: &Plane3) -> anyhow::Result<
             GeometryError::ParallelLines
         }
     );
-    // `n2 x d` is perpendicular to `n1` and `d x n1` is perpendicular to `n2`,
-    // and the remaining dot products are both `|d|^2` by the scalar triple
-    // product -- so `n1 . p = d1` and `n2 . p = d2` hold identically, which is
-    // what makes this checkable rather than merely plausible.
+    // `n2 x d` is perpendicular to `n2` and `d x n1` is perpendicular to `n1`,
+    // and the remaining dot products `n1 . (n2 x d)` and `n2 . (d x n1)` are
+    // both `|d|^2` by the scalar triple product -- so `n1 . p = d1` and
+    // `n2 . p = d2` hold identically, which is what makes this checkable
+    // rather than merely plausible.
     let (n2_turn, d_turn) = (
         second.normal.cross(&direction)?,
         direction.cross(&first.normal)?,
@@ -1410,9 +1411,10 @@ impl Rotation {
 ///   so quarter and half turns and the 3-4-5 turn are available and a
 ///   60-degree turn is not;
 /// - the *axis direction* must have a rational length. `(0, 0, 1)`, `(3, 4, 0)`
-///   and `(1, 1, 0)` are fine; `(1, 1, 1)` has length `sqrt(3)` and is refused
-///   with [`GeometryError::IrrationalRequired`], because normalizing it would
-///   put `sqrt(3)` denominators into what is supposed to be a rational point.
+///   and `(2, 3, 6)` are fine; `(1, 1, 0)` (length `sqrt(2)`) and `(1, 1, 1)`
+///   (length `sqrt(3)`) are refused with [`GeometryError::IrrationalRequired`],
+///   because normalizing them would put a square root into the denominators of
+///   what is supposed to be a rational point.
 ///
 /// Note the thing a 2D habit gets wrong: a rotation is defined about a *line*,
 /// and a point on the axis is a fixed point. `rotation_about_axis` on a point of

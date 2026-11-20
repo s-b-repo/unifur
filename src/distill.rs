@@ -288,11 +288,15 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             // the same solver draws; the targets are then averaged.
             let ratio = (sigma_lo / sigma_hi).powf(1.0 / substeps as f64);
             let mut target: Option<Tensor<B, 2>> = None;
+            // One seed for all teachers, drawn once: a stochastic solver must
+            // see the *same* draws in every trajectory, or the averaged target
+            // mixes teacher disagreement with independent solver noise.
+            let solver_seed = rng.random::<u64>();
             for (teacher, w) in teachers {
                 let mut z_teacher = zt.clone().detach();
                 let mut sigma = sigma_hi;
                 let mut solver = crate::solver::SolverState::new(config.solver);
-                let mut local_rng = rand::rngs::StdRng::seed_from_u64(rng.random::<u64>());
+                let mut local_rng = rand::rngs::StdRng::seed_from_u64(solver_seed);
                 for _ in 0..substeps {
                     let next = sigma * ratio;
                     let x0 = teacher

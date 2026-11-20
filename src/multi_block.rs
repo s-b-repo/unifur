@@ -217,12 +217,22 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
                 z = window_precision.round(z);
             }
 
+            // Probabilities are needed by the adaptive strategy *and* by a
+            // gate with a confidence floor; without them `quality::evaluate`
+            // skips the confidence check, so a configured `min_confidence`
+            // would silently never fire under any other strategy.
+            let gate_needs_probs = config
+                .strategy
+                .gate
+                .for_block(base_block)
+                .min_confidence
+                .is_some();
             let (x0, probs) = self.x0_estimate_probs(
                 pixel_values,
                 &z,
                 sigma,
                 Some(span.clone()),
-                config.strategy.inner.needs_probabilities(),
+                config.strategy.inner.needs_probabilities() || gate_needs_probs,
             );
             let x0 = window_precision.round(x0);
             stats.model_calls += 1;
@@ -265,14 +275,25 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             }
 
             // The solver may need extra evaluations (Heun's corrector); they
-            // reuse the same span policy and the same precision, so both the
-            // cost accounting and the emulated arithmetic stay consistent with
-            // the primary call.
+            // reuse the same span policy, the same precision and the same
+            // guidance, so the cost accounting, the emulated arithmetic and
+            // the guided dynamics all stay consistent with the primary call.
+            // (A corrector without guidance would average a guided slope with
+            // an unguided one.)
             let mut predictor = |sig: f64, zz: &Tensor<B, 2>| {
+                let precision = config.precision.for_sigma(sig);
                 stats.model_calls += 1;
                 stats.layers_executed += span.len();
-                let estimate = self.x0_estimate(pixel_values, zz, sig, Some(span.clone()));
-                config.precision.for_sigma(sig).round(estimate)
+                let estimate =
+                    precision.round(self.x0_estimate(pixel_values, zz, sig, Some(span.clone())));
+                if config.guidance.is_identity() {
+                    return estimate;
+                }
+                stats.model_calls += 1;
+                stats.layers_executed += span.len();
+                let uncond =
+                    self.x0_estimate_unconditional(pixel_values, zz, sig, Some(span.clone()));
+                config.guidance.apply(estimate, precision.round(uncond))
             };
             let new_z = solver.step(sigma, s_next, z.clone(), &x0, &mut predictor, rng);
 
@@ -463,7 +484,9 @@ impl PlanTrace {
 
     /// Steps the planner chose, excluding any forced final step.
     pub fn planned_steps(&self) -> usize {
-        self.depths.len() - usize::from(self.forced_final_step)
+        self.depths
+            .len()
+            .saturating_sub(usize::from(self.forced_final_step))
     }
 
     /// Total candidate evaluations across the run.

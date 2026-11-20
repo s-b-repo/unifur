@@ -157,6 +157,13 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         let steps = dblock_config
             .num_inference_steps
             .unwrap_or(dblock_config.num_blocks);
+        // Zero steps gives an empty schedule, and `diffusion_step` reads its
+        // first sigma: refuse it here, naming the field, instead of panicking
+        // on an index at inference time.
+        anyhow::ensure!(
+            steps >= 1,
+            "num_inference_steps must be at least 1, not {steps}"
+        );
         let inference_sigmas = discrete_sigmas_dblock(steps, SIGMA_MIN, SIGMA_MAX, P_MEAN, P_STD);
 
         let model = ViTDiTForImageClassification::new(vit_config, device)?
@@ -193,7 +200,6 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         self.sigma_data
     }
 
-    /// Weight applied to the MoE load-balancing auxiliary loss.
     /// Attach zero selection biases to every sparse layer that lacks one
     /// (roadmap 23.5). Call after loading a checkpoint: Burn zips an `Option`
     /// field with its record, so a bias missing on either side comes back as
@@ -231,6 +237,7 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         self.model.vit().balance_biases()
     }
 
+    /// Weight applied to the MoE load-balancing auxiliary loss.
     pub fn moe_aux_weight(&self) -> f64 {
         self.moe_aux_weight
     }
@@ -398,9 +405,17 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         let b = pixel_values.dims()[0];
         let h_dim = self.model.label_embedding_weight().dims()[1];
 
-        let schedule =
-            crate::sigma::discrete_sigmas_dblock(num_steps, SIGMA_MIN, SIGMA_MAX, P_MEAN, P_STD);
-        let s0 = schedule[0];
+        // `discrete_sigmas_dblock` yields exactly `num_steps` sigmas, so zero
+        // steps would be an empty schedule; one step is the least that has a
+        // starting noise level to read.
+        let schedule = crate::sigma::discrete_sigmas_dblock(
+            num_steps.max(1),
+            SIGMA_MIN,
+            SIGMA_MAX,
+            P_MEAN,
+            P_STD,
+        );
+        let s0 = schedule.first().copied().unwrap_or(SIGMA_MAX);
         let initial = Tensor::<B, 2>::random(
             [b, h_dim],
             Distribution::Normal(0.0, 1.0),
@@ -416,8 +431,8 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             rng,
         );
 
-        // `discrete_sigmas_dblock` always yields at least two sigmas; the
-        // first was read above as `s0`, so the last is present too.
+        // The schedule is non-empty (at least one step, above), so this is
+        // its smallest sigma.
         let min_sigma = schedule.last().copied().unwrap_or(s0);
         self.denoise(pixel_values.clone(), z_end, &vec![min_sigma; b], None)
     }
@@ -797,6 +812,39 @@ mod tests {
             (got - expected).abs() < 1e-4,
             "aggregated loss {got} != weighted mean {expected}"
         );
+    }
+
+    #[test]
+    fn test_zero_inference_steps_is_refused_at_construction() {
+        // An empty schedule used to build fine and then panic indexing its
+        // first sigma inside `diffusion_step`.
+        let device = Default::default();
+        let err = DblockClassifier::<B>::new(
+            &ViTDiTConfig::tiny(10),
+            &DblockConfig {
+                num_blocks: 2,
+                num_inference_steps: Some(0),
+                ..DblockConfig::default()
+            },
+            &device,
+        )
+        .expect_err("zero inference steps must be refused");
+        assert!(err.to_string().contains("num_inference_steps"), "{err}");
+
+        // One step is the smallest schedule, and it runs.
+        let one = DblockClassifier::<B>::new(
+            &ViTDiTConfig::tiny(10),
+            &DblockConfig {
+                num_blocks: 2,
+                num_inference_steps: Some(1),
+                ..DblockConfig::default()
+            },
+            &device,
+        )
+        .unwrap();
+        assert_eq!(one.inference_sigmas().len(), 1);
+        let pixels = Tensor::<B, 4>::zeros([2, 3, 32, 32], &device);
+        assert_eq!(one.diffusion_step(pixels).dims(), [2, 10]);
     }
 
     #[test]

@@ -138,7 +138,7 @@ impl LoadReport {
 pub const PERMISSIVE_LICENSES: &[&str] = &[
     "MIT",
     "Apache-2.0",
-    "BSD-2-3",
+    "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
     "Unlicense",
@@ -150,11 +150,20 @@ pub const PERMISSIVE_LICENSES: &[&str] = &[
 /// whitespace-insensitive: `"Apache 2.0"`, `"apache-2.0"`, and
 /// `"APACHE-2.0"` all match the `Apache-2.0` entry on the
 /// permissive list.
+///
+/// The match is on the *whole* identifier, not a substring: a substring
+/// test accepted `"Limited"` and `"Commercial-Limited"` (they contain
+/// `MIT`) and `"LicenseRef-Misc"` (it contains `ISC`). An SPDX `OR`
+/// expression is permissive when any alternative is, since the licensee
+/// may choose it; anything else (`AND`, `WITH`, free text) is rejected.
 pub fn is_permissive(license: &str) -> bool {
     let normalized = license.trim().to_ascii_uppercase().replace([' ', '_'], "-");
-    PERMISSIVE_LICENSES
-        .iter()
-        .any(|p| normalized.contains(p.to_ascii_uppercase().as_str()))
+    normalized.split("-OR-").any(|alternative| {
+        let alternative = alternative.trim_matches(|c| c == '(' || c == ')' || c == '-');
+        PERMISSIVE_LICENSES
+            .iter()
+            .any(|p| alternative == p.to_ascii_uppercase())
+    })
 }
 
 // ------------------------------------------------------ CodeReviewer --
@@ -303,7 +312,11 @@ pub fn load_swe_bench(path: &Path) -> Result<(Vec<Example>, LoadReport)> {
                 severity: 1.0,
                 explanation: row.problem_statement.clone(),
             }],
-            test_command: Some(row.test_patch.clone()),
+            // Not `row.test_patch`: that is SWE-bench's held-out test diff
+            // -- the very tests a fix is judged by -- not a command, and
+            // rendering it into the prompt ("Tests must pass: <diff>") would
+            // leak the evaluation into every training and eval prompt.
+            test_command: None,
         };
         let id = if row.instance_id.is_empty() {
             format!("line:{}", line_no + 1)
@@ -555,8 +568,25 @@ mod tests {
         );
         let (examples, report) = load_swe_bench(&path).unwrap();
         assert_eq!(report.loaded, 1);
-        assert!(examples[0].prompt.text.contains("Tests must pass"));
+        // The held-out test patch must never reach the prompt.
+        assert!(!examples[0].prompt.text.contains("Tests must pass"));
+        assert!(!examples[0].prompt.text.contains("test_f"));
+        assert!(examples[0].prompt.text.contains("fix f"));
         assert_eq!(examples[0].source, Source::SweBench);
+    }
+
+    #[test]
+    fn test_permissive_matching_is_by_identifier_not_substring() {
+        // Each of these contains a permissive id as a substring.
+        assert!(!is_permissive("Limited"));
+        assert!(!is_permissive("Commercial-Limited-Use"));
+        assert!(!is_permissive("LicenseRef-Misc"));
+        assert!(!is_permissive("GPL-3.0 AND MIT"));
+        // Real identifiers and OR-expressions still match.
+        assert!(is_permissive("BSD-2-Clause"));
+        assert!(is_permissive("MIT OR Apache-2.0"));
+        assert!(is_permissive("(GPL-3.0 OR MIT)"));
+        assert!(!is_permissive("GPL-2.0-or-later"));
     }
 
     #[test]

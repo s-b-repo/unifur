@@ -1527,7 +1527,11 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
     ) -> LmStep<B> {
         assert_eq!(mask.dims()[0], tokens.dims()[0]);
         assert_eq!(mask.dims()[1], tokens.dims()[1]);
-        let (out, states) = match extras.has_active_direction() {
+        // The same rule as the unmasked path: MTP reads the last hidden state,
+        // and without it the configured MTP term was silently dropped from
+        // every masked (SFT) step.
+        let need_states = extras.has_active_direction() || self.mtp_active();
+        let (out, states) = match need_states {
             true => self.forward_span_states(tokens.clone(), span.clone(), None),
             false => (self.forward_span(tokens.clone(), span.clone()), Vec::new()),
         };
@@ -1584,6 +1588,16 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         };
         let counted = loss_keep.clone().sum().clamp_min(1.0);
         let keep_all = loss_keep.clone();
+        // Targets that actually carry loss. Counted *before* the clamp above:
+        // reading the clamped denominator reported one target for a window
+        // with none, so the trainer's "no supervised target" guard could never
+        // fire and every such window inflated `tokens_seen`.
+        let supervised = loss_keep.clone().greater_elem(0.0).float().sum();
+        // Perplexity is `exp` of the mean NLL over the counted targets -- not of
+        // the objective, which also carries the unlikelihood charge, the
+        // distillation KL, the direction and MTP terms.
+        let mean_nll: f32 =
+            ((nll.clone() * loss_keep.clone()).sum() / counted.clone()).into_scalar();
 
         let (loss, penalized_tokens, penalty, penalized_prob) = match negatives {
             None => ((nll * loss_keep).sum() / counted.clone(), 0, 0.0, 0.0),
@@ -1784,8 +1798,8 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             crate::moe::RoutingStats::summarize(&routing);
         let metrics = LmMetrics {
             loss: value,
-            perplexity: value.exp(),
-            tokens_counted: counted.into_scalar() as usize,
+            perplexity: mean_nll.exp(),
+            tokens_counted: supervised.into_scalar() as usize,
             balance_loss: out
                 .balance_loss
                 .as_ref()
@@ -2159,10 +2173,13 @@ pub struct LmStep<B: Backend> {
 #[derive(Debug, Clone, Copy)]
 pub struct LmMetrics {
     pub loss: f32,
-    /// `exp(loss)` — the per-token branching factor, which is the number
-    /// language modeling is actually read in.
+    /// `exp` of the mean next-token NLL over the counted targets (flagged
+    /// ones included) — the per-token branching factor, which is the number
+    /// language modeling is actually read in. Not `exp(loss)`: `loss` also
+    /// carries every auxiliary term.
     pub perplexity: f32,
-    /// Non-padding targets the loss was averaged over.
+    /// Non-padding targets the loss was averaged over (with a loss mask,
+    /// those it gives a positive weight); 0 when there were none.
     pub tokens_counted: usize,
     pub balance_loss: f32,
     /// Targets carrying a penalty weight (roadmap Phase 24); 0 without labels.
@@ -2862,6 +2879,19 @@ mod tests {
         );
         assert!((metrics.penalized_prob - prob / 2.0).abs() < 1e-6);
         assert_eq!(metrics.tokens_counted, 4);
+        // Perplexity reads the data likelihood over every counted target, not
+        // `exp` of an objective that also holds the unlikelihood charge.
+        let mean_nll = logp.iter().map(|lp| -lp).sum::<f32>() / 4.0;
+        assert!(
+            (metrics.perplexity - mean_nll.exp()).abs() < 1e-4 * mean_nll.exp(),
+            "perplexity {} vs exp(mean NLL) {}",
+            metrics.perplexity,
+            mean_nll.exp()
+        );
+        assert!(
+            (metrics.perplexity - metrics.loss.exp()).abs() > 1e-3 * metrics.perplexity,
+            "the charge must not leak into the perplexity"
+        );
     }
 
     #[test]
@@ -3047,6 +3077,9 @@ mod tests {
         // An all-padding batch must not divide by zero.
         let (_, empty) = m.next_token_loss(tokens(&device, &[pad, pad, pad]), 0..4);
         assert!(empty.loss.is_finite(), "all-padding must not produce NaN");
+        // ...and must say it counted nothing: the clamped denominator is not a
+        // target, and the trainer's empty-window guard keys on this being 0.
+        assert_eq!(empty.tokens_counted, 0);
     }
 
     #[test]
@@ -3647,7 +3680,37 @@ mod tests {
             .reshape([1, ids.len()]);
         let (masked_loss, masked_metrics) =
             m.next_token_loss_masked(input, mask, 0..m.num_layers());
-        assert!(masked_loss.into_scalar().is_finite());
         assert_eq!(masked_metrics.tokens_counted, 2);
+        // The loss is the mean NLL of exactly the two unmasked targets (tokens
+        // 4 and 5, predicted from positions 3 and 4), recomputed from logits.
+        let logp = logp_of_targets(&m, &ids, &device);
+        let expected = -(logp[3] + logp[4]) / 2.0;
+        let got = masked_loss.into_scalar();
+        assert!(
+            (got - expected).abs() < 1e-5 * expected.abs().max(1.0),
+            "masked loss {got} vs hand {expected}"
+        );
+    }
+
+    #[test]
+    fn test_the_masked_path_keeps_the_mtp_term() {
+        // The masked (SFT) objective used to skip the per-layer states MTP
+        // reads, so the configured MTP term silently vanished from it. With an
+        // all-ones mask it must be the unmasked objective, MTP included.
+        let device = Default::default();
+        let m = LanguageModel::<B>::new(&LmConfig::tiny().with_mtp(2, 0.5), &device).unwrap();
+        let ids = [4u16, 8, 15, 16, 23, 42];
+        let input = tokens(&device, &ids);
+        let plain = m.next_token_step(input.clone(), LmExtras::plain(), 0..m.num_layers());
+        let all = Tensor::<B, 1>::ones([ids.len()], &device).reshape([1, ids.len()]);
+        let masked = m.next_token_step_masked(input, all, LmExtras::plain(), 0..m.num_layers());
+        assert!(plain.metrics.mtp_loss > 0.0, "the MTP term must be live");
+        assert!(
+            (masked.metrics.mtp_loss - plain.metrics.mtp_loss).abs() < 1e-6,
+            "masked MTP {} vs plain {}",
+            masked.metrics.mtp_loss,
+            plain.metrics.mtp_loss
+        );
+        assert!((masked.metrics.loss - plain.metrics.loss).abs() < 1e-5);
     }
 }

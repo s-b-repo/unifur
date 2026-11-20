@@ -12,11 +12,16 @@
 //!    lint-clean, tested code and is explicitly forbidden the suppression
 //!    patterns [`crate::cheat`] scans for — the filter then measures how well
 //!    the teacher complied.
-//! 2. **Traces** — with a [`NimClient`], prompts go to the teacher model via
-//!    [`NimClient::generate_traces`] (which is itself resumable). With
-//!    `None`, the pipeline runs keyless: Magicoder-sourced seeds reuse their
-//!    dataset solutions and template seeds use hand-written reference
-//!    completions, all marked `source: "offline"`.
+//! 2. **Traces** — with a [`NimClient`], prompts go to the teacher through
+//!    [`crate::teacher::generate_resumable`]: each trace is appended and
+//!    fsynced as it arrives, rate limits pause and resume (or rotate across
+//!    [`PipelineConfig::teacher_pool`]), and a rerun resumes mid-language
+//!    from the trace file and its journal. A language whose teacher stage
+//!    stopped because every model is paused past the idle bound is left
+//!    unfinished (no `report.json`), so the rerun picks it up. With `None`,
+//!    the pipeline runs keyless: Magicoder-sourced seeds reuse their dataset
+//!    solutions and template seeds use hand-written reference completions,
+//!    all marked `source: "offline"`.
 //! 3. **Cheat filter** — [`crate::cheat::filter_traces`] per language.
 //!    Reject-grade traces (suppression, eval gaming) are dropped; what
 //!    happens to quarantine-grade traces (stubs, broken snippets) is the
@@ -414,8 +419,10 @@ pub fn build_seeds(
     // same four, and it registered 0.848 — a number measuring the template
     // bank, not the language.
     //
-    // A language magicoder covers still gets its full complement; only the
-    // padding is gone, and the report says so (`magicoder_seeds` vs
+    // The padding is gone, and so is part of the count: Magicoder is still
+    // capped at `3 * count / 4`, so even a language it covers in full gets
+    // `3 * count / 4 + 4` seeds, not `count`, once `count > 16` (28 of the
+    // default 32). The report says so (`tasks`, `magicoder_seeds` and
     // `template_seeds` are reported per language).
     let mut template_n = 0usize;
     while seeds.len() < count && template_n < TaskKind::ALL.len() {
@@ -2634,6 +2641,10 @@ pub struct PipelineConfig {
     /// Cap on how much of a Magicoder problem statement enters a prompt.
     #[serde(default = "default_max_problem_chars")]
     pub max_problem_chars: usize,
+    /// Teacher models (priority order), pause bounds and the mixing rule.
+    /// Empty `models` uses the client's configured model.
+    #[serde(default)]
+    pub teacher_pool: crate::teacher::PoolConfig,
 }
 
 impl Default for PipelineConfig {
@@ -2650,6 +2661,7 @@ impl Default for PipelineConfig {
             decontaminate: default_decontaminate(),
             cheat_policy: CheatPolicy::default(),
             max_problem_chars: default_max_problem_chars(),
+            teacher_pool: crate::teacher::PoolConfig::default(),
         }
     }
 }
@@ -2677,6 +2689,12 @@ pub struct TrainRecord {
     /// quarantine-grade finding.
     #[serde(default)]
     pub quarantined: bool,
+    /// Teacher provider (`nim`, `openrouter`, `custom`); absent offline.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider: String,
+    /// The exact model id requested from the teacher; absent offline.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub requested_model: String,
 }
 
 /// One line of `rejects.jsonl`: a trace a filter dropped, with the reason.
@@ -2731,6 +2749,11 @@ pub struct LanguageReport {
     /// True when this report was read back from disk rather than recomputed.
     #[serde(default)]
     pub resumed: bool,
+    /// Set when the teacher stage stopped before every seed was attempted
+    /// (every model paused past the idle bound). Such a language is not
+    /// finalized: no outputs, no `report.json`, and a rerun resumes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete: Option<String>,
 }
 
 /// The top-level `report.json`.
@@ -2744,6 +2767,10 @@ pub struct PipelineReport {
     pub decontam_index_tasks: Option<usize>,
     /// Per-language outcomes, in config order.
     pub languages: Vec<LanguageReport>,
+    /// Why the run stopped before its last language, when it did (a teacher
+    /// pause past the idle bound); rerun the same command to resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<String>,
 }
 
 impl PipelineReport {
@@ -2771,17 +2798,23 @@ struct Candidate {
     completion: String,
     source: &'static str,
     model: String,
+    provider: String,
+    requested_model: String,
 }
 
 /// Run the whole pipeline and return the report that `report.json` records.
 ///
 /// With `client: Some`, task prompts go to the teacher (budget-capped,
-/// resumable at the request level by [`NimClient::generate_traces`]). With
-/// `None`, every seed is answered offline from its reference completion.
-/// Either way the cheat filter, the decontamination stage and the output
-/// layout are identical. A language whose `report.json` already exists in
-/// `config.out_dir` is skipped and its stored report read back, so a rerun
-/// resumes at language granularity.
+/// durable and resumable at the request level, pausing on rate limits and
+/// rotating across [`PipelineConfig::teacher_pool`]; see
+/// [`crate::teacher::generate_resumable`]). With `None`, every seed is
+/// answered offline from its reference completion. Either way the cheat
+/// filter, the decontamination stage and the output layout are identical. A
+/// language whose `report.json` already exists in `config.out_dir` is
+/// skipped and its stored report read back, so a rerun resumes at language
+/// granularity; a language whose teacher stage stopped on a pause is left
+/// without one, the run stops there ([`PipelineReport::stopped`]), and the
+/// rerun resumes inside it.
 pub fn run_pipeline(
     client: Option<&NimClient>,
     config: &PipelineConfig,
@@ -2826,6 +2859,7 @@ pub fn run_pipeline(
         teacher: client.is_some(),
         decontam_index_tasks: eval_index.as_ref().map(CorpusIndex::task_count),
         languages: Vec::new(),
+        stopped: None,
     };
     for &language in &config.languages {
         let lang_dir = config.out_dir.join(language.name());
@@ -2847,6 +2881,18 @@ pub fn run_pipeline(
         }
         let language_report =
             run_language(client, config, language, &lang_dir, eval_index.as_ref())?;
+        if let Some(reason) = language_report.incomplete.clone() {
+            eprintln!(
+                "[langdata] {}: teacher paused; language left unfinished: {reason}",
+                language.name()
+            );
+            report.languages.push(language_report);
+            report.stopped = Some(format!(
+                "{} unfinished: {reason}",
+                language.name()
+            ));
+            break;
+        }
         write_json(&report_path, &language_report)?;
         report.languages.push(language_report);
     }
@@ -2881,7 +2927,19 @@ fn run_language(
     let mut teacher_missing = 0usize;
     match client {
         Some(client) => {
-            let records = generate_teacher_traces(client, config, language, &seeds, lang_dir)?;
+            let (records, stopped) =
+                generate_teacher_traces(client, config, language, &seeds, lang_dir)?;
+            if let Some(reason) = stopped {
+                return Ok(LanguageReport {
+                    language: language.name().to_string(),
+                    tasks: seeds.len(),
+                    magicoder_seeds,
+                    template_seeds: seeds.len() - magicoder_seeds,
+                    traces_generated: records.len(),
+                    incomplete: Some(reason),
+                    ..LanguageReport::default()
+                });
+            }
             for seed in &seeds {
                 let prompt = trace_prompt(config, language, seed);
                 match records.get(&prompt.id()) {
@@ -2890,6 +2948,8 @@ fn run_language(
                         completion: record.completion.clone(),
                         source: "teacher",
                         model: record.model.clone(),
+                        provider: record.provider.clone(),
+                        requested_model: record.requested_model.clone(),
                     }),
                     None => teacher_missing += 1,
                 }
@@ -2902,6 +2962,8 @@ fn run_language(
                     completion: seed.reference.clone(),
                     seed,
                     source: "offline",
+                    provider: String::new(),
+                    requested_model: String::new(),
                 });
             }
         }
@@ -2950,8 +3012,18 @@ fn run_language(
             // near-duplicates an eval task lets the model memorise the eval,
             // whatever the completion says (mirrors codegen_eval::index_sft,
             // which indexes instructions only).
-            let hit =
-                codegen_eval::decontaminate(index, &candidate.seed.prompt, "repo-native-eval");
+            //
+            // The check reads the *task*, without the fixed
+            // PROMPT_REQUIREMENTS tail every prompt carries. The overlap is a
+            // fraction of the checked text's n-grams, so ~120 words of shared
+            // boilerplate diluted it: a verbatim copy of a short (~20-word)
+            // eval task scored under the 10% threshold and was kept.
+            let task_text = candidate
+                .seed
+                .prompt
+                .strip_suffix(PROMPT_REQUIREMENTS)
+                .unwrap_or(&candidate.seed.prompt);
+            let hit = codegen_eval::decontaminate(index, task_text, "repo-native-eval");
             if hit.is_contaminated {
                 decontam_hits += 1;
                 let example = hit.example.unwrap_or_default();
@@ -2981,6 +3053,8 @@ fn run_language(
             model: candidate.model.clone(),
             seed: candidate.seed.seed,
             quarantined,
+            provider: candidate.provider.clone(),
+            requested_model: candidate.requested_model.clone(),
         });
     }
 
@@ -3018,29 +3092,53 @@ fn run_language(
         train_path,
         rejects_path,
         resumed: false,
+        incomplete: None,
     })
 }
 
-/// The teacher stage: hand every seed to [`NimClient::generate_traces`] (whose
-/// own id-based resume makes rerunning cheap) and read the trace file back.
+/// The teacher stage: hand every seed to
+/// [`crate::teacher::generate_resumable`] over the configured pool (the
+/// client's own model when the pool names none) and read the trace file
+/// back. The second value is set when the stage stopped on a pause before
+/// every seed was attempted.
 fn generate_teacher_traces(
     client: &NimClient,
     config: &PipelineConfig,
     language: CodeLanguage,
     seeds: &[TaskSeed],
     lang_dir: &Path,
-) -> anyhow::Result<HashMap<String, TraceRecord>> {
+) -> anyhow::Result<(HashMap<String, TraceRecord>, Option<String>)> {
     let prompts: Vec<TracePrompt> = seeds
         .iter()
         .map(|seed| trace_prompt(config, language, seed))
         .collect();
     let raw_dir = lang_dir.join("raw");
-    let trace_report = client.generate_traces(&prompts, &raw_dir, config.budget)?;
+    std::fs::create_dir_all(&raw_dir)
+        .with_context(|| format!("create trace output directory {}", raw_dir.display()))?;
+    let mut pool = config.teacher_pool.clone();
+    if pool.models.is_empty() {
+        pool.models = vec![client.config().model.clone()];
+    }
+    let gate = crate::cheat::CheatGate::patterns_only();
+    let settings = crate::teacher::GenerationSettings {
+        budget: config.budget,
+        gate: &gate,
+        pool: &pool,
+        max_retries: client.config().max_retries,
+        backoff_base_ms: client.config().backoff_base_ms,
+    };
+    let trace_report = crate::teacher::generate_resumable(
+        client,
+        &crate::teacher::SystemEnv,
+        &prompts,
+        &raw_dir.join("traces.jsonl"),
+        &settings,
+    )?;
     let mut records = HashMap::new();
     for record in crate::nim::read_traces(&trace_report.out_path)? {
         records.insert(record.id.clone(), record);
     }
-    Ok(records)
+    Ok((records, trace_report.stopped))
 }
 
 /// The [`TracePrompt`] for one seed: the id is a hash of language, seed and
@@ -3291,6 +3389,8 @@ pub fn identity_documents() -> Vec<TraceRecord> {
                 usage: crate::nim::Usage::default(),
                 seed: i as u64,
                 source: "identity".to_string(),
+                provider: String::new(),
+                requested_model: String::new(),
             }
         })
         .collect()
@@ -3486,9 +3586,9 @@ mod tests {
     const STUB_PYTHON: &str = "```python\ndef checksum(data):\n    pass\n```";
     const CLEAN_RUST: &str = "```rust\nfn reverse_words(s: &str) -> String {\n    s.split_whitespace().rev().collect::<Vec<_>>().join(\" \")\n}\n```";
 
-    /// A problem long enough (38 tokens) that a verbatim copy in the eval
-    /// corpus crosses the 10% n-gram overlap threshold even diluted by the
-    /// requirements tail of the prompt.
+    /// A 38-token problem. (It was chosen long enough to cross the 10%
+    /// threshold *despite* the requirements tail diluting the overlap — the
+    /// hole `decontamination_catches_a_short_verbatim_eval_task` now pins.)
     const LONG_PROBLEM: &str = "Implement a function that takes a slice of signed integers and returns a new vector containing the cumulative prefix maximum at every position, handling empty input by returning an empty vector without panicking or allocating more than necessary.";
 
     // -- language mapping ---------------------------------------------------
@@ -3822,6 +3922,31 @@ mod tests {
         assert_eq!(dup.classes, vec!["decontaminated".to_string()]);
     }
 
+    #[test]
+    fn decontamination_catches_a_short_verbatim_eval_task() {
+        // 20 words: with the ~120-word requirements tail in the checked text
+        // its 8 shared 13-grams were ~6% of the prompt's and the copy was
+        // kept; checked as a task it is far past the threshold.
+        const SHORT_PROBLEM: &str = "Return the index of the first repeated byte in a slice, or None when every byte in it is distinct.";
+        let dir = unique_tmp_dir("decontam-short");
+        write_oss_fixture(&dir, &[("rust", 51, SHORT_PROBLEM, CLEAN_RUST)]);
+        write_eval_fixture(&dir, &[("eval-short-1", SHORT_PROBLEM)]);
+        let mut config = tiny_config(&dir, vec![CodeLanguage::Rust], 4);
+        config.decontaminate = true;
+        let report = run_pipeline(None, &config).expect("pipeline");
+        let lang = &report.languages[0];
+        assert_eq!(
+            lang.decontam_hits, 1,
+            "the verbatim eval task must be dropped"
+        );
+        let rejects = read_rejects(&lang.rejects_path);
+        assert!(rejects
+            .iter()
+            .any(|r| r.stage == "decontaminate" && r.id == "rust-oss-000051"));
+        // The template tasks share only boilerplate with nothing: kept.
+        assert_eq!(lang.kept, lang.tasks - 1);
+    }
+
     // -- offline end to end ---------------------------------------------------
 
     #[test]
@@ -3863,8 +3988,9 @@ mod tests {
             // never more than the six asked for, and every row a distinct
             // answer. The count itself is the corpus's business; the invariant
             // is that the bank does not pad.
-            assert!(
-                lang.kept <= 6,
+            assert!(lang.tasks <= 6, "{}: never more than asked", lang.language);
+            assert_eq!(
+                lang.kept, lang.tasks,
                 "{}: a clean slice keeps everything",
                 lang.language
             );
@@ -4023,6 +4149,7 @@ mod tests {
                 timeout_secs: 15,
                 max_retries: 0,
                 backoff_base_ms: 1,
+                ..NimConfig::default()
             },
             "test-key",
         )
@@ -4206,6 +4333,8 @@ mod tests {
             usage: crate::nim::Usage::default(),
             seed: i as u64,
             source: "teacher".to_string(),
+            provider: String::new(),
+            requested_model: String::new(),
         }
     }
 

@@ -359,6 +359,15 @@ impl VecReader {
             "the lens reads one prompt at a time, got a batch of {b}"
         );
         anyhow::ensure!(n >= 1, "the prompt must hold at least one token");
+        // The translators are fitted against a *student* trunk's readout
+        // (`train_translators`); this path has no fitting of its own and
+        // decodes raw. Ignoring installed translators silently would hand back
+        // a raw-lens trace from a reader configured as a tuned lens.
+        anyhow::ensure!(
+            self.translators.as_ref().is_none_or(Vec::is_empty),
+            "the fused-model lens decodes raw: tuned-lens translators are fitted for the \
+             student lens and cannot be applied here"
+        );
         let positions = self.selected_positions(n)?;
         let depths: Vec<usize> = if self.per_step {
             depth_sweep.to_vec()
@@ -372,18 +381,23 @@ impl VecReader {
         let translators_used = Vec::new();
         for depth in depths {
             let pass = model.forward_traced(tokens.clone(), Some(depth))?;
+            // An empty trace is an error, as on the student path: reporting
+            // energy 0.0 for a refinement that recorded nothing would read as
+            // a perfectly converged state.
             let energy = pass
                 .fused
                 .traces
                 .last()
                 .and_then(|t| t.energy.last().copied())
-                .unwrap_or(0.0);
+                .ok_or_else(|| anyhow::anyhow!("depth {depth} produced an empty energy trace"))?;
             let displacement = pass
                 .fused
                 .traces
                 .last()
                 .and_then(|t| t.displacement.last().copied())
-                .unwrap_or(0.0);
+                .ok_or_else(|| {
+                    anyhow::anyhow!("depth {depth} produced an empty displacement trace")
+                })?;
             let metric = model.metric();
             let geometry = slot_geometry(metric, &pass.fused.final_state)?;
             let decodes = decode_qwen_hidden(
@@ -446,8 +460,16 @@ pub fn read_student_thinking<B: Backend<FloatElem = f32>>(
 }
 
 /// Decode `positions` of `hidden` (`[1, n, hidden]`) through a Qwen trunk's
-/// own readout: final norm + untied lm_head, softmax, top-k. Mirrors
-/// [`decode_hidden`] for the fused path.
+/// own readout -- the untied lm_head, exactly as `FusedQwen::forward_traced`
+/// applies it -- then softmax, top-k. Mirrors [`decode_hidden`] for the fused
+/// path.
+///
+/// No final norm here: the fused hidden state is built on
+/// `QwenTrunk::forward_hidden`, which has already applied `final_norm`, and
+/// the model's own logits are `lm_head(fused.hidden)`. This decode used to go
+/// through a `QwenTrunk::logits_from_hidden` that applied `final_norm` again,
+/// so the "exact at the output layer" lens did not reproduce the model's
+/// logits; calling the head directly states the readout the model uses.
 fn decode_qwen_hidden<B: Backend<FloatElem = f32>>(
     trunk: &crate::qwennet::QwenTrunk<B>,
     hidden: &Tensor<B, 3>,
@@ -460,8 +482,13 @@ fn decode_qwen_hidden<B: Backend<FloatElem = f32>>(
         b == 1,
         "the lens reads one prompt at a time, got a batch of {b}"
     );
+    anyhow::ensure!(
+        site.translator.is_none(),
+        "the fused-model lens has no translator support (depth {})",
+        site.depth
+    );
     let hidden = hidden.clone();
-    let logits = trunk.logits_from_hidden(hidden.clone());
+    let logits = trunk.lm_head.forward(hidden.clone());
     let vocab = logits.dims()[2];
     let probs = softmax(logits.clone(), 2);
     let logits_host: Vec<f32> = logits
@@ -503,9 +530,16 @@ fn decode_qwen_hidden<B: Backend<FloatElem = f32>>(
         });
         let mut top = Vec::with_capacity(top_k.min(vocab));
         for idx in order.into_iter().take(top_k) {
+            // A real Qwen vocabulary (~152k) does not fit `TokenCandidate`'s
+            // u16 id. Clamping reported every such token as id 65535, and the
+            // `as u16` text cast named an unrelated token; refuse instead, as
+            // the student path does.
+            let id = u16::try_from(idx).with_context(|| {
+                format!("vocabulary index {idx} does not fit the u16 token space")
+            })?;
             top.push(TokenCandidate {
-                id: u16::try_from(idx).unwrap_or(u16::MAX),
-                text: token_text(idx as u16),
+                id,
+                text: token_text(id),
                 probability: probs_row[idx],
             });
         }
@@ -1311,6 +1345,115 @@ mod tests {
                 dec.position
             );
         }
+    }
+
+    /// The fused lens at the output layer is the fused model's own readout:
+    /// every reported probability equals the softmax of
+    /// `FusedQwen::forward_traced`'s logits at that id. The final-norm gain is
+    /// made non-trivial on purpose -- at the zero-init gain a second RMSNorm
+    /// is nearly the identity, which is how decoding through
+    /// `logits_from_hidden` (norm applied twice) went unnoticed.
+    #[test]
+    fn test_fused_lens_at_output_layer_reproduces_the_models_logits() {
+        use crate::geomfusion::{FusedQwen, GeomFusionConfig};
+        use crate::qwen::QwenArchDims;
+        use crate::qwennet::{QwenTrunk, QwenTrunkConfig};
+        let device = Default::default();
+        let config = QwenTrunkConfig {
+            dims: QwenArchDims {
+                num_layers: 5,
+                hidden_size: 64,
+                intermediate_size: 96,
+                vocab_size: 128,
+                num_q_heads: 4,
+                num_kv_heads: 2,
+                head_dim: 16,
+                linear_k_groups: 2,
+                linear_v_heads: 4,
+                linear_head_dim: 16,
+                conv_kernel: 4,
+                full_attention_interval: 4,
+                attn_output_gate: true,
+            },
+            num_layers: None,
+            rope_base: 10_000_000.0,
+            eps: 1e-6,
+        };
+        let mut trunk = QwenTrunk::<B>::new(config, &device);
+        let gain: Vec<f32> = (0..64).map(|i| 0.5 + (i % 7) as f32 * 0.3).collect();
+        trunk.final_norm.weight =
+            Param::from_tensor(Tensor::<B, 1>::from_floats(gain.as_slice(), &device));
+        crate::tensor_ext::force_initialization(&trunk);
+        let model = FusedQwen::<B>::new(trunk, &GeomFusionConfig::tiny(), &device).unwrap();
+
+        // At least as many tokens as the stream has slots (8 in `tiny`).
+        let ids: Vec<i64> = vec![80, 48, 49, 50, 65, 66, 67, 68, 69, 70];
+        let tokens = Tensor::<B, 1, Int>::from_ints(ids.as_slice(), &device).reshape([1, ids.len()]);
+        let reader = VecReader {
+            positions: PositionSelection::All,
+            top_k: 3,
+            ..VecReader::default()
+        };
+        let trace = reader
+            .read_fused_thinking(&model, tokens.clone(), &[1])
+            .unwrap();
+        let out = model.forward_traced(tokens, Some(1)).unwrap();
+        let [_, n, vocab] = out.logits.dims();
+        let logits: Vec<f32> = out
+            .logits
+            .clone()
+            .reshape([n, vocab])
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
+        let probs: Vec<f32> = softmax(out.logits, 2)
+            .reshape([n, vocab])
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
+        let decodes = &trace.depths[0].decodes;
+        assert_eq!(decodes.len(), n);
+        for dec in decodes {
+            let row = &probs[dec.position * vocab..(dec.position + 1) * vocab];
+            for cand in &dec.top {
+                let want = row[usize::from(cand.id)];
+                assert!(
+                    (cand.probability - want).abs() < 1e-6,
+                    "position {} id {}: lens {} vs model {want}",
+                    dec.position,
+                    cand.id,
+                    cand.probability
+                );
+            }
+            let logit_row = &logits[dec.position * vocab..(dec.position + 1) * vocab];
+            let argmax = logit_row
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0)))
+                .map(|(i, _)| i)
+                .unwrap();
+            assert_eq!(usize::from(dec.top[0].id), argmax, "position {}", dec.position);
+        }
+
+        // A configured tuned lens is refused rather than silently dropped.
+        let tuned = VecReader {
+            translators: Some(vec![AffineTranslator {
+                depth: 1,
+                matrix: vec![0.0; 64 * 64],
+                bias: vec![0.0; 64],
+                initial_kl: 0.0,
+                final_kl: 0.0,
+            }]),
+            ..VecReader::default()
+        };
+        let tokens = Tensor::<B, 1, Int>::from_ints(ids.as_slice(), &device).reshape([1, ids.len()]);
+        let err = tuned
+            .read_fused_thinking(&model, tokens, &[1])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("decodes raw"), "{err}");
     }
 
     #[test]

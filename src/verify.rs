@@ -28,9 +28,9 @@
 //! | Group | What is certified |
 //! |---|---|
 //! | `schedule` | Block boundaries, CDF-uniform spacing, window tiling, and that the train-time and inference-time block routing are mutual inverses |
-//! | `preconditioning` | The EDM identity `D(z) = x` for an exact denoiser, and the two normalization identities that motivate `c_in` and the loss weight |
-//! | `stats` | `erf`/`erfc` complementarity and `norm_cdf`/`norm_ppf` involution against scipy reference values |
-//! | `solver` | Closed-form exactness, kernel moments against quadrature, interpolation nodes, observed order of convergence, ancestral variance preservation |
+//! | `preconditioning` | The variance criterion the EDM coefficients are derived from (`c_skip` minimizes the target variance, the target has unit variance, `c_noise = ln(sigma)/4`), and the two normalization identities that motivate `c_in` and the loss weight |
+//! | `stats` | `erf`/`erfc` against 50-digit reference values across their regime boundary, `norm_cdf` against reference values, and the `norm_cdf`/`norm_ppf` involution |
+//! | `solver` | Closed-form exactness, kernel moments against quadrature, interpolation nodes, 3M exactness on a quadratic `x0` after warm-up, observed order of convergence, ancestral variance preservation and the eta = 1 DDPM posterior |
 //! | `precision` | Unit-roundoff bound and idempotence of the reduced-format emulation |
 //! | `quantize` | NF4 error bound, exact zero, and LoRA's identity-at-init |
 //! | `loopgraph` | ACT weights form a partition of unity; the planner respects its budget |
@@ -46,6 +46,12 @@
 //! | `autodiff` | Finite-difference gradient check on the distillation objective |
 //! | `qwennet` | Qwen3.8 trunk: full attention decodes from its KV cache bit for bit, a mixed linear+full trunk decodes to its prefill logits bit for bit, and the zero-centered RMSNorm is identity at zero weight |
 //! | `vecread` | The raw-vector readout lens ([`crate::vecread`]): at the output layer the lens is exactly the student's own readout (argmax agreement at tolerance 0.0), every decoded step's top-k is cut from a normalized softmax row, the decode measurably tracks interventions on the refinement trajectory (truncation and bounded offsets) while the certified descent holds, and the final logits depend on the refinement depth — causal validation, not just readability |
+//! | `routing` | Routing integrity and expert layout ([`crate::routeprobe`], [`crate::expertlayout`]): a random MoE LM's routing and layer outputs before position p ignore every token from p on, bit for bit, while a change before p does travel forward; a trace is deterministic; the causality probe flags a planted whole-sequence leak and clears its causal twin; layout plans are bijections whose laid-out reads are byte-identical; and a planted block structure is recovered contiguously without lowering locality |
+//! | `ncm` | The NCM residual-VQ tokenizer ([`crate::ncm::tokenizer`]): geometric level schedules and the alpha = 0 / alpha = 1 loss-weight identities; Down_k windows tile the sequence (dividing or not) and Down_k inverts Up_k; the quantizer and `encode` pick the nearest row of exactly the codebook `level_codebook` returns (brute-force f64 reference); the reconstruction telescopes and matches a host recomputation of the sum of lifted codes; the EMA codebook state equals its closed form; the straight-through gradient is the reconstruction gradient bit for bit within one backward pass and to the backend's backward reproducibility across passes; nested dropout truncates bit for bit; and the intent term at weight zero never runs (no reader call, no head gradient, bit-identical loss) with gradients equal to backward reproducibility; and the TRISKELE concept-field generator ([`crate::ncm::generator`]): generation makes exactly K level calls per sample (counted; a looping model is caught), the prefix-LM mask keeps prompt outputs bit-identical under target perturbation with the operator off and on, level-k logits depend only on coarser codes, corruption never touches labels (uniform and self-conditioned), the weighted loss and the sampled-level estimator's expectation match a scalar recomputation, the attractor energy descends for every step size up to the certified bound 2 (and rises at 3), the soft thought is a convex codebook mixture, the degenerate operator is one Euclidean-distance-attention block (host reference), thought readout round-trips hard codes, and crystal growth never exceeds its budget, reduces bit for bit to fixed depth, and never moves a crystal |
+//! | `ncm-decode` | NCM decoding strategies ([`crate::ncm::decode`]) on toy codecs and level models: speculative sampling emits the target's distribution (single code and a 2-level joint, total variation within 0.04, a wrong acceptance rule fails); greedy speculation is plain greedy bit for bit and a draft equal to the target is always accepted; early exit above threshold 1, one particle, and disabled repair are each plain decoding bit for bit; no strategy mix exceeds its budget; the decode report's call counts equal independent counters |
+//! | `router` | The three-layer hierarchical router ([`crate::hrouter`], [`crate::taxonomy`]): every layer of a routed plan is a distribution (a planted NaN is refused); every chosen specialist sits in a chosen category carrying exactly its weight within top-k bounds (a planted orphan is refused); routing is byte-for-byte deterministic and the comparison sees a one-ULP change; the taxonomy and a legacy expert index round-trip, and an unknown leaf id is refused |
+//! | `alien` | The ALIEN-FINDER between-space math ([`crate::alien`]): an affine combination (extrapolation included) reconstructs to itself on a rank-deficient hull and a known orthogonal offset comes back as exactly that residual; complement points score coherence ~0 while hull points score 1, and a hull that fills the space is refused; known vectors score as obvious while farthest-interior betweens do not; between-cluster midpoints outrank within-cluster ones by the likelihood term; the Poincare geodesic hits its endpoints, stays in the ball and is distance-additive (a chord is not); and the survival predictor refuses tiny samples without refusing everything |
+//! | `integrity` | The chained integrity pipeline ([`crate::integrity`]): adding a detector never lowers a decision on a planted corpus (a weakest-finding combiner fails it); a base64-encoded suppression is caught only because the layer is decoded, and an encoded ordinary payload is kept; the pre-tokenize calibration's clean Unicode is kept and its reject cases rejected; the corpus stage quarantines every planted reject-category document, keeps clean documents byte-identical and is idempotent on its own output; the batch report is byte-for-byte deterministic and sees a one-character change |
 
 use crate::{
     dblock::{DblockClassifier, DblockConfig},
@@ -101,6 +107,21 @@ fn cert(
         theorem,
         residual,
         tolerance,
+    }
+}
+
+/// `a.max(b)` for residual accumulation, except that a NaN in either operand
+/// is kept rather than discarded.
+///
+/// `f64::max` returns the non-NaN operand, so a residual folded with it
+/// silently drops every NaN term: a model whose outputs went NaN at some
+/// positions would report the residual of the positions that did not. A NaN
+/// residual must reach [`Certificate::passed`] and fail there.
+fn worst(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        f64::NAN
+    } else {
+        a.max(b)
     }
 }
 
@@ -228,7 +249,7 @@ impl Report {
 }
 
 /// Names of every certificate group, in the order [`run_all`] emits them.
-pub const GROUPS: [&str; 31] = [
+pub const GROUPS: [&str; 37] = [
     "schedule",
     "preconditioning",
     "stats",
@@ -260,6 +281,12 @@ pub const GROUPS: [&str; 31] = [
     "vecread",
     "tokenblocks",
     "cohort",
+    "routing",
+    "router",
+    "ncm",
+    "ncm-decode",
+    "alien",
+    "integrity",
 ];
 
 /// Run only the certificates in `group`.
@@ -320,6 +347,25 @@ pub fn run_all() -> Report {
     certificates.extend(checks_or_failed("vecread", vecread_checks));
     certificates.extend(crate::tokenblocks::certificates());
     certificates.extend(crate::cohort::certificates());
+    certificates.extend(checks_or_failed("routing", routing_checks));
+    certificates.extend(crate::hrouter::certificates());
+    certificates.extend(checks_or_failed(
+        "ncm",
+        crate::ncm::tokenizer::certificate_checks,
+    ));
+    certificates.extend(checks_or_failed("ncm", crate::ncm::generator::certificates));
+    certificates.extend(checks_or_failed(
+        "ncm-decode",
+        crate::ncm::decode::certificate_checks,
+    ));
+    certificates.extend(checks_or_failed(
+        "alien",
+        crate::alien::certificate_checks,
+    ));
+    certificates.extend(checks_or_failed(
+        "integrity",
+        crate::integrity::certificate_checks,
+    ));
     Report { certificates }
 }
 
@@ -378,8 +424,22 @@ fn schedule_certificates() -> Vec<Certificate> {
         for blk in 0..n - 1 {
             let (lo, _) = sigma::block_window(&b, blk);
             let (_, hi_next) = sigma::block_window(&b, blk + 1);
-            tiling_err = tiling_err.max((lo - hi_next).abs());
-            tiling_err = tiling_err.max((lo - sigma::shared_boundary_sigma(&b, blk)).abs());
+            tiling_err = worst(tiling_err, (lo - hi_next).abs());
+            tiling_err = worst(
+                tiling_err,
+                (lo - sigma::shared_boundary_sigma(&b, blk)).abs(),
+            );
+        }
+        // Gap-free in the interior is only half of "tiles [min, max]": the
+        // outermost windows must reach the two ends of the grid, block 0 the
+        // top and the last block the bottom, and every window be non-empty.
+        tiling_err = worst(tiling_err, (sigma::block_window(&b, 0).1 - b[n]).abs());
+        tiling_err = worst(tiling_err, (sigma::block_window(&b, n - 1).0 - b[0]).abs());
+        for blk in 0..n {
+            let (lo, hi) = sigma::block_window(&b, blk);
+            if lo.partial_cmp(&hi) != Some(std::cmp::Ordering::Less) {
+                tiling_err = f64::INFINITY;
+            }
         }
     }
     out.push(cert(
@@ -428,7 +488,7 @@ fn schedule_certificates() -> Vec<Certificate> {
         .rev()
         .zip(blocks.iter())
         .map(|(s, b)| (s - b).abs() / b)
-        .fold(0.0f64, f64::max);
+        .fold(0.0f64, worst);
     out.push(cert(
         "schedule",
         "discrete_matches_blocks",
@@ -466,22 +526,31 @@ fn preconditioning_certificates() -> Vec<Certificate> {
         .map(|i| SIGMA_MIN * (SIGMA_MAX / SIGMA_MIN).powf(i as f64 / 63.0))
         .collect();
 
-    // The identity the whole EDM parameterization exists to provide: if the
-    // network output F is the *exact* target, the preconditioned denoiser
-    // reconstructs the clean sample at every noise level. If this fails, the
-    // training target and the sampling formula disagree.
+    // What the EDM coefficients are *derived* from (Karras et al. 2022,
+    // App. B.6), checked without restating their formulas. The previous form
+    // of this certificate -- define F* = (x - c_skip z) / c_out, then check
+    // c_out F* + c_skip z = x -- is an algebraic tautology that holds for ANY
+    // c_skip and nonzero c_out, so it could not fail.
+    //
+    // For clean data of variance sd^2 and z = x + sigma n, the network target
+    // is F* = (x - c_skip z) / c_out, with variance
+    // V(c) = (1 - c)^2 sd^2 + c^2 sigma^2 over c_out^2 at c = c_skip:
+    //  - c_skip is the stationary point of V: (1 - c) sd^2 = c sigma^2;
+    //  - c_out is the std of x - c_skip z, so Var[F*] = 1;
+    //  - c_noise is ln(sigma) / 4 (Table 1), checked against the closed form
+    //    at sigma = e^{4k}, where it is exactly k.
     let mut identity_err: f64 = 0.0;
+    let sd2 = sigma_data * sigma_data;
     for &s in &sigmas {
         let p = EdmPreconditioning::new(s, sigma_data);
-        for &x in &[-2.0f64, -0.3, 0.0, 0.7, 3.5] {
-            for &eps in &[-1.5f64, 0.4] {
-                let z = x + s * eps;
-                // The exact network output at this (z, sigma).
-                let f_star = (x - p.c_skip * z) / p.c_out;
-                let reconstructed = p.c_out * f_star + p.c_skip * z;
-                identity_err = identity_err.max((reconstructed - x).abs() / (1.0 + x.abs()));
-            }
-        }
+        let stationarity = ((1.0 - p.c_skip) * sd2 - p.c_skip * s * s).abs() / (sd2 + s * s);
+        let target_var =
+            ((1.0 - p.c_skip).powi(2) * sd2 + p.c_skip.powi(2) * s * s) / (p.c_out * p.c_out);
+        identity_err = worst(identity_err, worst(stationarity, (target_var - 1.0).abs()));
+    }
+    for k in [-2i32, -1, 0, 1] {
+        let p = EdmPreconditioning::new((4.0 * f64::from(k)).exp(), sigma_data);
+        identity_err = worst(identity_err, (p.c_noise - f64::from(k)).abs());
     }
     let mut variance_err: f64 = 0.0;
     let mut weight_err: f64 = 0.0;
@@ -500,7 +569,7 @@ fn preconditioning_certificates() -> Vec<Certificate> {
         cert(
             "preconditioning",
             "edm_denoiser_identity",
-            "D(z) = c_out F*(z) + c_skip z reconstructs x exactly when F* is the exact target, at every sigma.",
+            "c_skip minimizes the variance of the network target x - c z (stationarity of (1 - c)^2 sd^2 + c^2 sigma^2), c_out is that target's std so F* = (x - c_skip z)/c_out has unit variance, and c_noise = ln(sigma)/4, at every sigma.",
             identity_err,
             1e-12,
         ),
@@ -524,13 +593,32 @@ fn preconditioning_certificates() -> Vec<Certificate> {
 // ------------------------------------------------------------------ stats --
 
 fn stats_certificates() -> Vec<Certificate> {
-    // erf and erfc are implemented by different algorithms in different
-    // regimes; their sum is the cheapest way to catch a bad regime boundary.
-    let mut complement_err: f64 = 0.0;
-    for i in -600..=600 {
-        let x = i as f64 * 0.01;
-        complement_err = complement_err.max((erf(x) + erfc(x) - 1.0).abs());
-    }
+    // `erf(x) + erfc(x) = 1` cannot be checked through the implementation:
+    // in every regime one of the two is evaluated and the other is defined as
+    // its complement, so the sum is 1 to rounding whatever either returns.
+    // Each is checked instead against independent 50-digit values (mpmath, at
+    // these exact doubles) on both sides of the series/continued-fraction
+    // crossover at |x| = 2 and into the deep tail, as a relative error. The
+    // complement identity then holds because both sides are right.
+    let references: [(f64, f64, f64); 13] = [
+        (0.5, 0.5204998778130465, 0.4795001221869535),
+        (1.0, 0.8427007929497149, 0.15729920705028513),
+        (1.9, 0.9927904292352575, 0.0072095707647425325),
+        (1.99, 0.995111413199617, 0.004888586800383003),
+        (2.0, 0.9953222650189527, 0.004677734981047266),
+        (2.01, 0.9955248493552482, 0.004475150644751763),
+        (2.5, 0.999593047982555, 0.0004069520174449589),
+        (3.0, 0.9999779095030014, 2.209049699858544e-05),
+        (5.0, 0.9999999999984626, 1.537459794428035e-12),
+        (10.0, 1.0, 2.088487583762545e-45),
+        (26.0, 1.0, 5.663192408856143e-296),
+        (-1.5, -0.9661051464753108, 1.9661051464753108),
+        (-2.5, -0.999593047982555, 1.999593047982555),
+    ];
+    let complement_err = references
+        .iter()
+        .map(|&(x, e, c)| worst(((erf(x) - e) / e).abs(), ((erfc(x) - c) / c).abs()))
+        .fold(0.0f64, worst);
 
     // Phi and its inverse must compose to the identity across the whole range
     // the sigma schedules actually visit, tails included.
@@ -543,27 +631,30 @@ fn stats_certificates() -> Vec<Certificate> {
         }
     }
 
-    // Independently computed scipy values, so an internally consistent but
-    // wrong implementation cannot pass.
+    // Independently computed values (scipy, checked against 40-digit mpmath;
+    // the Phi(-3) entry used to be wrong in its 14th digit), so an internally
+    // consistent but wrong implementation cannot pass.
     let references: [(f64, f64); 5] = [
         (0.0, 0.5),
         (1.96, 0.975_002_104_851_779_5),
         (2.5, 0.993_790_334_674_223_8),
-        (-3.0, 0.001_349_898_031_630_103_5),
+        (-3.0, 0.001_349_898_031_630_094_6),
         (-4.6517, 1.646_048_869_580_465_5e-6),
     ];
     let reference_err = references
         .iter()
         .map(|&(x, expected)| (norm_cdf(x) - expected).abs() / expected)
-        .fold(0.0f64, f64::max);
+        .fold(0.0f64, worst);
 
     vec![
         cert(
             "stats",
             "erf_erfc_complementary",
-            "erf(x) + erfc(x) = 1 across every algorithmic regime boundary.",
+            "erf(x) and erfc(x) each match independent 50-digit reference values on both sides of the series/continued-fraction crossover and into the deep tail, so erf + erfc = 1 holds for correct values rather than by one being defined as the other's complement.",
             complement_err,
-            1e-14,
+            // Relative. The worst case is erfc just below the crossover,
+            // where it is computed as 1 - erf (~1e-13 at x = 1.99).
+            5e-13,
         ),
         cert(
             "stats",
@@ -577,7 +668,9 @@ fn stats_certificates() -> Vec<Certificate> {
             "cdf_reference_values",
             "norm_cdf matches independently computed scipy values.",
             reference_err,
-            1e-9,
+            // Measured ~1e-15; the bound still leaves room for the ~1e-13
+            // relative error erfc carries just below its crossover.
+            1e-12,
         ),
     ]
 }
@@ -632,6 +725,12 @@ fn solver_certificates() -> Vec<Certificate> {
     // z(s) = c + (z0 - c) s / s0. Every consistent solver must reproduce it
     // regardless of step size, so this catches sign and scaling errors that
     // an order study would not.
+    //
+    // `c` must not be zero. With c = 0 the oracle term of every update is
+    // multiplied by zero and `c + (z0 - c) s/s0` collapses to `z0 s/s0`, so
+    // the certificate could not see the x0 coefficient at all -- which is
+    // what it used to do.
+    let c = 0.3f64;
     let mut closed_form_err: f64 = 0.0;
     for kind in SolverKind::deterministic() {
         let mut rng = StdRng::seed_from_u64(0);
@@ -639,19 +738,73 @@ fn solver_certificates() -> Vec<Certificate> {
         let z_end = solver::integrate(
             z0.clone(),
             &schedule,
-            |_s, _z| Tensor::<B, 2>::zeros([2, 4], &device),
+            |_s, _z| Tensor::<B, 2>::full([2, 4], c as f32, &device),
             kind,
             &mut rng,
         );
-        let expected = z0 * (schedule[schedule.len() - 1] / schedule[0]) as f32;
-        closed_form_err = closed_form_err.max((z_end - expected).abs().max().into_scalar() as f64);
+        let expected =
+            (z0 - c as f32) * (schedule[schedule.len() - 1] / schedule[0]) as f32 + c as f32;
+        let gap: Vec<f32> = (z_end - expected)
+            .abs()
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
+        closed_form_err = gap
+            .iter()
+            .map(|v| f64::from(*v))
+            .fold(closed_form_err, worst);
     }
     out.push(cert(
         "solver",
         "constant_oracle_closed_form",
-        "Every deterministic solver reproduces z(s) = c + (z0 - c) s/s0 for a constant x0 oracle.",
+        "Every deterministic solver reproduces z(s) = c + (z0 - c) s/s0 for a constant x0 oracle c != 0.",
         closed_form_err,
-        1e-4,
+        // Exact in real arithmetic for every kind; what remains is f32
+        // rounding over seven steps of O(1) values.
+        1e-5,
+    ));
+
+    // 3M integrates its quadratic interpolant against the exact kernel, so
+    // once two history points exist every step is exact for an x0 that is
+    // quadratic in lambda, at any step size. Measured as a *local* error:
+    // each step starts on the exact solution and is compared with the exact
+    // solution at its end. The reference is the closed-form particular
+    // solution z_p = q - q' + q'' of dz/dlambda = q(lambda) - z, which shares
+    // nothing with the solver's kernel moments or interpolation weights. The
+    // two warm-up steps are lower order, and must be visibly inexact on the
+    // same measurement -- otherwise it could not see an inexact step at all.
+    let q = |lam: f64| 0.05 * lam * lam + 0.3 * lam - 0.7;
+    let z_exact = |lam: f64| q(lam) - (0.1 * lam + 0.3) + 0.1;
+    let mut state = solver::SolverState::<B>::new(SolverKind::DpmPlusPlus3M);
+    let mut rng = StdRng::seed_from_u64(0);
+    let mut unused_predictor = |_s: f64, z: &Tensor<B, 2>| z.clone();
+    let (mut exact_err, mut warmup_err) = (0.0f64, f64::INFINITY);
+    for (i, w) in schedule.windows(2).enumerate() {
+        let (s, s_next) = (w[0], w[1]);
+        let (lam, lam_next) = (-s.ln(), -s_next.ln());
+        let z = Tensor::<B, 2>::full([1, 1], z_exact(lam) as f32, &device);
+        let x0 = Tensor::<B, 2>::full([1, 1], q(lam) as f32, &device);
+        let got: f32 = state
+            .step(s, s_next, z, &x0, &mut unused_predictor, &mut rng)
+            .into_scalar();
+        let want = z_exact(lam_next);
+        let err = (f64::from(got) - want).abs() / (1.0 + want.abs());
+        if i >= 2 {
+            exact_err = worst(exact_err, err);
+        } else {
+            warmup_err = warmup_err.min(err);
+        }
+    }
+    out.push(cert(
+        "solver",
+        "dpmpp3m_exact_on_quadratic_after_warmup",
+        "Once its two-step history is filled, every DPM-Solver++(3M) step reproduces the exact solution for an x0 quadratic in lambda at steps of h ~ 1 to 3.2 (closed-form particular solution q - q' + q''), while the lower-order warm-up steps are measurably inexact.",
+        exact_err + if warmup_err > 1e-3 { 0.0 } else { 1.0 },
+        // f32 inputs and outputs of O(1): a few ulps through the kernel
+        // moments (J2 ~ 6 at h = 3.2) -- against ~1e-2 for a second-order
+        // step on the same quadratic.
+        1e-5,
     ));
 
     // The exponential integrator's step-size dependence lives entirely in
@@ -735,18 +888,41 @@ fn solver_certificates() -> Vec<Certificate> {
 
     // The ancestral split must move variance between the deterministic target
     // and the injected noise without creating or destroying any.
+    //
+    // `down` is computed as sqrt(s_next^2 - up^2), so the variance identity
+    // alone holds for *any* `up` the function returns. What pins `up` is the
+    // independent statement at eta = 1: the split is the DDPM posterior of
+    // the VE process, from Gaussian conditioning of z_next = x + s_next n1 on
+    // z = z_next + sqrt(s^2 - s_next^2) n2 -- mean x + (s_next/s)^2 (z - x),
+    // i.e. an Euler step to sigma_down = s_next^2 / s, and variance
+    // s_next^2 (1 - s_next^2 / s^2). eta = 0 must be the plain Euler target.
     let mut ancestral_err: f64 = 0.0;
     for &(s, s_next) in &[(80.0f64, 30.0), (1.0, 0.3), (0.05, 0.002)] {
         for &eta in &[0.0f64, 0.25, 1.0, 2.0] {
             let (down, up) = solver::ancestral_split(s, s_next, Some(eta));
-            ancestral_err = ancestral_err
-                .max(((down * down + up * up) - s_next * s_next).abs() / (s_next * s_next));
+            ancestral_err = worst(
+                ancestral_err,
+                ((down * down + up * up) - s_next * s_next).abs() / (s_next * s_next),
+            );
+            if eta == 0.0 {
+                ancestral_err = worst(ancestral_err, (down - s_next).abs() + up.abs());
+            }
+            if eta == 1.0 {
+                let posterior_var = s_next * s_next * (1.0 - (s_next * s_next) / (s * s));
+                ancestral_err = worst(
+                    ancestral_err,
+                    worst(
+                        (down - s_next * s_next / s).abs() / s_next,
+                        (up * up - posterior_var).abs() / (s_next * s_next),
+                    ),
+                );
+            }
         }
     }
     out.push(cert(
         "solver",
         "ancestral_variance_preserved",
-        "sigma_down^2 + sigma_up^2 = sigma_next^2 for every eta: DDIM noise is redistributed, not added.",
+        "sigma_down^2 + sigma_up^2 = sigma_next^2 for every eta: DDIM noise is redistributed, not added; eta = 0 is the plain Euler target, and eta = 1 is exactly the DDPM posterior (sigma_down = s_next^2/s, sigma_up^2 = s_next^2 (1 - s_next^2/s^2)).",
         ancestral_err,
         1e-12,
     ));
@@ -774,14 +950,29 @@ fn precision_certificates() -> Vec<Certificate> {
         let u = precision.unit_roundoff() as f64;
         let max_exp: i32 = if precision == Precision::F16 { 14 } else { 100 };
         for exp in -max_exp..=max_exp {
-            for mantissa in 0..32 {
-                let x = ((1.0f64 + mantissa as f64 / 32.0) * (2.0f64).powi(exp)) as f32;
-                for signed in [x, -x] {
-                    let r = precision.round_scalar(signed);
-                    let rel = ((r - signed) / signed).abs() as f64;
-                    bound_excess = bound_excess.max((rel - u).max(0.0) / u);
-                    idempotence_err =
-                        idempotence_err.max((precision.round_scalar(r) - r).abs() as f64);
+            for mantissa in 0..32u64 {
+                // Two inputs per slot. `1 + m/32` has six significant bits and
+                // is exactly representable in both bf16 (8) and f16 (11), so
+                // on its own it never rounds -- the bound and idempotence were
+                // then trivially 0 and a truncating or off-by-one-ulp `round`
+                // passed. The second input fills all 23 f32 fraction bits with
+                // a fixed hash of the slot, so it always needs rounding.
+                let dense = ((mantissa * 2_654_435_761 + 12_345) % (1 << 23)) as f64
+                    / f64::from(1u32 << 23);
+                for fraction in [mantissa as f64 / 32.0, dense] {
+                    let x = ((1.0f64 + fraction) * (2.0f64).powi(exp)) as f32;
+                    for signed in [x, -x] {
+                        let r = precision.round_scalar(signed);
+                        let rel = f64::from(((r - signed) / signed).abs());
+                        bound_excess = worst(bound_excess, (rel - u).max(0.0) / u);
+                        if !rel.is_finite() {
+                            bound_excess = f64::INFINITY;
+                        }
+                        idempotence_err = worst(
+                            idempotence_err,
+                            f64::from((precision.round_scalar(r) - r).abs()),
+                        );
+                    }
                 }
             }
         }
@@ -801,9 +992,14 @@ fn precision_certificates() -> Vec<Certificate> {
         }
 
         // The scalar and tensor paths are two implementations of one claim;
-        // they must not drift.
+        // they must not drift. The inputs need rounding in both formats (the
+        // `(i + 1) 2^-19` term sits below f16's 2^-10 resolution): on exactly
+        // representable inputs an inert tensor `round` would agree with the
+        // scalar one bit for bit, which is what the old `1 + i/64` grid did.
         let values: Vec<f32> = (0..64)
-            .map(|i| (1.0 + i as f32 / 64.0) * 2f32.powi((i % 9) - 4))
+            .map(|i| {
+                (1.0 + i as f32 / 64.0 + (i + 1) as f32 * 2f32.powi(-19)) * 2f32.powi((i % 9) - 4)
+            })
             .collect();
         let rounded = precision
             .round(Tensor::<B, 1>::from_floats(values.as_slice(), &device).reshape([8, 8]));
@@ -918,7 +1114,7 @@ fn quantize_certificates() -> Vec<Certificate> {
                     .iter()
                     .zip(simulated)
                     .map(|(a, b)| f64::from((a - b).abs()))
-                    .fold(0.0, f64::max),
+                    .fold(0.0, worst),
             );
         }
     }
@@ -949,7 +1145,7 @@ fn quantize_certificates() -> Vec<Certificate> {
         .iter()
         .zip(&b)
         .map(|(x, y)| f64::from((x - y).abs()))
-        .fold(0.0, f64::max);
+        .fold(0.0, worst);
 
     vec![
         cert(
@@ -1004,7 +1200,12 @@ fn loopgraph_certificates() -> Vec<Certificate> {
             let mut guard = 0;
             loop {
                 guard += 1;
-                assert!(guard < 1000, "planner failed to terminate");
+                // A planner that never stops is a failed certificate, not a
+                // panic that takes the whole verification run down with it.
+                if guard >= 1000 {
+                    mass = f32::NAN;
+                    break;
+                }
                 match planner.next(0.5) {
                     Decision::Stop => break,
                     Decision::Skip(_) => continue,
@@ -1014,9 +1215,105 @@ fn loopgraph_certificates() -> Vec<Certificate> {
                     break;
                 }
             }
-            mass_err = mass_err.max((mass as f64 - 1.0).abs());
+            // As `LoopGraph::x0_estimate` does: whatever is unspent when the
+            // run stops goes to the last block that ran.
+            mass += planner.settle();
+            mass_err = worst(mass_err, (f64::from(mass) - 1.0).abs());
         }
     }
+
+    // ...including runs that end on a skip. The loop above never skips
+    // (confidence 0.5 is below the default skip threshold), so it could not
+    // see the case where `charge` books a non-terminal weight for the last
+    // block that runs and the trailing blocks are then skipped: without
+    // `settle` handing the leftover to that block, the weights summed to
+    // less than one and the mixture was a shrunken estimate. Here the first
+    // `ran` blocks run and every later one is judged converged and skipped.
+    let skip_config = LoopGraphConfig {
+        skip_threshold: 0.5,
+        loopback_threshold: f32::NEG_INFINITY,
+        exit_threshold: f32::INFINITY,
+        ..LoopGraphConfig::default()
+    };
+    let mut settled_runs = 0usize;
+    for num_blocks in [2usize, 3, 5] {
+        for ran in 1..num_blocks {
+            for halt in [0.0f32, 0.3, 0.9] {
+                let mut planner = LoopPlanner::new(skip_config, num_blocks);
+                let mut weights: Vec<f32> = Vec::new();
+                let mut calls = 0usize;
+                loop {
+                    calls += 1;
+                    if calls >= 1000 {
+                        weights.push(f32::NAN);
+                        break;
+                    }
+                    let confidence = if calls <= ran { 0.1 } else { 0.9 };
+                    match planner.next(confidence) {
+                        Decision::Stop => break,
+                        Decision::Skip(_) => continue,
+                        _ => weights.push(planner.charge(halt)),
+                    }
+                    if planner.finished() {
+                        break;
+                    }
+                }
+                let rest = planner.settle();
+                if rest > 0.0 {
+                    settled_runs += 1;
+                }
+                match weights.last_mut() {
+                    Some(last) => *last += rest,
+                    None => weights.push(f32::NAN),
+                }
+                let mass: f32 = weights.iter().sum();
+                mass_err = worst(mass_err, (f64::from(mass) - 1.0).abs());
+            }
+        }
+    }
+    // The schedule must actually produce runs that stop with mass unspent,
+    // or the trailing-skip half above is vacuous.
+    if settled_runs == 0 {
+        mass_err = f64::INFINITY;
+    }
+
+    // Every block skipped means every block judged its input converged, so
+    // the loop graph is the identity on z -- checked on the real tensor path,
+    // `LoopGraph::x0_estimate`, which used to return a zero mixture there
+    // (an estimate pulling the solver toward the origin).
+    let all_skipped_err = (|| -> anyhow::Result<f64> {
+        let device = Default::default();
+        let model = DblockClassifier::<B>::new(
+            &ViTDiTConfig::tiny(10),
+            &DblockConfig {
+                num_blocks: 2,
+                ..DblockConfig::default()
+            },
+            &device,
+        )?;
+        let hidden = model.model().label_embedding_weight().dims()[1];
+        let graph = crate::loopgraph::LoopGraph::<B>::new(2, hidden, &device);
+        let pixels =
+            Tensor::<B, 4>::random([2, 3, 32, 32], Distribution::Uniform(-1.0, 1.0), &device);
+        let z = Tensor::<B, 2>::random([2, hidden], Distribution::Normal(0.0, 1.0), &device);
+        let config = LoopGraphConfig {
+            skip_threshold: f32::NEG_INFINITY,
+            loopback_threshold: f32::NEG_INFINITY,
+            ..LoopGraphConfig::default()
+        };
+        let (out, trace) = graph.x0_estimate(&model, &pixels, &z, 1.0, &config);
+        let bits = |t: Tensor<B, 2>| -> Vec<u32> {
+            t.into_data()
+                .convert::<f32>()
+                .iter::<f32>()
+                .map(f32::to_bits)
+                .collect()
+        };
+        let identity = bits(out) == bits(z);
+        let skipped_all = trace.blocks_run.is_empty() && trace.skipped.len() == 2;
+        Ok(f64::from(u8::from(!(identity && skipped_all))))
+    })()
+    .unwrap_or_else(|err| failed("loopgraph: all-skipped run", &err));
 
     // Budgets must be hard. Driven adversarially: confidence pinned so the
     // planner always wants to loop back, halting probability pinned at zero so
@@ -1036,7 +1333,10 @@ fn loopgraph_certificates() -> Vec<Certificate> {
         let mut guard = 0;
         loop {
             guard += 1;
-            assert!(guard < 5000, "planner failed to terminate");
+            if guard >= 5000 {
+                executions = usize::MAX;
+                break;
+            }
             match planner.next(0.0) {
                 Decision::Stop => break,
                 Decision::Skip(_) => continue,
@@ -1056,9 +1356,16 @@ fn loopgraph_certificates() -> Vec<Certificate> {
         cert(
             "loopgraph",
             "act_partition_of_unity",
-            "ACT mixture weights sum to exactly 1 for any halting probabilities and block count.",
+            "ACT mixture weights sum to exactly 1 for any halting probabilities and block count, including runs that end on skipped blocks (the unspent mass is settled onto the last block that ran).",
             mass_err,
             1e-5,
+        ),
+        cert(
+            "loopgraph",
+            "all_skipped_run_is_the_identity",
+            "When every block is skipped, LoopGraph::x0_estimate returns its input z bit for bit and runs nothing: a converged input is passed through, not replaced by an empty mixture.",
+            all_skipped_err,
+            0.0,
         ),
         cert(
             "loopgraph",
@@ -1081,17 +1388,55 @@ fn moe_checks() -> anyhow::Result<Vec<Certificate>> {
 
     // Renormalized top-k gates must be a distribution, or the layer rescales
     // its own output as a side effect of the routing decision.
+    //
+    // Measured through `MoELayer::forward` itself. With every expert the same
+    // MLP f, the layer's output is (sum of the token's gates) * f(x), so it
+    // equals f(x) exactly when the gates the layer really scatters and mixes
+    // with sum to one. The previous version renormalized `topk(softmax)`
+    // here and summed it -- `v / sum(v)` sums to 1 for any `v` -- and never
+    // touched the layer's selection, renormalization or scatter.
     let mut gate_err: f64 = 0.0;
     for top_k in [1usize, 2, 4] {
         let config = MoEConfig::new(8, 4, 4).with_top_k(top_k);
         let layer = MoELayer::<B>::new(&config, &device);
+        // Forced before cloning: an unforced `Param` draws fresh weights on
+        // each clone, which would make the "identical" experts differ.
+        crate::tensor_ext::force_initialization(&layer);
+        let expert = layer
+            .experts()
+            .first()
+            .cloned()
+            .context("an MoE layer with at least one expert")?;
+        let identical = MoELayer::from_parts(
+            crate::moe::TopKRouter::from_parts(layer.router().weight(), layer.router().bias()),
+            vec![expert.clone(); 4],
+            layer.top_k(),
+            true,
+            layer.z_level(),
+        );
         let x = Tensor::<B, 3>::random([2, 3, 8], Distribution::Uniform(-1.0, 1.0), &device);
         let cond = Tensor::<B, 2>::random([2, 4], Distribution::Uniform(-1.0, 1.0), &device);
-        let probs = softmax(layer.router_logits(&x, &cond), 1);
-        let (vals, _) = probs.topk_with_indices(top_k, 1);
-        let gates = vals.clone() / vals.sum_dim(1).clamp_min(1e-12);
-        for s in gates.sum_dim(1).into_data().convert::<f32>().iter::<f32>() {
-            gate_err = gate_err.max((s as f64 - 1.0).abs());
+        let mixed: Vec<f32> = identical
+            .forward(x.clone(), cond)
+            .output
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
+        let single: Vec<f32> = expert
+            .forward(x.reshape([6, 8]))
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .collect();
+        if mixed.len() != single.len() {
+            gate_err = f64::INFINITY;
+        }
+        let scale = single
+            .iter()
+            .fold(1.0f64, |a, v| worst(a, f64::from(v.abs())));
+        for (m, f) in mixed.iter().zip(&single) {
+            gate_err = worst(gate_err, f64::from((m - f).abs()) / scale);
         }
     }
 
@@ -1491,9 +1836,11 @@ fn moe_checks() -> anyhow::Result<Vec<Certificate>> {
         cert(
             "moe",
             "gates_partition_of_unity",
-            "Renormalized top-k gates sum to 1 per token, for every k.",
+            "Renormalized top-k gates sum to 1 per token, for every k: a layer whose experts are all the same MLP f returns exactly f(x).",
             gate_err,
-            1e-6,
+            // f32: k gate products, k accumulations and the renormalization
+            // each cost at most an ulp of |f|.
+            2e-6,
         ),
         cert(
             "moe",
@@ -1727,7 +2074,7 @@ fn mosme_checks() -> anyhow::Result<Vec<Certificate>> {
         .convert::<f32>()
         .iter::<f32>()
         .map(|m| (m as f64 - 1.0).abs())
-        .fold(0.0f64, f64::max);
+        .fold(0.0f64, worst);
     // Skipping an unselected specialist contributes `0.0 * y`, and `x + 0.0`
     // is exact, so the two dispatch paths must agree bit-for-bit.
     let dispatch_err = (dense.probs - sparse.probs).abs().max().into_scalar() as f64;
@@ -2046,7 +2393,7 @@ fn hybrid_checks() -> anyhow::Result<Vec<Certificate>> {
         a.iter()
             .zip(b)
             .map(|(x, y)| f64::from((x - y).abs()))
-            .fold(0.0, f64::max)
+            .fold(0.0, worst)
     };
     let max_rel_diff = |a: &[f32], b: &[f32]| -> f64 {
         if a.len() != b.len() {
@@ -2055,7 +2402,7 @@ fn hybrid_checks() -> anyhow::Result<Vec<Certificate>> {
         a.iter()
             .zip(b)
             .map(|(x, y)| f64::from((x - y).abs()) / f64::from(y.abs()).max(1.0))
-            .fold(0.0, f64::max)
+            .fold(0.0, worst)
     };
     let build = |config: &LmConfig| -> anyhow::Result<LanguageModel<B>> {
         let model = LanguageModel::<B>::new(config, &device)?;
@@ -2153,7 +2500,7 @@ fn hybrid_checks() -> anyhow::Result<Vec<Certificate>> {
     let rotary_gap = [1usize, 7, 30, 250]
         .iter()
         .map(|s| (score(9 + s, 4 + s) - base_score).abs())
-        .fold(0.0, f64::max);
+        .fold(0.0, worst);
 
     // 5. Every mode decodes from its state exactly as it recomputes, under
     //    several chunkings.
@@ -2358,7 +2705,7 @@ fn hybrid_checks() -> anyhow::Result<Vec<Certificate>> {
     let partial_rotary_gap = [1usize, 7, 30]
         .iter()
         .map(|s| (pscore(9 + s, 4 + s) - pbase).abs())
-        .fold(0.0, f64::max);
+        .fold(0.0, worst);
     let cover_ok = if rotary_dim_for(1.0, 8) == 8 && rotary_dim_for(0.25, 8) == 2 {
         0.0
     } else {
@@ -2627,11 +2974,16 @@ fn deltanet_certificates() -> Vec<Certificate> {
     let device: <B as burn::tensor::backend::BackendTypes>::Device = Default::default();
     let flat =
         |t: Tensor<B, 2>| -> Vec<f32> { t.into_data().convert::<f32>().iter::<f32>().collect() };
+    // `zip` stops at the shorter side, so a shape mismatch would otherwise be
+    // compared on the overlap only and could pass.
     let gap = |a: &[f32], b: &[f32]| -> f64 {
+        if a.len() != b.len() {
+            return f64::INFINITY;
+        }
         a.iter()
             .zip(b)
             .map(|(x, y)| f64::from((x - y).abs()))
-            .fold(0.0, f64::max)
+            .fold(0.0, worst)
     };
 
     // 1. alpha = 1 is the pure delta rule, against the direct Householder form.
@@ -2902,11 +3254,16 @@ fn qwennet_checks() -> anyhow::Result<Vec<Certificate>> {
         |t: Tensor<B, 2>| -> Vec<f32> { t.into_data().convert::<f32>().iter::<f32>().collect() };
     let flat3 =
         |t: Tensor<B, 3>| -> Vec<f32> { t.into_data().convert::<f32>().iter::<f32>().collect() };
+    // `zip` stops at the shorter side, so a shape mismatch would otherwise be
+    // compared on the overlap only and could pass.
     let gap = |a: &[f32], b: &[f32]| -> f64 {
+        if a.len() != b.len() {
+            return f64::INFINITY;
+        }
         a.iter()
             .zip(b)
             .map(|(x, y)| f64::from((x - y).abs()))
-            .fold(0.0, f64::max)
+            .fold(0.0, worst)
     };
 
     let dims = qwennet_tiny_dims();
@@ -3291,73 +3648,116 @@ fn geom_checks() -> anyhow::Result<Vec<Certificate>> {
     ));
 
     // -- model: the certified relaxation ------------------------------------------
-    // a fresh identity metric: the closed-form fixed point holds for any G,
-    // but the *rate* is a function of the condition number, so the
-    // certificate's step budget needs the deterministic identity landscape
+    // Three landscapes. The fresh identity metric alone could not see a step
+    // bound that is only right at lambda_max(G) >= 1: the former `lam^2`
+    // bound gave a step of ~3.3/L at lambda_max = 0.25 -- past the descent
+    // lemma's 2/L edge -- and raised the energy every step while this
+    // certificate, run on the identity only, passed. So the step is also
+    // exercised on a uniformly contracted metric (0.25 I) and on a skewed,
+    // ill-conditioned L L^T with a dense lower factor.
     let g = MetricField::<B>::new(4, &device).metric();
+    let contracted = Tensor::<B, 2>::from_floats(
+        [
+            [0.25f32, 0.0, 0.0, 0.0],
+            [0.0, 0.25, 0.0, 0.0],
+            [0.0, 0.0, 0.25, 0.0],
+            [0.0, 0.0, 0.0, 0.25],
+        ],
+        &device,
+    );
+    let lower = Tensor::<B, 2>::from_floats(
+        [
+            [1.5f32, 0.0, 0.0, 0.0],
+            [0.7, 0.4, 0.0, 0.0],
+            [-0.3, 0.2, 0.9, 0.0],
+            [0.5, -0.6, 0.1, 0.2],
+        ],
+        &device,
+    );
+    let skewed = lower.clone().matmul(lower.transpose());
     let lambda = 0.5f32;
     let slots = 6usize;
-    let eta = lipschitz_step(&g, lambda, slots);
-    let mut z = Tensor::<B, 3>::random([2, slots, 4], Distribution::Normal(0.0, 1.0), &device);
+    let z_start = Tensor::<B, 3>::random([2, slots, 4], Distribution::Normal(0.0, 1.0), &device);
     let c = Tensor::<B, 3>::random([2, slots, 4], Distribution::Normal(0.0, 1.0), &device);
-    let mut worst = 0.0f32;
-    let mut previous = energy_value(&g, &z, &c, lambda, slots);
-    for _ in 0..64 {
-        z = energy_grad_step(&g, &z, &c, lambda, slots, eta);
-        let current = energy_value(&g, &z, &c, lambda, slots);
-        worst = worst.max(current - previous);
-        previous = current;
+    let mut rise = 0.0f64;
+    for metric in [g.clone(), contracted.clone(), skewed] {
+        let step = lipschitz_step(&metric, lambda, slots);
+        let mut z = z_start.clone();
+        let mut previous = energy_value(&metric, &z, &c, lambda, slots);
+        for _ in 0..64 {
+            z = energy_grad_step(&metric, &z, &c, lambda, slots, step);
+            let current = energy_value(&metric, &z, &c, lambda, slots);
+            // A diverging step overflows to inf and then NaN, which
+            // `f32::max` would drop; it is the failure this exists to catch.
+            rise = if current.is_finite() {
+                worst(rise, f64::from(current - previous))
+            } else {
+                f64::INFINITY
+            };
+            previous = current;
+        }
     }
     out.push(cert(
         "geom",
         "energy_descent_is_monotone_under_the_certified_step",
-        "With the step size from the closed-form Lipschitz bound, the relaxation's energy never increases.",
-        f64::from(worst),
+        "With the step size from the closed-form Lipschitz bound, the relaxation's energy never increases -- on the identity metric, a contracted one (lambda_max < 1) and a skewed L L^T alike.",
+        rise,
         1e-4,
     ));
 
-    // The exact fixed point of the identity-metric landscape. Solving
-    // `(I + 2*lambda*K) z - 2*lambda*S = c` with `S = sum_l z_l` per
-    // coordinate gives `A = (I + 2*lambda*K)I - 2*lambda*J`, and since
-    // `A - K*b = 1` the inverse collapses to `(c + 2*lambda*sum(c)) /
-    // (1 + 2*lambda*K)`. The `2*lambda` matches the gradient the step
-    // actually takes -- the same factor the monotone-descent certificate
-    // pins down.
-    let mut z = Tensor::<B, 3>::random([2, slots, 4], Distribution::Normal(0.0, 1.0), &device);
-    let z0 = z.clone();
+    // The exact fixed point. Solving `(I + 2*lambda*K) z - 2*lambda*S = c`
+    // with `S = sum_l z_l` per coordinate gives `A = (I + 2*lambda*K)I -
+    // 2*lambda*J`, and since `A - K*b = 1` the inverse collapses to
+    // `(c + 2*lambda*sum(c)) / (1 + 2*lambda*K)`. The `2*lambda` matches the
+    // gradient the step actually takes -- the same factor the monotone-descent
+    // certificate pins down. The stationary point is the same for every
+    // invertible G (the gradient is G times a G-free vector), but the *rate*
+    // depends on the conditioning, so the 96-step budget is checked on the
+    // well-conditioned landscapes: the identity and the contracted metric.
+    let z0 = Tensor::<B, 3>::random([2, slots, 4], Distribution::Normal(0.0, 1.0), &device);
     let gap0 = z0.clone().sub(c.clone());
     let initial = gap0.clone().mul(gap0).sum().sqrt().into_scalar();
-    for _ in 0..96 {
-        z = energy_grad_step(&g, &z, &c, lambda, slots, eta);
-    }
     let fixed = c
         .clone()
         .add(c.clone().sum_dim(1).mul_scalar(2.0 * lambda))
         .div_scalar(1.0 + 2.0 * lambda * slots as f32);
-    let gap = z.sub(fixed);
-    let residual = gap.clone().mul(gap).sum().sqrt().into_scalar();
+    let mut fixed_point_err = 0.0f64;
+    for metric in [g.clone(), contracted.clone()] {
+        let step = lipschitz_step(&metric, lambda, slots);
+        let mut z = z0.clone();
+        for _ in 0..96 {
+            z = energy_grad_step(&metric, &z, &c, lambda, slots, step);
+        }
+        let gap = z.sub(fixed.clone());
+        let residual = gap.clone().mul(gap).sum().sqrt().into_scalar();
+        fixed_point_err = worst(fixed_point_err, f64::from(residual / initial.max(1e-6)));
+    }
     out.push(cert(
         "geom",
         "relaxation_converges_to_the_exact_fixed_point",
-        "With an identity metric the fixed point is (c + 2*lambda*sum(c))/(1 + 2*lambda*K); 96 certified steps land within 1% of it.",
-        f64::from(residual / initial.max(1e-6)),
+        "The fixed point is (c + 2*lambda*sum(c))/(1 + 2*lambda*K) for any invertible metric; 96 certified steps land within 1% of it on the identity and on a contracted metric.",
+        fixed_point_err,
         1e-2,
     ));
 
     // with repulsion off, the attractor is the context
     let lambda_tiny = 0.0f32;
-    let eta_tiny = lipschitz_step(&g, lambda_tiny, slots);
-    let mut z = z0.clone();
-    for _ in 0..8 {
-        z = energy_grad_step(&g, &z, &c, lambda_tiny, slots, eta_tiny);
+    let mut end_err = 0.0f64;
+    for metric in [g.clone(), contracted] {
+        let eta_tiny = lipschitz_step(&metric, lambda_tiny, slots);
+        let mut z = z0.clone();
+        for _ in 0..8 {
+            z = energy_grad_step(&metric, &z, &c, lambda_tiny, slots, eta_tiny);
+        }
+        let gap_end = z.sub(c.clone());
+        let end = gap_end.clone().mul(gap_end).sum().sqrt().into_scalar();
+        end_err = worst(end_err, f64::from(end / initial.max(1e-6)));
     }
-    let gap_end = z.sub(c.clone());
-    let end = gap_end.clone().mul(gap_end).sum().sqrt().into_scalar();
     out.push(cert(
         "geom",
         "with_repulsion_off_the_attractor_is_the_context",
-        "With the repulsion vanishing, eight certified steps drive every slot onto its context.",
-        f64::from(end / initial.max(1e-6)),
+        "With the repulsion vanishing, eight certified steps drive every slot onto its context, on the identity and on a contracted metric.",
+        end_err,
         1e-4,
     ));
 
@@ -3523,8 +3923,8 @@ fn geom_checks() -> anyhow::Result<Vec<Certificate>> {
     // and re-derives every label from the transformed coordinates.
     {
         use crate::geometry::{
-            answer_for, augment_coords, collinear_triple, extreme_query, inside_scenes,
-            non_collinear_triple, GRID_MAX,
+            answer_for, augment_coords, collinear_triple, inside_scenes, non_collinear_triple,
+            unambiguous_extreme_query, GRID_MAX,
         };
         use rand::Rng as _;
 
@@ -3545,12 +3945,20 @@ fn geom_checks() -> anyhow::Result<Vec<Certificate>> {
                     }
                 }
                 let (refs, answer): (Vec<usize>, u8) = match kind {
+                    // An all-tied scene has no answer to preserve; it is
+                    // redrawn, exactly as the corpus generator does.
                     "nearest" => {
-                        let (r, idx) = extreme_query(&coords, &mut rng, false);
+                        let Some((r, idx)) = unambiguous_extreme_query(&coords, &mut rng, false)
+                        else {
+                            continue;
+                        };
                         (vec![r], b'A' + idx as u8)
                     }
                     "farthest" => {
-                        let (r, idx) = extreme_query(&coords, &mut rng, true);
+                        let Some((r, idx)) = unambiguous_extreme_query(&coords, &mut rng, true)
+                        else {
+                            continue;
+                        };
                         (vec![r], b'A' + idx as u8)
                     }
                     "direction" => (
@@ -3681,8 +4089,13 @@ fn geom_checks() -> anyhow::Result<Vec<Certificate>> {
             match answer_for(kind, &coords, &refs) {
                 Some(recomputed) if recomputed == answer => {}
                 Some(_) => corpus_err += 1.0,
-                // A tied extremum keeps its generation-time fallback label.
-                None => {}
+                // No recomputable answer means the stored label is an
+                // arbitrary tie-fallback point, not the answer to the scene's
+                // question. The generator rejects those
+                // (`unambiguous_extreme_query`) and augmentation rejects copies
+                // that do not recompute, so one reaching the corpus is a
+                // defect -- it used to pass here silently.
+                None => corpus_err += 1.0,
             }
         }
         out.push(cert(
@@ -3884,6 +4297,10 @@ fn geomfusion_checks() -> anyhow::Result<Vec<Certificate>> {
         a: &'a burn::optim::GradientsParams,
         b: &'a burn::optim::GradientsParams,
         worst: f32,
+        /// Parameters that carried a gradient on both sides. Zero means the
+        /// comparison was vacuous: two backward passes that both produced no
+        /// gradient at all would otherwise "agree" with a residual of 0.
+        compared: usize,
     }
     impl<'a, AB: burn::tensor::backend::AutodiffBackend<FloatElem = f32>>
         burn::module::ModuleVisitor<AB> for GradDiff<'a>
@@ -3893,30 +4310,45 @@ fn geomfusion_checks() -> anyhow::Result<Vec<Certificate>> {
             let gb = self.b.get::<AB::InnerBackend, D>(param.id);
             match (ga, gb) {
                 (Some(x), Some(y)) => {
-                    self.worst = self.worst.max((x - y).abs().max().into_scalar());
+                    self.compared += 1;
+                    let gap = (x - y).abs().max().into_scalar();
+                    // `f32::max` drops a NaN operand; keep it.
+                    self.worst = if gap.is_nan() || self.worst.is_nan() {
+                        f32::NAN
+                    } else {
+                        self.worst.max(gap)
+                    };
                 }
                 (None, None) => {}
                 _ => self.worst = f32::INFINITY,
             }
         }
     }
-    let mut backward_err = 0.0f32;
+    let mut backward_err = 0.0f64;
     {
         use burn::module::Module as _;
         let mut diff = GradDiff {
             a: &one_shot,
             b: &segmented.trunk,
             worst: 0.0,
+            compared: 0,
         };
         amodel.trunk.visit(&mut diff);
-        backward_err = backward_err.max(diff.worst);
+        backward_err = worst(backward_err, f64::from(diff.worst));
+        if diff.compared == 0 {
+            backward_err = f64::INFINITY;
+        }
         let mut diff = GradDiff {
             a: &one_shot,
             b: &segmented.fusion,
             worst: 0.0,
+            compared: 0,
         };
         amodel.fusion.visit(&mut diff);
-        backward_err = backward_err.max(diff.worst);
+        backward_err = worst(backward_err, f64::from(diff.worst));
+        if diff.compared == 0 {
+            backward_err = f64::INFINITY;
+        }
     }
 
     Ok(vec![
@@ -3952,7 +4384,7 @@ fn geomfusion_checks() -> anyhow::Result<Vec<Certificate>> {
             "geomfusion",
             "fused_segmented_backward_matches_one_shot",
             "The fused segment-checkpointed backward (boundary-storing no-grad trunk pass, loss segment with the geometric stream inside, per-layer exact VJP chaining) reproduces the one-shot gradients of the adapters and the stream up to cross-row float accumulation order and the threaded-GEMM reduction sliver.",
-            f64::from(backward_err),
+            backward_err,
             1e-6,
         ),
     ])
@@ -4271,7 +4703,16 @@ fn cheat_gate_coverage_checks() -> anyhow::Result<Vec<Certificate>> {
     // `LanguageBatch::load` is what every text training path reads through,
     // including `dblocks student train` calling it directly. If a row can
     // reach a token tensor from here, it can reach training from anywhere.
-    let dir = std::env::temp_dir().join(format!("dblocks-gate-coverage-{}", std::process::id()));
+    // Unique per call, not only per process: `run_all` runs concurrently in
+    // more than one test of this process, and a shared directory let one run
+    // delete the other's fixtures mid-load (the mix and policy scratch dirs
+    // below carry the same counter for the same reason).
+    static COVERAGE_SCRATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "dblocks-gate-coverage-{}-{}",
+        std::process::id(),
+        COVERAGE_SCRATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     std::fs::create_dir_all(&dir).map_err(|e| anyhow::anyhow!("create {}: {e}", dir.display()))?;
     let fixture: PathBuf = dir.join("gate-coverage.jsonl");
     let line = |completion: &str| {
@@ -4359,7 +4800,8 @@ fn cheat_gate_coverage_checks() -> anyhow::Result<Vec<Certificate>> {
         "every_row_the_gate_saw_is_either_kept_or_dropped_exactly_once",
         "`kept + dropped == scanned` on a real load, so the report the gate leaves behind loses \
          nothing and double-counts nothing.",
-        (total.saturating_sub(accounted)) as f64,
+        // Both directions: `saturating_sub` was 0 for a double count.
+        (total as f64 - accounted as f64).abs(),
         0.0,
     ));
 
@@ -4443,17 +4885,25 @@ fn cheatharness_adaptation_checks() -> anyhow::Result<Vec<Certificate>> {
                 v.push(p);
             }
         }
-        // A raised mixing threshold is the other tightening axis.
+        // A *lowered* mixing threshold is the other tightening axis: the
+        // check fires when the scored language reaches `min_score` and leads
+        // the declared one by `min_margin`, so a lower bar fires on more
+        // traces. (This grid used to label the raised threshold tightening --
+        // the same inversion `is_monotone_over` had, which the restated
+        // certificate below could not see.)
         for bump in [1u32, 2] {
             let mut p = base.clone();
-            p.mixing.min_score += bump;
-            p.mixing.min_margin += bump;
+            p.mixing.min_score = p.mixing.min_score.saturating_sub(bump);
+            p.mixing.min_margin = p.mixing.min_margin.saturating_sub(bump);
             v.push(p);
         }
         // And the loosening shapes, which must never be accepted.
-        let mut lowered = base.clone();
-        lowered.mixing.min_score = lowered.mixing.min_score.saturating_sub(1);
-        v.push(lowered);
+        let mut raised = base.clone();
+        raised.mixing.min_score += 1;
+        v.push(raised);
+        let mut raised_margin = base.clone();
+        raised_margin.mixing.min_margin += 2;
+        v.push(raised_margin);
 
         let mut disabled = base.clone();
         disabled.gates.insert(
@@ -4473,6 +4923,7 @@ fn cheatharness_adaptation_checks() -> anyhow::Result<Vec<Certificate>> {
                 enabled: true,
             },
         );
+        v.push(demoted.clone());
         let mut weaker = demoted.clone();
         weaker.gates.insert(
             crate::cheatharness::class_key_for(CheatClass::DataStub).to_string(),
@@ -4523,13 +4974,72 @@ fn cheatharness_adaptation_checks() -> anyhow::Result<Vec<Certificate>> {
             }
         }
     }
+    // `accept` refuses whatever `is_monotone_over` rejects before it looks at
+    // a number, so the count above is zero by construction whatever that
+    // order gets wrong -- it restates `accept`, and it passed while the order
+    // had the mixing thresholds backwards. What makes "no weaker" true is
+    // behaviour: a profile the order admits over a baseline must reject every
+    // trace the baseline rejects. Measured on probe traces through `tally`,
+    // the exact rejection rule `accept`'s reward is computed with.
+    use crate::cheatharness::tally;
+    let python_as_rust =
+        "Example:\n\n```python\nimport os\n\ndef main():\n    self = None\n    print(self)\n```\n";
+    let probes: Vec<Labeled> = [
+        ("fn g() { todo!() }", SnippetLanguage::Rust),
+        (
+            "pub fn add(a: i64, b: i64) -> i64 {\n    a + b\n}",
+            SnippetLanguage::Rust,
+        ),
+        (python_as_rust, SnippetLanguage::Rust),
+        ("def main():\n    print('hi')\n", SnippetLanguage::Rust),
+        (
+            "import os\nfor x in range(3):\n    print(x)\n",
+            SnippetLanguage::Rust,
+        ),
+        (
+            "fn main() {\n    let v: Vec<i32> = Vec::new();\n    println!(\"{:?}\", v);\n}\n",
+            SnippetLanguage::Python,
+        ),
+        (
+            "#include <stdio.h>\nint main(void) { printf(\"hi\"); return 0; }\n",
+            SnippetLanguage::Rust,
+        ),
+        ("def f():\n    pass\n", SnippetLanguage::Python),
+    ]
+    .iter()
+    .map(|(code, lang)| Labeled {
+        code: (*code).to_string(),
+        lang: *lang,
+        cheat: true,
+    })
+    .collect();
+    let rejects = |profile: &HarnessProfile| -> Vec<bool> {
+        probes
+            .iter()
+            .map(|item| tally(std::slice::from_ref(item), profile).caught == 1)
+            .collect()
+    };
+    let rejected_sets: Vec<Vec<bool>> = profiles.iter().map(rejects).collect();
+    let mut behavioural = 0usize;
+    for (baseline, base_set) in profiles.iter().zip(&rejected_sets) {
+        for (candidate, cand_set) in profiles.iter().zip(&rejected_sets) {
+            if candidate.is_monotone_over(baseline) {
+                behavioural += base_set
+                    .iter()
+                    .zip(cand_set)
+                    .filter(|(b, c)| **b && !**c)
+                    .count();
+            }
+        }
+    }
     out.push(cert(
         "cheat",
         "an_accepted_profile_is_never_weaker_than_its_baseline",
-        "Over every baseline/candidate pair in the adaptation grid, an accepted profile is \
-         monotone-tightening over the profile it replaces: no threshold lowered, no class \
-         disabled, no severity reduced, no calibrated pair re-admitted.",
-        violations as f64,
+        "Over every baseline/candidate pair in the adaptation grid, a profile the monotonicity \
+         order admits over its baseline (the precondition of acceptance) rejects every probe \
+         trace the baseline rejects -- measured through the scanner, not restated from the \
+         order -- and acceptance implies that order.",
+        (violations + behavioural) as f64,
         0.0,
     ));
     // The claim above is only worth reading if the grid actually contains
@@ -4545,12 +5055,22 @@ fn cheatharness_adaptation_checks() -> anyhow::Result<Vec<Certificate>> {
         .iter()
         .filter(|p| !p.is_monotone_over(&HarnessProfile::default()))
         .count();
+    // ...and the probes must be able to *see* a loosening: the profile that
+    // disables the stub class has to let through a trace the default
+    // rejects, or the behavioural check above could not fail.
+    let default_set = rejects(&HarnessProfile::default());
+    let sees_loosening = profiles
+        .iter()
+        .zip(&rejected_sets)
+        .filter(|(p, _)| !p.is_monotone_over(&HarnessProfile::default()))
+        .any(|(_, set)| default_set.iter().zip(set).any(|(d, l)| *d && !*l));
     out.push(cert(
         "cheat",
         "the_monotonicity_grid_is_actually_exercised",
         "The grid the claim above is stated over holds both tightening and loosening \
-         profiles, so the check is not vacuously true over an all-strengthening set.",
-        if tightening > 0 && loosening > 0 {
+         profiles, and some loosening profile measurably lets through a probe trace the \
+         default rejects, so the check is not vacuously true.",
+        if tightening > 0 && loosening > 0 && sees_loosening {
             0.0
         } else {
             1.0
@@ -4953,7 +5473,9 @@ fn codegen_eval_checks() -> anyhow::Result<Vec<Certificate>> {
         "a_large_corpus_cannot_launder_a_contaminated_task",
         "A task present verbatim in a 401-row corpus still scores full overlap, because overlap is \
          measured against the task rather than the corpus.",
-        c.overlap - 1.0,
+        // Absolute: the signed `overlap - 1` is negative for exactly the
+        // laundered (diluted) task this exists to catch, and passed it.
+        (c.overlap - 1.0).abs(),
         0.0,
     ));
 
@@ -4979,7 +5501,11 @@ fn codegen_eval_checks() -> anyhow::Result<Vec<Certificate>> {
         "codegen_eval",
         "a_task_whose_tests_leak_is_rejected",
         "A task is rejected when its tests appear in the corpus even if its prompt is original.",
-        report.rejected.len() as f64,
+        // Exactly one task went in and it must come back rejected. The
+        // residual used to be `rejected.len()`, which is 0 -- a pass -- when
+        // the leaky task is admitted, i.e. it certified the opposite of its
+        // theorem.
+        (report.rejected.len() as f64 - 1.0).abs(),
         0.0,
     ));
 
@@ -4994,7 +5520,8 @@ fn codegen_eval_checks() -> anyhow::Result<Vec<Certificate>> {
         "codegen_eval",
         "known_contaminated_provenance_is_surfaced",
         "A task sourced from a benchmark known to be in pretraining data is reported at risk.",
-        report.at_risk.len() as f64 - 1.0,
+        // Absolute: the signed form was -1 (a pass) when nothing was flagged.
+        (report.at_risk.len() as f64 - 1.0).abs(),
         0.0,
     ));
 
@@ -5182,7 +5709,15 @@ fn antipattern_checks() -> anyhow::Result<Vec<Certificate>> {
     // and every labeled token must decode to a rule body: here the ":" of a
     // bare except, "pass" under it, and the "}" of an empty catch.
     let text = "try:\n    f()\nexcept:\n    pass\ncatch (e) {}\n";
-    let dir = std::env::temp_dir().join("dblocks-verify-antipattern");
+    // Unique per process *and* per call: a fixed name was shared by every
+    // concurrent `run_all` (and every process), which rewrote each other's
+    // source and corpus files mid-read.
+    static ANTIPATTERN_SCRATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "dblocks-verify-antipattern-{}-{}",
+        std::process::id(),
+        ANTIPATTERN_SCRATCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let corpus_err = (|| -> anyhow::Result<f64> {
         std::fs::create_dir_all(&dir)?;
         let source = dir.join("source.txt");
@@ -5224,6 +5759,9 @@ fn antipattern_checks() -> anyhow::Result<Vec<Certificate>> {
         Ok(mismatches as f64 + f64::from(u8::from(flagged != ":pass}")))
     })()
     .unwrap_or_else(|err| failed("antipattern", &err));
+    if let Err(err) = std::fs::remove_dir_all(&dir) {
+        eprintln!("verify: could not remove scratch {}: {err}", dir.display());
+    }
 
     // ------------------------------------------------------------------
     // With nothing flagged, the penalized objective must be the plain one to
@@ -5653,7 +6191,7 @@ fn accuracy_certificates() -> Vec<Certificate> {
         .iter()
         .zip(&reference)
         .map(|(a, b)| f64::from((a.to_bits() != b.to_bits()) as u8))
-        .fold(0.0f64, f64::max);
+        .fold(0.0f64, worst);
 
     // Guidance is an affine extrapolation through the two estimates, so at
     // scale s the result must be u + s(c - u). Checked against independently
@@ -5740,7 +6278,7 @@ fn accuracy_certificates() -> Vec<Certificate> {
         .iter()
         .zip(&raw_bits)
         .map(|(a, b)| f64::from((a.to_bits() != b.to_bits()) as u8))
-        .fold(0.0f64, f64::max);
+        .fold(0.0f64, worst);
 
     // ------------------------------------------------------------------
     // Every ensemble emits a probability distribution. A combination rule that
@@ -5846,6 +6384,23 @@ fn accuracy_certificates() -> Vec<Certificate> {
                 curve_violation = 1.0;
             }
         }
+        // ...and it drops no undominated point. Without this half the check
+        // was satisfied by a "frontier" holding only the single most accurate
+        // point. A point is undominated when nothing is at least as cheap and
+        // at least as accurate while strictly better in one of the two; it
+        // (or an exact duplicate of it) must be on the frontier.
+        for &(l, a) in &raw_points {
+            let dominated = raw_points
+                .iter()
+                .any(|&(lq, aq)| lq <= l && aq >= a && (lq < l || aq > a));
+            if !dominated
+                && !frontier
+                    .iter()
+                    .any(|p| p.layers_executed == l && p.accuracy == a)
+            {
+                curve_violation = 1.0;
+            }
+        }
     }
 
     vec![
@@ -5894,7 +6449,7 @@ fn accuracy_certificates() -> Vec<Certificate> {
         cert(
             "accuracy",
             "pareto_frontier_is_exactly_the_undominated_set",
-            "The reported scaling frontier contains no dominated configuration, attains the best accuracy measured, and increases in both cost and accuracy.",
+            "The reported scaling frontier contains no dominated configuration, omits no undominated one, attains the best accuracy measured, and increases in both cost and accuracy.",
             curve_violation,
             0.0,
         ),
@@ -6018,6 +6573,24 @@ fn optim_certificates() -> Vec<Certificate> {
     let probe: burn::nn::Linear<A2> = burn::nn::LinearConfig::new(2, 2)
         .with_bias(false)
         .init(&ema_device);
+    // A second, independently initialized module to serve as the shadow, so
+    // the blend has two different endpoints. Both are forced before any
+    // clone (an unforced `Param` draws fresh weights on each clone).
+    let shadow_probe: burn::nn::Linear<A2> = burn::nn::LinearConfig::new(2, 2)
+        .with_bias(false)
+        .init(&ema_device);
+    crate::tensor_ext::force_initialization(&probe);
+    crate::tensor_ext::force_initialization(&shadow_probe);
+    let weights_of = |m: &burn::nn::Linear<A2>| -> Vec<f64> {
+        m.weight
+            .val()
+            .into_data()
+            .convert::<f32>()
+            .iter::<f32>()
+            .map(f64::from)
+            .collect()
+    };
+    let (shadow_w, live_w) = (weights_of(&shadow_probe), weights_of(&probe));
 
     let mut convexity_err: f64 = 0.0;
     let mut interval_err: f64 = 0.0;
@@ -6032,19 +6605,59 @@ fn optim_certificates() -> Vec<Certificate> {
             // Bias correction: early on the shadow is still mostly its
             // initialization, so the nominal decay is ramped in.
             let warm = (1.0 + updates as f64) / (10.0 + updates as f64);
-            convexity_err = convexity_err.max((d - decay.min(warm)).abs());
-            convexity_err = convexity_err.max((d + (1.0 - d) - 1.0).abs());
+            convexity_err = worst(convexity_err, (d - decay.min(warm)).abs());
             if !(0.0..=1.0).contains(&d) {
                 convexity_err = 1.0;
             }
 
-            for (shadow, live) in [(-3.0f64, 7.0), (7.0, -3.0), (2.0, 2.0), (0.0, 1e6)] {
-                let blended = d * shadow + (1.0 - d) * live;
-                let (lo, hi) = (shadow.min(live), shadow.max(live));
-                interval_err = interval_err
-                    .max((lo - blended).max(0.0))
-                    .max((blended - hi).max(0.0));
+            // The blend itself, through `Ema::update` on real weights. This
+            // used to be `d * shadow + (1 - d) * live` evaluated right here,
+            // which lies in the interval for any `d` in [0, 1] whatever the
+            // update does -- a non-convex update would have passed. Each new
+            // shadow weight must be that blend (coefficients summing to 1)
+            // and inside [min, max] of its endpoints, up to f32 rounding.
+            let mut blended =
+                crate::schedule::Ema::from_parts(shadow_probe.clone(), decay, updates);
+            let d_used = blended.effective_decay();
+            blended.update::<A2>(&probe);
+            let got = weights_of(blended.shadow());
+            if got.len() != shadow_w.len() {
+                interval_err = f64::INFINITY;
             }
+            for ((g, sw), lw) in got.iter().zip(&shadow_w).zip(&live_w) {
+                let want = d_used * sw + (1.0 - d_used) * lw;
+                let slack = 4.0 * f64::from(f32::EPSILON) * sw.abs().max(lw.abs());
+                let (lo, hi) = (sw.min(*lw), sw.max(*lw));
+                let excess = ((g - want).abs() - slack)
+                    .max(lo - slack - g)
+                    .max(g - hi - slack)
+                    .max(0.0);
+                interval_err = worst(interval_err, if g.is_finite() { excess } else { f64::NAN });
+            }
+        }
+
+        // Repeated application against the closed form: from shadow S0 and a
+        // constant live L, n updates from a fresh average leave
+        // P S0 + (1 - P) L with P the product of the per-step decays
+        // min(decay, (1 + k)/(10 + k)), k = 0..n -- computed here from the
+        // documented ramp, not read back from the implementation.
+        let steps = 5usize;
+        let mut repeated = crate::schedule::Ema::from_parts(shadow_probe.clone(), decay, 0);
+        for _ in 0..steps {
+            repeated.update::<A2>(&probe);
+        }
+        let retained: f64 = (0..steps)
+            .map(|k| decay.min((1.0 + k as f64) / (10.0 + k as f64)))
+            .product();
+        let got = weights_of(repeated.shadow());
+        if got.len() != shadow_w.len() {
+            interval_err = f64::INFINITY;
+        }
+        for ((g, sw), lw) in got.iter().zip(&shadow_w).zip(&live_w) {
+            let want = retained * sw + (1.0 - retained) * lw;
+            let slack = 4.0 * steps as f64 * f64::from(f32::EPSILON) * sw.abs().max(lw.abs());
+            let excess = ((g - want).abs() - slack).max(0.0);
+            interval_err = worst(interval_err, if g.is_finite() { excess } else { f64::NAN });
         }
     }
 
@@ -6257,7 +6870,7 @@ fn optim_certificates() -> Vec<Certificate> {
         cert(
             "optim",
             "ema_is_a_convex_combination",
-            "The EMA coefficients sum to 1 and the blend never leaves the interval spanned by the shadow and the live weights, at every decay and update count.",
+            "`Ema::update` replaces each shadow weight by d * shadow + (1 - d) * live with the bias-corrected d = min(decay, (1 + t)/(10 + t)) -- coefficients summing to 1, never leaving the interval spanned by the shadow and the live weight (up to f32 rounding) -- at every decay and update count, and n updates toward a constant live weight leave exactly prod(d_k) S0 + (1 - prod(d_k)) L.",
             convexity_err.max(interval_err),
             1e-12,
         ),
@@ -6603,6 +7216,23 @@ fn experiment_checks() -> anyhow::Result<Vec<Certificate>> {
         last = t;
     }
     table_err = table_err.max((t_quantile_975(1000) - 1.96).abs());
+    // Monotonicity and the 1.96 floor are only shape: a typo that kept the
+    // table monotone (most single-digit typos do) passed them. The entries
+    // themselves are checked against published t(0.975, df) quantiles
+    // (scipy.stats.t.ppf, 6 decimals) to the four decimals they are
+    // tabulated to, at every tabulated df and at the 40/60/120 anchors.
+    const PUBLISHED: [f64; 30] = [
+        12.706205, 4.302653, 3.182446, 2.776445, 2.570582, 2.446912, 2.364624, 2.306004, 2.262157,
+        2.228139, 2.200985, 2.178813, 2.160369, 2.144787, 2.13145, 2.119905, 2.109816, 2.100922,
+        2.093024, 2.085963, 2.079614, 2.073873, 2.068658, 2.063899, 2.059539, 2.055529, 2.051831,
+        2.048407, 2.04523, 2.042272,
+    ];
+    let anchors = [(40usize, 2.021075f64), (60, 2.000298), (120, 1.97993)];
+    for (df, published) in (1..=30usize).zip(PUBLISHED).chain(anchors) {
+        // Half a unit in the fourth decimal, plus the reference's rounding.
+        let excess = (t_quantile_975(df) - published).abs() - 5.1e-5;
+        table_err = worst(table_err, excess.max(0.0));
+    }
 
     Ok(vec![
         cert(
@@ -6629,7 +7259,7 @@ fn experiment_checks() -> anyhow::Result<Vec<Certificate>> {
         cert(
             "experiment",
             "t_table_is_monotone_and_bounded_by_the_normal_quantile",
-            "t(0.975, df) is non-increasing in df, never below 1.96, and equals 1.96 far out.",
+            "t(0.975, df) matches published quantiles to its four tabulated decimals (df 1-30, 40, 60, 120), is non-increasing in df, never below 1.96, and equals 1.96 far out.",
             table_err,
             0.0,
         ),
@@ -7333,7 +7963,7 @@ fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
                     .into_scalar(),
             )
         })
-        .fold(0.0f64, f64::max);
+        .fold(0.0f64, worst);
     let inference_tolerance = 4.0 * h as f64 * eps * largest_state;
 
     // ------------------------------------------------------------------
@@ -7708,7 +8338,7 @@ pub fn model_health<BB: burn::tensor::backend::Backend<FloatElem = f32>>(
         .convert::<f32>()
         .iter::<f32>()
         .map(|s| (s as f64 - 1.0).abs())
-        .fold(0.0f64, f64::max);
+        .fold(0.0f64, worst);
 
     // x0 = probs @ W is a convex combination of the label-embedding rows, so
     // it can never leave their convex hull. A violation means the projection is
@@ -7721,14 +8351,24 @@ pub fn model_health<BB: burn::tensor::backend::Backend<FloatElem = f32>>(
         .sqrt()
         .max()
         .into_scalar() as f64;
+    // Row norms come to the host and are folded NaN-propagating: a diverged
+    // model's NaN estimate must fail here, and neither a device-side `max` nor
+    // `f64::max` is guaranteed to keep a NaN.
     let x0_norm = model
         .x0_estimate(pixel_values, latent, 1.0, None)
         .powf_scalar(2.0)
         .sum_dim(1)
         .sqrt()
-        .max()
-        .into_scalar() as f64;
-    let hull_excess = ((x0_norm - max_row_norm) / max_row_norm.max(1e-12)).max(0.0);
+        .into_data()
+        .convert::<f32>()
+        .iter::<f32>()
+        .map(f64::from)
+        .fold(0.0f64, worst);
+    let hull_excess = if x0_norm.is_finite() && max_row_norm.is_finite() {
+        ((x0_norm - max_row_norm) / max_row_norm.max(1e-12)).max(0.0)
+    } else {
+        f64::INFINITY
+    };
 
     // The label embeddings are the diffusion process's clean data; the
     // objective assumes they are unit norm after normalization.
@@ -8053,7 +8693,9 @@ fn vecread_checks() -> anyhow::Result<Vec<Certificate>> {
 
     let mut trajectory_residual = descent_violations;
     for (what, kl) in [("truncation", kl_truncation), ("offset", kl_offset)] {
-        if kl <= 1e-6 {
+        // Written so a NaN KL fails: `kl <= 1e-6` is false for NaN, which let
+        // an undefined divergence count as "the decode moved".
+        if kl.partial_cmp(&1e-6) != Some(std::cmp::Ordering::Greater) {
             eprintln!("verify: vecread: {what} intervention moved the decode by only {kl}");
             trajectory_residual += 1.0;
         }
@@ -8120,7 +8762,8 @@ fn vecread_checks() -> anyhow::Result<Vec<Certificate>> {
             "lens_decode_tracks_perturbed_trajectory",
             "Truncating the refinement (2 vs 4 steps) and adding a bounded offset at the \
              decoded position each move the lens decode measurably (full-row KL > 1e-6), the \
-             report's top-1 changes, and the certified energy descent still holds on both \
+             report's top-k distribution moves (total variation above LENS_REPORT_MOVE; its \
+             top-1 need not change), and the certified energy descent still holds on both \
              trajectories: the lens sees the intervention. (On a student whose zero-init \
              readout was nudged off zero — at exact init the stream is the identity and \
              there is nothing to see.)",
@@ -8135,6 +8778,244 @@ fn vecread_checks() -> anyhow::Result<Vec<Certificate>> {
              not decoration. (Same caveat: the zero-init readout is nudged off zero first, \
              because a fresh student's stream is an exact identity by design.)",
             depth_dependence_residual,
+            0.0,
+        ),
+    ])
+}
+
+// ---------------------------------------------------------------- routing --
+
+/// Routing integrity ([`crate::routeprobe`]) and the co-activation expert
+/// layout ([`crate::expertlayout`]).
+///
+/// Every random draw here comes from a seeded host RNG except the LM's
+/// weights, which come from Burn's process-wide RNG. The LM claims are
+/// therefore stated so they hold for any weight draw.
+fn routing_checks() -> anyhow::Result<Vec<Certificate>> {
+    use crate::expertlayout::{apply_layout, plan_layout, read_expert, CoActivation};
+    use crate::lm::{LanguageModel, LmConfig};
+    use crate::routeprobe::{
+        causality_probe, marker_tokens, perturb_suffix, trace_distance, PooledControlRouter,
+        Pooling, RoutingTracer,
+    };
+    use crate::tokenizer::VOCAB_SIZE;
+    use crate::vit::MoeTrunkConfig;
+    use rand::seq::SliceRandom;
+    use rand::Rng;
+
+    let device = Default::default();
+    let config = LmConfig {
+        moe: Some(MoeTrunkConfig {
+            num_experts: 4,
+            top_k: 2,
+            every_n_layers: 2,
+            z_level: 1e-3,
+            balance_bias: false,
+        }),
+        ..LmConfig::tiny()
+    }
+    .with_routing_state(4);
+    let model = LanguageModel::<B>::new(&config, &device)?;
+    let vocab = model.vocab_size();
+    let tokens = marker_tokens("if x { y() }");
+    let split = 6;
+
+    // A causal trunk's routing (and every layer output) at positions before
+    // `split` is a function of the tokens before `split` alone. Masked
+    // attention weights are exactly zero, so this holds bit for bit.
+    let perturbed = perturb_suffix(&tokens, split, vocab)?;
+    let report = causality_probe(&model, &tokens, &perturbed)?;
+    let mut causal = report.max_violation();
+    // Anti-vacuity, three ways. Both routed layers were traced. The suffix
+    // perturbation registered at every perturbed position. A single change
+    // *before* a position reached the positions after it: the probe sees
+    // changes that do flow, so its zero upstream is a measurement.
+    if report.layers.len() != 2 {
+        causal = worst(causal, 1.0);
+    }
+    if !report.downstream.iter().all(|d| *d > 0.0) {
+        causal = worst(causal, 1.0);
+    }
+    let mut one = tokens.clone();
+    let at = one
+        .get_mut(split - 1)
+        .context("the probe sequence is shorter than its split")?;
+    *at = (*at + 1) % u32::try_from(vocab)?;
+    let reached = causality_probe(&model, &tokens, &one)?.downstream_after(0);
+    if reached.is_nan() || reached <= 0.0 {
+        causal = worst(causal, 1.0);
+    }
+
+    // The same input traced twice is the same trace, every number of it.
+    let first = model.routing_trace(&tokens)?;
+    let second = model.routing_trace(&tokens)?;
+    let mut deterministic = trace_distance(&first, &second)?;
+    if first.layers.is_empty() || first.taps.is_empty() {
+        deterministic = worst(deterministic, 1.0);
+    }
+
+    // The probe flags a router that reads the future, and clears its causal twin.
+    let leaky = PooledControlRouter::seeded(VOCAB_SIZE, 8, 6, 2, Pooling::Whole, 7)?;
+    let twin = PooledControlRouter::seeded(VOCAB_SIZE, 8, 6, 2, Pooling::Prefix, 7)?;
+    let flagged = causality_probe(&leaky, &tokens, &perturbed)?.routing_violation();
+    let planted_leak = worst(
+        causality_probe(&twin, &tokens, &perturbed)?.max_violation(),
+        if flagged > 0.0 { 0.0 } else { 1.0 },
+    );
+
+    // Layout plans over random co-activation are bijections, and a
+    // corrupted plan is refused.
+    let mut rng = rand::rngs::StdRng::seed_from_u64(0x1a70);
+    let mut bijection = 0.0f64;
+    let mut layouts = Vec::new();
+    for experts in [1usize, 2, 5, 9, 16] {
+        let mut co = CoActivation::new(experts)?;
+        for _ in 0..3 * experts {
+            let k = rng.random_range(1..=experts.min(3));
+            let set: Vec<usize> = (0..k).map(|_| rng.random_range(0..experts)).collect();
+            co.observe(&set)?;
+        }
+        let plan = plan_layout(&co, 2)?;
+        let mut seen = vec![false; experts];
+        for (slot, &e) in plan.order.iter().enumerate() {
+            match (seen.get_mut(e), plan.inverse.get(e)) {
+                (Some(mark), Some(&back)) if !*mark && back == slot => *mark = true,
+                _ => bijection += 1.0,
+            }
+        }
+        if plan.order.len() != experts || plan.validate().is_err() {
+            bijection += 1.0;
+        }
+        if experts >= 2 {
+            let mut broken = plan.clone();
+            broken.inverse.swap(0, 1);
+            if broken.validate().is_ok() {
+                bijection += 1.0;
+            }
+        }
+        layouts.push(plan);
+    }
+
+    // Every expert reads back byte for byte from the laid-out buffer,
+    // including zero-length experts, and the slot table tiles the buffer.
+    let mut reads = 0.0f64;
+    for plan in &layouts {
+        let blobs: Vec<Vec<u8>> = (0..plan.experts)
+            .map(|_| {
+                let len = if rng.random_range(0..3) == 0 {
+                    0
+                } else {
+                    rng.random_range(1..64)
+                };
+                (0..len).map(|_| rng.random()).collect()
+            })
+            .collect();
+        let (bytes, extents) = apply_layout(&blobs, plan)?;
+        for (e, blob) in blobs.iter().enumerate() {
+            if read_expert(&bytes, &extents, plan, e)? != blob.as_slice() {
+                reads += 1.0;
+            }
+        }
+        let mut next = 0u64;
+        for &(offset, len) in &extents {
+            if offset != next {
+                reads += 1.0;
+            }
+            next = offset + u64::try_from(len)?;
+        }
+        if next != u64::try_from(bytes.len())? {
+            reads += 1.0;
+        }
+    }
+
+    // Plant four blocks of three co-firing experts under a shuffled id
+    // assignment. The plan must not lower locality, must raise it here (the
+    // shuffle scattered the blocks), and, checked independently of the
+    // locality number, must place every block in a contiguous slot range.
+    let (blocks, size) = (4usize, 3usize);
+    let mut ids: Vec<usize> = (0..blocks * size).collect();
+    let mut planting = rand::rngs::StdRng::seed_from_u64(11);
+    ids.shuffle(&mut planting);
+    let mut co = CoActivation::new(blocks * size)?;
+    let groups: Vec<&[usize]> = ids.chunks(size).collect();
+    for group in &groups {
+        co.observe(group)?;
+        for _ in 0..20 {
+            let a = group.get(planting.random_range(0..size)).copied();
+            let b = group.get(planting.random_range(0..size)).copied();
+            if let (Some(a), Some(b)) = (a, b) {
+                co.observe(&[a, b])?;
+            }
+        }
+    }
+    let plan = plan_layout(&co, size - 1)?;
+    let mut planted = (plan.locality_before - plan.locality_after).max(0.0);
+    if plan.locality_after <= plan.locality_before {
+        planted = worst(planted, 1.0);
+    }
+    for group in &groups {
+        let slots = group
+            .iter()
+            .map(|&e| plan.slot_of(e))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let lo = slots.iter().min().copied().unwrap_or(0);
+        let hi = slots.iter().max().copied().unwrap_or(0);
+        if hi - lo + 1 != group.len() {
+            planted += 1.0;
+        }
+    }
+
+    Ok(vec![
+        cert(
+            "routing",
+            "routing_is_causal_in_the_lm",
+            "Replacing every token from position p on leaves each routed layer's top-1 and every \
+             layer output and logit at positions < p bit-identical in a random MoE LM with a \
+             routing state; and, so the zero is a measurement, a change at p-1 does reach the \
+             positions after it. (The trunk exports only per-token top-1, not per-token router \
+             probabilities, so the layer outputs are the continuous signal.)",
+            causal,
+            0.0,
+        ),
+        cert(
+            "routing",
+            "routing_trace_is_deterministic",
+            "Tracing the same tokens twice gives the same routing trace: every selection, \
+             probability and tap value equal.",
+            deterministic,
+            0.0,
+        ),
+        cert(
+            "routing",
+            "routing_probe_flags_a_planted_leak",
+            "The causality probe reports a non-zero violation for a control router that pools \
+             the whole sequence and exactly zero for its prefix-pooled twin.",
+            planted_leak,
+            0.0,
+        ),
+        cert(
+            "routing",
+            "layout_is_a_bijection",
+            "Every plan over random co-activation is a permutation with inverse[order[i]] == i, \
+             and validation refuses a plan whose inverse was corrupted.",
+            bijection,
+            0.0,
+        ),
+        cert(
+            "routing",
+            "laid_out_reads_are_byte_identical",
+            "For random blob sizes including zero, every expert read from the laid-out buffer \
+             equals its original blob byte for byte, and the slot table tiles the buffer.",
+            reads,
+            0.0,
+        ),
+        cert(
+            "routing",
+            "layout_never_lowers_locality_on_a_planted_structure",
+            "On block-diagonal co-activation with shuffled ids the plan's locality is not \
+             below the identity's (and here strictly above it), and every planted block \
+             occupies a contiguous range of slots.",
+            planted,
             0.0,
         ),
     ])
@@ -8285,23 +9166,30 @@ mod tests {
             vec![
                 "ablation",
                 "accuracy",
+                "alien",
                 "antipattern",
                 "autodiff",
                 "cheat",
                 "codegen_eval",
-                "cohort",
+                // Sorted order: `groups` is sorted before the comparison, and
+                // "codequality" < "cohort". With these two swapped (as they
+                // were) this test could never pass.
                 "codequality",
+                "cohort",
                 "deltanet",
                 "experiment",
                 "geom",
                 "geomfusion",
                 "hybrid",
+                "integrity",
                 "lm",
                 "loopgraph",
                 "model",
                 "moe",
                 "mosme",
                 "multisource",
+                "ncm",
+                "ncm-decode",
                 "optim",
                 "planner",
                 "policy",
@@ -8309,6 +9197,8 @@ mod tests {
                 "preconditioning",
                 "quantize",
                 "qwennet",
+                "router",
+                "routing",
                 "schedule",
                 "solver",
                 "stats",

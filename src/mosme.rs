@@ -750,10 +750,17 @@ impl<B: Backend> MosmeFeedForward<B> {
         expert_idx: usize,
     ) -> Tensor<B, 3> {
         let [b, n, h] = x.dims();
-        let (boxes, experts) = (self.boxes.len(), self.boxes.first().map_or(0, Vec::len));
+        // Bound the expert index by *this* box's width: boxes are ragged, so
+        // the first box's width would let an index past a narrower box through
+        // to a bare out-of-bounds panic.
+        let (boxes, experts) = (
+            self.boxes.len(),
+            self.boxes.get(box_idx).map_or(0, Vec::len),
+        );
         assert!(
             box_idx < boxes && expert_idx < experts,
-            "specialist ({box_idx}, {expert_idx}) is outside this MoSME module's {boxes}x{experts} layout"
+            "specialist ({box_idx}, {expert_idx}) is outside this MoSME module: {boxes} boxes, \
+             box {box_idx} holds {experts} experts"
         );
         let flat = x.reshape([b * n, h]);
         // The assert above bounds both indices against the layout this module
@@ -1048,6 +1055,8 @@ impl<B: Backend> MosmeFeedForward<B> {
                         sha256: crate::checkpoint::canonical_hash_hex::<B, _>(module),
                     },
                     tags: expert_spec.tags.clone(),
+                    category: None,
+                    subfield: None,
                 });
                 global += 1;
             }
@@ -1056,6 +1065,7 @@ impl<B: Backend> MosmeFeedForward<B> {
                 label: box_spec.label.clone(),
                 index: bi,
                 experts,
+                category: None,
             });
         }
 
@@ -1291,6 +1301,8 @@ impl<B: Backend> MosmeAdapterBank<B> {
                         sha256: crate::checkpoint::canonical_hash_hex::<B, _>(adapter),
                     },
                     tags: expert_spec.tags.clone(),
+                    category: None,
+                    subfield: None,
                 });
                 global += 1;
             }
@@ -1299,6 +1311,7 @@ impl<B: Backend> MosmeAdapterBank<B> {
                 label: box_spec.label.clone(),
                 index: bi,
                 experts,
+                category: None,
             });
         }
 
@@ -1620,6 +1633,8 @@ impl<B: Backend<FloatElem = f32>> MosmeEnsemble<B> {
                         sha256: crate::checkpoint::canonical_hash_hex::<B, _>(model),
                     },
                     tags: expert_spec.tags.clone(),
+                    category: None,
+                    subfield: None,
                 });
                 global += 1;
             }
@@ -1628,6 +1643,7 @@ impl<B: Backend<FloatElem = f32>> MosmeEnsemble<B> {
                 label: box_spec.label.clone(),
                 index: bi,
                 experts,
+                category: None,
             });
         }
 
@@ -2729,6 +2745,29 @@ mod tests {
         // silent fall-back to training everything.
         assert!(TrainingMode::parse("specialist", None).is_err());
         assert!(TrainingMode::parse("nonsense", None).is_err());
+    }
+
+    #[test]
+    fn test_forward_specialist_bounds_the_index_by_its_own_box() {
+        // Box 0 holds three experts, box 1 only two. Index 2 is valid in box
+        // 0 and must be rejected by the layout check for box 1 -- not slip past
+        // a check against box 0's width and die on a bare slice index.
+        let device = Default::default();
+        let layer = MosmeFeedForward::<B>::new(&config(ragged_spec()), &device);
+        let (x, _) = inputs(&device);
+        let ok = layer.forward_specialist(x.clone(), 0, 2);
+        assert_eq!(ok.dims(), [2, 3, 8]);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            layer.forward_specialist(x.clone(), 1, 2)
+        }));
+        let message = caught
+            .err()
+            .and_then(|e| e.downcast::<String>().ok().map(|s| *s))
+            .expect("an index past box 1 must panic with a message");
+        assert!(
+            message.contains("box 1 holds 2 experts"),
+            "the layout check must name the box it checked: {message}"
+        );
     }
 
     #[test]

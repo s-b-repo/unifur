@@ -51,6 +51,12 @@ impl Grid {
                 "unknown grid key {key:?}; supported: {}",
                 SUPPORTED.join(", ")
             );
+            // A repeated key would let the later axis silently overwrite the
+            // earlier one in every cell while both still appear in its name.
+            anyhow::ensure!(
+                !axes.iter().any(|a: &Axis| a.key == key),
+                "grid key {key:?} appears twice"
+            );
             axes.push(Axis {
                 key: key.to_string(),
                 values,
@@ -131,7 +137,13 @@ pub fn apply(config: &mut TrainConfig, key: &str, value: &str) -> anyhow::Result
         "uncertainty" => config.uncertainty = num(value)?,
         "importance_bins" => config.importance_bins = int(value)?,
         "normalize_block_loss" => {
-            config.normalize_block_loss = matches!(value, "1" | "true" | "yes")
+            config.normalize_block_loss = match value {
+                "1" | "true" | "yes" => true,
+                "0" | "false" | "no" => false,
+                // Anything else (a typo, "on", "True") used to read as
+                // `false`, silently sweeping one value twice.
+                other => anyhow::bail!("{key}={other}: expected 1|true|yes or 0|false|no"),
+            }
         }
         "objective" => config.objective = Objective::parse(value)?,
         "consistency" => {
@@ -178,23 +190,37 @@ pub fn cell_name(cell: &[(String, String)]) -> String {
     format!("sweep/{}", parts.join(","))
 }
 
+/// `base` with every override of `cell` applied, then the learning-rate
+/// schedule re-derived from the final `lr` and `steps`.
+fn cell_config(base: &TrainConfig, cell: &[(String, String)]) -> anyhow::Result<TrainConfig> {
+    let mut config = base.clone();
+    for (key, value) in cell {
+        apply(&mut config, key, value)?;
+    }
+    // Unconditionally: an `lr_schedule` axis applied *before* an `lr` or
+    // `steps` axis was built from the old values, and skipping the
+    // re-derivation whenever the cell named a schedule left the swept `lr`
+    // never reaching the optimizer (which reads the schedule, not `lr`).
+    config.lr_schedule =
+        crate::schedule::LrSchedule::parse(config.lr_schedule.name(), config.lr, config.steps)?;
+    Ok(config)
+}
+
 /// Train one cell once per seed and summarize the final losses.
 ///
-/// The learning-rate schedule is re-derived after the overrides so a swept
-/// `lr` or `steps` reaches it. Every per-seed outcome is kept in `extra`.
+/// The learning-rate schedule is re-derived after *all* the overrides so a
+/// swept `lr` or `steps` reaches it whatever order the axes come in. Every
+/// per-seed outcome is kept in `extra`.
 pub fn run_cell(
     base: &TrainConfig,
     cell: &[(String, String)],
     seeds: &[u64],
 ) -> anyhow::Result<Record> {
-    let mut config = base.clone();
-    for (key, value) in cell {
-        apply(&mut config, key, value)?;
-    }
-    if !cell.iter().any(|(k, _)| k == "lr_schedule") {
-        config.lr_schedule =
-            crate::schedule::LrSchedule::parse(config.lr_schedule.name(), config.lr, config.steps)?;
-    }
+    anyhow::ensure!(
+        !seeds.is_empty(),
+        "a sweep cell needs at least one seed; with none it would record no trials"
+    );
+    let config = cell_config(base, cell)?;
     let config_json = serde_json::to_value(&config).context("serialize sweep cell config")?;
     let mut record = Record::new(cell_name(cell), "loss", config_json, seeds.to_vec());
     let mut per_seed = Vec::with_capacity(seeds.len());
@@ -313,6 +339,41 @@ mod tests {
         assert!(Grid::parse("lr=").is_err());
         assert!(Grid::parse("bogus=1").is_err());
         assert!(Grid::parse("").is_err());
+        assert!(
+            Grid::parse("lr=1e-4 lr=3e-4").is_err(),
+            "a repeated key would overwrite itself in every cell"
+        );
+    }
+
+    #[test]
+    fn test_swept_lr_reaches_the_schedule_in_any_axis_order() {
+        let base = TrainConfig::default();
+        for cell in [
+            vec![
+                ("lr_schedule".to_string(), "cosine".to_string()),
+                ("lr".to_string(), "5e-4".to_string()),
+            ],
+            vec![
+                ("lr".to_string(), "5e-4".to_string()),
+                ("lr_schedule".to_string(), "cosine".to_string()),
+            ],
+        ] {
+            let config = cell_config(&base, &cell).unwrap();
+            assert_eq!(config.lr, 5e-4);
+            assert_eq!(config.lr_schedule.name(), "cosine");
+            assert_eq!(config.lr_schedule.peak(), 5e-4, "{cell:?}");
+        }
+        assert!(run_cell(&base, &[], &[]).is_err(), "no seeds, no record");
+    }
+
+    #[test]
+    fn test_boolean_flags_reject_unknown_spellings() {
+        let mut config = TrainConfig::default();
+        apply(&mut config, "normalize_block_loss", "true").unwrap();
+        assert!(config.normalize_block_loss);
+        apply(&mut config, "normalize_block_loss", "0").unwrap();
+        assert!(!config.normalize_block_loss);
+        assert!(apply(&mut config, "normalize_block_loss", "on").is_err());
     }
 
     #[test]

@@ -283,18 +283,20 @@ impl FromStr for GeometryKind {
 
     /// Parse a declared geometry. Case and surrounding space are forgiven --
     /// the string arrives from a human-written problem file -- and the
-    /// classical synonyms are accepted (`elliptic` for the sphere,
-    /// `boltzmann` for the hyperbolic plane), because those are the names the
-    /// literature uses. Everything else is an error: leniency toward the
+    /// classical synonyms are accepted (`elliptic` for the sphere, `bolyai` /
+    /// `lobachevsky` for the hyperbolic plane), because those are the names
+    /// the literature uses. Everything else is an error: leniency toward the
     /// listed synonyms costs nothing, leniency toward unknown names is exactly
-    /// the silent defaulting this module refuses.
+    /// the silent defaulting this module refuses. (`boltzmann` was once
+    /// accepted as a hyperbolic synonym; it is not one, so it is refused.)
     fn from_str(text: &str) -> anyhow::Result<Self> {
         match text.trim().to_ascii_lowercase().as_str() {
             "euclidean" | "euclid" | "euclidian" => Ok(GeometryKind::Euclidean),
             "affine" => Ok(GeometryKind::Affine),
             "projective" => Ok(GeometryKind::Projective),
             "spherical" | "spheric" | "elliptic" | "elliptical" => Ok(GeometryKind::Spherical),
-            "hyperbolic" | "boltzmann" | "klein" | "cayley-klein" => Ok(GeometryKind::Hyperbolic),
+            "hyperbolic" | "bolyai" | "lobachevsky" | "lobachevskian" | "bolyai-lobachevsky"
+            | "klein" | "cayley-klein" => Ok(GeometryKind::Hyperbolic),
             _ => Err(NonEuclideanError::UnknownGeometry {
                 name: text.to_string(),
             }
@@ -1642,7 +1644,8 @@ impl ProjectivePlane {
             }
         }
         Err(NonEuclideanError::DegenerateCrossRatio {
-            detail: "the four points share no coordinate plane in which they can be                      distinguished, so no determinant pairing decides their cross ratio"
+            detail: "the four points share no coordinate plane in which they can be \
+                     distinguished, so no determinant pairing decides their cross ratio"
                 .to_string(),
         }
         .into())
@@ -1654,6 +1657,24 @@ impl ProjectivePlane {
     /// kernel's reflection does in the plane, carried where lengths do not
     /// exist.
     pub fn harmonic_conjugate(a: &PPoint, b: &PPoint, c: &PPoint) -> anyhow::Result<PPoint> {
+        // The parameter below is read off one coordinate, which silently
+        // projects an off-line `C` onto the line: `C = (1, 5)` against
+        // `A = (0, 0)`, `B = (2, 0)` would come back as "the point at
+        // infinity", a conjugate of a point that is not on the line at all.
+        // A harmonic quadruple is four collinear points, so refuse the rest,
+        // as `cross_ratio` does -- with the typed error, so a caller can match.
+        if !PLine::through(a, b)?.contains(c)? {
+            return Err(NonEuclideanError::DegenerateCrossRatio {
+                detail: format!(
+                    "{} is not on the line through {} and {}, so it has no harmonic conjugate \
+                     with respect to them",
+                    c.describe(),
+                    a.describe(),
+                    b.describe()
+                ),
+            }
+            .into());
+        }
         let (a_aff, b_aff, c_aff) = (a.to_affine()?, b.to_affine()?, c.to_affine()?);
         // in the parameter with A at 0, B at 1: t_D = t_C / (2 t_C - 1)
         let t = if !b_aff.0.sub(&a_aff.0)?.is_zero() {
@@ -1847,11 +1868,12 @@ impl AffinePlane {
         } else {
             m_aff.1.sub(&a_aff.1)?.div(&dy)?
         };
-        anyhow::ensure!(
-            !t.is_zero() && !Q::ONE.less(&t),
-            "{}",
-            GeometryError::DegenerateSegment
-        );
+        // Only `M = A` (t = 0) and `M = B` (t = 1, below) have no ratio. A
+        // point beyond `B` (t > 1) has a directed ratio like any other: it
+        // used to be refused as a "degenerate segment" while a point beyond
+        // `A` (t < 0) was accepted, and `point_at_ratio` with a negative
+        // ratio -- its documented inverse -- builds exactly such points.
+        anyhow::ensure!(!t.is_zero(), "{}", GeometryError::DegenerateSegment);
         // AM / MB = t / (1 - t)
         let one_minus = Q::ONE.sub(&t)?;
         anyhow::ensure!(!one_minus.is_zero(), "{}", GeometryError::DegenerateSegment);
@@ -2038,6 +2060,23 @@ impl CayleyKleinDisk {
                 circle: "the Klein disk".to_string(),
             }
         );
+        // The documented refusal of a line that is not a hyperbolic line at
+        // all. `ax + by + c = 0` crosses the open disk exactly when its
+        // distance from the centre is below the radius, `c^2 < r^2 (a^2 + b^2)`.
+        // Without this, a line wholly outside the disk got "witness" lines,
+        // since every line through `point` meets it outside the disk.
+        let line_norm_sq = line.a.mul(&line.a)?.add(&line.b.mul(&line.b)?)?;
+        anyhow::ensure!(
+            line.c
+                .mul(&line.c)?
+                .less(&self.radius_sq.mul(&line_norm_sq)?),
+            "{}",
+            GeometryError::EmptyGeometry(format!(
+                "the line {} does not cross the Klein disk, so it is not a line of the \
+                 hyperbolic plane and there is nothing to be parallel to",
+                line.describe()
+            ))
+        );
         // A finite point of `line` to start from: the foot of the perpendicular
         // from the origin, which is the closest point of the line to the centre
         // of the disk and is rational whenever the line is. Any point of the
@@ -2133,15 +2172,15 @@ impl SRay {
                 z: self.z.div(&self.x)?,
             })
         } else if !self.y.is_zero() {
-            let positive = if self.y.less(&Q::ZERO) {
-                self.y.neg()?
-            } else {
-                self.y
-            };
+            // Divide by the signed `y`, as the `x` branch divides by the
+            // signed `x`: the representative must be a scalar multiple of the
+            // ray. Dividing `z` by `|y|` mapped `(0, -2, 4)` to `(0, 1, 2)`,
+            // which is a different point of the sphere (the ray is
+            // `(0, 1, -2)`), so `antipodal` answered both ways wrongly.
             Ok(Self {
                 x: Q::ZERO,
                 y: Q::ONE,
-                z: self.z.div(&positive)?,
+                z: self.z.div(&self.y)?,
             })
         } else {
             anyhow::ensure!(
@@ -2422,9 +2461,15 @@ mod tests {
             GeometryKind::Spherical
         );
         assert_eq!(
-            "Boltzmann".parse::<GeometryKind>().unwrap(),
+            "Lobachevsky".parse::<GeometryKind>().unwrap(),
             GeometryKind::Hyperbolic
         );
+        assert_eq!(
+            "bolyai".parse::<GeometryKind>().unwrap(),
+            GeometryKind::Hyperbolic
+        );
+        // a physicist's name is not a geometry, and is not read as one
+        assert!("Boltzmann".parse::<GeometryKind>().is_err());
         // and anything else is an error carrying the valid list, not a default
         let why = refusal("hyperbolic-ish".parse::<GeometryKind>());
         assert_eq!(
@@ -3490,6 +3535,81 @@ mod tests {
         assert!(!disjoint.meets());
         assert!(disjoint.at().is_none());
         assert!(disjoint.to_string().contains("no point"), "{disjoint}");
+    }
+
+    #[test]
+    fn test_ray_normalization_keeps_the_ray_when_y_leads_negative() {
+        // (0, -2, 4) is the ray (0, 1, -2) up to scale; (0, 1, 2) is a
+        // different point of the sphere. Dividing `z` by `|y|` swapped them.
+        let ray = SRay::new(Q::ZERO, q(-2, 1), Q::from_int(4)).unwrap();
+        let same = SRay::new(Q::ZERO, Q::ONE, q(-2, 1)).unwrap();
+        let other = SRay::new(Q::ZERO, Q::ONE, Q::from_int(2)).unwrap();
+        assert_eq!(ray.normalize().unwrap(), same);
+        assert!(ray.antipodal(&same).unwrap());
+        assert!(!ray.antipodal(&other).unwrap());
+        // and two distinct points do determine a great circle
+        assert!(SphericalModel.normal_of(&ray, &other).is_ok());
+    }
+
+    #[test]
+    fn test_harmonic_conjugate_refuses_an_off_line_point() {
+        // C = (1, 5) is not on the x-axis through A and B; its x-parameter is
+        // that of the midpoint, so the unchecked construction answered "the
+        // point at infinity" for a quadruple that does not exist.
+        let (a, b) = (
+            PPoint::affine(Q::ZERO, Q::ZERO),
+            PPoint::affine(Q::from_int(2), Q::ZERO),
+        );
+        let off = PPoint::affine(Q::ONE, Q::from_int(5));
+        let why = refusal(ProjectivePlane::harmonic_conjugate(&a, &b, &off));
+        assert!(
+            matches!(why, NonEuclideanError::DegenerateCrossRatio { .. }),
+            "{why:?}"
+        );
+        // an on-line point still has its conjugate, with cross ratio -1
+        let on = PPoint::affine(q(1, 2), Q::ZERO);
+        let d = ProjectivePlane::harmonic_conjugate(&a, &b, &on).unwrap();
+        assert_eq!(
+            ProjectivePlane::cross_ratio(&a, &b, &on, &d).unwrap(),
+            q(-1, 1)
+        );
+    }
+
+    #[test]
+    fn test_affine_ratio_is_directed_on_both_sides() {
+        // External division is a directed ratio on either side of the
+        // segment, and `point_at_ratio` builds both; `ratio` must invert it.
+        let (a, b) = (
+            PPoint::affine(Q::ZERO, Q::ZERO),
+            PPoint::affine(Q::from_int(4), Q::ZERO),
+        );
+        // beyond B: M = 6, AM / MB = 6 / -2 = -3
+        let beyond_b = PPoint::affine(Q::from_int(6), Q::ZERO);
+        assert_eq!(AffinePlane::ratio(&a, &beyond_b, &b).unwrap(), q(-3, 1));
+        let rebuilt = AffinePlane::point_at_ratio(&a, &b, q(-3, 1), Q::ONE).unwrap();
+        assert_eq!(rebuilt.to_affine().unwrap(), (Q::from_int(6), Q::ZERO));
+        // beyond A: M = -2, AM / MB = -2 / 6 = -1/3
+        let beyond_a = PPoint::affine(Q::from_int(-2), Q::ZERO);
+        assert_eq!(AffinePlane::ratio(&a, &beyond_a, &b).unwrap(), q(-1, 3));
+        // and the endpoints themselves still have no ratio
+        assert!(AffinePlane::ratio(&a, &a, &b).is_err());
+        assert!(AffinePlane::ratio(&a, &b, &b).is_err());
+    }
+
+    #[test]
+    fn test_a_line_outside_the_klein_disk_gets_no_parallels() {
+        // y = 2 never enters the unit disk: it is not a hyperbolic line, and
+        // the exhibit must refuse it rather than produce "witnesses".
+        let disk = klein();
+        let outside = PLine::new(Q::ZERO, Q::ONE, q(-2, 1)).unwrap();
+        let centre = PPoint::affine(Q::ZERO, Q::ZERO);
+        let why = message(disk.non_merging_lines_through(&centre, &outside, 1));
+        assert!(why.contains("does not cross the Klein disk"), "{why}");
+        // a tangent line touches only an ideal point, and is refused too
+        let tangent = PLine::new(Q::ZERO, Q::ONE, q(-1, 1)).unwrap();
+        assert!(disk
+            .non_merging_lines_through(&centre, &tangent, 1)
+            .is_err());
     }
 
     #[test]

@@ -13,10 +13,12 @@
 //!   default; the rest of the pipeline pays nothing when filtering is off.
 //! - [`Policy::Downweight`]: weights in `[floor, ceiling]` are derived from
 //!   the score. `floor == ceiling == 1.0` is exactly [`Policy::Keep`].
-//! - [`Policy::Drop`]: any window whose `overall <= drop_below` is
+//! - [`Policy::Drop`]: any window whose `overall < drop_below` (strictly) is
 //!   removed from the batch. A `Drop` policy with `drop_below = 0.0`
 //!   drops nothing; a `Drop` policy with `drop_below = 1.0` drops
-//!   everything -- the policy is the lever, not the threshold.
+//!   everything except a perfect `1.0` -- the policy is the lever, not the
+//!   threshold. A NaN score reads as `0.0`: a window whose quality could not
+//!   be measured is never kept *because* it could not be measured.
 
 use super::QualityScore;
 
@@ -34,7 +36,7 @@ pub enum Policy {
     /// that the user enabled for diagnostics should not change what is
     /// trained on.
     Downweight { floor: f32, ceiling: f32 },
-    /// Drop the window if `overall <= drop_below`. Otherwise keep it with
+    /// Drop the window if `overall < drop_below`. Otherwise keep it with
     /// weight `1.0`.
     Drop { drop_below: f32 },
 }
@@ -50,9 +52,9 @@ impl Policy {
     }
 
     /// The weight this policy assigns to a window with overall score `s`.
-    /// `s` is clamped to `[0, 1]` defensively.
+    /// `s` is clamped to `[0, 1]` defensively, and a NaN reads as `0.0`.
     pub fn weight(&self, s: f32) -> f32 {
-        let s = s.clamp(0.0, 1.0);
+        let s = unit_score(s);
         match *self {
             Self::Keep => 1.0,
             Self::Downweight { floor, ceiling } => {
@@ -66,12 +68,25 @@ impl Policy {
 
     /// Whether this policy drops a window with overall score `s`.
     pub fn drops(&self, s: f32) -> bool {
-        let s = s.clamp(0.0, 1.0);
+        let s = unit_score(s);
         // Strict inequality: `drop_below == 0.0` therefore drops nothing,
         // which is the containment a `--quality-filter drop --threshold 0`
         // flag relies on. The threshold is the *first* score that survives,
         // not the *last* that is dropped.
         matches!(*self, Self::Drop { drop_below } if s < drop_below)
+    }
+}
+
+/// `s` clamped into `[0, 1]`, with NaN read as `0.0`.
+///
+/// `f32::clamp` passes NaN through, and every comparison against NaN is false:
+/// `drops(NaN)` used to keep the window, and `weight(NaN)` returned a NaN
+/// weight that would poison the batch loss it multiplied.
+fn unit_score(s: f32) -> f32 {
+    if s.is_nan() {
+        0.0
+    } else {
+        s.clamp(0.0, 1.0)
     }
 }
 
@@ -316,6 +331,19 @@ mod tests {
         let report = FilterReport::from_decide(4, 1);
         assert_eq!(report.dropped, 3);
         assert!((report.drop_rate() - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_a_nan_score_is_dropped_and_never_weighted_nan() {
+        assert!(WindowFilter::drop_below(0.5).policy.drops(f32::NAN));
+        let w = WindowFilter::downweight(0.1, 1.0).policy.weight(f32::NAN);
+        assert!(
+            (w - 0.1).abs() < 1e-6,
+            "NaN must weigh as the floor, got {w}"
+        );
+        // Keep stays the identity whatever the score.
+        assert!(!WindowFilter::keep().policy.drops(f32::NAN));
+        assert_eq!(WindowFilter::keep().policy.weight(f32::NAN), 1.0);
     }
 
     #[test]

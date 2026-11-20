@@ -2,12 +2,8 @@
 name = "diffusionblocks"
 version = "0.1.0"
 edition = "2021"
-# The floor this crate claims to build on. `rust-toolchain.toml` pins 1.96 for
-# development; the two are different numbers on purpose and CI keeps them honest
-# with a job that compiles the whole tree at exactly this version. Raise this
-# when a dependency or a language feature moves the floor -- and let that job
-# fail first, so the bump is a decision rather than a surprise.
-rust-version = "1.85"
+# Burn 0.21 requires Rust 1.92. The MSRV job checks this version against Cargo.lock.
+rust-version = "1.92"
 license = "Apache-2.0"
 description = "Block-wise neural network training via diffusion interpretation (DiffusionBlocks++ in Rust)"
 readme = "README.md"
@@ -167,6 +163,8 @@ dbg_macro = "deny"
 # legitimate case impossible to write.
 
 # --- misc hygiene ----------------------------------------------------------
+# Integer remainder checks can rely on `%` panicking on a zero divisor.
+manual_is_multiple_of = "allow"
 # `use foo::*;` makes it impossible to see what a file depends on.
 wildcard_imports = "deny"
 # `mem::forget` leaks whatever it is handed.

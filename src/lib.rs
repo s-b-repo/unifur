@@ -31,8 +31,6 @@
 //! two shapes match" -- and there is no error channel to return through at that
 //! point. What is denied is reaching for a runtime value that might be absent.
 //!
-//! # Layout
-//!
 //! # Testing exemptions
 //!
 //! A `#[cfg(test)]` module gets the unwrap family back, and only that module
@@ -49,6 +47,8 @@
 //!
 //! A new test module therefore needs its grant written the same way, or both
 //! will report it.
+//!
+//! # Layout
 //!
 //! - [`stats`]: scalar statistics helpers (erf, normal CDF / quantile)
 //! - [`sigma`]: EDM / dblock noise schedules and preconditioning
@@ -71,9 +71,6 @@
 //!   linear, learned), rotary positions and per-mode decode state
 //! - [`import`]: safetensors reader (header index + ranged `f32` decode)
 //!   for Phase B of `docs/Frontier-27B-Plan.md`
-//! - [`geometry`]: the geometric reasoner (roadmap Phase 33): a dual-stream
-//!   symbolic + geometric model answering by attractor relaxation under a
-//!   learned Riemannian metric, trained with the block-diffusion machinery
 //! - [`routing`]: the per-token routing state carried through the layers,
 //!   router kinds and routing-locality diagnostics
 //! - [`blockexec`]: how a batch of independent blocks is executed -- one at a
@@ -111,6 +108,11 @@
 //! - [`moe`]: top-k mixture-of-experts layer with load balancing
 //! - [`expert_index`]: the expert manifest an inference engine routes from
 //! - [`mosme`]: boxes of specialized micro experts, two-level routing
+//! - [`taxonomy`]: the field / sub-field taxonomy (TRISKELE §13) as versioned,
+//!   mergeable data, and the mapping of the shipped specialists onto it
+//! - [`hrouter`]: the three-layer hierarchical router -- meta-router over
+//!   categories, MoSME category routers, specialists resolved through the
+//!   registry / expert index
 //! - [`peregrine`]: the parallel I/O engine -- mirror-striped reads split
 //!   across every drive, batched through io_uring where the kernel allows it,
 //!   checked byte-for-byte against a single-drive read
@@ -131,34 +133,21 @@
 //!   the trunk's own readout (logit lens, with optional tuned-lens affine
 //!   translators), rendered as a thought trace with the slot geometry under
 //!   the learned metric
+//! - [`alien`]: ALIEN-FINDER -- ranks coherent-but-unproposed points between
+//!   specialist vectors (affine-hull coherence x KDE unlikelihood), with
+//!   pilot-outcome records and a survival predictor that refuses tiny samples
 //! - [`logging`]: JSONL metrics logger
 //! - [`verify`]: numerical certificate suite (the quality gate)
-//!
-//! # The error-handling contract
-//!
-//! Two rules, both machine-enforced rather than conventional (see the `[lints]`
-//! table in `Cargo.toml`):
-//!
-//! 1. **No panicking escape hatch in production code.** `unwrap`, `expect`,
-//!    `panic!`, `todo!`, `unimplemented!` and `unreachable!` are all denied
-//!    outside `#[cfg(test)]`. A fallible path returns
-//!    [`anyhow::Result`] and names the value that made it fail.
-//! 2. **Tests are exempt, not exempt-by-default.** A `#[cfg(test)]` module may
-//!    `unwrap`; that is the point of a test. An exemption is scoped to the
-//!    module or file that asked for it, so it cannot leak into the next one.
-//!
-//! `assert!` is *not* denied, and that is deliberate. An assertion states an
-//! invariant the caller established -- "the block index is in range", "these
-//! two shapes match" -- and there is no error channel to return through at that
-//! point. What is denied is reaching for a runtime value that might be absent.
 
 pub mod ablation;
 pub mod accuracy;
 pub mod adaptive;
+pub mod alien;
 pub mod antipattern;
 pub mod audit;
 pub mod blockexec;
 pub mod bpe;
+pub mod character;
 pub mod cheat;
 pub mod cheatharness;
 pub mod checkpoint;
@@ -175,6 +164,7 @@ pub mod deltanet;
 pub mod distill;
 pub mod experiment;
 pub mod expert_index;
+pub mod expertlayout;
 pub mod flow;
 
 pub mod geom3d;
@@ -189,11 +179,14 @@ pub mod fieldnorm;
 pub mod geomfusion;
 pub mod grade;
 pub mod heretic;
+pub mod hrouter;
 pub mod hybrid;
 pub mod import;
 pub mod infer;
+pub mod integrity;
 pub mod interop;
 pub mod langdata;
+pub mod lintrunner;
 pub mod lm;
 pub mod logging;
 pub mod loopgraph;
@@ -203,12 +196,14 @@ pub mod mlcheat;
 pub mod moe;
 pub mod mosme;
 pub mod multi_block;
+pub mod ncm;
 pub mod nim;
 pub mod nina;
 pub mod ninagui;
 pub mod peregrine;
 pub mod planner;
 pub mod policy;
+pub mod polyglot;
 pub mod precision;
 pub mod profile;
 pub mod quality;
@@ -217,15 +212,22 @@ pub mod quantize;
 pub mod qwen;
 pub mod qwennet;
 pub mod qwentrain;
+pub mod ratelimit;
 pub mod rawdata;
 pub mod reweight;
+pub mod rogue;
+pub mod routeprobe;
 pub mod routing;
 pub mod schedule;
 pub mod sigma;
+pub mod smuggle;
 pub mod solver;
 pub mod stats;
 pub mod student;
 pub mod sweep;
+pub mod taxonomy;
+pub mod teacher;
+pub mod teachereval;
 pub mod tensor_ext;
 pub mod tinyimagenet;
 pub mod tokenblocks;

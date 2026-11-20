@@ -25,12 +25,61 @@
 //!   residual stream through a **zero-initialized** projection — so a fresh
 //!   student is *exactly* the plain trunk, and training the stream is pure
 //!   gain from a known-good start.
+//! - **The stream is causal**: every position `t` has its own slot set,
+//!   pooled from the prefix `0..=t` cut into `geom_slots` chunks, drawn
+//!   toward a geodesic context over the keys of `0..=t` only, relaxed, and
+//!   written back into position `t` alone. Position `t`'s logits are
+//!   therefore the logits of `tokens[..=t]` run alone (up to float
+//!   summation order), so teacher-forced training, the held-out accuracy
+//!   and greedy generation all compute one function, and right-padding
+//!   never reaches a real position.
 //! - **Router-which-knows**: a probe [`crate::mosme::HierarchicalRouter`]
 //!   over the same box layout reads the trunk's hidden states and reports
 //!   per-box traffic (`LanguageRouting::traffic`), each token's most likely
 //!   language specialist (`LanguageRouting::top_language`) and its most
 //!   likely box overall, field boxes included (`LanguageRouting::top_box`) —
 //!   gates only, no expert MLP is run.
+//!
+//! # Causality: what changed, and what it costs
+//!
+//! The stream used to pool the *whole* sequence (padding included) into one
+//! slot set and add one pooled delta to every position, so position `t`
+//! read every later token -- its own next-token target among them.
+//! Teacher-forced CE, `crate::nina`'s held-out next-token accuracy and the
+//! toy "CE falls" tests could all profit from that leak, while generation,
+//! which only ever sees the prefix, computed a different function.
+//!
+//! The fix keeps the parameter layout, so every saved checkpoint loads
+//! unchanged, and it keeps the stream's arithmetic: position `t` gets what
+//! the old whole-sequence pass computed on `tokens[..=t]`. Consequences for
+//! checkpoints trained before the fix:
+//!
+//! - **Generation is unchanged** (up to float summation order): greedy
+//!   decoding reads the last position of an unpadded window, whose prefix
+//!   is the whole window.
+//! - **Teacher-forced outputs change at every other position**, because
+//!   they no longer see the future. Those checkpoints were trained with the
+//!   leak, so their training curves and held-out accuracy overstate them and
+//!   their next-token quality should be re-measured; retraining under the
+//!   causal stream is what makes training optimize the function generation
+//!   runs.
+//!
+//! Cost: the slot init is a prefix sum, `O(n K d)`; each relaxation step is
+//! `O(n K d^2)` (every position's `K` slots, under the metric). The
+//! geodesic context is the one quadratic term, `O(n^2 K d)` once per
+//! forward: each position's slot queries are a function of its own prefix,
+//! so no prefix-sum shortcut exists for a softmax over them. It runs in
+//! position blocks with a bounded score transient, and at the default
+//! `K = 16, d = 32` it is on the order of one extra dense-attention layer
+//! in both compute and the activations a training step keeps for backward
+//! (about `n^2 K / 2` attention weights per row, against a dense layer's
+//! `heads * n^2`). The whole-sequence stream's context was `O(n K d)`
+//! because one slot set served every position -- the same sharing that made
+//! it non-causal.
+//!
+//! Only the final position's slot set is reported (`SlotPass::slots`, the
+//! refinement trace): its prefix is the whole input, so it is the state the
+//! whole-sequence stream used to report.
 //!
 //! # What the wave-2 per-language training agent gets
 //!
@@ -85,7 +134,11 @@ use burn::{
     module::{Initializer, Module},
     nn::{Linear, LinearConfig},
     optim::{AdamWConfig, Optimizer},
-    tensor::{activation::log_softmax, backend::Backend, Int, Tensor},
+    tensor::{
+        activation::{log_softmax, softmax},
+        backend::Backend,
+        Int, Tensor,
+    },
 };
 use rand::{seq::SliceRandom, Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
@@ -97,7 +150,7 @@ use crate::{
         coding_spec_for, validate_coding_box_names, validate_field_box_names, MosmeSpec,
         CODING_LANGUAGES,
     },
-    geometry::{GeomBlock, GeomConfig, RefineTrace},
+    geometry::{energy_grad_step, energy_value, GeomBlock, GeomConfig, RefineTrace},
     hybrid::{AttentionSchedule, PositionKind},
     lm::{LanguageModel, LmConfig},
     mosme::{HierarchicalRouter, MosmeConfig, TrainableSet},
@@ -818,7 +871,10 @@ pub struct StudentCost {
     /// Every parameter the checkpoint holds, resident experts included.
     pub total_params: usize,
     /// Trunk FLOPs per token at `context` (the cost model's multiply-adds
-    /// times two; the geometric stream adds a small dense term on top).
+    /// times two). Not counted here: the causal geometric stream, whose
+    /// per-token cost at position `t` is dominated by its geodesic context,
+    /// about `2 * geom_slots * geom_dim * t` multiply-adds (see the module
+    /// docs).
     pub trunk_flops_per_token: f64,
     pub geom_stream_params: usize,
     pub probe_router_params: usize,
@@ -855,13 +911,15 @@ pub struct LanguageRouting {
 #[derive(Debug)]
 pub struct StudentForward<B: Backend> {
     /// `[b, n, vocab]`, from the trunk's tied readout of the
-    /// geometrically-refined hidden states. The loss attach point.
+    /// geometrically-refined hidden states. The loss attach point. Causal:
+    /// position `t` depends on tokens `0..=t` only.
     pub logits: Tensor<B, 3>,
     /// The residual stream after the geometric write-back, `[b, n, hidden]`
     /// (before the trunk's final norm).
     pub hidden: Tensor<B, 3>,
-    /// The certified refinement trace: energy and displacement per
-    /// relaxation step. The energy descends by construction.
+    /// The certified refinement trace of the final position's slot set:
+    /// energy and displacement per relaxation step. The energy descends by
+    /// construction (at every position; the final one is reported).
     pub refine: RefineTrace,
     pub routing: LanguageRouting,
 }
@@ -874,11 +932,133 @@ pub struct SlotPass<B: Backend> {
     /// The residual stream after the geometric write-back, `[b, n, hidden]`
     /// (identical to `forward_depth`'s hidden for the same arguments).
     pub hidden: Tensor<B, 3>,
-    /// The relaxed slot states `[b, geom_slots, geom_dim]` — the attractor
-    /// the certified refinement landed on.
+    /// The relaxed slot states of the final position `[b, geom_slots,
+    /// geom_dim]` — the attractor the certified refinement landed on after
+    /// reading the whole input (each position has its own slot set; the
+    /// final one's prefix is everything).
     pub slots: Tensor<B, 3>,
-    /// The certified refinement trace: energy and displacement per step.
+    /// The certified refinement trace of that slot set: energy and
+    /// displacement per step.
     pub refine: RefineTrace,
+}
+
+/// The chunk bounds of every prefix, position-major (entry `t * K + j`):
+/// for position `t`, prefix length `m = t + 1` and slot `j`, chunk `j` is
+/// `[j m / K, max((j + 1) m / K, j m / K + 1))` -- the contiguous-chunk rule
+/// the stream has always pooled the whole sequence with, applied to each
+/// prefix. A prefix shorter than `K` repeats single-position chunks rather
+/// than leaving a slot empty, as the whole-sequence rule did; `end <= m`
+/// holds for every `j < K`, so no chunk reaches past its own position.
+struct PrefixChunks {
+    /// Prefix-sum index of each chunk's first position.
+    starts: Vec<i64>,
+    /// Prefix-sum index one past each chunk's last position.
+    ends: Vec<i64>,
+    /// `end - start >= 1`, as the divisor of the chunk mean.
+    lengths: Vec<f32>,
+}
+
+impl PrefixChunks {
+    fn new(n: usize, slots: usize) -> anyhow::Result<Self> {
+        anyhow::ensure!(slots >= 1, "the geometric stream needs at least one slot");
+        let total = n.checked_mul(slots).ok_or_else(|| {
+            anyhow::anyhow!("{n} positions times {slots} slots overflows the index space")
+        })?;
+        let mut starts = Vec::with_capacity(total);
+        let mut ends = Vec::with_capacity(total);
+        let mut lengths = Vec::with_capacity(total);
+        for t in 0..n {
+            let m = t + 1;
+            for j in 0..slots {
+                let start = j * m / slots;
+                let end = ((j + 1) * m / slots).max(start + 1);
+                starts.push(i64::try_from(start)?);
+                ends.push(i64::try_from(end)?);
+                lengths.push((end - start) as f32);
+            }
+        }
+        Ok(Self {
+            starts,
+            ends,
+            lengths,
+        })
+    }
+}
+
+/// Element budget of one causal-context score block `[b, positions * K,
+/// visible keys]`: 4 Mi f32, 16 MiB. It bounds the transient (a 4096-token
+/// row with 16 slots runs in 64-position blocks instead of one 1 GiB score
+/// tensor); the result depends on it only through float summation order.
+const CONTEXT_BLOCK_ELEMENTS: usize = 1 << 22;
+
+/// `t [b, m, d] @ g [d, d]`, flattened so the matmul stays two-dimensional.
+fn metric_product<B: Backend>(t: Tensor<B, 3>, g: &Tensor<B, 2>) -> Tensor<B, 3> {
+    let [b, m, d] = t.dims();
+    t.reshape([b * m, d]).matmul(g.clone()).reshape([b, m, d])
+}
+
+/// Causal geodesic attention: the context each slot is drawn toward, with
+/// the slot set of position `t` reading the keys of positions `0..=t` only.
+///
+/// `queries` is `[b, n * K, d]`, position-major (one slot set per position,
+/// [`GeometricStudent::init_slots`]); `keys` and `values` are `[b, n, d]`.
+/// Each weight is `softmax_s(-||q - k_s||^2_G / tau)` over the visible
+/// keys -- the [`crate::geometry::GeomBlock::refine`] context, masked. The
+/// squared distance expands to `q'Gq - 2 q'G k_s + k_s'G k_s`; the `q'Gq`
+/// term is constant along a softmax row and cancels exactly, so it is
+/// never formed, and masked keys get `-inf` (weight exactly zero, whatever
+/// the masked tokens are).
+///
+/// The cost is the price of exactness: every position's queries are a
+/// function of its own prefix, so no prefix-sum shortcut exists, and the
+/// context is `O(n^2 K d)` -- computed once per forward, outside the
+/// relaxation loop, in position blocks of at most
+/// [`CONTEXT_BLOCK_ELEMENTS`] scores.
+fn causal_geodesic_context<B: Backend>(
+    g: &Tensor<B, 2>,
+    queries: Tensor<B, 3>,
+    keys: Tensor<B, 3>,
+    values: Tensor<B, 3>,
+    tau: f32,
+    slots: usize,
+) -> Tensor<B, 3> {
+    let [b, n, _] = keys.dims();
+    let device = keys.device();
+    let scale = 1.0 / tau;
+    let query_g = metric_product(queries, g); // [b, n * K, d]
+    let key_norms = metric_product(keys.clone(), g)
+        .mul(keys.clone())
+        .sum_dim(2)
+        .reshape([b, 1, n]); // k_s' G k_s
+    let block = (CONTEXT_BLOCK_ELEMENTS / (b * slots * n).max(1)).clamp(1, n);
+    let mut parts = Vec::with_capacity(n.div_ceil(block));
+    let mut start = 0;
+    while start < n {
+        let len = block.min(n - start);
+        let visible = start + len;
+        let rows = len * slots;
+        // Row r is slot r % K of position start + r / K; key s is visible to
+        // it iff s <= that position.
+        let position = Tensor::<B, 1, Int>::arange(0..rows as i64, &device)
+            .div_scalar(slots as i64)
+            .add_scalar(start as i64)
+            .reshape([rows, 1]);
+        let key = Tensor::<B, 1, Int>::arange(0..visible as i64, &device).reshape([1, visible]);
+        let future = key.greater(position).unsqueeze_dim::<3>(0); // [1, rows, visible]
+        let mask =
+            Tensor::<B, 3>::zeros([1, rows, visible], &device).mask_fill(future, f32::NEG_INFINITY);
+        let scores = query_g
+            .clone()
+            .narrow(1, start * slots, rows)
+            .matmul(keys.clone().narrow(1, 0, visible).swap_dims(1, 2))
+            .mul_scalar(2.0)
+            .sub(key_norms.clone().narrow(2, 0, visible))
+            .mul_scalar(scale)
+            .add(mask);
+        parts.push(softmax(scores, 2).matmul(values.clone().narrow(1, 0, visible)));
+        start = visible;
+    }
+    Tensor::cat(parts, 1)
 }
 
 /// The specialist coding student. See the module docs for the architecture
@@ -944,42 +1124,129 @@ impl<B: Backend<FloatElem = f32>> GeometricStudent<B> {
         &self.probe
     }
 
-    /// The initial geometric state: the hidden states pooled into
-    /// `geom_slots` contiguous chunks, each projected into the geometric
-    /// space, so slot `k` starts near the region it was pooled from.
-    fn init_slots(&self, h: &Tensor<B, 3>) -> Tensor<B, 3> {
-        let [_, n, _] = h.dims();
+    /// The initial geometric state of every position's slot set, causally:
+    /// slot `j` of position `t` starts at `slot_init` of the mean hidden
+    /// state over chunk `j` of the prefix `0..=t` ([`PrefixChunks`]), so it
+    /// starts near the region of the prefix it was pooled from. Returned
+    /// position-major, `[b, n * geom_slots, geom_dim]`.
+    ///
+    /// `slot_init` is affine, so the mean of the projected states is the
+    /// projection of the mean. Projecting first lets one prefix sum in the
+    /// `geom_dim`-wide space serve every chunk of every prefix: `O(n K d)`
+    /// after the `O(n hidden d)` projection.
+    fn init_slots(&self, h: &Tensor<B, 3>) -> anyhow::Result<Tensor<B, 3>> {
+        let [b, n, _] = h.dims();
         let slots = self.config.geom_slots;
-        let mut pooled = Vec::with_capacity(slots);
-        for k in 0..slots {
-            let start = k * n / slots;
-            let end = ((k + 1) * n / slots).max(start + 1).min(n);
-            pooled.push(h.clone().narrow(1, start, end - start).mean_dim(1));
-        }
-        self.slot_init.forward(Tensor::cat(pooled, 1))
+        let device = h.device();
+        let projected = self.slot_init.forward(h.clone());
+        let [_, _, dim] = projected.dims();
+        // Entry i of the prefix is the sum of the first i projected positions
+        // (entry zero is the empty sum).
+        let prefix = Tensor::cat(
+            vec![
+                Tensor::<B, 3>::zeros([b, 1, dim], &device),
+                projected.cumsum(1),
+            ],
+            1,
+        );
+        let chunks = PrefixChunks::new(n, slots)?;
+        let ends = Tensor::<B, 1, Int>::from_ints(chunks.ends.as_slice(), &device);
+        let starts = Tensor::<B, 1, Int>::from_ints(chunks.starts.as_slice(), &device);
+        let lengths = Tensor::<B, 1>::from_floats(chunks.lengths.as_slice(), &device).reshape([
+            1,
+            n * slots,
+            1,
+        ]);
+        Ok((prefix.clone().select(1, ends) - prefix.select(1, starts)) / lengths)
     }
 
-    /// One geometric pass over the trunk's hidden states: pool to slots,
-    /// certified relaxation, zero-init readout back into the residual
-    /// stream. Returns the modified hidden states, the relaxed slot states
-    /// and the certified trace.
+    /// One causal geometric pass over the trunk's hidden states `[b, n,
+    /// hidden]`: every position `t` gets its own slot set, pooled from the
+    /// prefix `0..=t` ([`Self::init_slots`]), drawn toward a geodesic
+    /// context read from the keys of `0..=t` only
+    /// ([`causal_geodesic_context`]), relaxed by the block's certified
+    /// energy descent, and written back into position `t` alone through the
+    /// zero-initialized readout. Position `t`'s write is therefore what the
+    /// whole-sequence stream computed on `tokens[..=t]` (up to float
+    /// summation order) -- the function generation always evaluated at the
+    /// last position -- and no later token, padding included, reaches it.
+    ///
+    /// Returns the modified hidden states, the relaxed slot set of the
+    /// *final* position `[b, geom_slots, geom_dim]` (its prefix is the whole
+    /// input, so it is the state the whole-sequence stream reported) and the
+    /// certified trace of that same slot set. Every position's relaxation
+    /// uses the same metric, step size and repulsion, so the descent the
+    /// trace certifies holds for each of them.
     ///
     /// The block's *own* symbolic-stream write (`writer_out`, not
-    /// zero-initialized) is deliberately discarded: using it would break the
-    /// fresh-student-is-the-plain-trunk contract. The certified half of the
-    /// refinement — the geometric trajectory and its energy trace — is what
-    /// this stream keeps; the write into the hidden states is this module's
-    /// own zero-initialized projection of the relaxed slots.
+    /// zero-initialized) is deliberately not computed: using it would break
+    /// the fresh-student-is-the-plain-trunk contract. The certified half of
+    /// the refinement -- the geometric trajectory and its energy trace -- is
+    /// what this stream keeps; the write into the hidden states is this
+    /// module's own zero-initialized projection of the relaxed slots.
     fn geometric_pass(
         &self,
         h: &Tensor<B, 3>,
         refine_override: Option<usize>,
-    ) -> (Tensor<B, 3>, Tensor<B, 3>, RefineTrace) {
-        let z0 = self.init_slots(h);
-        let (_, z, trace) = self.geom.refine(h.clone(), z0, 0.0, refine_override);
-        let pooled = z.clone().mean_dim(1); // [b, 1, dim]
-        let delta = self.readout.forward(pooled); // [b, 1, hidden]
-        (h.clone() + delta, z, trace)
+    ) -> anyhow::Result<(Tensor<B, 3>, Tensor<B, 3>, RefineTrace)> {
+        let [b, n, _] = h.dims();
+        anyhow::ensure!(n >= 1, "the geometric stream needs at least one position");
+        let slots = self.config.geom_slots;
+        let steps = refine_override.unwrap_or(self.config.geom_refine_steps);
+
+        let z0 = self.init_slots(h)?; // [b, n * K, d]
+        let [_, _, dim] = z0.dims();
+        // The clean path: noise scale zero, as the whole-sequence pass ran it.
+        let landscape = self.geom.landscape(h.clone(), 0.0);
+        let g = self.geom.metric_field().metric();
+        let eta = self.geom.step_size(&g, landscape.lambda);
+        let queries = self.geom.slot_queries(z0.clone());
+        let context = causal_geodesic_context(
+            &g,
+            queries,
+            landscape.keys,
+            landscape.values,
+            landscape.tau,
+            slots,
+        )
+        .reshape([b * n, slots, dim]);
+
+        // Every position's slot set relaxes at once: one batch row per
+        // (sequence, position), `O(n K d^2)` per step.
+        let mut z = z0.reshape([b * n, slots, dim]);
+        let final_set = |t: Tensor<B, 3>| -> Tensor<B, 3> {
+            t.reshape([b, n, slots, dim])
+                .narrow(1, n - 1, 1)
+                .reshape([b, slots, dim])
+        };
+        let final_context = final_set(context.clone().detach());
+        let mut energy = Vec::with_capacity(steps);
+        let mut displacement = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            let z_old = final_set(z.clone().detach());
+            z = energy_grad_step(&g, &z, &context, landscape.lambda, slots, eta);
+            let z_final = final_set(z.clone().detach());
+            energy.push(energy_value(
+                &g,
+                &z_final,
+                &final_context,
+                landscape.lambda,
+                slots,
+            ));
+            let dz = z_final.sub(z_old);
+            displacement.push(dz.clone().mul(dz).mean().into_scalar());
+        }
+
+        let pooled = z.clone().mean_dim(1).reshape([b, n, dim]);
+        let delta = self.readout.forward(pooled); // [b, n, hidden]
+        Ok((
+            h.clone() + delta,
+            final_set(z),
+            RefineTrace {
+                energy,
+                displacement,
+            },
+        ))
     }
 
     /// The gates over the specialist boxes for already-computed hidden
@@ -1092,12 +1359,17 @@ impl<B: Backend<FloatElem = f32>> GeometricStudent<B> {
         let (out, states) =
             self.trunk
                 .forward_span_states(tokens, 0..self.trunk.num_layers(), None);
-        let hidden = states.last().cloned().ok_or_else(|| {
+        let trunk_hidden = states.last().cloned().ok_or_else(|| {
             anyhow::anyhow!("the trunk produced no hidden states for an empty span")
         })?;
-        let (hidden, _, refine) = self.geometric_pass(&hidden, refine_override);
+        let (hidden, _, refine) = self.geometric_pass(&trunk_hidden, refine_override)?;
         let logits = self.trunk.logits_from_hidden(hidden.clone());
-        let mut routing = self.route_languages_from_hidden(&hidden)?;
+        // The probe reads the *trunk's* hidden states -- the input
+        // `specialist_step_boxes` trains it on and `route_languages` reads.
+        // Reading the post-geometric states instead fed it an input it was
+        // never trained on once the readout is non-zero, so this readout and
+        // `route_languages` disagreed on the same tokens.
+        let mut routing = self.route_languages_from_hidden(&trunk_hidden)?;
         routing.trunk_layers = out
             .balance_loss
             .as_ref()
@@ -1125,7 +1397,7 @@ impl<B: Backend<FloatElem = f32>> GeometricStudent<B> {
         let hidden = states.last().cloned().ok_or_else(|| {
             anyhow::anyhow!("the trunk produced no hidden states for an empty span")
         })?;
-        let (hidden, slots, refine) = self.geometric_pass(&hidden, refine_override);
+        let (hidden, slots, refine) = self.geometric_pass(&hidden, refine_override)?;
         Ok(SlotPass {
             hidden,
             slots,
@@ -1216,7 +1488,7 @@ impl<B: Backend<FloatElem = f32>> GeometricStudent<B> {
         let trunk_hidden = states.last().cloned().ok_or_else(|| {
             anyhow::anyhow!("the trunk produced no hidden states for an empty span")
         })?;
-        let (hidden, _, refine) = self.geometric_pass(&trunk_hidden, None);
+        let (hidden, _, refine) = self.geometric_pass(&trunk_hidden, None)?;
         let logits = self.trunk.logits_from_hidden(hidden);
 
         // --- masked completion CE (the masked path of lm::objective) ------
@@ -1359,10 +1631,12 @@ struct TokenizedTrace {
 ///
 /// Two on-disk shapes are read: the trace schema (`prompt` + `completion`,
 /// with a `language` key) and the older SFT schema (`instruction` +
-/// `response`, with `lang`), whose lines get `language = unknown`. A line
-/// whose language names no shipped box (e.g. `go`, a *planned* registry
-/// entry) is likewise unknown: it can train the trunk in an unfiltered run
-/// but cannot supervise a routing box. Either shape may also carry a
+/// `response`, with a `lang` key that is often empty). A line whose language
+/// this build does not know (`ruby`, a typo, an empty `lang`) is unknown: it
+/// can train the trunk in an unfiltered run but cannot supervise a routing
+/// box. A known language supervises its box only when the training config's
+/// `coding_boxes` names it ([`StudentConfig::box_target`]), so `go` under the
+/// default six-box config supervises nothing. Either shape may also carry a
 /// `"field"` string (the NINA pair-file contract): it is kept verbatim and
 /// supervises a configured field box at training time — or nothing, when
 /// the field is unknown, the same rule as an unknown language. The load is
@@ -2142,7 +2416,14 @@ pub fn train_language_specialist<B: burn::tensor::backend::AutodiffBackend<Float
                 );
                 let micro_loss: f32 = out.loss.clone().into_scalar();
                 if out.tokens_counted == 0 || !micro_loss.is_finite() {
-                    accumulator.skip();
+                    // A skip still advances the cycle, and on the k-th
+                    // micro-batch it is the call that completes it: its
+                    // `Ready` carries the gradients the earlier micro-batches
+                    // folded. Ignoring it discarded the whole step whenever
+                    // the *last* micro-batch was the bad one.
+                    if let crate::schedule::Cycle::Ready(g) = accumulator.skip() {
+                        summed = g;
+                    }
                     skipped_micros += 1;
                     continue;
                 }
@@ -2702,6 +2983,367 @@ mod tests {
         // The depth actually reaches the hidden states (and so the logits).
         assert_ne!(to_vec(shallow.hidden), to_vec(deep.hidden));
         assert_ne!(to_vec(shallow.logits), to_vec(deep.logits));
+    }
+
+    // --------------------------------------------------- causal stream --
+
+    /// Relative tolerance for comparing logits computed at two different
+    /// sequence lengths (a prefix against the full row, an unpadded row
+    /// against a padded one). Same length, same arithmetic: the comparison
+    /// is exact. Different lengths change the inner dimension of the
+    /// trunk's attention matmuls and of the stream's softmax/context sums,
+    /// so the same real numbers are summed in a different order; nothing
+    /// else differs.
+    const LENGTH_CHANGE_TOLERANCE: f32 = 1e-4;
+
+    /// A tiny student whose geometric stream actually writes: the
+    /// zero-initialized readout swapped for a random one (the init identity
+    /// has its own test), weights forced so every pass reads the same values.
+    fn writing_student(
+        device: &<B as burn::tensor::backend::BackendTypes>::Device,
+    ) -> GeometricStudent<B> {
+        let mut student = tiny_student(device);
+        student.readout = LinearConfig::new(8, 64).with_bias(true).init(device);
+        crate::tensor_ext::force_initialization(&student);
+        student
+    }
+
+    fn row_tokens(
+        device: &<B as burn::tensor::backend::BackendTypes>::Device,
+        ids: &[i64],
+    ) -> Tensor<B, 2, Int> {
+        Tensor::<B, 1, Int>::from_ints(ids, device).reshape([1, ids.len()])
+    }
+
+    /// Twelve real byte tokens: three full chunks of the tiny config's four
+    /// slots, so prefixes cross every chunk boundary.
+    fn causal_ids() -> Vec<i64> {
+        (0..12i64).map(|i| (i * 7 + 3) % 250 + 4).collect()
+    }
+
+    /// Vocab row `t` of a flattened `[1, n, vocab]` logits tensor.
+    fn logit_row(all: &[f32], t: usize) -> &[f32] {
+        &all[t * VOCAB_SIZE..(t + 1) * VOCAB_SIZE]
+    }
+
+    /// `max |a - b| / max(|b|, 1)` over two equal-length rows.
+    fn relative_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| (x - y).abs() / y.abs().max(1.0))
+            .fold(0.0, f32::max)
+    }
+
+    /// The pre-fix stream, reimplemented from its old source as the control
+    /// every causality test checks itself against: ONE slot set chunk-pooled
+    /// from every position of the row (padding included), relaxed by the
+    /// whole-sequence [`GeomBlock::refine`], and one pooled delta added to
+    /// every position. Returns its logits, relaxed slots and trace.
+    fn whole_sequence_pass(
+        student: &GeometricStudent<B>,
+        tokens: Tensor<B, 2, Int>,
+        depth: Option<usize>,
+    ) -> (Tensor<B, 3>, Tensor<B, 3>, RefineTrace) {
+        let (_, states) =
+            student
+                .trunk
+                .forward_span_states(tokens, 0..student.trunk.num_layers(), None);
+        let h = states.last().cloned().unwrap();
+        let [_, n, _] = h.dims();
+        let slots = student.config.geom_slots;
+        let mut pooled = Vec::with_capacity(slots);
+        for k in 0..slots {
+            let start = k * n / slots;
+            let end = ((k + 1) * n / slots).max(start + 1).min(n);
+            pooled.push(h.clone().narrow(1, start, end - start).mean_dim(1));
+        }
+        let z0 = student.slot_init.forward(Tensor::cat(pooled, 1));
+        let (_, z, trace) = student.geom.refine(h.clone(), z0, 0.0, depth);
+        let delta = student.readout.forward(z.clone().mean_dim(1));
+        (student.trunk.logits_from_hidden(h + delta), z, trace)
+    }
+
+    #[test]
+    fn test_prefix_chunks_tile_each_prefix_like_the_whole_sequence_rule() {
+        for slots in 2..=5 {
+            for n in 1..=20 {
+                let chunks = PrefixChunks::new(n, slots).unwrap();
+                assert_eq!(chunks.starts.len(), n * slots);
+                for t in 0..n {
+                    for j in 0..slots {
+                        let at = t * slots + j;
+                        let (start, end) = (chunks.starts[at], chunks.ends[at]);
+                        // Inside the prefix 0..=t, never empty, length matches.
+                        assert!(0 <= start && start < end && end <= t as i64 + 1);
+                        assert_eq!(chunks.lengths[at], (end - start) as f32);
+                    }
+                }
+                // The final position's chunks are the old whole-sequence ones.
+                for j in 0..slots {
+                    let start = j * n / slots;
+                    let end = ((j + 1) * n / slots).max(start + 1).min(n);
+                    let at = (n - 1) * slots + j;
+                    assert_eq!(chunks.starts[at], start as i64, "n={n} K={slots} j={j}");
+                    assert_eq!(chunks.ends[at], end as i64, "n={n} K={slots} j={j}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_future_tokens_never_reach_earlier_logits_or_routing() {
+        // The leak this guards against: the stream used to pool the whole
+        // row, so position t read every later token -- its own next-token
+        // target included. Perturb everything after p; logits and per-token
+        // routing at 0..=p must not move by a single bit.
+        let device = Default::default();
+        let student = writing_student(&device);
+        let base = causal_ids();
+        let n = base.len();
+        let base_out = student.forward(row_tokens(&device, &base)).unwrap();
+        let base_logits = to_vec(base_out.logits.clone());
+
+        // The stream is live: the logits are not the plain trunk's.
+        let trunk_logits = to_vec(student.trunk().forward(row_tokens(&device, &base)).logits);
+        assert_ne!(base_logits, trunk_logits, "the readout must write");
+        let old_base = to_vec(whole_sequence_pass(&student, row_tokens(&device, &base), None).0);
+
+        for p in [0usize, 2, 3, 4, 7, 8, 10] {
+            let mut perturbed = base.clone();
+            for (i, id) in perturbed.iter_mut().enumerate().skip(p + 1) {
+                *id = (i as i64 * 13 + 101) % 250 + 4;
+            }
+            assert!(perturbed[p + 1..]
+                .iter()
+                .zip(&base[p + 1..])
+                .all(|(a, b)| a != b));
+            let out = student.forward(row_tokens(&device, &perturbed)).unwrap();
+            let logits = to_vec(out.logits);
+            for t in 0..=p {
+                assert_eq!(
+                    logit_row(&logits, t),
+                    logit_row(&base_logits, t),
+                    "perturbing tokens after {p} moved the logits at {t}"
+                );
+            }
+            assert_eq!(out.routing.top_box[..=p], base_out.routing.top_box[..=p]);
+            assert_eq!(
+                out.routing.top_language[..=p],
+                base_out.routing.top_language[..=p]
+            );
+            // Not vacuous: the perturbation is visible right after p...
+            assert_ne!(logit_row(&logits, p + 1), logit_row(&base_logits, p + 1));
+            // ...and the pre-fix whole-sequence stream DID leak it backwards
+            // to position p: this test fails on the old code.
+            let old_perturbed =
+                to_vec(whole_sequence_pass(&student, row_tokens(&device, &perturbed), None).0);
+            assert_ne!(
+                logit_row(&old_perturbed, p),
+                logit_row(&old_base, p),
+                "control: the whole-sequence stream should leak the future into position {p}"
+            );
+        }
+        assert!(n > 10);
+    }
+
+    #[test]
+    fn test_teacher_forced_logits_are_the_generation_logits() {
+        // Train/generation match: the logits a full teacher-forced forward
+        // puts at position t are the logits generation computes from
+        // tokens[..=t] alone (its last position). Checked across the tiny
+        // config's chunk boundaries (prefix lengths 4, 8, 12 are exact
+        // multiples of the 4 slots; shorter-than-K prefixes repeat chunks).
+        let device = Default::default();
+        let student = writing_student(&device);
+        let ids = causal_ids();
+        let n = ids.len();
+        let full = to_vec(student.forward(row_tokens(&device, &ids)).unwrap().logits);
+        let old_full = to_vec(whole_sequence_pass(&student, row_tokens(&device, &ids), None).0);
+        let mut worst = 0.0f32;
+        let mut old_worst = 0.0f32;
+        for t in [0usize, 1, 2, 3, 4, 5, 6, 7, 8, 9, 11] {
+            let prefix = to_vec(
+                student
+                    .forward(row_tokens(&device, &ids[..=t]))
+                    .unwrap()
+                    .logits,
+            );
+            let diff = relative_diff(logit_row(&full, t), logit_row(&prefix, t));
+            assert!(
+                diff <= LENGTH_CHANGE_TOLERANCE,
+                "position {t}: teacher-forced and generation logits differ by {diff:.3e}"
+            );
+            worst = worst.max(diff);
+            if t + 1 < n {
+                let old_prefix =
+                    to_vec(whole_sequence_pass(&student, row_tokens(&device, &ids[..=t]), None).0);
+                old_worst = old_worst.max(relative_diff(
+                    logit_row(&old_full, t),
+                    logit_row(&old_prefix, t),
+                ));
+            }
+        }
+        println!("causal stream: worst prefix/full diff {worst:.3e}; old stream: {old_worst:.3e}");
+        // Control: the pre-fix stream computed a different function in
+        // training than in generation -- this test fails on the old code.
+        assert!(
+            old_worst > 100.0 * LENGTH_CHANGE_TOLERANCE,
+            "control: the whole-sequence stream should disagree with its own prefixes, got {old_worst:.3e}"
+        );
+    }
+
+    #[test]
+    fn test_right_padding_never_reaches_a_real_position() {
+        // Batched training rows are right-padded to the context. A padded row
+        // must produce, at its real positions, the logits and routing of the
+        // same row unpadded -- also next to a longer row in the same batch.
+        let device = Default::default();
+        let student = writing_student(&device);
+        let long = causal_ids();
+        let short: Vec<i64> = long[..5].iter().map(|id| (id + 17) % 250 + 4).collect();
+        let pad = i64::from(Special::Pad.id());
+        let width = long.len();
+        let mut batch_ids = short.clone();
+        batch_ids.resize(width, pad);
+        batch_ids.extend(&long);
+        let batch =
+            Tensor::<B, 1, Int>::from_ints(batch_ids.as_slice(), &device).reshape([2, width]);
+        let padded = student.forward(batch).unwrap();
+        let padded_logits = to_vec(padded.logits);
+        let alone_short = student.forward(row_tokens(&device, &short)).unwrap();
+        let alone_long = student.forward(row_tokens(&device, &long)).unwrap();
+        let short_logits = to_vec(alone_short.logits);
+        let long_logits = to_vec(alone_long.logits);
+        for t in 0..short.len() {
+            let diff = relative_diff(logit_row(&padded_logits, t), logit_row(&short_logits, t));
+            assert!(
+                diff <= LENGTH_CHANGE_TOLERANCE,
+                "padding moved real position {t} by {diff:.3e}"
+            );
+        }
+        for t in 0..width {
+            let diff = relative_diff(
+                logit_row(&padded_logits, width + t),
+                logit_row(&long_logits, t),
+            );
+            assert!(
+                diff <= LENGTH_CHANGE_TOLERANCE,
+                "batching moved the long row's position {t} by {diff:.3e}"
+            );
+        }
+        assert_eq!(
+            padded.routing.top_box[..short.len()],
+            alone_short.routing.top_box[..]
+        );
+        assert_eq!(
+            padded.routing.top_box[width..],
+            alone_long.routing.top_box[..]
+        );
+
+        // Appending pad tokens to one row changes nothing at its real
+        // positions either.
+        let mut appended = short.clone();
+        appended.extend(std::iter::repeat_n(pad, 9));
+        let appended_logits = to_vec(
+            student
+                .forward(row_tokens(&device, &appended))
+                .unwrap()
+                .logits,
+        );
+        for t in 0..short.len() {
+            let diff = relative_diff(logit_row(&appended_logits, t), logit_row(&short_logits, t));
+            assert!(
+                diff <= LENGTH_CHANGE_TOLERANCE,
+                "appended pads moved position {t}"
+            );
+        }
+
+        // Control: the whole-sequence stream pooled the pads into every
+        // position -- this test fails on the old code.
+        let old_short = to_vec(whole_sequence_pass(&student, row_tokens(&device, &short), None).0);
+        let old_appended =
+            to_vec(whole_sequence_pass(&student, row_tokens(&device, &appended), None).0);
+        let old_diff = relative_diff(logit_row(&old_appended, 0), logit_row(&old_short, 0));
+        assert!(
+            old_diff > 100.0 * LENGTH_CHANGE_TOLERANCE,
+            "control: pads should move the whole-sequence stream's first position, got {old_diff:.3e}"
+        );
+    }
+
+    #[test]
+    fn test_final_position_is_the_whole_sequence_stream() {
+        // What makes the fix safe for checkpoints trained before it: the
+        // final position's prefix is the whole input, so its slot set, trace
+        // and logits are what the old whole-sequence stream computed. That is
+        // the position greedy generation reads, so generation from an
+        // existing checkpoint is unchanged (up to summation order).
+        let device = Default::default();
+        let student = writing_student(&device);
+        let ids = causal_ids();
+        let n = ids.len();
+        for depth in [1usize, 3] {
+            let pass = student
+                .slots_at_depth(row_tokens(&device, &ids), Some(depth))
+                .unwrap();
+            let new_logits = to_vec(
+                student
+                    .forward_depth(row_tokens(&device, &ids), Some(depth))
+                    .unwrap()
+                    .logits,
+            );
+            let (old_logits, old_slots, old_trace) =
+                whole_sequence_pass(&student, row_tokens(&device, &ids), Some(depth));
+            let old_logits = to_vec(old_logits);
+            let slot_diff = relative_diff(&to_vec(pass.slots), &to_vec(old_slots));
+            assert!(
+                slot_diff <= LENGTH_CHANGE_TOLERANCE,
+                "slots differ by {slot_diff:.3e}"
+            );
+            let logit_diff =
+                relative_diff(logit_row(&new_logits, n - 1), logit_row(&old_logits, n - 1));
+            assert!(
+                logit_diff <= LENGTH_CHANGE_TOLERANCE,
+                "final-position logits differ by {logit_diff:.3e}"
+            );
+            assert_eq!(pass.refine.energy.len(), depth);
+            assert_eq!(pass.refine.displacement.len(), depth);
+            for (new, old) in pass.refine.energy.iter().zip(&old_trace.energy) {
+                assert!(
+                    (new - old).abs() <= LENGTH_CHANGE_TOLERANCE * old.abs().max(1.0),
+                    "energy {new} vs whole-sequence {old}"
+                );
+            }
+            for (new, old) in pass.refine.displacement.iter().zip(&old_trace.displacement) {
+                assert!(
+                    (new - old).abs() <= LENGTH_CHANGE_TOLERANCE * old.abs().max(1.0),
+                    "displacement {new} vs whole-sequence {old}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_forward_routing_reads_the_trunk_hidden_like_route_languages() {
+        // The probe is trained on the trunk's hidden states, so the routing a
+        // forward pass reports must be the routing `route_languages` reports
+        // for the same tokens -- also once the geometric readout is non-zero
+        // and the post-geometric hidden states differ from the trunk's.
+        let device = Default::default();
+        let mut student = tiny_student(&device);
+        student.readout = LinearConfig::new(8, 64).with_bias(true).init(&device);
+        crate::tensor_ext::force_initialization(&student);
+        let input = tokens(&device, 2, 8);
+
+        let out = student.forward(input.clone()).unwrap();
+        let direct = student.route_languages(input).unwrap();
+        // The readout really moved the hidden states...
+        let trunk_logits = to_vec(student.trunk().forward(tokens(&device, 2, 8)).logits);
+        assert_ne!(to_vec(out.logits), trunk_logits);
+        // ...and the routing readout did not follow them.
+        assert_eq!(out.routing.traffic, direct.traffic);
+        assert_eq!(out.routing.top_box, direct.top_box);
+        assert_eq!(out.routing.top_language, direct.top_language);
     }
 
     #[test]

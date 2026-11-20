@@ -232,8 +232,9 @@ pub enum Ensemble {
     /// dominated by whichever member has the largest logit scale — pair it
     /// with [`LogitNorm`] if the members are not calibrated alike.
     LogitMean,
-    /// Mean of the member one-hot predictions: a plurality vote, with ties
-    /// broken toward the earlier member.
+    /// Mean of the member one-hot predictions: a plurality vote. Ties stay
+    /// ties in the returned distribution; an arg-max over it resolves them
+    /// toward the lower class index, not toward any particular member.
     MajorityVote,
 }
 

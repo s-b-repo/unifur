@@ -209,6 +209,13 @@ impl LayerGates {
                 };
                 let mse = if loose.max_mse.is_finite() && strict.max_mse.is_finite() {
                     loose.max_mse.powf(1.0 - t) * strict.max_mse.powf(t)
+                } else if strict.max_mse.is_finite() && t >= 1.0 {
+                    // An unbounded loose end has no geometric midpoint, so the
+                    // blocks before the last stay unbounded -- but the last
+                    // block is still held to `strict`. Falling back to `loose`
+                    // here made `tightening(n, lenient(), strict())` an MSE
+                    // gate that could not reject anything on any block.
+                    strict.max_mse
                 } else {
                     loose.max_mse
                 };
@@ -499,6 +506,14 @@ pub struct BlockHealth {
     pub routed_steps: usize,
     load_entropy_sum: f64,
     token_entropy_sum: f64,
+    /// Steps whose loss was not finite. They are left out of `loss_sum`, so
+    /// they must also be left out of the mean's denominator. Absent from
+    /// older sidecars, where it reads as zero (the old behaviour).
+    #[serde(default)]
+    non_finite_losses: usize,
+    /// Steps whose gradient norm was not finite; same treatment as above.
+    #[serde(default)]
+    non_finite_grads: usize,
 }
 
 impl BlockHealth {
@@ -522,19 +537,24 @@ impl BlockHealth {
         }
     }
 
+    /// Mean of the *finite* losses recorded; `0.0` when there were none.
     pub fn mean_loss(&self) -> f32 {
-        if self.steps == 0 {
+        let counted = self.steps.saturating_sub(self.non_finite_losses);
+        if counted == 0 {
             0.0
         } else {
-            (self.loss_sum / self.steps as f64) as f32
+            (self.loss_sum / counted as f64) as f32
         }
     }
 
+    /// Mean of the *finite* gradient norms recorded; `0.0` when there were
+    /// none.
     pub fn mean_grad_norm(&self) -> f32 {
-        if self.steps == 0 {
+        let counted = self.steps.saturating_sub(self.non_finite_grads);
+        if counted == 0 {
             0.0
         } else {
-            (self.grad_sum / self.steps as f64) as f32
+            (self.grad_sum / counted as f64) as f32
         }
     }
 
@@ -580,8 +600,16 @@ impl TrainingHealth {
         block.steps += 1;
         if loss.is_finite() {
             block.loss_sum += loss as f64;
+        } else {
+            block.non_finite_losses += 1;
         }
-        block.grad_sum += verdict.grad_norm as f64;
+        // One NaN norm added here would make the block's mean |g| NaN for the
+        // rest of the run -- exactly when the table is being read.
+        if verdict.grad_norm.is_finite() {
+            block.grad_sum += verdict.grad_norm as f64;
+        } else {
+            block.non_finite_grads += 1;
+        }
         if block.steps == 1 {
             block.min_grad = verdict.grad_norm;
             block.max_grad = verdict.grad_norm;
@@ -1072,7 +1100,42 @@ mod tests {
         ok.grad_norm = 1.0;
         health.record(0, 0, 2.0, &ok);
         health.record(1, 0, f32::NAN, &ok);
-        assert!(health.block(0).unwrap().mean_loss().is_finite());
+        health.record(2, 0, 4.0, &ok);
+        // Excluded means excluded from the denominator too: the mean of the
+        // finite losses 2.0 and 4.0 is 3.0. Dividing by all three steps gave
+        // 2.0, a finite but wrong number that the old `is_finite` check passed.
+        let mean = health.block(0).unwrap().mean_loss();
+        assert!((mean - 3.0).abs() < 1e-6, "mean loss {mean}");
+
+        // The same for a non-finite gradient norm, which used to turn the
+        // block's mean |g| into NaN for the rest of the run.
+        let mut blown = StepVerdict::accepted();
+        blown.grad_norm = f32::NAN;
+        health.record(3, 0, 2.0, &blown);
+        let mean_grad = health.block(0).unwrap().mean_grad_norm();
+        assert!((mean_grad - 1.0).abs() < 1e-6, "mean |g| {mean_grad}");
+    }
+
+    #[test]
+    fn test_tightening_from_an_unbounded_loose_gate_still_ends_strict() {
+        // `lenient()` has no MSE bound. Tightening from it must still hold the
+        // last block to the strict bound, or the MSE gate rejects nothing.
+        let gates =
+            LayerGates::tightening(4, QualityGateConfig::lenient(), QualityGateConfig::strict());
+        assert_eq!(gates.for_block(3).max_mse, QualityGateConfig::strict().max_mse);
+        assert!(gates.for_block(0).max_mse.is_infinite());
+        let device = Default::default();
+        let prev = Tensor::<B, 2>::zeros([1, 4], &device);
+        let far = Tensor::<B, 2>::full([1, 4], 10.0, &device); // MSE = 100
+        assert!(
+            !evaluate(gates.for_block(3), &prev, &far, None).all_passed(),
+            "the strict end must reject an MSE-100 jump"
+        );
+        let mut prev_mse = f32::INFINITY;
+        for b in 0..4 {
+            assert!(gates.for_block(b).max_mse <= prev_mse, "mse gate must tighten");
+            prev_mse = gates.for_block(b).max_mse;
+        }
     }
 
     #[test]

@@ -926,6 +926,13 @@ impl<B: Backend<FloatElem = f32>> FusedQwen<B> {
 
     /// `tokens [b, n]` -> logits `[b, n, vocab]`. `depth` overrides the
     /// refinement depth (the test-time-compute knob).
+    ///
+    /// **Not causal.** The geometric stream pools every position into one
+    /// slot set and writes it back into every position, so the logits at
+    /// `t` read tokens after `t`. Only the final position is a prefix
+    /// function; to score position `t` as a language model would, run
+    /// `tokens[..=t]` and read its last position, as
+    /// [`Self::predict_answer`] and [`fused_answer_loss`] do.
     pub fn forward(
         &self,
         tokens: Tensor<B, 2, Int>,
@@ -938,7 +945,9 @@ impl<B: Backend<FloatElem = f32>> FusedQwen<B> {
     }
 
     /// The fused forward with the full trace: logits, refinement traces,
-    /// routing gates and diagnostics.
+    /// routing gates and diagnostics. Not causal, for the reason
+    /// [`Self::forward`] gives: only the final position's logits are a
+    /// function of its prefix alone.
     pub fn forward_traced(
         &self,
         tokens: Tensor<B, 2, Int>,
@@ -980,6 +989,12 @@ impl<B: Backend<FloatElem = f32>> FusedQwen<B> {
     /// Predict the answer byte for one tokenized scene: the argmax at the
     /// query position restricted to the declared candidate ids (the closed
     /// answer set, so an impossible byte can never win).
+    ///
+    /// Only the question prefix `tokens[..=query]` is fed: `scene.tokens`
+    /// ends in the gold answer token, and the geometric stream is not causal
+    /// (it pools every position into the slots and writes back into the
+    /// query position), so feeding the whole row would let the prediction
+    /// read the answer it is being scored on.
     pub fn predict_answer(
         &self,
         scene: &TokenizedScene,
@@ -987,8 +1002,18 @@ impl<B: Backend<FloatElem = f32>> FusedQwen<B> {
         depth: Option<usize>,
         device: &B::Device,
     ) -> anyhow::Result<(u8, FusedForward<B>)> {
-        let tokens = Tensor::<B, 1, Int>::from_ints(scene.tokens.as_slice(), device)
-            .reshape([1, scene.len()]);
+        anyhow::ensure!(
+            !candidates.is_empty(),
+            "an empty candidate set has no answer to predict"
+        );
+        let prefix = scene.tokens.get(..=scene.query).ok_or_else(|| {
+            anyhow::anyhow!(
+                "query position {} is outside the scene's {} tokens",
+                scene.query,
+                scene.len()
+            )
+        })?;
+        let tokens = Tensor::<B, 1, Int>::from_ints(prefix, device).reshape([1, prefix.len()]);
         let (logits, fused) = self.query_logits(tokens, scene.query, depth)?;
         let cand_ids: Vec<i64> = candidates.iter().map(|(_, id)| i64::from(*id)).collect();
         let cand = Tensor::<B, 1, Int>::from_ints(cand_ids.as_slice(), device);
@@ -1200,12 +1225,20 @@ impl<B: Backend<FloatElem = f32>> GeomFusion<B> {
 }
 
 /// The answer-span loss over one batch, from the trunk's (grad-carrying)
-/// hidden state. Each row's fusion runs on its TRUE length: rows are padded
-/// for the batched trunk pass, but the slot pooling must not see padding.
+/// hidden state. Each row's fusion runs on its question PREFIX only,
+/// `tokens[..=query]`: rows are padded for the batched trunk pass, and the
+/// slot pooling must see neither the padding nor the answer token.
+///
+/// The prefix cut is what keeps the answer out of the input. The trunk is
+/// causal, so its state at `query` never sees `tokens[query + 1]`; the
+/// geometric stream is NOT -- it pools every position it is handed into the
+/// slots and writes the refined slots back into every position, the query
+/// included. Handing it the full row (as this function once did) put the
+/// gold answer's hidden state into the residual added at the very position
+/// the answer is read from, so the stream could learn to copy the label.
 ///
 /// `hidden` is `[b, n_max, hidden_size]` post-`final_norm`; `scenes` carries
-/// the per-row true length (`scene.len()`), the query position and the
-/// answer token id.
+/// the per-row query position and the answer token id.
 pub fn fused_answer_loss<B: AutodiffBackend<FloatElem = f32>>(
     model: &FusedQwen<B>,
     hidden: Tensor<B, 3>,
@@ -1241,7 +1274,18 @@ pub fn fused_answer_loss<B: AutodiffBackend<FloatElem = f32>>(
             scene.len(),
             model.fusion.slots()
         );
-        let row_hidden = hidden.clone().narrow(0, row, 1).narrow(1, 0, scene.len());
+        anyhow::ensure!(
+            scene.query < scene.len(),
+            "row {row}: query position {} is outside its {} tokens",
+            scene.query,
+            scene.len()
+        );
+        // The question prefix only: see the function docs for why the answer
+        // token must not reach the (non-causal) geometric stream.
+        let row_hidden = hidden
+            .clone()
+            .narrow(0, row, 1)
+            .narrow(1, 0, scene.query + 1);
         let fused_hidden = match spec {
             FusedLossSpec::Answer => {
                 let fused = model.fusion.forward(row_hidden, depth)?;
@@ -1586,6 +1630,13 @@ impl FusedTrainConfig {
             self.moe_balance_weight.is_finite() && self.moe_balance_weight >= 0.0,
             "moe_balance_weight must be non-negative and finite, not {}",
             self.moe_balance_weight
+        );
+        // The EDM loss weight is `(s^2 + sd^2) / (s * sd)^2`: at sigma_data 0
+        // every diffusion step's loss is infinite and silently discarded.
+        anyhow::ensure!(
+            self.sigma_data.is_finite() && self.sigma_data > 0.0,
+            "sigma_data must be positive and finite, not {}",
+            self.sigma_data
         );
         if let Some(depth) = self.depth {
             anyhow::ensure!(depth >= 1, "depth must be positive, not {depth}");
@@ -3224,6 +3275,88 @@ mod tests {
             report.mse.is_finite() && report.mse >= 0.0,
             "denoising term: {}",
             report.mse
+        );
+    }
+
+    #[test]
+    fn test_the_answer_loss_never_sees_the_answer_token() {
+        // The trunk is causal, the geometric stream is not: it pools every
+        // position it is handed and writes back into the query position. So
+        // the loss must hand it the question prefix only. Overwrite everything
+        // after each row's query (the answer token, and padding) with junk:
+        // with a live stream, a loss that still read those positions moves.
+        let device = Default::default();
+        let mut model = fused_seeded(23);
+        model.fusion.out_proj = LinearConfig::new(32, 64).with_bias(false).init(&device);
+        let tokenizer = tiny_tokenizer();
+        let (tokens, meta) = tiny_corpus();
+        let scenes = tokenized_scenes(&tokenizer, &tokens, &meta, 2);
+        let hidden = model.trunk.forward_hidden(padded_batch(&scenes, &device));
+        let loss_of = |h: Tensor<AB, 3>| -> f32 {
+            fused_answer_loss(&model, h, &scenes, FusedLossSpec::Answer, None, 0.0)
+                .unwrap_or_else(|e| panic!("loss: {e:#}"))
+                .loss
+                .into_scalar()
+        };
+        let clean = loss_of(hidden.clone());
+        let [_, n, width] = hidden.dims();
+        let rows: Vec<Tensor<AB, 3>> = scenes
+            .iter()
+            .enumerate()
+            .map(|(row, scene)| {
+                let keep = hidden
+                    .clone()
+                    .narrow(0, row, 1)
+                    .narrow(1, 0, scene.query + 1);
+                let junk = Tensor::<AB, 3>::random(
+                    [1, n - scene.query - 1, width],
+                    Distribution::Normal(0.0, 10.0),
+                    &device,
+                );
+                Tensor::cat(vec![keep, junk], 1)
+            })
+            .collect();
+        let tampered = loss_of(Tensor::cat(rows, 0));
+        assert!(
+            (clean - tampered).abs() <= 1e-6,
+            "the answer loss reads past the query: {clean} vs {tampered}"
+        );
+    }
+
+    #[test]
+    fn test_prediction_never_reads_the_answer_token() {
+        // The same leak on the evaluation side: `TokenizedScene::tokens` ends
+        // in the gold answer, and the prediction must not depend on it.
+        let device = Default::default();
+        let mut model = fused_seeded(29);
+        model.fusion.out_proj = LinearConfig::new(32, 64).with_bias(false).init(&device);
+        let tokenizer = tiny_tokenizer();
+        let (tokens, meta) = tiny_corpus();
+        let candidates =
+            answer_token_ids(&tokenizer, &meta).unwrap_or_else(|e| panic!("candidates: {e:#}"));
+        let scene = tokenized_scenes(&tokenizer, &tokens, &meta, 1).remove(0);
+        let mut flipped = scene.clone();
+        let last = flipped.tokens.len() - 1;
+        flipped.tokens[last] = candidates
+            .iter()
+            .map(|(_, id)| i64::from(*id))
+            .find(|id| *id != scene.answer)
+            .unwrap_or_else(|| panic!("a second candidate"));
+        flipped.answer = flipped.tokens[last];
+        let (_, gold) = model
+            .predict_answer(&scene, &candidates, None, &device)
+            .unwrap_or_else(|e| panic!("predict: {e:#}"));
+        let (_, other) = model
+            .predict_answer(&flipped, &candidates, None, &device)
+            .unwrap_or_else(|e| panic!("predict: {e:#}"));
+        let at_query = |f: &FusedForward<AB>| f.hidden.clone().narrow(1, scene.query, 1);
+        let gap: f32 = (at_query(&gold) - at_query(&other))
+            .abs()
+            .max()
+            .into_scalar();
+        assert!(
+            gap <= 1e-6,
+            "the query state moved by {gap} when only the answer token changed"
         );
     }
 

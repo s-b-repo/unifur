@@ -55,8 +55,6 @@ impl ScopeStats {
         Duration::from_nanos(self.samples.iter().copied().max().unwrap_or(0))
     }
 
-    /// Nearest-rank percentile: the smallest sample at or above `q` of the
-    /// distribution. `q` is clamped to `[0, 1]`.
     /// Sample standard deviation of the samples (roadmap Phase 28).
     pub fn std(&self) -> Duration {
         let values: Vec<f64> = self.samples.iter().map(|&s| s as f64).collect();
@@ -84,6 +82,8 @@ impl ScopeStats {
         self.samples.clone()
     }
 
+    /// Nearest-rank percentile: the smallest sample at or above `q` of the
+    /// distribution. `q` is clamped to `[0, 1]`.
     pub fn percentile(&self, q: f64) -> Duration {
         if self.samples.is_empty() {
             return Duration::ZERO;
@@ -322,13 +322,23 @@ mod tests {
         let mut p = Profiler::new();
         p.record("a", Duration::from_nanos(250));
         p.record("b", Duration::from_nanos(750));
-        let total = p.total_nanos() as f64;
-        let share: f64 = p
-            .ranked()
-            .iter()
-            .map(|(_, s)| 100.0 * s.total_nanos() as f64 / total)
-            .sum();
-        assert!((share - 100.0).abs() < 1e-9);
+        // Read the shares the table actually prints, not a recomputation of
+        // them in the test.
+        let shares: Vec<f64> = p
+            .render()
+            .lines()
+            .skip(2)
+            .map(|l| {
+                l.split_whitespace()
+                    .last()
+                    .unwrap()
+                    .trim_end_matches('%')
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(shares, vec![75.0, 25.0]);
+        assert!((shares.iter().sum::<f64>() - 100.0).abs() < 1e-9);
     }
 
     #[test]

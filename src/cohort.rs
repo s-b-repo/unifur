@@ -8,8 +8,9 @@
 //! This module pins the *policy* of the strategy as pure, certified logic:
 //! fingerprint construction and comparison, the dual-method redundancy gate,
 //! cohort rotation, early gatekeeping, cross-cohort replay scheduling, and
-//! the load-balance accounting. The GPU-bound training loops that consume
-//! these decisions live elsewhere and are exercised by the existing trainers.
+//! the load-balance accounting. No trainer in this crate consumes these
+//! decisions yet: they are exercised only by the certificates below and the
+//! unit tests.
 
 use crate::verify::Certificate;
 
@@ -177,8 +178,9 @@ pub fn replay_schedule(n_experts: usize, n_rotations: usize) -> Vec<Option<usize
         .collect()
 }
 
-/// Load-balance accounting: returns the mean squared deviation of per-expert
-/// usage counts from uniform. Lower is better; 0 is perfectly balanced.
+/// Load-balance accounting: returns the coefficient of variation (standard
+/// deviation over mean) of the per-expert usage counts. Lower is better; 0 is
+/// perfectly balanced.
 pub fn load_imbalance(usage: &[u64]) -> f64 {
     if usage.is_empty() {
         return 0.0;

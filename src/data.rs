@@ -72,6 +72,11 @@ impl SyntheticDataset {
 
 impl<B: Backend> TrainDataset<B> for SyntheticDataset {
     fn next_batch<R: Rng>(&mut self, rng: &mut R, device: &B::Device) -> anyhow::Result<Batch<B>> {
+        // `random_range(0..0)` panics; an empty label set is a config error.
+        anyhow::ensure!(
+            self.num_labels > 0,
+            "a synthetic dataset needs at least one label, got num_labels = 0"
+        );
         // Draw pixel values directly on-device (uniform in [0,1)), then
         // normalize with the CIFAR-100 statistics to mirror real inputs.
         let shape = [self.batch_size, 3, self.image_size, self.image_size];

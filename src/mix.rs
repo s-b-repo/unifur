@@ -60,6 +60,13 @@ impl MixWeights {
             "every source weight must be positive and finite: {raw:?}"
         );
         let total: f64 = raw.iter().sum();
+        // Individually finite weights can still overflow their sum, and
+        // `w / inf` is 0 for every source: a mixture that silently always
+        // draws its last source.
+        anyhow::ensure!(
+            total.is_finite(),
+            "the source weights {raw:?} sum to {total}; scale them down"
+        );
         Ok(Self {
             weights: raw.iter().map(|w| w / total).collect(),
         })
@@ -216,6 +223,12 @@ pub struct SourceStats {
     pub batches: Vec<usize>,
     pub samples: Vec<usize>,
     loss_sum: Vec<f64>,
+    /// Per source, the sum of its batch shares (`count / batch total`): the
+    /// weight the share-weighted `loss_sum` is normalized by. Absent from
+    /// sidecars written before it existed; [`Self::record`] back-fills it from
+    /// `batches` (exact for mixture-mode history, where every share is 1).
+    #[serde(default)]
+    share_sum: Vec<f64>,
 }
 
 impl SourceStats {
@@ -226,6 +239,7 @@ impl SourceStats {
             batches: vec![0; n],
             samples: vec![0; n],
             loss_sum: vec![0.0; n],
+            share_sum: vec![0.0; n],
         }
     }
 
@@ -236,24 +250,53 @@ impl SourceStats {
         if self.names.is_empty() || !loss.is_finite() {
             return;
         }
+        // A sidecar from before `share_sum` existed (or a hand-built value)
+        // can carry shorter vectors than `names`; grow them rather than index
+        // past the end.
+        let n = self.names.len();
+        if self.share_sum.len() < n {
+            let mut back_filled: Vec<f64> = self.batches.iter().map(|b| *b as f64).collect();
+            back_filled.resize(n, 0.0);
+            self.share_sum = back_filled;
+        }
+        self.batches.resize(n.max(self.batches.len()), 0);
+        self.samples.resize(n.max(self.samples.len()), 0);
+        self.loss_sum.resize(n.max(self.loss_sum.len()), 0.0);
         let total = origin.total().max(1) as f64;
         for (i, count) in origin.counts.iter().enumerate() {
-            if *count == 0 || i >= self.names.len() {
+            if *count == 0 || i >= n {
                 continue;
             }
+            let share = *count as f64 / total;
             self.batches[i] += 1;
             self.samples[i] += count;
-            self.loss_sum[i] += f64::from(loss) * (*count as f64 / total);
+            self.loss_sum[i] += f64::from(loss) * share;
+            self.share_sum[i] += share;
         }
     }
 
-    /// Mean loss attributed to source `i`, per batch it contributed to.
+    /// Mean loss attributed to source `i`: the share-weighted mean of the
+    /// losses of the batches it contributed to.
+    ///
+    /// The share-weighted sum is divided by the summed shares, not by the
+    /// batch count. Dividing by the count reported a source holding a quarter
+    /// of every composite batch at a quarter of the batch loss, so a minority
+    /// source looked four times better trained than it was; a composite run
+    /// with one loss per batch genuinely cannot tell its sources apart, and
+    /// now says so by reporting the same mean for each.
     pub fn mean_loss(&self, i: usize) -> f32 {
         if self.batches.get(i).copied().unwrap_or(0) == 0 {
-            0.0
-        } else {
-            (self.loss_sum[i] / self.batches[i] as f64) as f32
+            return 0.0;
         }
+        let loss = self.loss_sum.get(i).copied().unwrap_or(0.0);
+        // Old sidecars without `share_sum` fall back to the batch count.
+        let weight = self
+            .share_sum
+            .get(i)
+            .copied()
+            .filter(|w| *w > 0.0)
+            .unwrap_or(self.batches[i] as f64);
+        (loss / weight) as f32
     }
 
     pub fn is_multi(&self) -> bool {
@@ -763,10 +806,45 @@ mod tests {
         stats.record(&composite, 4.0);
         assert_eq!(stats.batches, vec![1, 2, 0]);
         assert_eq!(stats.samples, vec![6, 10, 0]);
-        assert!((stats.mean_loss(0) - 3.0).abs() < 1e-6, "6/8 of 4.0");
-        assert!((stats.mean_loss(1) - (2.0 + 1.0) / 2.0).abs() < 1e-6);
+        // Source a only ever saw the loss-4.0 batch: its mean is 4.0, not the
+        // 3.0 ("6/8 of 4.0") that dividing a share-weighted sum by a batch
+        // count reported.
+        assert!((stats.mean_loss(0) - 4.0).abs() < 1e-6);
+        // Source b: a whole batch at 2.0 plus a quarter of one at 4.0.
+        let expected_b = (2.0 * 1.0 + 4.0 * 0.25) / (1.0 + 0.25);
+        assert!((stats.mean_loss(1) - expected_b).abs() < 1e-6);
         assert_eq!(stats.mean_loss(2), 0.0);
         assert!(stats.render().contains("mean loss"));
+    }
+
+    #[test]
+    fn test_a_constant_composite_loss_is_reported_equally_for_every_source() {
+        // One loss per composite batch cannot distinguish its sources, so the
+        // per-source report must not invent a difference. Under the old
+        // per-batch-count denominator, a 0.9/0.1 split reported 1.8 and 0.2.
+        let mut stats = SourceStats::new(vec!["big".into(), "small".into()]);
+        let origin = BatchOrigin { counts: vec![9, 1] };
+        for _ in 0..5 {
+            stats.record(&origin, 2.0);
+        }
+        assert!((stats.mean_loss(0) - 2.0).abs() < 1e-6, "{}", stats.mean_loss(0));
+        assert!((stats.mean_loss(1) - 2.0).abs() < 1e-6, "{}", stats.mean_loss(1));
+    }
+
+    #[test]
+    fn test_source_stats_from_an_older_sidecar_still_record() {
+        // A sidecar written before `share_sum` existed parses (serde default)
+        // and keeps reporting the mixture-mode mean it always did.
+        let old = serde_json::json!({
+            "names": ["a", "b"],
+            "batches": [2, 0],
+            "samples": [16, 0],
+            "loss_sum": [6.0, 0.0],
+        });
+        let mut stats: SourceStats = serde_json::from_value(old).unwrap();
+        assert!((stats.mean_loss(0) - 3.0).abs() < 1e-6);
+        stats.record(&BatchOrigin::single(0, 2, 8), 1.0);
+        assert!((stats.mean_loss(0) - 7.0 / 3.0).abs() < 1e-6);
     }
 
     #[test]

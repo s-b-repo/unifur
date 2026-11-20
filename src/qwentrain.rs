@@ -182,20 +182,34 @@ fn freeze_param<B: AutodiffBackend, const D: usize>(param: &mut Param<Tensor<B, 
     *param = Param::initialized(param.id, param.val().set_require_grad(false));
 }
 
-/// Freeze a `QwenLinear` slot's own parameters (never the adapter's).
-fn freeze_slot<B: AutodiffBackend>(slot: &mut QwenLinear<B>) {
+/// Freeze a `QwenLinear` slot's own parameters (never the adapter's),
+/// returning how many tensors it froze.
+fn freeze_slot<B: AutodiffBackend>(slot: &mut QwenLinear<B>) -> usize {
     match slot {
-        QwenLinear::F32(linear) => freeze_param(&mut linear.weight),
-        QwenLinear::Nf4(linear) => {
-            if let Some(bias) = linear.bias.as_mut() {
-                freeze_param(bias);
+        QwenLinear::F32(linear) => {
+            freeze_param(&mut linear.weight);
+            match linear.bias.as_mut() {
+                Some(bias) => {
+                    freeze_param(bias);
+                    2
+                }
+                None => 1,
             }
         }
-        QwenLinear::Qlora(linear) => {
-            if let Some(bias) = linear.base.bias.as_mut() {
+        QwenLinear::Nf4(linear) => match linear.bias.as_mut() {
+            Some(bias) => {
                 freeze_param(bias);
+                1
             }
-        }
+            None => 0,
+        },
+        QwenLinear::Qlora(linear) => match linear.base.bias.as_mut() {
+            Some(bias) => {
+                freeze_param(bias);
+                1
+            }
+            None => 0,
+        },
     }
 }
 
@@ -222,9 +236,7 @@ pub fn freeze_non_adapter_params<B: AutodiffBackend>(trunk: &mut QwenTrunk<B>) -
         if let crate::qwennet::QwenEmbed::F32(embedding) = &mut trunk.embed_tokens {
             freeze!(embedding.weight);
         }
-        if let QwenLinear::F32(linear) = &mut trunk.lm_head {
-            freeze!(linear.weight);
-        }
+        frozen += freeze_slot(&mut trunk.lm_head);
         freeze!(trunk.final_norm.weight);
         for layer in &mut trunk.layers {
             freeze!(layer.input_norm.weight);
@@ -236,7 +248,7 @@ pub fn freeze_non_adapter_params<B: AutodiffBackend>(trunk: &mut QwenTrunk<B>) -
                     freeze!(head.a_log);
                     freeze!(head.norm.weight);
                     for slot in layer_adapter_slots_mut_head(head) {
-                        freeze_slot(slot);
+                        frozen += freeze_slot(slot);
                     }
                 }
                 QwenMixer::Full(attn) => {
@@ -248,7 +260,7 @@ pub fn freeze_non_adapter_params<B: AutodiffBackend>(trunk: &mut QwenTrunk<B>) -
                         &mut attn.v_proj,
                         &mut attn.o_proj,
                     ] {
-                        freeze_slot(slot);
+                        frozen += freeze_slot(slot);
                     }
                 }
             }
@@ -257,7 +269,7 @@ pub fn freeze_non_adapter_params<B: AutodiffBackend>(trunk: &mut QwenTrunk<B>) -
                 &mut layer.mlp.up_proj,
                 &mut layer.mlp.down_proj,
             ] {
-                freeze_slot(slot);
+                frozen += freeze_slot(slot);
             }
         }
     }
@@ -691,7 +703,20 @@ impl<B: AutodiffBackend<FloatElem = f32>> QwenTrainer<B> {
     /// empty.
     pub fn evict_optimizer_pages(&mut self, dir: &Path) -> Result<Vec<(usize, StateFile)>> {
         let record = self.optim.to_record();
+        let held = record.len();
         let pages = self.pager.split(record);
+        // `split` keeps only entries whose parameter belongs to a page; any
+        // other optimizer state (a non-adapter parameter that somehow drew a
+        // gradient) would be discarded by the fresh optimizer below and the
+        // next step would restart its m/v from zero without a word. Refuse
+        // before anything is dropped -- the in-memory optimizer is untouched.
+        let paged: usize = pages.iter().map(|page| page.len()).sum();
+        ensure!(
+            paged == held,
+            "optimizer holds state for {held} parameters but only {paged} belong to an adapter \
+             page; evicting would silently discard {} of them",
+            held - paged.min(held)
+        );
         let mut files = Vec::new();
         for (page, record) in pages.into_iter().enumerate() {
             if record.is_empty() {
@@ -797,6 +822,17 @@ impl<B: AutodiffBackend<FloatElem = f32>> QwenTrainer<B> {
         state.verify_files(&state_dir)?;
         let extras: QwenTrainExtras =
             serde_json::from_value(state.extras.clone()).context("parse qwen training extras")?;
+        // The adapter scaling `alpha / rank` is not a parameter, so the model
+        // record does not carry it: resuming with a different LoRA config
+        // would load the saved factors under the caller's scaling (or, for a
+        // different rank, factors whose shape disagrees with the `rank` the
+        // config claims) and continue a different run under the old name.
+        ensure!(
+            extras.lora == config.lora,
+            "checkpoint was trained with LoRA {:?}, resume asks for {:?}",
+            extras.lora,
+            config.lora
+        );
 
         attach_lora(&mut trunk, &config.lora, device)?;
         trunk = checkpoint::load(trunk, model_path, device)?;
@@ -1091,7 +1127,10 @@ mod tests {
             &device,
         )
         .unwrap_or_else(|e| panic!("attach: {e:#}"));
-        freeze_non_adapter_params(&mut trunk);
+        // f32 embedding + final norm, then per linear layer 2 norms + conv,
+        // dt_bias, A_log, gate norm, per full layer 2 norms + q/k norms; the
+        // NF4 projections (lm_head included) are bias-free and hold no Param.
+        assert_eq!(freeze_non_adapter_params(&mut trunk), 2 + 4 * 6 + 4);
 
         // Count trainable (require_grad) parameters by visit.
         struct TrainableIds(Vec<ParamId>);
@@ -1327,10 +1366,13 @@ mod tests {
 
     #[test]
     fn ema_is_bias_corrected() {
-        // With updates = 0 the effective decay is min(0.99, 1/10) = 0.1,
-        // so after one update the shadow sits 10% of the way from the
-        // initial adapters to the stepped ones -- the warm-up ramp the
-        // bias correction exists for (schedule.rs's EMA discipline).
+        // With updates = 0 the effective decay is min(0.99, 1/10) = 0.1, and
+        // `shadow <- decay * shadow + (1 - decay) * live`, so after one
+        // update the shadow sits 90% of the way from the initial adapters to
+        // the stepped ones: early on the average follows the live weights,
+        // which is what the warm-up ramp exists for. (This test used to pin
+        // the inverted blend, 10% of the way, which made a 0.99 EMA track the
+        // live weights with a 1% lag instead of averaging them.)
         let device = Default::default();
         let trunk = nf4_trunk(&device);
         let config = tiny_train_config(31);
@@ -1365,7 +1407,7 @@ mod tests {
         assert_eq!(live.len(), shadow.len(), "live and shadow differ in size");
         let mut worst = 0.0f32;
         for ((i, l), s) in init.iter().zip(&live).zip(&shadow) {
-            let want = 0.9 * i + 0.1 * l;
+            let want = 0.1 * i + 0.9 * l;
             worst = worst.max((want - s).abs());
         }
         assert!(
@@ -1437,6 +1479,19 @@ mod tests {
         // checkpoint record carries the adapters and smalls, but the packed
         // NF4 base is `#[module(skip)]` and comes from the donor -- so the
         // donor must BE the same base, not merely the same seed.
+        // A resume under a different adapter scaling is a different run:
+        // alpha is not in the record, so it must be refused, not adopted.
+        let mismatched = QwenTrainConfig {
+            lora: QwenLoraConfig {
+                rank: 4,
+                alpha: 8.0,
+            },
+            ..tiny_train_config(seed)
+        };
+        assert!(
+            QwenTrainer::resume(&model_path, resume_donor.clone(), mismatched, &device).is_err(),
+            "resume accepted a LoRA config the checkpoint was not trained with"
+        );
         let (mut trainer_b2, rng_b2) =
             QwenTrainer::resume(&model_path, resume_donor, tiny_train_config(seed), &device)
                 .unwrap_or_else(|e| panic!("resume: {e:#}"));

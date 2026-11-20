@@ -291,11 +291,14 @@ pub struct ChannelRequest {
 }
 
 impl ChannelRequest {
-    /// Parse a request envelope, rejecting unknown envelope versions.
+    /// Parse a request envelope, rejecting unknown envelope versions — and an
+    /// unknown version of the wrapped [`ContextQuery`], which the envelope
+    /// parse alone would otherwise accept silently.
     pub fn from_json(json: &str) -> anyhow::Result<Self> {
         let msg: Self = serde_json::from_str(json)
             .map_err(|e| anyhow::anyhow!("invalid ChannelRequest JSON: {e}"))?;
         check_version("ChannelRequest", msg.version, CHANNEL_ENVELOPE_VERSION)?;
+        check_version("ContextQuery", msg.query.version, CONTEXT_QUERY_VERSION)?;
         Ok(msg)
     }
 
@@ -329,11 +332,17 @@ impl ChannelResponse {
         }
     }
 
-    /// Parse a response envelope, rejecting unknown envelope versions.
+    /// Parse a response envelope, rejecting unknown envelope versions — and
+    /// any hit carrying an unknown (or missing) [`ContextHit`] version, which
+    /// the envelope parse alone would otherwise accept silently.
     pub fn from_json(json: &str) -> anyhow::Result<Self> {
         let msg: Self = serde_json::from_str(json)
             .map_err(|e| anyhow::anyhow!("invalid ChannelResponse JSON: {e}"))?;
         check_version("ChannelResponse", msg.version, CHANNEL_ENVELOPE_VERSION)?;
+        for (index, hit) in msg.hits.iter().enumerate() {
+            check_version("ContextHit", hit.version, CONTEXT_HIT_VERSION)
+                .map_err(|e| anyhow::anyhow!("hit {index} ('{}'): {e}", hit.id))?;
+        }
         Ok(msg)
     }
 
@@ -354,8 +363,20 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("creating '{}': {e}", parent.display()))?;
         }
     }
-    let tmp = PathBuf::from(format!("{}.tmp-{}", path.display(), std::process::id()));
-    fs::write(&tmp, bytes).map_err(|e| anyhow::anyhow!("writing '{}': {e}", tmp.display()))?;
+    // pid alone is not unique: two threads of one process writing the same
+    // destination would share the tmp file, and one could rename the other's
+    // half-written bytes into place. The counter makes every write its own.
+    static TMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = PathBuf::from(format!("{}.tmp-{}-{n}", path.display(), std::process::id()));
+    {
+        use std::io::Write;
+        let mut file = fs::File::create(&tmp)
+            .map_err(|e| anyhow::anyhow!("creating '{}': {e}", tmp.display()))?;
+        file.write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| anyhow::anyhow!("writing '{}': {e}", tmp.display()))?;
+    }
     fs::rename(&tmp, path).map_err(|e| {
         anyhow::anyhow!(
             "renaming '{}' over '{}': {e}",
@@ -936,20 +957,29 @@ impl LocalRetriever {
         }
         let doc_total = self.docs.len() as f64; // audit-allow: doc counts fit f64 exactly far past any real corpus
         let k1 = 1.5_f64;
-        let mut scored: Vec<(f64, &CorpusDoc)> = Vec::new();
-        for doc in &self.docs {
-            let mut score = 0.0_f64;
-            for term in &query_terms {
-                let tf = doc.tokens.iter().filter(|t| t == &term).count() as f64; // audit-allow: term counts fit f64 exactly
-                if tf == 0.0 {
-                    continue;
-                }
+        // idf depends on the term only, so it is computed once per query term
+        // — not once per (document, term) pair, which rescanned the whole
+        // corpus for every matching document and made a query quadratic in
+        // the corpus size.
+        let idfs: Vec<f64> = query_terms
+            .iter()
+            .map(|term| {
                 let df = self
                     .docs
                     .iter()
                     .filter(|d| d.tokens.iter().any(|t| t == term))
                     .count() as f64; // audit-allow: document counts fit f64 exactly
-                let idf = (1.0 + (doc_total - df + 0.5) / (df + 0.5)).ln();
+                (1.0 + (doc_total - df + 0.5) / (df + 0.5)).ln()
+            })
+            .collect();
+        let mut scored: Vec<(f64, &CorpusDoc)> = Vec::new();
+        for doc in &self.docs {
+            let mut score = 0.0_f64;
+            for (term, idf) in query_terms.iter().zip(&idfs) {
+                let tf = doc.tokens.iter().filter(|t| t == &term).count() as f64; // audit-allow: term counts fit f64 exactly
+                if tf == 0.0 {
+                    continue;
+                }
                 score += idf * (tf * (k1 + 1.0)) / (tf + k1);
             }
             if score > 0.0 {
@@ -1107,6 +1137,74 @@ mod tests {
         // A missing version parses as 0 and is rejected the same way.
         let err = ContextQuery::from_json(r#"{"text": "x", "k": 1}"#).unwrap_err();
         assert!(format!("{err}").contains("version 0"), "{err}");
+    }
+
+    #[test]
+    fn envelopes_reject_unknown_nested_message_versions() {
+        // The envelope version alone used to gate a response: a hit with an
+        // unknown (or missing) ContextHit version was accepted silently.
+        let mut response = ChannelResponse::new(
+            "r1",
+            vec![ContextHit::new("d", 1.0, "t", Provenance::default())],
+        );
+        response.hits[0].version = 7;
+        let err = ChannelResponse::from_json(&response.to_json().unwrap()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("ContextHit") && msg.contains('7'), "{msg}");
+        let err = ChannelResponse::from_json(
+            r#"{"version": 1, "id": "r", "hits": [{"id": "d", "text": "t"}]}"#,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("version 0"), "{err}");
+
+        let request = ChannelRequest {
+            version: CHANNEL_ENVELOPE_VERSION,
+            id: "q".to_string(),
+            query: ContextQuery {
+                version: 9,
+                ..ContextQuery::default()
+            },
+        };
+        let err = ChannelRequest::from_json(&request.to_json().unwrap()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("ContextQuery") && msg.contains('9'), "{msg}");
+
+        // Current versions still round-trip through both envelopes.
+        let ok = ChannelResponse::new(
+            "r2",
+            vec![ContextHit::new("d", 1.0, "t", Provenance::default())],
+        );
+        assert_eq!(
+            ChannelResponse::from_json(&ok.to_json().unwrap()).unwrap(),
+            ok
+        );
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_to_one_path_never_mix() {
+        // One process, many threads, one destination: each write must land
+        // whole. A tmp name keyed on the pid alone was shared by every thread.
+        let dir = unique_dir("atomic-race");
+        let path = dir.join("shared.json");
+        let bodies: Vec<String> = (0..8).map(|i| i.to_string().repeat(64 * 1024)).collect();
+        std::thread::scope(|scope| {
+            for body in &bodies {
+                let path = &path;
+                scope.spawn(move || {
+                    for _ in 0..4 {
+                        write_atomic(path, body.as_bytes()).unwrap();
+                    }
+                });
+            }
+        });
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(bodies.contains(&text), "the file holds a mixture of writes");
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "a tmp file was left"
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

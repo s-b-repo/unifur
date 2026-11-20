@@ -474,6 +474,18 @@ impl MirrorSet {
                 .filter(|_| ring_available()),
             Backend::Threaded => None,
         };
+        #[cfg(feature = "peregrine-uring")]
+        let ring_ready = ring.is_some();
+        #[cfg(not(feature = "peregrine-uring"))]
+        let ring_ready = false;
+        // A set that asked for the ring but could not get one (no feature, old
+        // kernel, sandbox) reads on threads, and `backend()` says so: it used
+        // to report `IoUring` for a set that never touched a ring.
+        let backend = if ring_ready {
+            backend
+        } else {
+            Backend::Threaded
+        };
         Ok(Self {
             files,
             paths: paths.to_vec(),
@@ -564,10 +576,12 @@ impl MirrorSet {
         let (ring_batches, syscalls) = match self.backend {
             #[cfg(feature = "peregrine-uring")]
             Backend::IoUring if self.ring.is_some() && order.len() <= RING_QUEUE_DEPTH => {
-                self.read_ring(plan, &order, &mut out)
+                // Normally one enter for the whole batch; the count is the
+                // number actually made (an interrupted wait costs another).
+                let enters = self
+                    .read_ring(plan, &order, &mut out)
                     .context("io_uring stripe batch")?;
-                // One enter for the whole batch. The ring does the waiting.
-                (1, 1)
+                (1, enters)
             }
             _ => {
                 self.read_threaded(plan, &mut out)
@@ -675,22 +689,29 @@ impl MirrorSet {
     /// path* on this machine despite doing four times fewer syscalls. Batching
     /// the syscalls is worth nothing if the data is then copied twice, so the
     /// read lands where it is needed the first time.
+    ///
+    /// Returns the number of `io_uring_enter` calls made, for the stats.
     #[cfg(feature = "peregrine-uring")]
     fn read_ring(
         &mut self,
         plan: &MirrorPlan,
         order: &[&Stripe],
         out: &mut [u8],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<u64> {
         use io_uring::{opcode, types};
 
         // Borrow the ring and the file table from disjoint fields of `self`, so
         // neither borrow has to be re-taken while the other is live.
-        let Self { files, ring, .. } = self;
+        let Self {
+            files,
+            ring: ring_slot,
+            backend,
+            ..
+        } = self;
         // Reported rather than assumed: the caller checks the ring exists before
         // choosing this backend, and if that ever changes the right answer is to
         // fall back to the threaded path, not to read through a missing ring.
-        let ring = ring.as_mut().ok_or_else(|| {
+        let ring = ring_slot.as_mut().ok_or_else(|| {
             anyhow::anyhow!("the io_uring backend was chosen without a ring to submit to")
         })?;
         let files: &[File] = files;
@@ -734,59 +755,115 @@ impl MirrorSet {
             taken
         };
 
+        // Every SQE pushed below points into `out`, which the caller frees as
+        // soon as this function returns. So no read may still be in flight when
+        // it returns -- on success *or* on error. The push loop therefore stops
+        // at its first failure but still submits and reaps what it pushed, and
+        // the reap loop drains every completion instead of returning at the
+        // first bad one. (The previous version returned early from both loops;
+        // an early return left reads in flight into a freed buffer, and left
+        // completions in the queue for the *next* batch to misread as its own.)
+        let mut pushed = 0usize;
+        let mut first_error: Option<anyhow::Error> = None;
         for (slot, stripe) in order.iter().enumerate() {
+            let Ok(len) = u32::try_from(stripe.len) else {
+                first_error = Some(anyhow::anyhow!(
+                    "stripe {} is {} bytes, more than one ring read can carry",
+                    stripe.index,
+                    stripe.len
+                ));
+                break;
+            };
             let fd = types::Fd(files[stripe.replica].as_raw_fd());
             let dst = by_index[slot].as_mut_ptr();
-            let entry = opcode::Read::new(fd, dst, stripe.len as u32)
+            let entry = opcode::Read::new(fd, dst, len)
                 .offset(stripe.file_offset)
                 .build()
                 .user_data(slot as u64);
             // SAFETY: `dst` points into `out` at this stripe's own disjoint
             // destination range (proved by `validate` and by the `split_at_mut`
             // walk above). The kernel writes at most `stripe.len` bytes there,
-            // `out` outlives this function, and every completion is reaped
-            // before the slices are dropped -- so no pointer outlives its
-            // buffer and no two writes can overlap.
-            unsafe {
-                ring.submission()
-                    .push(&entry)
-                    .map_err(|_| anyhow::anyhow!("the ring's submission queue filled up"))?;
+            // `out` outlives this function, and every pushed entry is reaped by
+            // the loop below before this function returns -- so no pointer
+            // outlives its buffer and no two writes can overlap.
+            let queued = unsafe { ring.submission().push(&entry) };
+            if queued.is_err() {
+                first_error = Some(anyhow::anyhow!("the ring's submission queue filled up"));
+                break;
+            }
+            pushed += 1;
+        }
+
+        // `submit_and_wait` submits the queue and waits in one `io_uring_enter`
+        // (a separate `submit()` first, as before, was a second syscall the
+        // stats did not count). It takes the *count* to wait for, as a `usize`
+        // in io-uring 0.7. An `Ok` return is not "all done": when a signal
+        // interrupts the wait after the submission, the kernel reports the
+        // submission count rather than an error. So the loop runs until every
+        // pushed read has been reaped.
+        let mut enters = 0u64;
+        let mut reaped = 0usize;
+        while reaped < pushed {
+            enters += 1;
+            match ring.submit_and_wait(pushed - reaped) {
+                Ok(_) => {}
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::ResourceBusy
+                    ) => {}
+                Err(err) => {
+                    // The ring's state is unknown: unsubmitted entries may
+                    // still sit in its queue pointing into `out`. Retire the
+                    // ring so no later batch ever submits them; the set
+                    // reads on threads from here on.
+                    let in_flight = pushed - reaped;
+                    *ring_slot = None;
+                    *backend = Backend::Threaded;
+                    return Err(anyhow::Error::new(err).context(format!(
+                        "io_uring enter failed with {in_flight} of {pushed} stripe reads \
+                         unreaped; the ring is retired"
+                    )));
+                }
+            }
+            for cqe in ring.completion() {
+                let slot = cqe.user_data() as usize;
+                let result = cqe.result();
+                let Some(stripe) = order.get(slot) else {
+                    if first_error.is_none() {
+                        first_error = Some(anyhow::anyhow!(
+                            "the ring returned a completion for slot {slot}, which this batch \
+                             never submitted"
+                        ));
+                    }
+                    continue;
+                };
+                reaped += 1;
+                if first_error.is_some() {
+                    continue;
+                }
+                if result < 0 {
+                    first_error = Some(anyhow::anyhow!(
+                        "stripe {} (replica {}) failed: {}",
+                        stripe.index,
+                        stripe.replica,
+                        std::io::Error::from_raw_os_error(-result)
+                    ));
+                } else if result as usize != stripe.len {
+                    first_error = Some(anyhow::anyhow!(
+                        "stripe {} read {} bytes, expected {}: a short read is a mirror that is \
+                         not a mirror, not a region to be zero-filled",
+                        stripe.index,
+                        result,
+                        stripe.len
+                    ));
+                }
             }
         }
-        ring.submit().context("io_uring submit")?;
-        // `submit_and_wait` takes the *count* it should wait for, as a `usize`
-        // in io-uring 0.7 (it was a `u32` in earlier versions).
-        ring.submit_and_wait(order.len()).context("io_uring reap")?;
-
-        let mut completed = 0usize;
-        for cqe in ring.completion() {
-            let slot = cqe.user_data() as usize;
-            let result = cqe.result();
-            let stripe = order[slot];
-            anyhow::ensure!(
-                result >= 0,
-                "stripe {} (replica {}) failed: {}",
-                stripe.index,
-                stripe.replica,
-                std::io::Error::from_raw_os_error(-result)
-            );
-            let got = result as usize;
-            anyhow::ensure!(
-                got == stripe.len,
-                "stripe {} read {} bytes, expected {}: a short read is a mirror that is \
-                 not a mirror, not a region to be zero-filled",
-                stripe.index,
-                got,
-                stripe.len
-            );
-            completed += 1;
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(enters),
         }
-        anyhow::ensure!(
-            completed == order.len(),
-            "the ring completed {completed} of {} stripes",
-            order.len()
-        );
-        Ok(())
     }
 }
 
@@ -898,6 +975,43 @@ mod tests {
                     "replicas={replicas} region=({off}, {n}): striped read differs from serial"
                 );
             }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The oracle above uses identical replicas, so it cannot tell a striped
+    /// read that really spreads across the drives from one that reads every
+    /// stripe from replica 0. Here each replica has distinct bytes, and every
+    /// stripe of the result must be the bytes of the replica its plan names.
+    #[test]
+    fn each_stripe_is_read_from_the_replica_its_plan_names() {
+        let dir = tempdir("routing");
+        let len = 64 * 1024;
+        let contents: Vec<Vec<u8>> = (0..4u8)
+            .map(|r| (0..len).map(|i| ((i * 31 + 7) % 251) as u8 ^ (r * 64)).collect())
+            .collect();
+        let paths: Vec<PathBuf> = contents
+            .iter()
+            .enumerate()
+            .map(|(r, bytes)| {
+                let path = dir.join(format!("d{r}.bin"));
+                std::fs::write(&path, bytes).expect("write replica");
+                path
+            })
+            .collect();
+        let mut set = MirrorSet::open(&paths, Backend::Threaded).expect("open");
+        let plan = MirrorPlan::new(Region::new(100, len - 200), 4);
+        assert_eq!(plan.stripes.len(), 4, "one stripe per replica");
+        let got = set.read_plan(&plan).expect("striped");
+        for stripe in &plan.stripes {
+            let from = stripe.file_offset as usize;
+            assert_eq!(
+                &got[stripe.dst_offset..stripe.dst_offset + stripe.len],
+                &contents[stripe.replica][from..from + stripe.len],
+                "stripe {} does not hold replica {}'s bytes",
+                stripe.index,
+                stripe.replica
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1120,6 +1234,31 @@ mod tests {
         let mut short = MirrorPlan::new(Region::new(0, 4 * MIN_STRIPE), 4);
         short.stripes[0].len -= 1;
         assert!(set.read_plan(&short).is_err(), "a short plan was accepted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A set opened for the ring reports the backend that will actually run:
+    /// `IoUring` only when it holds a live ring. Without the feature (or on a
+    /// kernel that refuses a ring) it reads on threads and must say so --
+    /// it used to report `IoUring` while every batch went to `pread`.
+    #[test]
+    fn a_set_without_a_ring_reports_the_threaded_backend() {
+        let dir = tempdir("honest-backend");
+        let paths = vec![patterned_file(&dir, "h.bin", 64 * 1024)];
+        let mut set = MirrorSet::open(&paths, Backend::IoUring).expect("open");
+        assert_eq!(set.backend() == Backend::IoUring, has_ring(&set));
+        #[cfg(not(feature = "peregrine-uring"))]
+        assert_eq!(set.backend(), Backend::Threaded);
+        let want = set.read_serial(Region::new(0, 64 * 1024)).expect("serial");
+        let got = set.read_striped(Region::new(0, 64 * 1024)).expect("striped");
+        assert_eq!(got, want);
+        let stats = set.stats();
+        assert_eq!(
+            stats.ring_batches > 0,
+            set.backend() == Backend::IoUring,
+            "ring batches {stats:?} disagree with the reported backend {:?}",
+            set.backend()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

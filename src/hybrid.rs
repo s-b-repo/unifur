@@ -342,7 +342,9 @@ pub fn attention_mask<B: Backend>(
         let q = query_offset + query;
         for key in 0..total {
             let k = key_offset + key;
-            let visible = k <= q && window.is_none_or(|w| k + w > q);
+            // `q - k` cannot underflow once `k <= q` holds, and unlike
+            // `k + w > q` it cannot overflow for a huge parsed window.
+            let visible = k <= q && window.is_none_or(|w| q - k < w);
             values.push(if visible { 0.0f32 } else { f32::NEG_INFINITY });
         }
     }
@@ -660,9 +662,15 @@ impl<B: Backend> LayerState<B> {
             return;
         }
         let drop = total - keep;
-        if let (Some(k), Some(v)) = (self.keys.take(), self.values.take()) {
-            self.keys = Some(k.narrow(2, drop, keep));
-            self.values = Some(v.narrow(2, drop, keep));
+        let (keys, values) = (self.keys.take(), self.values.take());
+        // Keeping nothing (a sliding window of 1) is dropping the tensors:
+        // `narrow` refuses a zero-length window, so `narrow(2, total, 0)` used
+        // to abort the first decode step of every window-1 layer.
+        if keep > 0 {
+            if let (Some(k), Some(v)) = (keys, values) {
+                self.keys = Some(k.narrow(2, drop, keep));
+                self.values = Some(v.narrow(2, drop, keep));
+            }
         }
         self.first_key_position += drop;
     }
@@ -815,6 +823,15 @@ mod tests {
         );
         let keep = to_vec(causal_keep_mask::<B>(2, 2, 0, 0, &device));
         assert_eq!(keep, vec![1.0, 0.0, 1.0, 1.0]);
+        // A window wider than any position is plain causal, not an overflow.
+        let wide = to_vec(attention_mask::<B>(2, 5, 3, 0, Some(usize::MAX), &device));
+        assert_eq!(wide, c.clone());
+        // Window 1 sees exactly the query's own position.
+        let own = to_vec(attention_mask::<B>(1, 5, 4, 0, Some(1), &device));
+        assert_eq!(
+            own.iter().map(|v| *v == 0.0).collect::<Vec<_>>(),
+            vec![false, false, false, false, true]
+        );
     }
 
     #[test]
@@ -979,6 +996,14 @@ mod tests {
         let kept = to_vec(state.keys.clone().unwrap());
         assert_eq!(kept, vec![3.0, 3.0, 4.0, 4.0]);
         assert!(state.resident_floats() == 8);
+        // Trimming to nothing forgets every key but keeps counting positions.
+        state.trim(0);
+        assert_eq!(state.len(), 0);
+        assert_eq!(state.first_key_position, 5);
+        assert!(state.kv().is_none());
+        let (k1, _) = state.push_kv(k(5.0), k(-5.0), None);
+        assert_eq!(to_vec(k1), vec![5.0, 5.0]);
+        assert_eq!(state.first_key_position, 5);
         state.clear();
         assert!(state.is_empty() && state.first_key_position == 0);
         assert_eq!(

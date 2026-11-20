@@ -5,8 +5,10 @@
 //! Pairing is by **traversal order**, as the EMA does, because Burn's
 //! `load_record` adopts a record's parameter ids and an id-keyed pairing would
 //! fail silently across checkpoints. Shapes are checked at every parameter.
-//! Merging is linear and a merge of identical checkpoints is the identity, to
-//! the bit -- both certified.
+//! Merging is linear, and a merge of identical checkpoints is the identity to
+//! the bit whenever the normalized weights are exact in `f32` (two equal
+//! weights, say: `0.5 x + 0.5 x == x`) -- both certified for that case. With
+//! weights like thirds the result can differ from the input in the last bit.
 
 use anyhow::Context;
 use burn::{

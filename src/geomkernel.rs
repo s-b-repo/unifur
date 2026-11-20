@@ -158,7 +158,50 @@ impl Q {
 
     pub fn less(&self, other: &Self) -> bool {
         // both denominators are positive, so the cross product orders exactly
-        self.num * other.den < other.num * self.den
+        // -- when it fits. An unchecked `i128` product here used to wrap in a
+        // release build (and panic in a debug one) for values the checked
+        // arithmetic above had produced legitimately, so an "exact" ordering
+        // could come back inverted. Past the overflow the comparison falls
+        // back to the continued-fraction walk, which never multiplies.
+        match (
+            self.num.checked_mul(other.den),
+            other.num.checked_mul(self.den),
+        ) {
+            (Some(left), Some(right)) => left < right,
+            _ => cmp_fractions(self.num, self.den, other.num, other.den).is_lt(),
+        }
+    }
+}
+
+/// Exact order of `a/b` against `c/d` (`b, d > 0`) without a single
+/// multiplication: compare the integer parts, and when they agree compare the
+/// reciprocals of the fractional parts the other way round -- Euclid's
+/// algorithm run on both fractions at once, so it terminates and cannot
+/// overflow.
+fn cmp_fractions(a: i128, b: i128, c: i128, d: i128) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (mut a, mut b, mut c, mut d) = (a, b, c, d);
+    loop {
+        if b <= 0 || d <= 0 {
+            // Not a normalized rational; nothing exact can be said, and the
+            // kernel never builds one (`Q::new` makes every denominator
+            // positive).
+            return Ordering::Equal;
+        }
+        let (whole_a, rest_a) = (a.div_euclid(b), a.rem_euclid(b));
+        let (whole_c, rest_c) = (c.div_euclid(d), c.rem_euclid(d));
+        if whole_a != whole_c {
+            return whole_a.cmp(&whole_c);
+        }
+        match (rest_a == 0, rest_c == 0) {
+            (true, true) => return Ordering::Equal,
+            (true, false) => return Ordering::Less,
+            (false, true) => return Ordering::Greater,
+            (false, false) => {}
+        }
+        // rest_a/b against rest_c/d, both in (0, 1), orders exactly as
+        // d/rest_c against b/rest_a.
+        (a, b, c, d) = (d, rest_c, b, rest_a);
     }
 }
 
@@ -264,6 +307,9 @@ impl QSqrt {
     pub fn new(a: Frac, b: Frac, d: i64) -> anyhow::Result<Self> {
         anyhow::ensure!(d >= 0, "a radicand cannot be negative (got {d})");
         let (a_q, b_q) = (a.to_q()?, b.to_q()?);
+        // `a` is stored normalized too: `Frac` compares field by field, so a
+        // `2/4` kept verbatim would make two equal values unequal under `==`.
+        let a = Frac::from_q(a_q);
         if b_q.is_zero() || d == 0 {
             return Ok(Self::rational(a));
         }
@@ -923,10 +969,20 @@ impl SceneGraph {
                 ));
                 return false;
             }
-            Err(why) => self.record_refusal(format!(
-                "{} is undecidable for the kernel: {why}",
-                constraint.describe()
-            )),
+            Err(why) => {
+                self.record_refusal(format!(
+                    "{} is undecidable for the kernel: {why}",
+                    constraint.describe()
+                ));
+                // A statement the problem *gives* may be kept as an assumption
+                // with the gap on the ledger. A rule's *conclusion* may not: it
+                // would be stored as `Derived` at confidence 1.0, i.e. as
+                // established, which is exactly the "true by default" this
+                // kernel's predicates refuse.
+                if matches!(provenance, Provenance::Derived { .. }) {
+                    return false;
+                }
+            }
         }
         let confidence = match &provenance {
             Provenance::Constructed { op } => op
@@ -1032,11 +1088,16 @@ impl SceneGraph {
                 name: point.name.clone()
             }
         );
-        let taken = self
-            .points
-            .iter()
-            .find(|p| p.x == point.x && p.y == point.y)
-            .map(|p| p.name.clone());
+        // Compared as rationals, not as `Frac` fields: `1/2` and `2/4` are one
+        // location, and a field-wise test let the second name in.
+        let (x, y) = (point.x.to_q()?, point.y.to_q()?);
+        let mut taken = None;
+        for p in &self.points {
+            if p.x.to_q()? == x && p.y.to_q()? == y {
+                taken = Some(p.name.clone());
+                break;
+            }
+        }
         if let Some(other) = taken {
             return Err(GeometryError::CoincidentPoints {
                 a: other,
@@ -1324,7 +1385,13 @@ pub fn constraint_holds_in(
         }
         Constraint::AngleEqual { first, second } => angle_of(first)?.equal(&angle_of(second)?),
         Constraint::RightAngle { at } => Ok(angle_of(at)?.is_right()),
-        Constraint::AngleIs { at, cos } => Ok(angle_of(at)?.cosine()? == *cos),
+        // The stated cosine is normalized before the comparison: one read off
+        // JSON may say `2/4` or `sqrt(8)` where the kernel computes `1/2` or
+        // `2 sqrt(2)`, and `QSqrt`'s `==` is only a decision between
+        // normalized values.
+        Constraint::AngleIs { at, cos } => {
+            Ok(angle_of(at)?.cosine()? == QSqrt::new(cos.a, cos.b, cos.d)?)
+        }
         Constraint::AreaEqual { first, second } => {
             Ok(doubled_area_magnitude(coords, first)? == doubled_area_magnitude(coords, second)?)
         }
@@ -1342,7 +1409,7 @@ pub fn constraint_holds_in(
             // interchangeable with a look-alike, which is the entire point of
             // handing it an identity in the first place.
             let found = find_circle(name)?;
-            Ok(&found.center == center && found.radius_sq == *radius_sq)
+            Ok(&found.center == center && found.radius_sq.to_q()? == radius_sq.to_q()?)
         }
         Constraint::OnCircle { p, circle } => {
             let found = find_circle(circle)?;
@@ -2149,18 +2216,28 @@ impl Rule {
                         else {
                             continue;
                         };
-                        let pairs = [(a, c, d), (b, c, d), (c, a, b), (d, a, b)];
-                        for (target, first, second) in pairs {
-                            let partner = if first == target {
-                                second
-                            } else if second == target {
-                                first
+                        // `a || b` and `c _|_ d`: when one side of the
+                        // parallel is also a side of the perpendicular, the
+                        // *other* parallel side is perpendicular to the
+                        // perpendicular's other side. The old pairing paired
+                        // each segment with its own fact's partner, so it only
+                        // ever re-emitted `c _|_ d` itself or the false
+                        // `c _|_ b` for `c == a` (parallel, not perpendicular)
+                        // -- the rule never derived anything true and new.
+                        for (shared, other) in [(a, b), (b, a)] {
+                            let partner = if shared == c {
+                                d
+                            } else if shared == d {
+                                c
                             } else {
                                 continue;
                             };
+                            if other == partner {
+                                continue;
+                            }
                             out.push((
                                 Constraint::Perpendicular {
-                                    first: target.clone(),
+                                    first: other.clone(),
                                     second: partner.clone(),
                                 },
                                 vec![f1.constraint.describe(), f2.constraint.describe()],
@@ -2234,6 +2311,22 @@ impl Rule {
                             },
                             inputs.clone(),
                         ));
+                        // The other pair of opposite sides, a2->b1 and a1->b2,
+                        // which the rule's own doc promises ("bc parallel ad")
+                        // and which was never emitted.
+                        out.push((
+                            Constraint::Parallel {
+                                first: Segment {
+                                    from: a2.clone(),
+                                    to: b1.clone(),
+                                },
+                                second: Segment {
+                                    from: a1.clone(),
+                                    to: b2.clone(),
+                                },
+                            },
+                            inputs.clone(),
+                        ));
                     }
                 }
             }
@@ -2266,18 +2359,20 @@ impl Rule {
                 if at_b == 0 || at_d == 0 || at_b != at_d {
                     return Ok(out);
                 }
-                let inputs = vec![
-                    Constraint::OnCircle {
-                        p: b.clone(),
-                        circle: circle.clone(),
-                    }
-                    .describe(),
-                    Constraint::OnCircle {
-                        p: d.clone(),
-                        circle: circle.clone(),
-                    }
-                    .describe(),
-                ];
+                // All four incidences are premises, so all four are named:
+                // `confidence_in` walks these names, and a chord endpoint left
+                // off the list let a conclusion resting on a graded `a` or `c`
+                // come back at full confidence.
+                let inputs: Vec<String> = [a, b, c, d]
+                    .into_iter()
+                    .map(|p| {
+                        Constraint::OnCircle {
+                            p: p.clone(),
+                            circle: circle.clone(),
+                        }
+                        .describe()
+                    })
+                    .collect();
                 out.push((
                     Constraint::AngleEqual {
                         first: Angle3::new(b, a, c),
@@ -2664,13 +2759,21 @@ impl Rule {
                     }
                 }
             }
-            if fresh.is_empty() {
+            // Count what the ledger actually admitted, not what the rules
+            // proposed: a proposal the exact predicate refuses (or a duplicate
+            // two rules both emitted this round) is not a derived fact, and
+            // counting it inflated the total -- by the same refused proposal
+            // again every round, since nothing stopped the loop either.
+            let mut admitted = 0usize;
+            for (constraint, provenance) in fresh {
+                if graph.add_fact(constraint, provenance) {
+                    admitted += 1;
+                }
+            }
+            if admitted == 0 {
                 break;
             }
-            added += fresh.len();
-            for (constraint, provenance) in fresh {
-                graph.add_fact(constraint, provenance);
-            }
+            added += admitted;
         }
         Ok(added)
     }
@@ -2812,11 +2915,12 @@ pub fn falsify_with_circles<R: rand::Rng>(
             push_name(&name);
         }
         // The centre of a circle in play is a point of the figure too: it has to
-        // be placed for the circle to exist anywhere.
-        for constraint in std::iter::once(constraint) {
-            if let Constraint::OnCircle { circle, .. } = constraint {
-                push_name(&circle_of(circle)?.center);
-            }
+        // be placed for the circle to exist anywhere -- for a diameter as much
+        // as for an incidence, since `Diameter` is decided against the centre.
+        if let Constraint::OnCircle { circle, .. } | Constraint::Diameter { circle, .. } =
+            constraint
+        {
+            push_name(&circle_of(circle)?.center);
         }
     }
     let mut constructed: Vec<(String, String, String)> = Vec::new();
@@ -2921,9 +3025,13 @@ pub fn falsify_with_circles<R: rand::Rng>(
         if !ok {
             continue;
         }
+        // Decided against the circle pool, not against no circles at all:
+        // `constraint_holds` refuses every circle predicate by design, so the
+        // first `OnCircle` premise used to turn the whole circle-aware
+        // falsifier into an "unknown circle" error.
         let mut premises_hold = true;
         for premise in premises {
-            if !constraint_holds(&coords, premise)? {
+            if !constraint_holds_in(&pool, &coords, premise)? {
                 premises_hold = false;
                 break;
             }
@@ -2932,7 +3040,7 @@ pub fn falsify_with_circles<R: rand::Rng>(
             continue;
         }
         satisfying += 1;
-        if !constraint_holds(&coords, claim)? {
+        if !constraint_holds_in(&pool, &coords, claim)? {
             return Ok(Verdict::Counterexample {
                 trial,
                 points: coords,
@@ -2991,6 +3099,9 @@ pub fn rational_sqrt(value: &Frac) -> Option<Q> {
         }
         None
     }
+    // Normalized first: `8/2` is `4`, a perfect square, though neither `8` nor
+    // `2` is; and a `-4/-1` read off JSON is `4`, not a negative radicand.
+    let value = value.to_q().ok()?;
     Q::new(root_of(value.num)?, root_of(value.den)?).ok()
 }
 
@@ -3408,6 +3519,244 @@ mod tests {
             }
             other => panic!("the midpoint claim is a theorem; falsified anyway: {other:?}"),
         }
+    }
+
+    fn pt(name: &str, x: i64, y: i64) -> KPoint {
+        KPoint {
+            name: name.into(),
+            x: Frac::from_int(x),
+            y: Frac::from_int(y),
+        }
+    }
+
+    fn sg(from: &str, to: &str) -> Segment {
+        Segment {
+            from: from.into(),
+            to: to.into(),
+        }
+    }
+
+    #[test]
+    fn test_ordering_is_exact_past_i128_overflow() {
+        // Both cross products overflow i128; the old `num * den` wrapped (or
+        // panicked) and could invert the order.
+        let m = i128::MAX;
+        let big = q(m - 1, m); // 1 - 1/m
+        let smaller = q(m - 2, m - 1); // 1 - 1/(m-1)
+        assert!(smaller.less(&big));
+        assert!(!big.less(&smaller));
+        assert!(!big.less(&big));
+        assert!(q(-(m - 1), m).less(&q(-(m - 2), m - 1)));
+    }
+
+    #[test]
+    fn test_parallel_perpendicular_derives_the_other_side() {
+        // AB || CD and CD _|_ CE: the rule must conclude AB _|_ CE, and
+        // nothing false (the old pairing proposed CD _|_ AB).
+        let mut graph = graph_from_points(
+            vec![
+                pt("A", 0, 0),
+                pt("B", 4, 0),
+                pt("C", 0, 2),
+                pt("D", 3, 2),
+                pt("E", 0, 5),
+            ],
+            vec![
+                Constraint::Parallel {
+                    first: sg("A", "B"),
+                    second: sg("C", "D"),
+                },
+                Constraint::Perpendicular {
+                    first: sg("C", "D"),
+                    second: sg("C", "E"),
+                },
+            ],
+        );
+        Rule::saturate(&mut graph, 8).unwrap();
+        assert!(graph.has_fact(&Constraint::Perpendicular {
+            first: sg("A", "B"),
+            second: sg("C", "E"),
+        }));
+        assert!(
+            !graph
+                .not_established
+                .iter()
+                .any(|line| line.contains("is false of the stated figure")),
+            "the rule proposed a false conclusion: {:?}",
+            graph.not_established
+        );
+    }
+
+    #[test]
+    fn test_saturation_counts_only_admitted_facts() {
+        // An (unchecked) given midpoint that is false of the figure: the rule
+        // proposes two conclusions, the exact predicate refuses both, and
+        // nothing was derived -- not 2 per round for every round.
+        let mut graph = graph_from_points(
+            vec![pt("B", 0, 0), pt("C", 4, 0), pt("D", 1, 3)],
+            vec![Constraint::MidpointOf {
+                p: "D".into(),
+                a: "B".into(),
+                b: "C".into(),
+            }],
+        );
+        assert_eq!(Rule::saturate(&mut graph, 8).unwrap(), 0);
+        assert_eq!(graph.derived().len(), 0);
+    }
+
+    #[test]
+    fn test_parallelogram_rule_gives_both_pairs_of_sides() {
+        let mut graph = graph_from_points(
+            vec![
+                pt("A", 0, 0),
+                pt("B", 4, 0),
+                pt("C", 5, 2),
+                pt("D", 1, 2),
+                KPoint {
+                    name: "P".into(),
+                    x: Frac { num: 5, den: 2 },
+                    y: Frac::from_int(1),
+                },
+            ],
+            vec![
+                Constraint::MidpointOf {
+                    p: "P".into(),
+                    a: "A".into(),
+                    b: "C".into(),
+                },
+                Constraint::MidpointOf {
+                    p: "P".into(),
+                    a: "B".into(),
+                    b: "D".into(),
+                },
+            ],
+        );
+        Rule::saturate(&mut graph, 8).unwrap();
+        assert!(graph.has_fact(&Constraint::Parallel {
+            first: sg("B", "C"),
+            second: sg("A", "D"),
+        }));
+    }
+
+    #[test]
+    fn test_inscribed_angle_conclusion_carries_every_incidence() {
+        // A graded incidence of a chord endpoint must bound the confidence of
+        // the inscribed-angle conclusion; the rule used to name only b and d.
+        let mut graph = graph_from_points(
+            vec![
+                pt("O", 0, 0),
+                pt("A", 5, 0),
+                pt("C", -5, 0),
+                pt("B", 3, 4),
+                pt("D", -3, 4),
+            ],
+            vec![],
+        );
+        graph
+            .add_circle(KCircle {
+                name: "w".into(),
+                center: "O".into(),
+                radius_sq: Frac::from_int(25),
+            })
+            .unwrap();
+        assert!(graph.add_fact(
+            Constraint::OnCircle {
+                p: "A".into(),
+                circle: "w".into()
+            },
+            Provenance::Constructed {
+                op: "observed:0.5".into()
+            }
+        ));
+        for p in ["B", "C", "D"] {
+            assert!(graph.add_fact(
+                Constraint::OnCircle {
+                    p: p.into(),
+                    circle: "w".into()
+                },
+                Provenance::Given
+            ));
+        }
+        Rule::saturate(&mut graph, 4).unwrap();
+        let target = Constraint::AngleEqual {
+            first: Angle3::new("B", "A", "C"),
+            second: Angle3::new("D", "A", "C"),
+        };
+        assert!(graph.has_fact(&target));
+        let worth = graph.confidence_in(&target).unwrap();
+        assert!(worth <= 0.5 + 1e-12, "worth {worth}");
+    }
+
+    #[test]
+    fn test_falsifier_samples_circle_premises() {
+        use rand::rngs::StdRng;
+        use rand::SeedableRng;
+        let circles = vec![KCircle {
+            name: "w".into(),
+            center: "O".into(),
+            radius_sq: Frac { num: 50, den: 2 },
+        }];
+        let premises = vec![Constraint::OnCircle {
+            p: "P".into(),
+            circle: "w".into(),
+        }];
+        let mut rng = StdRng::seed_from_u64(7);
+        // true: |OP|^2 = 25 for every point placed on the circle
+        let truth = Constraint::LengthIs {
+            seg: sg("O", "P"),
+            square: Frac::from_int(25),
+        };
+        match falsify_with_circles(&mut rng, &premises, &circles, &truth, 64, 6).unwrap() {
+            Verdict::Unrefuted { satisfying, .. } => assert!(satisfying > 0),
+            other => panic!("a true circle claim was refuted: {other:?}"),
+        }
+        // false: the radius is not 4
+        let wrong = Constraint::LengthIs {
+            seg: sg("O", "P"),
+            square: Frac::from_int(16),
+        };
+        assert!(matches!(
+            falsify_with_circles(&mut rng, &premises, &circles, &wrong, 64, 6).unwrap(),
+            Verdict::Counterexample { .. }
+        ));
+    }
+
+    #[test]
+    fn test_unnormalized_fractions_compare_as_values() {
+        // one location written two ways is still one location
+        let mut graph = graph_from_points(vec![], vec![]);
+        graph
+            .add_point(KPoint {
+                name: "A".into(),
+                x: Frac { num: 1, den: 2 },
+                y: Frac::from_int(0),
+            })
+            .unwrap();
+        assert!(graph
+            .add_point(KPoint {
+                name: "B".into(),
+                x: Frac { num: 2, den: 4 },
+                y: Frac { num: 0, den: 7 },
+            })
+            .is_err());
+        // a stated cosine of 2/4 is the cosine 1/2
+        let tri = graph_from_points(vec![pt("A", 0, 0), pt("B", 2, 0), pt("C", 1, 1)], vec![]);
+        let wrong_form = Constraint::AngleIs {
+            at: Angle3::new("A", "B", "C"),
+            cos: QSqrt {
+                a: Frac::from_int(0),
+                b: Frac { num: 1, den: 4 },
+                d: 8,
+            },
+        };
+        assert!(
+            tri.holds(&wrong_form).unwrap(),
+            "1/4 sqrt(8) == 1/2 sqrt(2)"
+        );
+        assert_eq!(
+            rational_sqrt(&Frac { num: 8, den: 2 }),
+            Some(Q::from_int(2))
+        );
     }
 
     #[test]

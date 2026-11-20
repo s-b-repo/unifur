@@ -76,8 +76,11 @@ impl Budget {
     /// Reported rather than merely bounded, so a caller can see what it is
     /// about to spend before spending it.
     pub fn worst_case(&self, candidates: usize) -> usize {
-        let per_level = self.beam_width.max(1) * candidates;
-        let levels = self.max_depth + 1;
+        // Saturating throughout: `Budget::greedy` carries `usize::MAX` and a
+        // caller may ask about a huge candidate set; the answer is then "the
+        // cap", not an overflow panic.
+        let per_level = self.beam_width.max(1).saturating_mul(candidates);
+        let levels = self.max_depth.saturating_add(1);
         per_level.saturating_mul(levels).min(self.max_evaluations)
     }
 }
@@ -265,8 +268,11 @@ impl Beam {
             }
 
             // A stable sort means equal scores retain expansion order, so ties
-            // resolve deterministically.
-            next.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
+            // resolve deterministically. The comparator is a total order (NaN
+            // ranks below every number): `partial_cmp(..).unwrap_or(Equal)`
+            // is not one, which lets a NaN score land anywhere -- including
+            // first -- and lets `sort_by` panic on the inconsistent order.
+            next.sort_by(|a, b| score_order(b.score, a.score));
             next.truncate(self.budget.beam_width.max(1));
 
             settled = next.first().cloned();
@@ -287,11 +293,30 @@ impl Beam {
 }
 
 /// Highest-scoring path, or `None` when there are none.
+///
+/// Ties go to the *earliest* path, matching the documented rule that ties are
+/// broken by expansion order (`Iterator::max_by` would return the last).
 fn best_of<T: Clone>(paths: Vec<Path<T>>) -> Option<Path<T>> {
     paths
         .into_iter()
         .filter(|p| p.depth() > 0)
-        .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(Ordering::Equal))
+        .fold(None, |best: Option<Path<T>>, p| match best {
+            Some(b) if score_order(b.score, p.score) != Ordering::Less => Some(b),
+            _ => Some(p),
+        })
+}
+
+/// A total order on scores in which NaN ranks below every number, so a path
+/// whose score went NaN can never be selected over one with a real score, and
+/// the sorts that use this order are well defined.
+fn score_order(a: f64, b: f64) -> Ordering {
+    // With NaN mapped away, `partial_cmp` is total (and keeps `-0.0 == 0.0`,
+    // so ties stay ties); a NaN then ranks just below a genuine `-inf`.
+    let rank = |s: f64| if s.is_nan() { f64::NEG_INFINITY } else { s };
+    rank(a)
+        .partial_cmp(&rank(b))
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| a.is_nan().cmp(&b.is_nan()).reverse())
 }
 
 /// Outcome of a search.
@@ -531,7 +556,7 @@ impl LookaheadDecoder {
             context.extend(path.steps.iter().map(|s| s.token));
 
             let mut options = next_logprobs(&context);
-            options.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+            options.sort_by(|a, b| score_order(b.1, a.1));
             options.truncate(self.top_k.min(remaining));
 
             options
@@ -980,6 +1005,56 @@ mod tests {
             "the declined candidate must not be selectable"
         );
         assert_eq!(plan.evaluations, 2, "and it is not charged for");
+    }
+
+    #[test]
+    fn test_a_nan_score_never_wins_and_never_panics() {
+        // A scorer that returns NaN (a model whose log-probability went
+        // non-finite) must neither be selected nor break the sort. Under the
+        // old `partial_cmp(..).unwrap_or(Equal)` comparator NaN compared equal
+        // to everything, so it could survive the beam and win.
+        let beam = Beam::new(Budget {
+            max_evaluations: 64,
+            max_depth: 0,
+            beam_width: 4,
+        });
+        let plan = beam.search(|path: &Path<u32>, _budget: usize| {
+            if path.depth() > 0 {
+                return Vec::new();
+            }
+            vec![(1, f64::NAN), (2, 0.5), (3, f64::NAN), (4, 0.9), (5, f64::NAN)]
+        });
+        assert_eq!(plan.commit(), Some(&4), "the best real score wins");
+        assert!(plan.score().is_finite());
+
+        let decoder = LookaheadDecoder::new(Budget::greedy(), 2);
+        let plan = decoder.plan(&[0], |_| vec![(1, f64::NAN), (2, -0.3), (3, -0.1)]);
+        assert_eq!(plan.commit().map(|s| s.token), Some(3));
+    }
+
+    #[test]
+    fn test_a_partial_level_breaks_ties_by_expansion_order() {
+        // The documented tie rule (earliest candidate wins) must also hold on
+        // the budget-cut fallback path, where `max_by` returned the *last*.
+        let beam = Beam::new(Budget {
+            max_evaluations: 2,
+            max_depth: 5,
+            beam_width: 4,
+        });
+        let plan = beam.search(|_: &Path<u32>, _budget: usize| vec![(7, 1.0), (8, 1.0), (9, 1.0)]);
+        assert!(plan.budget_exhausted);
+        assert_eq!(plan.commit(), Some(&7));
+    }
+
+    #[test]
+    fn test_worst_case_saturates_instead_of_overflowing() {
+        assert_eq!(Budget::greedy().worst_case(usize::MAX), usize::MAX);
+        let deep = Budget {
+            max_evaluations: 10,
+            max_depth: usize::MAX,
+            beam_width: usize::MAX,
+        };
+        assert_eq!(deep.worst_case(3), 10);
     }
 
     #[test]

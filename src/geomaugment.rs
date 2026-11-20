@@ -650,13 +650,18 @@ impl Affine {
     }
 
     /// Whether the linear part is a similarity -- a scalar multiple of an
-    /// orthogonal matrix, decided exactly by `a^2 + b^2 == c^2 + d^2 != 0`.
+    /// orthogonal matrix, decided exactly by `a^2 + b^2 == c^2 + d^2 != 0` and
+    /// `ac + bd == 0`.
     /// This is the predicate the shear fails, and it is why the shear is the
     /// one variant in the library that drops metric facts.
     fn is_similarity(&self) -> anyhow::Result<bool> {
         let left = self.a.mul(&self.a)?.add(&self.b.mul(&self.b)?)?;
         let right = self.c.mul(&self.c)?.add(&self.d.mul(&self.d)?)?;
-        Ok(left == right && !left.is_zero())
+        // Equal row norms alone do not make a similarity: `[[1, 0], [3/5,
+        // 4/5]]` has both rows of norm 1 and still skews. The rows must also
+        // be orthogonal.
+        let cross = self.a.mul(&self.c)?.add(&self.b.mul(&self.d)?)?;
+        Ok(left == right && !left.is_zero() && cross.is_zero())
     }
 
     /// The image of an exact point under the affine map.
@@ -725,9 +730,15 @@ impl Transform {
                     let xy = ux.mul(&uy)?.div(&norm)?;
                     let yy = uy.mul(&uy)?.div(&norm)?;
                     let two = Q::from_int(2);
-                    // `p' = 2 proj_L(p) - p` with `proj_L(p) = a + ((p-a).u/u.u) u`.
-                    // Written through `a` so the offset is exact and the
-                    // reflection fixes `a` itself, as a reflection must.
+                    // `p' = 2 proj_L(p) - p` with `proj_L(p) = a + ((p-a).u/u.u) u`,
+                    // i.e. `p' = R p + (a - R a)` with `R = 2 u u^T / u.u - I`.
+                    // `R a = 2 (P a) - a` where `P a = (ma, mb)`, so the offset
+                    // is `2 a - 2 (ma, mb)`. It used to be `2 a - (ma, mb)`,
+                    // which is right only when `P a = 0` (an axis through the
+                    // origin, as every test happened to use); for any other
+                    // axis the map was a reflection *plus a stray translation*
+                    // and did not fix `a` -- still an isometry, so no fact
+                    // noticed, but not the reflection the report named.
                     let ma = xx.mul(&ax)?.add(&xy.mul(&ay)?)?;
                     let mb = xy.mul(&ax)?.add(&yy.mul(&ay)?)?;
                     Ok(Affine {
@@ -735,8 +746,8 @@ impl Transform {
                         b: xy.mul(&two)?,
                         c: xy.mul(&two)?,
                         d: yy.mul(&two)?.sub(&Q::ONE)?,
-                        tx: ax.add(&ax)?.sub(&ma)?,
-                        ty: ay.add(&ay)?.sub(&mb)?,
+                        tx: ax.add(&ax)?.sub(&ma.mul(&two)?)?,
+                        ty: ay.add(&ay)?.sub(&mb.mul(&two)?)?,
                     })
                 }
             },
@@ -878,6 +889,11 @@ impl Transform {
         let mut kept: Vec<Fact> = Vec::new();
         let mut retargeted: Vec<Constraint> = Vec::new();
         let mut dropped: Vec<DroppedFact> = Vec::new();
+        // Old fact key -> new fact key, for the facts that survived. Built
+        // here, fact by fact, because `kept` is shorter than `graph.facts` as
+        // soon as anything is dropped: zipping the two (as this used to)
+        // shifted every key after the first drop onto the wrong fact.
+        let mut keys: BTreeMap<String, String> = BTreeMap::new();
         for fact in &graph.facts {
             let remapped = remap_constraint(&fact.constraint, &rename, &affine)?;
             let was_retargeted = remapped != fact.constraint;
@@ -896,6 +912,7 @@ impl Transform {
                     if was_retargeted {
                         retargeted.push(remapped.clone());
                     }
+                    keys.insert(fact.key(), remapped.describe());
                     kept.push(Fact {
                         constraint: remapped,
                         ..fact.clone()
@@ -923,11 +940,6 @@ impl Transform {
         // whose fact did not survive is dropped from the list rather than left
         // pointing at something the graph no longer states -- a certificate
         // naming a missing fact is worse than a certificate naming fewer.
-        let keys: BTreeMap<String, String> = kept
-            .iter()
-            .zip(graph.facts.iter())
-            .map(|(new, old)| (old.key(), new.key()))
-            .collect();
         for fact in kept.iter_mut() {
             fact.depends_on = fact
                 .depends_on
@@ -1643,10 +1655,12 @@ impl InvarianceReport {
     ///   **every** class. A single lost incidence under a quarter turn is a
     ///   failure of that family, and the verdict names the class;
     /// - the shear must keep every incidence, parallelism, ratio and area
-    ///   fact, and must lose every length, angle and congruence fact the scene
-    ///   actually has. A shear that kept a right angle is a shear whose
-    ///   augmentation teaches the model to ignore the drawing, and the verdict
-    ///   says so by name.
+    ///   fact, and must lose *at least one* fact of each length, angle and
+    ///   congruence class the scene actually has (`refuted_any`, not
+    ///   `refuted_all`: a metric claim along the shear's axis survives by
+    ///   accident -- see [`ClassCell::refuted_any`]). How many it lost is the
+    ///   `kept/total` count printed beside it and the discrimination sentence
+    ///   below, so a shear that only grazed the metric is visible, not hidden.
     pub fn verdict(&self) -> String {
         let mut lines = Vec::new();
         if !self.is_consistent() {
@@ -1923,33 +1937,60 @@ pub fn augmentations(
 ) -> anyhow::Result<Vec<AugmentedExample>> {
     let mut out: Vec<AugmentedExample> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
-    for (_family, transforms) in trial_catalogue(graph)? {
-        for transform in transforms {
-            if out.len() >= count {
-                break;
-            }
-            let report = match transform.apply_reported(graph) {
-                Ok(report) => report,
-                // A transform the scene cannot take (a reflection axis through
-                // coincident points, a permutation that is not a bijection) is
-                // not an example and not an error: the catalogue is a
-                // superset of what any one scene can accept.
-                Err(_) => continue,
-            };
-            let rename = transform.rename_map(graph)?;
-            let signature = presentation_signature(&report.graph)?;
-            if seen.contains(&signature) {
-                continue;
-            }
-            seen.push(signature);
-            // The claim is carried across *this* transform, rename included: a
-            // permuted example asked about `MidpointOf(B, C, A)` would be
-            // training a model on a claim about points the figure no longer
-            // has. And whether the carried claim still holds in the presented
-            // figure is decided by the kernel, not assumed, because under a
-            // shear it generally does not.
-            let carried = remap_constraint(&claim, &rename, &report.transform.affine(graph)?)?;
-            let claim_holds = constraint_holds_in(
+    // Round-robin over the families, as the doc above promises: the i-th
+    // transform of every family before the (i+1)-th of any. Walking the
+    // catalogue family by family instead (as this used to) made a request for
+    // four examples return four rotations, and kept the shear -- the one
+    // family that changes the answer -- out of every small request.
+    let catalogue = trial_catalogue(graph)?;
+    let depth = catalogue
+        .iter()
+        .map(|(_, transforms)| transforms.len())
+        .max()
+        .unwrap_or(0);
+    let interleaved = (0..depth).flat_map(|round| {
+        catalogue
+            .iter()
+            .filter_map(move |(_, transforms)| transforms.get(round))
+    });
+    for transform in interleaved {
+        if out.len() >= count {
+            break;
+        }
+        let report = match transform.apply_reported(graph) {
+            Ok(report) => report,
+            // A transform the scene cannot take (a reflection axis through
+            // coincident points, a permutation that is not a bijection) is
+            // not an example and not an error: the catalogue is a
+            // superset of what any one scene can accept.
+            Err(_) => continue,
+        };
+        let rename = transform.rename_map(graph)?;
+        let signature = presentation_signature(&report.graph)?;
+        if seen.contains(&signature) {
+            continue;
+        }
+        seen.push(signature);
+        // The claim is carried across *this* transform, rename included: a
+        // permuted example asked about `MidpointOf(B, C, A)` would be
+        // training a model on a claim about points the figure no longer
+        // has. And whether the carried claim still holds in the presented
+        // figure is decided by the kernel, not assumed, because under a
+        // shear it generally does not.
+        let affine = report.transform.affine(graph)?;
+        let carried = remap_constraint(&claim, &rename, &affine)?;
+        // Mirrors `checked`: a non-similarity turns the scene's circles into
+        // ellipses, which are dropped rather than carried, so a claim about
+        // one cannot hold of the presented figure -- and asking the kernel
+        // would be asking about a circle that is no longer there, an error
+        // that used to abort the whole generator at the first shear.
+        let claim_holds = if constraint_mentions_a_circle(&carried)
+            && !graph.circles.is_empty()
+            && !affine.is_similarity()?
+        {
+            false
+        } else {
+            constraint_holds_in(
                 &report.graph.circles,
                 &report
                     .graph
@@ -1958,23 +1999,23 @@ pub fn augmentations(
                     .map(|point| Ok((point.name.clone(), point.x.to_q()?, point.y.to_q()?)))
                     .collect::<anyhow::Result<Vec<_>>>()?,
                 &carried,
-            )?;
-            out.push(AugmentedExample {
-                transform: report.transform.clone(),
-                presentation: report.presentation.clone(),
-                claim: carried,
-                claim_holds,
-                refuted: report
-                    .dropped
-                    .iter()
-                    .map(|loss| loss.constraint.clone())
-                    .collect(),
-                classes: report.classes.clone(),
-                confidence_before: report.confidence_before,
-                confidence_after: report.confidence_after,
-                graph: report.graph,
-            });
-        }
+            )?
+        };
+        out.push(AugmentedExample {
+            transform: report.transform.clone(),
+            presentation: report.presentation.clone(),
+            claim: carried,
+            claim_holds,
+            refuted: report
+                .dropped
+                .iter()
+                .map(|loss| loss.constraint.clone())
+                .collect(),
+            classes: report.classes.clone(),
+            confidence_before: report.confidence_before,
+            confidence_after: report.confidence_after,
+            graph: report.graph,
+        });
     }
     Ok(out)
 }
@@ -2497,6 +2538,34 @@ mod tests {
         // transformation wearing a longer name.
         assert_eq!(
             report.graph.coords("C").unwrap(),
+            Transform::reflection_over_x_axis()
+                .apply(&graph)
+                .unwrap()
+                .coords("C")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_reflection_over_a_line_off_the_origin_fixes_its_axis() {
+        // The axis-through-the-origin test above cannot see the offset term:
+        // with `A = (0, 0)` the projection of `A` is zero. Here the axis is
+        // `y = x - 1` through `P(1, 0)` and `Q(3, 2)`, so both must stay put
+        // and `O(0, 0)` must land on its mirror image `(1, -1)`.
+        let graph = graph_from_points(vec![p("P", 1, 0), p("Q", 3, 2), p("O", 0, 0)], vec![]);
+        let mirrored = Transform::reflection_over_points("P", "Q")
+            .apply(&graph)
+            .unwrap();
+        assert_eq!(mirrored.coords("P").unwrap(), (q(1, 1), q(0, 1)));
+        assert_eq!(mirrored.coords("Q").unwrap(), (q(3, 1), q(2, 1)));
+        assert_eq!(mirrored.coords("O").unwrap(), (q(1, 1), q(-1, 1)));
+        // the horizontal axis through `(1, 0)` and `(2, 0)` is the x axis
+        let graph = graph_from_points(vec![p("P", 1, 0), p("Q", 2, 0), p("C", 5, 3)], vec![]);
+        let mirrored = Transform::reflection_over_points("P", "Q")
+            .apply(&graph)
+            .unwrap();
+        assert_eq!(
+            mirrored.coords("C").unwrap(),
             Transform::reflection_over_x_axis()
                 .apply(&graph)
                 .unwrap()
@@ -3212,7 +3281,78 @@ mod tests {
         assert_eq!(carried.depends_on[0], "midpoint(D)=mid(B,C)");
     }
 
+    #[test]
+    fn test_dependencies_survive_a_drop_earlier_in_the_ledger() {
+        // The dropped fact comes *before* the premise, so a key map built by
+        // zipping the kept facts against all facts pairs the premise's old key
+        // with the wrong new fact (here: the conclusion itself).
+        let mut graph = graph_from_points(
+            vec![
+                p("A", 0, 0),
+                p("B", 4, 0),
+                p("C", 0, 4),
+                p("D", 2, 0),
+                p("E", 0, 2),
+            ],
+            vec![Constraint::LengthIs {
+                seg: seg("A", "C"),
+                square: f(16, 1),
+            }],
+        );
+        let premise = Constraint::MidpointOf {
+            p: "D".into(),
+            a: "A".into(),
+            b: "B".into(),
+        };
+        assert!(graph.add_fact(premise.clone(), Provenance::Given));
+        let conclusion = Constraint::Distinct {
+            a: "E".into(),
+            b: "C".into(),
+        };
+        graph.facts.push(Fact::derived(
+            conclusion.clone(),
+            "given-figure",
+            vec![premise.describe()],
+        ));
+        let report = Transform::shear(Q::ONE).apply_reported(&graph).unwrap();
+        // the stated length across the shear axis is the drop
+        assert_eq!(report.dropped.len(), 1, "{}", report.summary());
+        let carried = report
+            .graph
+            .facts
+            .iter()
+            .find(|fact| fact.constraint == conclusion)
+            .expect("the conclusion survives a shear");
+        assert_eq!(carried.depends_on, vec![premise.describe()]);
+        if let Provenance::Derived { inputs, .. } = &carried.provenance {
+            assert_eq!(inputs, &vec![premise.describe()]);
+        } else {
+            panic!("the conclusion lost its derivation");
+        }
+    }
+
     // ------------------------------------------------------------- examples --
+
+    #[test]
+    fn test_a_small_request_spans_the_families() {
+        // The doc promises examples "drawn across families in turn": six
+        // examples are one of each family, the shear included, not five
+        // rotations and a reflection.
+        let graph = triangle_scene();
+        let claim = Constraint::MidpointOf {
+            p: "D".into(),
+            a: "A".into(),
+            b: "B".into(),
+        };
+        let examples = augmentations(&graph, claim, 6).unwrap();
+        let families: std::collections::BTreeSet<TransformFamily> =
+            examples.iter().map(|e| e.transform.family()).collect();
+        assert_eq!(
+            families.len(),
+            TransformFamily::ALL.len(),
+            "families seen: {families:?}"
+        );
+    }
 
     #[test]
     fn test_augmentations_give_distinct_presentations_of_one_graph() {
@@ -3289,9 +3429,9 @@ mod tests {
             seg: seg("A", "B"),
             square: f(16, 1),
         };
-        // The catalogue is walked family by family and the shear is last, so a
-        // small `count` stops before reaching it. Asking for the whole thing is
-        // the honest way to say "I want the shear included".
+        // The catalogue is walked round-robin across families, so even a small
+        // `count` reaches the shear; asking for the whole thing covers every
+        // trial of every family.
         let examples = augmentations(&graph, claim.clone(), 64).unwrap();
         assert!(!examples.is_empty());
         let sheared: Vec<&AugmentedExample> = examples

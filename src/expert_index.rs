@@ -38,6 +38,83 @@ use serde::{Deserialize, Serialize};
 /// Version of the on-disk index format. Bump on any breaking change.
 pub const INDEX_SCHEMA_VERSION: u32 = 1;
 
+/// Write `bytes` to `path` via a unique sibling tmp file and a rename, so an
+/// engine reading the index (or spec) next to a checkpoint sees either the
+/// previous document or the complete new one — never a truncated prefix from
+/// an interrupted write. Parent directories are created on demand.
+fn write_file_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
+        }
+    }
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = PathBuf::from(format!("{}.tmp-{}-{n}", path.display(), std::process::id()));
+    let mut file =
+        std::fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("write {}", tmp.display()))?;
+    drop(file);
+    std::fs::rename(&tmp, path)
+        .with_context(|| format!("rename {} over {}", tmp.display(), path.display()))
+}
+
+/// A weight locator's checkpoint path is joined onto the index's directory by
+/// whoever fetches it, so it must stay inside that directory: relative, and
+/// made of plain components only (no `..`, no root, no drive prefix).
+fn checkpoint_path_is_contained(path: &Path) -> bool {
+    !path.as_os_str().is_empty()
+        && path
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+}
+
+/// The taxonomy fields' own consistency, without a taxonomy to look ids up
+/// in: well-formed ids, and an expert's category, its sub-field's category
+/// part and its box's category all agreeing where present. Existence is
+/// [`ExpertIndex::validate_with_taxonomy`]'s job.
+fn check_taxonomy_syntax(entry: &BoxEntry, expert: &ExpertEntry) -> anyhow::Result<()> {
+    if let Some(category) = &entry.category {
+        anyhow::ensure!(
+            crate::taxonomy::is_valid_category_id(category),
+            "box '{}' carries category '{category}', which is not a taxonomy id",
+            entry.id
+        );
+    }
+    if let Some(category) = &expert.category {
+        anyhow::ensure!(
+            crate::taxonomy::is_valid_category_id(category),
+            "expert '{}' carries category '{category}', which is not a taxonomy id",
+            expert.id
+        );
+        if let Some(box_category) = &entry.category {
+            anyhow::ensure!(
+                box_category == category,
+                "expert '{}' claims category '{category}' inside box '{}' of category '{box_category}'",
+                expert.id,
+                entry.id
+            );
+        }
+    }
+    if let Some(subfield) = &expert.subfield {
+        let (owner, _) = crate::taxonomy::parse_leaf_id(subfield)
+            .with_context(|| format!("expert '{}'", expert.id))?;
+        if let Some(category) = expert.category.as_ref().or(entry.category.as_ref()) {
+            anyhow::ensure!(
+                owner == category,
+                "expert '{}' has sub-field '{subfield}' outside its category '{category}'",
+                expert.id
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Which architectural level a set of experts lives at.
 ///
 /// The three levels are genuinely different mechanisms with different call
@@ -178,6 +255,16 @@ pub struct ExpertEntry {
     /// Free-form, for an engine's own matching: `["rust", "memory-safety"]`.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Taxonomy category this expert serves ([`crate::taxonomy`]), e.g.
+    /// `cyber-offensive`. Optional and omitted from the wire form when absent,
+    /// so an index written before Stage 4 loads and re-serializes unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// Global taxonomy leaf id this expert specializes in, e.g.
+    /// `cyber-offensive/recon`. Its category part must agree with
+    /// [`Self::category`] (or the box's) when those are present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subfield: Option<String>,
 }
 
 /// One box: a domain grouping of experts.
@@ -189,6 +276,10 @@ pub struct BoxEntry {
     /// Position in the box router's output; must equal the vec position.
     pub index: usize,
     pub experts: Vec<ExpertEntry>,
+    /// Taxonomy category this box stands for, when the box is a category
+    /// (the hierarchical router's L2 boxes are). Optional, omitted when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
 }
 
 impl BoxEntry {
@@ -224,12 +315,7 @@ impl ExpertIndex {
 
     pub fn write(&self, path: &Path) -> anyhow::Result<()> {
         self.validate()?;
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        std::fs::write(path, self.to_json()?).with_context(|| format!("write {}", path.display()))
+        write_file_atomic(path, self.to_json()?.as_bytes())
     }
 
     pub fn read(path: &Path) -> anyhow::Result<Self> {
@@ -336,6 +422,27 @@ impl ExpertIndex {
                         self.site.name()
                     );
                 }
+                // The per-expert hash is what an engine checks fetched weights
+                // against; an empty or truncated value would make that check
+                // meaningless while the index still "validated".
+                let sha = &expert.weights.sha256;
+                if sha.len() != 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+                    bail!(
+                        "expert '{}' carries sha256 '{sha}', which is not a 64-digit hex digest",
+                        expert.id
+                    );
+                }
+                if let Some(checkpoint) = &expert.weights.checkpoint {
+                    if !checkpoint_path_is_contained(checkpoint) {
+                        bail!(
+                            "expert '{}' names checkpoint '{}', which is not a plain relative \
+                             path inside the index's directory",
+                            expert.id,
+                            checkpoint.display()
+                        );
+                    }
+                }
+                check_taxonomy_syntax(entry, expert)?;
                 running += 1;
             }
         }
@@ -346,13 +453,59 @@ impl ExpertIndex {
         Ok(())
     }
 
+    /// [`Self::validate`], plus: every taxonomy id the index carries exists in
+    /// `taxonomy`. Kept separate from `validate` because the taxonomy is
+    /// extensible — an index built against a merged taxonomy is valid against
+    /// that taxonomy and not necessarily against the built-in one, so the
+    /// caller names the taxonomy it routes with.
+    pub fn validate_with_taxonomy(
+        &self,
+        taxonomy: &crate::taxonomy::Taxonomy,
+    ) -> anyhow::Result<()> {
+        self.validate()?;
+        for entry in &self.boxes {
+            if let Some(category) = &entry.category {
+                taxonomy
+                    .check_ids(category, None)
+                    .with_context(|| format!("box '{}'", entry.id))?;
+            }
+            for expert in &entry.experts {
+                if let Some(category) = expert.category.as_ref().or(entry.category.as_ref()) {
+                    taxonomy
+                        .check_ids(category, expert.subfield.as_deref())
+                        .with_context(|| format!("expert '{}'", expert.id))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The taxonomy category an expert serves: its own, else its box's.
+    pub fn expert_category<'a>(
+        &self,
+        entry: &'a BoxEntry,
+        expert: &'a ExpertEntry,
+    ) -> Option<&'a str> {
+        expert
+            .category
+            .as_deref()
+            .or(expert
+                .subfield
+                .as_deref()
+                .and_then(|s| s.split_once('/').map(|(c, _)| c)))
+            .or(entry.category.as_deref())
+    }
+
     /// Human-readable table for `dblocks experts`.
     pub fn render(&self) -> String {
         let mut out = String::new();
+        // Characters, not bytes: `model_id` is read from an external file, and
+        // a byte slice through a multi-byte character would panic here.
+        let model_short: String = self.model_id.chars().take(16).collect();
         out.push_str(&format!(
             "site={}  model={}  boxes={}  experts={}  top_box={}  top_expert={}\n",
             self.site.name(),
-            &self.model_id[..self.model_id.len().min(16)],
+            model_short,
             self.num_boxes(),
             self.num_experts(),
             self.routing.top_box,
@@ -488,13 +641,8 @@ impl MosmeSpec {
 
     pub fn write(&self, path: &Path) -> anyhow::Result<()> {
         self.validate()?;
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        std::fs::write(path, serde_json::to_string_pretty(self)?)
-            .with_context(|| format!("write {}", path.display()))
+        let text = serde_json::to_string_pretty(self).context("serialize mosme spec")?;
+        write_file_atomic(path, text.as_bytes())
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -925,9 +1073,11 @@ mod tests {
                         weights: WeightLocator {
                             checkpoint: None,
                             param_path: format!("vit.layers.1.mlp.boxes.{bi}.experts.{ei}"),
-                            sha256: format!("{:016x}", global),
+                            sha256: format!("{:064x}", global),
                         },
                         tags: e.tags.clone(),
+                        category: None,
+                        subfield: None,
                     };
                     global += 1;
                     entry
@@ -938,6 +1088,7 @@ mod tests {
                 label: b.label.clone(),
                 index: bi,
                 experts,
+                category: None,
             });
         }
         ExpertIndex {
@@ -1077,6 +1228,60 @@ mod tests {
         };
         let err = index.validate().unwrap_err().to_string();
         assert!(err.contains("adapter expert in a mlp index"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_rejects_a_hash_that_is_not_a_digest() {
+        // An index whose per-expert hash is empty or truncated cannot back
+        // the "content hash of this expert's parameters" it claims.
+        let not_hex = "z".repeat(64);
+        for bad in ["", "deadbeef", not_hex.as_str()] {
+            let mut index = sample_index();
+            index.boxes[0].experts[1].weights.sha256 = bad.to_string();
+            let err = index.validate().unwrap_err().to_string();
+            assert!(err.contains("64-digit hex digest"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn test_validate_rejects_a_checkpoint_outside_the_index_dir() {
+        for bad in ["../escape.mpk", "/etc/passwd", "a/../../b.mpk", ""] {
+            let mut index = sample_index();
+            index.boxes[1].experts[0].weights.checkpoint = Some(PathBuf::from(bad));
+            let err = index.validate().unwrap_err().to_string();
+            assert!(err.contains("plain relative"), "{bad:?}: {err}");
+        }
+        let mut index = sample_index();
+        index.boxes[1].experts[0].weights.checkpoint = Some(PathBuf::from("cyber-netsec.mpk"));
+        index.validate().unwrap();
+    }
+
+    #[test]
+    fn test_render_survives_a_multibyte_model_id() {
+        // The id comes from a file; a byte slice at 16 used to split a
+        // multi-byte character and panic.
+        let mut index = sample_index();
+        index.model_id = "ééééééééééééééééé".into(); // 17 two-byte chars
+        let rendered = index.render();
+        assert!(rendered.contains(&"é".repeat(16)), "{rendered}");
+        assert!(!rendered.contains(&"é".repeat(17)), "{rendered}");
+    }
+
+    #[test]
+    fn test_index_file_write_leaves_no_tmp_behind() {
+        let dir = std::env::temp_dir().join(format!("expert-index-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.index.json");
+        let index = sample_index();
+        index.write(&path).unwrap();
+        index.write(&path).unwrap();
+        assert_eq!(ExpertIndex::read(&path).unwrap(), index);
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["model.index.json"], "{names:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1363,5 +1568,82 @@ mod tests {
             .contains("experts_per_box"));
         // An empty field list is the identity, not an error.
         assert_eq!(base.with_field_boxes(&[], 1).unwrap(), base);
+    }
+
+    #[test]
+    fn test_legacy_index_without_taxonomy_fields_loads_unchanged() {
+        // An index written before Stage 4 has no category/subfield keys. It
+        // must still parse, validate, and re-serialize byte for byte.
+        let json = sample_index().to_json().unwrap();
+        assert!(!json.contains("\"category\""), "absent fields are omitted");
+        assert!(!json.contains("\"subfield\""));
+        let back = ExpertIndex::from_json(&json).unwrap();
+        assert_eq!(back.to_json().unwrap(), json);
+        back.validate_with_taxonomy(&crate::taxonomy::Taxonomy::builtin())
+            .unwrap();
+    }
+
+    #[test]
+    fn test_taxonomy_fields_round_trip_and_validate() {
+        let taxonomy = crate::taxonomy::Taxonomy::builtin();
+        let mut index = sample_index();
+        index.boxes[0].category = Some("coding".into());
+        index.boxes[0].experts[0].subfield = Some("coding/rust".into());
+        index.boxes[1].experts[1].category = Some("cyber-defensive".into());
+        index.boxes[1].experts[1].subfield = Some("cyber-defensive/malware-analysis".into());
+        let json = index.to_json().unwrap();
+        let back = ExpertIndex::from_json(&json).unwrap();
+        assert_eq!(back, index);
+        back.validate_with_taxonomy(&taxonomy).unwrap();
+        let (b, e) = back.expert("coding/rust").unwrap();
+        assert_eq!(back.expert_category(b, e), Some("coding"));
+        let (b, e) = back.expert("cyber/malware").unwrap();
+        assert_eq!(back.expert_category(b, e), Some("cyber-defensive"));
+        let (b, e) = back.expert("cyber/netsec").unwrap();
+        assert_eq!(back.expert_category(b, e), None);
+    }
+
+    #[test]
+    fn test_validate_rejects_inconsistent_taxonomy_fields() {
+        let taxonomy = crate::taxonomy::Taxonomy::builtin();
+
+        // Syntax and consistency are checked by plain `validate`.
+        let mut index = sample_index();
+        index.boxes[0].category = Some("Coding!".into());
+        assert!(index.validate().is_err());
+
+        let mut index = sample_index();
+        index.boxes[0].category = Some("coding".into());
+        index.boxes[0].experts[0].category = Some("math".into());
+        assert!(index
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("inside box"));
+
+        let mut index = sample_index();
+        index.boxes[0].category = Some("coding".into());
+        index.boxes[0].experts[0].subfield = Some("math/algebra".into());
+        assert!(index
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("outside its category"));
+
+        let mut index = sample_index();
+        index.boxes[0].experts[0].subfield = Some("no-slash".into());
+        assert!(index.validate().is_err());
+
+        // Existence is checked against the taxonomy the caller names.
+        let mut index = sample_index();
+        index.boxes[0].category = Some("quantum-basket-weaving".into());
+        index.validate().unwrap();
+        assert!(index.validate_with_taxonomy(&taxonomy).is_err());
+
+        let mut index = sample_index();
+        index.boxes[0].category = Some("coding".into());
+        index.boxes[0].experts[0].subfield = Some("coding/cobol".into());
+        index.validate().unwrap();
+        assert!(index.validate_with_taxonomy(&taxonomy).is_err());
     }
 }

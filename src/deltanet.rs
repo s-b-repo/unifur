@@ -239,9 +239,16 @@ pub fn causal_depthwise_conv<B: Backend>(x: Tensor<B, 3>, weight: Tensor<B, 2>) 
     // Lag matrix [b, n, d, k]: lag l holds x shifted right by l (zeros first).
     let mut lags: Vec<Tensor<B, 4>> = Vec::with_capacity(k);
     for lag in 0..k {
-        let pad: Tensor<B, 3> = Tensor::zeros([b, lag.min(n), d], &device);
-        let keep = n - lag.min(n);
-        let shifted = Tensor::cat(vec![pad, x.clone().narrow(1, 0, keep)], 1);
+        // A lag at or past the sequence length reads only the zero padding.
+        // Built directly, because `narrow` refuses a zero-length window: a
+        // prompt shorter than the kernel (1-3 tokens at kernel 4) used to
+        // abort here instead of filtering.
+        let shifted = if lag >= n {
+            Tensor::<B, 3>::zeros([b, n, d], &device)
+        } else {
+            let pad: Tensor<B, 3> = Tensor::zeros([b, lag, d], &device);
+            Tensor::cat(vec![pad, x.clone().narrow(1, 0, n - lag)], 1)
+        };
         lags.push(shifted.unsqueeze_dim::<4>(3));
     }
     let lagmat = Tensor::cat(lags, 3); // [b, n, d, k]
@@ -409,6 +416,35 @@ mod tests {
             .iter()
             .collect();
         assert!(close(&out, &[0.0, 0.0, 1.0, 2.0, 3.0, 0.0], 1e-6));
+    }
+
+    #[test]
+    fn test_conv_on_sequences_shorter_than_the_kernel() {
+        // A prompt shorter than the kernel (1-3 tokens at kernel 4) is the
+        // normal start of a decode: lags past the sequence read only the zero
+        // padding. Each output must equal the hand-computed causal FIR, and a
+        // prefix's outputs must not depend on anything after it.
+        let device = Default::default();
+        let w = Tensor::<B, 1>::from_floats([0.5f32, -1.0, 2.0, 3.0], &device).reshape([1, 4]);
+        for n in 1..=5usize {
+            let x: Vec<f32> = (0..n).map(|i| 1.0 + i as f32).collect();
+            let input = Tensor::<B, 1>::from_floats(x.as_slice(), &device).reshape([1, n, 1]);
+            let out: Vec<f32> = causal_depthwise_conv(input, w.clone())
+                .into_data()
+                .convert::<f32>()
+                .iter()
+                .collect();
+            let taps = [0.5f32, -1.0, 2.0, 3.0];
+            let want: Vec<f32> = (0..n)
+                .map(|t| {
+                    (0..taps.len())
+                        .filter(|lag| *lag <= t)
+                        .map(|lag| x[t - lag] * taps[lag])
+                        .sum()
+                })
+                .collect();
+            assert!(close(&out, &want, 1e-6), "n={n}: {out:?} vs {want:?}");
+        }
     }
 
     #[test]

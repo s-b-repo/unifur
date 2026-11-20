@@ -17,8 +17,12 @@
 //! - `payload` — the record itself.
 //!
 //! The API has no edit or delete: history is append-only by construction, and
-//! any after-the-fact edit, insertion, deletion or reorder breaks the chain.
-//! [`ChainedLog::verify`] re-derives it and names the first bad line and why.
+//! any after-the-fact payload edit, insertion, deletion or reorder breaks the
+//! chain. [`ChainedLog::verify`] re-derives it and names the first bad line and
+//! why. Not covered: `ts` is **not** in the hash preimage (and `seq` is checked
+//! for gapless numbering rather than hashed), so a rewritten timestamp still
+//! verifies — treat `ts` and the report's `first_ts` / `last_ts` as
+//! unauthenticated annotations, not evidence.
 //! (The idea is ported from the user's subnext repo, credited in
 //! PLAN-NINA.md §8.)
 //!
@@ -434,11 +438,11 @@ impl ChainedLog {
 /// `cheat_mixing` is not a tally, are skipped rather than refused: the chain
 /// is an audit log that accumulates other events by design.
 pub fn mixing_tally_from_chain(path: &Path) -> Result<crate::cheat::MixingTally> {
-    let report = ChainedLog::verify(path)?;
+    ChainedLog::verify(path)?;
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("read chained log {}", path.display()))?;
     let mut total = crate::cheat::MixingTally::default();
-    for raw in text.lines() {
+    for (index, raw) in text.lines().enumerate() {
         let record: Value = serde_json::from_str(raw)
             .with_context(|| format!("parse chained log {}", path.display()))?;
         let Some(payload) = record.get("payload") else {
@@ -452,10 +456,13 @@ pub fn mixing_tally_from_chain(path: &Path) -> Result<crate::cheat::MixingTally>
         };
         let tally: crate::cheat::MixingTally = match serde_json::from_value(entry.clone()) {
             Ok(tally) => tally,
+            // The 1-based line of *this* record — the chain's total length
+            // (what this used to print) names the wrong record.
             Err(err) => anyhow::bail!(
-                "record {}: 'cheat_mixing' is not a mixing tally ({err}) — the chain is intact, so \
-                 this was written that way",
-                report.lines
+                "{} line {}: 'cheat_mixing' is not a mixing tally ({err}) — the chain is \
+                 intact, so this was written that way",
+                path.display(),
+                index + 1
             ),
         };
         total.absorb(&tally);
@@ -620,6 +627,25 @@ pub fn validate_name(name: &str) -> Result<(&str, &str)> {
     Ok((field, subfield))
 }
 
+/// Eval evidence is a measured fraction in `[0, 1]`. A NaN, an infinity or an
+/// out-of-range value is not a measurement, and is refused before it reaches
+/// the chain — otherwise [`Registry::promote`], which only asks whether an
+/// accuracy is present, would admit it.
+fn validate_evidence(name: &str, eval: &EvalEvidence) -> Result<()> {
+    for (what, value) in [
+        ("accuracy", eval.accuracy),
+        ("router_top1", eval.router_top1),
+    ] {
+        if let Some(v) = value {
+            ensure!(
+                v.is_finite() && (0.0..=1.0).contains(&v),
+                "eval {what} for '{name}' must be a finite fraction in [0, 1], got {v}"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The outcome of [`Registry::promote_if_better`]. Both halves are also in
 /// the chain (`promote` / `promotion_rejected`), with every number attached.
 #[derive(Debug, Clone, Serialize)]
@@ -702,6 +728,7 @@ impl Registry {
             entry.field,
             entry.subfield
         );
+        validate_evidence(&entry.name, &entry.eval)?;
         if let Some(existing) = self.get(&entry.name) {
             anyhow::bail!(
                 "model '{}' is already registered (status {}); the registry is append-only — \
@@ -816,6 +843,7 @@ impl Registry {
                     self.file.models.len()
                 )
             })?;
+        validate_evidence(name, &eval)?;
         let record = self.log_event(json!({
             "event": "eval",
             "name": name,
@@ -849,6 +877,14 @@ impl Registry {
         if !self.log_path.exists() {
             return Ok(None);
         }
+        // The chain is only "the truth" once it verifies: an edited `promote`
+        // record would otherwise lower the bar a candidate has to clear.
+        ChainedLog::verify(&self.log_path).with_context(|| {
+            format!(
+                "the registry log {} does not verify, so it cannot supply a promotion baseline",
+                self.log_path.display()
+            )
+        })?;
         let text = std::fs::read_to_string(&self.log_path)
             .with_context(|| format!("read registry log {}", self.log_path.display()))?;
         let mut baseline = None;
@@ -988,7 +1024,10 @@ impl Registry {
                 .with_context(|| format!("create {}", parent.display()))?;
         }
         let text = serde_json::to_string_pretty(&self.file).context("serialize the registry")?;
-        std::fs::write(&self.path, format!("{text}\n"))
+        // Atomic (tmp + rename): the dashboard, the MCP tools and the chat
+        // path read this file while a drain rewrites it, and a crash
+        // mid-write must not leave a truncated registry that no longer parses.
+        crate::interop::write_atomic(&self.path, format!("{text}\n").as_bytes())
             .with_context(|| format!("write registry {}", self.path.display()))
     }
 }
@@ -1008,7 +1047,7 @@ type TrainBackend = burn::backend::Autodiff<EvalBackend>;
 /// manifest beside it; the default config only when neither records one.
 /// Evaluating at the wrong context truncates every trace differently than
 /// training did, so a silent default here is a wrong number, not a safe one.
-fn student_config_for_checkpoint(path: &Path) -> Result<StudentConfig> {
+pub(crate) fn student_config_for_checkpoint(path: &Path) -> Result<StudentConfig> {
     if let Some(state) = crate::checkpoint::TrainState::for_model(path)? {
         return match state.config.get("student_config") {
             Some(value) => serde_json::from_value(value.clone()).with_context(|| {
@@ -1049,18 +1088,39 @@ fn student_config_for_checkpoint(path: &Path) -> Result<StudentConfig> {
 /// per-language box traffic; without one it returns the registry's field
 /// list with a loud note that no trained router is loaded — an honest
 /// "I don't know" rather than a chance-level pick presented as a route.
+///
+/// This is the default, unchanged by Stage 4; [`route_prompt_with`] adds the
+/// hierarchical router when one is configured.
 pub fn route_prompt(
     prompt: &str,
     checkpoint: Option<&Path>,
     registry_fields: &[String],
 ) -> Result<Value> {
+    route_prompt_with(prompt, checkpoint, registry_fields, None, None)
+}
+
+/// [`route_prompt`], optionally through the three-layer hierarchical router
+/// ([`crate::hrouter`]). With `hierarchical` set, the output is
+/// `"router": "hierarchical"` with the routed categories and specialists and
+/// a `layers` list saying which layer — L3 meta-router, L2 category router,
+/// the planner's specialist budget, L1 resolution — made each decision and
+/// with which router. When the student checkpoint exists its probe readout
+/// is also computed, and its per-language box traffic serves as the L2
+/// router for the `coding` category (the trained MoSME box router, promoted);
+/// the probe's own output is kept under `probe`. `context` is memory
+/// context (e.g. retrieved by subnext) the meta-router reads beside the
+/// prompt; the probe path does not read it. With `hierarchical` unset this is
+/// exactly [`route_prompt`].
+pub fn route_prompt_with(
+    prompt: &str,
+    checkpoint: Option<&Path>,
+    registry_fields: &[String],
+    hierarchical: Option<&crate::hrouter::LayeredRouter>,
+    context: Option<&str>,
+) -> Result<Value> {
     use crate::tokenizer::ByteTokenizer;
-    use burn::tensor::{Int, Tensor};
 
-    type Eval = EvalBackend;
-
-    let tokens = ByteTokenizer::new().encode_document(prompt);
-    let n = tokens.len();
+    let n = ByteTokenizer::new().encode_document(prompt).len();
     let mut found: Option<PathBuf> = None;
     if let Some(path) = checkpoint {
         if path
@@ -1070,6 +1130,43 @@ pub fn route_prompt(
             found = Some(path.to_path_buf());
         }
     }
+
+    if let Some(router) = hierarchical {
+        use crate::hrouter::{CategoryRouter, RouteQuery, TrafficCategoryRouter};
+        let probe = match &found {
+            Some(path) => Some(probe_readout(prompt, path)?),
+            None => None,
+        };
+        let coding_l2 = probe.as_ref().and_then(|(_, traffic)| {
+            TrafficCategoryRouter::from_box_traffic(
+                "probe:student-mosme-box-router",
+                "coding",
+                traffic,
+                router.taxonomy(),
+                router.catalogue(),
+                router.bounds().top_specialists_per_category,
+            )
+        });
+        let extra: Vec<&dyn CategoryRouter> =
+            coding_l2.iter().map(|r| r as &dyn CategoryRouter).collect();
+        let plan = router.route_with(&RouteQuery { prompt, context }, &extra)?;
+        // Never hand out a plan that breaks the routing invariants.
+        crate::hrouter::validate_plan(&plan, router.bounds())?;
+        return Ok(json!({
+            "router": "hierarchical",
+            "meta_router": router.meta_name(),
+            "catalogue": router.catalogue().source,
+            "taxonomy": router.taxonomy().version,
+            "prompt_tokens": n,
+            "categories": plan.categories,
+            "specialists": plan.specialists,
+            "unsure": plan.unsure,
+            "layers": plan.trace,
+            "probe": probe.map_or(Value::Null, |(value, _)| value),
+            "fields": registry_fields,
+        }));
+    }
+
     let Some(path) = found else {
         let note = match checkpoint {
             Some(path) => format!(
@@ -1089,17 +1186,30 @@ pub fn route_prompt(
             "fields": registry_fields,
         }));
     };
+    Ok(probe_readout(prompt, &path)?.0)
+}
 
+/// The student probe router's readout for `prompt` from the checkpoint at
+/// `path`: the `route_prompt` JSON, and the `(box id, traffic)` pairs it was
+/// built from.
+fn probe_readout(prompt: &str, path: &Path) -> Result<(Value, Vec<(String, f64)>)> {
+    use crate::tokenizer::ByteTokenizer;
+    use burn::tensor::{Int, Tensor};
+
+    type Eval = EvalBackend;
+
+    let tokens = ByteTokenizer::new().encode_document(prompt);
+    let n = tokens.len();
     ensure!(
         !tokens.is_empty(),
         "the prompt tokenizes to zero tokens — nothing to route"
     );
-    let config = student_config_for_checkpoint(&path)?;
+    let config = student_config_for_checkpoint(path)?;
     let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
     <Eval as burn::tensor::backend::Backend>::seed(&device, 0);
     let model = GeometricStudent::<Eval>::new(&config, &device)?;
     crate::tensor_ext::force_initialization(&model);
-    let model = crate::checkpoint::load::<Eval, _>(model, &path, &device)?;
+    let model = crate::checkpoint::load::<Eval, _>(model, path, &device)?;
     let tensor = Tensor::<Eval, 1, Int>::from_ints(
         tokens
             .iter()
@@ -1154,13 +1264,20 @@ pub fn route_prompt(
         .enumerate()
         .max_by(|a, b| a.1.total_cmp(b.1))
         .map(|(i, _)| box_id_of(i));
-    Ok(json!({
+    let box_traffic: Vec<(String, f64)> = routing
+        .traffic
+        .iter()
+        .enumerate()
+        .map(|(i, gate)| (box_id_of(i), f64::from(*gate)))
+        .collect();
+    let value = json!({
         "router": "probe",
         "checkpoint": path.display().to_string(),
         "prompt_tokens": n,
         "top": top,
         "traffic": traffic,
-    }))
+    });
+    Ok((value, box_traffic))
 }
 
 // ---------------------------------------------------------------------------
@@ -1305,6 +1422,16 @@ impl SchedulerConfig {
             self.margin.is_finite() && self.margin >= 0.0,
             "margin must be a non-negative finite number, got {}",
             self.margin
+        );
+        ensure!(
+            self.router_aux_weight.is_finite() && self.router_aux_weight >= 0.0,
+            "router_aux_weight must be a non-negative finite number, got {}",
+            self.router_aux_weight
+        );
+        ensure!(
+            self.ml_cheat_threshold.is_finite(),
+            "ml_cheat_threshold must be a finite number, got {}",
+            self.ml_cheat_threshold
         );
         crate::expert_index::validate_field_box_names(&self.field_boxes)?;
         self.student.validate()
@@ -1955,18 +2082,27 @@ fn write_deployment_sidecar(
             )
         })?
         .to_string();
+    // The architecture the run *trained*: `student_for_run` merges the
+    // scheduler-level field boxes in. Recording `config.student` instead
+    // described a model with fewer routing boxes than the checkpoint holds —
+    // exactly the shape mismatch this sidecar exists to prevent.
     let manifest = serde_json::json!({
         "name": name,
         "checkpoint": file_name,
         "checkpoint_sha256": crate::checkpoint::file_sha256_hex(checkpoint)?,
-        "student_config": serde_json::to_value(&config.student)?,
+        "student_config": serde_json::to_value(config.student_for_run())?,
         "build": crate::checkpoint::BuildInfo::current(),
         "refreshed_utc": crate::checkpoint::unix_now(),
     });
     std::fs::create_dir_all(model_dir)
         .with_context(|| format!("create model directory {}", model_dir.display()))?;
-    std::fs::write(model_dir.join("config.json"), manifest.to_string())
-        .with_context(|| format!("write the sidecar in {}", model_dir.display()))?;
+    // Atomic: `nina chat` and `student think` read this file while a retrain
+    // may be rewriting it.
+    crate::interop::write_atomic(
+        &model_dir.join("config.json"),
+        manifest.to_string().as_bytes(),
+    )
+    .with_context(|| format!("write the sidecar in {}", model_dir.display()))?;
     Ok(())
 }
 
@@ -2050,6 +2186,9 @@ fn run_entry<B: burn::tensor::backend::AutodiffBackend<FloatElem = f32>>(
         resume: None,
         language,
         micro_batch: config.micro_batch,
+        // The scheduler's knob, not the trainer's default: without this line
+        // `router_aux_weight: 0.0` ("disables it exactly") trained at 0.1.
+        router_aux_weight: config.router_aux_weight,
         ..SpecialistTrainConfig::default()
     };
     let (model, report) = train_language_specialist(model, &train_fold, &train_config, &device)?;
@@ -2327,6 +2466,12 @@ impl NinaPaths {
     pub fn student_dir(&self) -> PathBuf {
         self.root.join("student")
     }
+
+    /// `<root>/router/meta-router.json` — the hierarchical router's trained
+    /// L3 model (`dblocks router train --out <root>/router`).
+    pub fn meta_router(&self) -> PathBuf {
+        self.root.join("router").join("meta-router.json")
+    }
 }
 
 /// One entry of the v1 tool table. An unavailable tool is declared anyway,
@@ -2368,8 +2513,8 @@ pub fn tool_table() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "nina.queue.list",
-            description: "List the pending training queue (nothing consumes it in v1, so every \
-                          entry is pending).",
+            description: "List the pending training queue: every queue.add that no queue.done or \
+                          queue.failed has settled (nina.train.tick consumes entries).",
             input_schema: json!({"type": "object", "properties": {}}),
             available: true,
             unavailable_reason: None,
@@ -2378,10 +2523,15 @@ pub fn tool_table() -> Vec<ToolSpec> {
             name: "nina.route",
             description: "Route a prompt: the student's probe router when a checkpoint exists, \
                           else the registry's field list with a note that no trained router is \
-                          loaded.",
+                          loaded. With router=hierarchical: the three-layer router (meta-router \
+                          from <root>/router/meta-router.json, specialists from the registry), \
+                          reporting which layer made each decision.",
             input_schema: json!({
                 "type": "object",
-                "properties": {"prompt": {"type": "string"}},
+                "properties": {
+                    "prompt": {"type": "string"},
+                    "router": {"type": "string", "enum": ["probe", "hierarchical"]},
+                },
                 "required": ["prompt"],
             }),
             available: true,
@@ -2811,7 +2961,35 @@ impl McpServer {
             ),
         };
         let checkpoint = crate::checkpoint::latest_in_dir(&self.paths.student_dir(), "student")?;
-        let mut result = route_prompt(prompt, checkpoint.as_deref(), &fields)?;
+        let hierarchical = match args.get("router").and_then(Value::as_str) {
+            None | Some("probe") => None,
+            Some("hierarchical") => {
+                let meta = self.paths.meta_router();
+                Some(crate::hrouter::LayeredRouter::from_config(
+                    &crate::hrouter::LayeredRouterConfig {
+                        meta_router: meta.exists().then_some(meta),
+                        // A registry that failed to load above is already
+                        // reported in `registry_note`; route over the roster.
+                        registry: (registry_note.is_none() && registry_path.exists())
+                            .then(|| registry_path.clone()),
+                        // The shipped specialists are all candidates; the L1
+                        // decisions carry each one's status.
+                        admit_candidates: true,
+                        ..crate::hrouter::LayeredRouterConfig::default()
+                    },
+                )?)
+            }
+            Some(other) => anyhow::bail!(
+                "nina.route: unknown router '{other}' (expected 'probe' or 'hierarchical')"
+            ),
+        };
+        let mut result = route_prompt_with(
+            prompt,
+            checkpoint.as_deref(),
+            &fields,
+            hierarchical.as_ref(),
+            None,
+        )?;
         if let (Some(note), Some(object)) = (registry_note, result.as_object_mut()) {
             object.insert("registry_note".to_string(), Value::String(note));
         }
@@ -3321,6 +3499,53 @@ mod tests {
             "{result}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn route_prompt_with_none_is_route_prompt() {
+        let fields = vec!["coding".to_string()];
+        assert_eq!(
+            route_prompt_with("fn main() {}", None, &fields, None, None).unwrap(),
+            route_prompt("fn main() {}", None, &fields).unwrap()
+        );
+    }
+
+    #[test]
+    fn hierarchical_route_reports_each_layer() {
+        let fields = vec!["coding".to_string()];
+        let router = crate::hrouter::fixture_router().unwrap();
+        let result = route_prompt_with(
+            "rust function to read a file line by line",
+            None,
+            &fields,
+            Some(&router),
+            None,
+        )
+        .unwrap();
+        assert_eq!(result["router"], "hierarchical", "{result}");
+        assert_eq!(result["probe"], Value::Null, "no checkpoint, no probe");
+        let layers: Vec<&str> = result["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["layer"].as_str().unwrap())
+            .collect();
+        for layer in ["l3_meta", "l2_category", "planner_budget", "l1_specialist"] {
+            assert!(layers.contains(&layer), "{layer} missing: {result}");
+        }
+        assert_eq!(result["categories"][0][0], "coding", "{result}");
+
+        // An untrained meta-router abstains, and says so.
+        let untrained = crate::hrouter::LayeredRouter::from_config(
+            &crate::hrouter::LayeredRouterConfig::default(),
+        )
+        .unwrap();
+        let result = route_prompt_with("x", None, &fields, Some(&untrained), None).unwrap();
+        assert!(result["unsure"]
+            .as_str()
+            .unwrap()
+            .contains("no trained meta-router"));
+        assert_eq!(result["specialists"], json!([]));
     }
 
     // -- the MCP server ------------------------------------------------------
@@ -3883,12 +4108,30 @@ mod tests {
         let dataset = rust_traces(&root);
         queue_add(&root, "coding/rust", "coding", &dataset, 2);
 
-        let outcome = train_tick_with::<TrainBackend>(&root, &tiny_scheduler())
+        // A non-default routing-auxiliary weight: the scheduler's knob must
+        // reach the trainer (it used to be dropped for the trainer's 0.1).
+        let scheduler = SchedulerConfig {
+            router_aux_weight: 0.25,
+            ..tiny_scheduler()
+        };
+        let outcome = train_tick_with::<TrainBackend>(&root, &scheduler)
             .unwrap()
             .unwrap();
         assert!(outcome.ok, "{outcome:?}");
         assert_eq!(outcome.name, "coding/rust");
         assert_eq!(outcome.steps_taken, 2);
+        let state = crate::checkpoint::TrainState::for_model(outcome.checkpoint.as_ref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state
+                .config
+                .get("router_aux_weight")
+                .and_then(Value::as_f64),
+            Some(0.25),
+            "the trainer ran with {:?}",
+            state.config.get("router_aux_weight")
+        );
         // The entry is settled: a second tick on either spelling drains nothing.
         assert!(train_tick(&root, &tiny_scheduler()).unwrap().is_none());
         let paths = NinaPaths::new(&root);
@@ -3982,9 +4225,20 @@ mod tests {
         assert_eq!(entry.box_id, "field:pentest");
         assert_eq!(entry.eval.router_top1, Some(router_top1));
 
+        // The deployment sidecar (what `nina chat` serves from when the
+        // training state is not shipped) must describe the architecture this
+        // run trained — field box included — not the pre-merge config.
+        let checkpoint = outcome.checkpoint.clone().unwrap();
+        let sidecar = checkpoint.parent().unwrap().join("config.json");
+        let manifest: Value =
+            serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+        let recorded: StudentConfig =
+            serde_json::from_value(manifest["student_config"].clone()).unwrap();
+        assert_eq!(recorded, scheduler.student_for_run());
+        assert_eq!(recorded.field_boxes, vec!["pentest".to_string()]);
+
         // Eval determinism from disk: the checkpoint's sidecar carries the
         // merged field_boxes, so the re-eval routes to the same box.
-        let checkpoint = outcome.checkpoint.clone().unwrap();
         let eval_a = eval_from_checkpoint(&checkpoint, &dataset, None, &scheduler).unwrap();
         let eval_b = eval_from_checkpoint(&checkpoint, &dataset, None, &scheduler).unwrap();
         assert_eq!(eval_a.router_top1, Some(router_top1));
@@ -4426,6 +4680,100 @@ mod tests {
             .to_string();
         assert!(err.contains("eval accuracy"), "{err}");
         assert!(registry.promote_if_better("coding/rust", -0.1).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The promotion baseline comes from the chain only when the chain
+    /// verifies: lowering the recorded `promote` accuracy after the fact must
+    /// not lower the bar a later candidate has to clear.
+    #[test]
+    fn promotion_gate_refuses_a_baseline_from_an_edited_chain() {
+        let root = scratch("promotion-tampered");
+        let paths = NinaPaths::new(&root);
+        let mut registry = Registry::open(paths.registry_json(), paths.registry_log()).unwrap();
+        let mut candidate = entry("coding/rust", "coding", "rust");
+        candidate.eval.accuracy = Some(0.8);
+        registry.register(candidate).unwrap();
+        registry.promote_if_better("coding/rust", 0.0).unwrap();
+
+        let text = std::fs::read_to_string(paths.registry_log()).unwrap();
+        let edited: Vec<String> = text
+            .lines()
+            .map(|line| {
+                if line.contains("\"event\":\"promote\"") {
+                    line.replacen("0.8", "0.1", 1)
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect();
+        let edited = format!("{}\n", edited.join("\n"));
+        assert_ne!(
+            edited, text,
+            "the fixture must actually edit the promote record"
+        );
+        std::fs::write(paths.registry_log(), edited).unwrap();
+
+        // 0.5 beats the forged 0.1 but not the real 0.8: it must not pass.
+        registry
+            .record_eval(
+                "coding/rust",
+                EvalEvidence {
+                    accuracy: Some(0.5),
+                    ..EvalEvidence::default()
+                },
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let err = registry
+            .promote_if_better("coding/rust", 0.0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not verify"), "{err}");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Evidence is a measured fraction: NaN, infinities and values outside
+    /// [0, 1] are refused at registration and at record_eval, before
+    /// `promote` (which only asks whether an accuracy exists) can admit them.
+    #[test]
+    fn registry_refuses_evidence_that_is_not_a_fraction() {
+        let root = scratch("registry-evidence");
+        let paths = NinaPaths::new(&root);
+        let mut registry = Registry::open(paths.registry_json(), paths.registry_log()).unwrap();
+        for bad in [f64::NAN, f64::INFINITY, 1.5, -0.1] {
+            let mut forged = entry("coding/rust", "coding", "rust");
+            forged.eval.accuracy = Some(bad);
+            let err = registry.register(forged).unwrap_err().to_string();
+            assert!(err.contains("fraction in [0, 1]"), "{bad}: {err}");
+        }
+        assert!(registry.get("coding/rust").is_none());
+        assert!(
+            !paths.registry_log().exists(),
+            "a refused entry reached the chain"
+        );
+
+        registry
+            .register(entry("coding/rust", "coding", "rust"))
+            .unwrap();
+        let err = registry
+            .record_eval(
+                "coding/rust",
+                EvalEvidence {
+                    accuracy: Some(0.5),
+                    router_top1: Some(2.0),
+                    ..EvalEvidence::default()
+                },
+                None,
+                None,
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("router_top1"), "{err}");
+        assert_eq!(registry.get("coding/rust").unwrap().eval.accuracy, None);
         std::fs::remove_dir_all(&root).unwrap();
     }
 

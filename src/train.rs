@@ -514,6 +514,38 @@ where
             ),
         }
     }
+    // These are wired only into the `dblock` step (see `Reweighting::dblock_step`
+    // and `compute_loss`, which returns no routing for the other objectives).
+    // Under any other objective they did nothing while the banners below
+    // announced them as on; refuse rather than run a different experiment
+    // than the one configured.
+    if !matches!(config.objective, Objective::Dblock) {
+        let mut unsupported = Vec::new();
+        if config.bias_balance_rate > 0.0 {
+            unsupported.push("bias_balance_rate");
+        }
+        if config.balance_scope != BalanceScope::Micro {
+            unsupported.push("balance_scope");
+        }
+        if config.balance_schedule.is_some() {
+            unsupported.push("balance_schedule");
+        }
+        if config.uncertainty > 0.0 {
+            unsupported.push("uncertainty");
+        }
+        if config.importance_bins > 0 {
+            unsupported.push("importance_bins");
+        }
+        if config.synthetic_negatives > 0.0 {
+            unsupported.push("synthetic_negatives");
+        }
+        anyhow::ensure!(
+            unsupported.is_empty(),
+            "{} only apply to the `dblock` objective; the `{}` objective would silently ignore them",
+            unsupported.join(", "),
+            config.objective.name()
+        );
+    }
     if config.bias_balance_rate > 0.0 {
         // A record from before the bias existed, or one written without it,
         // loads as `None`; re-attach zeros so the run has a bias to nudge.
@@ -523,6 +555,13 @@ where
             config.bias_balance_rate
         );
     }
+    // Burn initializes parameters lazily, and cloning an unforced parameter
+    // draws a *different* value under the same id (see
+    // `tensor_ext::force_initialization`). This model is cloned for the
+    // self-distillation teacher, the EMA shadow and every checkpoint; each must
+    // hold the weights actually being trained, not a second random draw.
+    // Forced here, while the device RNG is still at `config.seed`.
+    crate::tensor_ext::force_initialization(&model);
     if config.balance_scope == BalanceScope::Global {
         anyhow::ensure!(
             config.mosme.is_none(),
@@ -665,9 +704,18 @@ where
 
     let mut summary = TrainSummary::default();
     let mut accumulator = GradientAccumulator::new(config.accumulate);
+    // The log-variance head is stepped on the same cadence as the trunk, so
+    // its gradients are accumulated the same way. Stepping it with only the
+    // cycle's *last* micro-batch discarded k-1 of its gradients and, when that
+    // micro-batch had been rejected, applied a non-finite gradient to it.
+    let mut head_accumulator = GradientAccumulator::new(config.accumulate);
     let mut scales = LossScales::new(config.num_blocks);
     let mut ema = config.ema_decay.map(|d| Ema::new(&model, d));
     let mut loss_sum = 0.0f64;
+    // Micro-batches whose loss was non-finite: kept out of `loss_sum` (one NaN
+    // would otherwise make the run's mean loss NaN for good) and out of its
+    // denominator.
+    let mut nonfinite_losses = 0usize;
     let mut elapsed_before = 0.0f64;
     let mut start_step = 0usize;
     if let Some(state) = &restored {
@@ -686,28 +734,41 @@ where
                 logvar_head = Some(head.load_record(
                     checkpoint::load_record::<TrainBackend<C>, _>(&dir, file, &device)?,
                 ));
-                if let (Some(file), Some(head_optim)) = (&state.head_optimizer, logvar_optim.take())
-                {
-                    logvar_optim =
-                        Some(head_optim.load_record(
-                            checkpoint::load_record::<TrainBackend<C>, _>(&dir, file, &device)?,
-                        ));
+                // `take()` only once the file is known present: taking it inside
+                // the tuple pattern dropped the head's optimizer whenever the
+                // state had no optimizer file, and the head then never stepped.
+                if let Some(file) = &state.head_optimizer {
+                    if let Some(head_optim) = logvar_optim.take() {
+                        logvar_optim = Some(head_optim.load_record(checkpoint::load_record::<
+                            TrainBackend<C>,
+                            _,
+                        >(
+                            &dir, file, &device
+                        )?));
+                    }
                 }
             }
             (_, head) => logvar_head = head,
         }
         let extras: DblockExtras =
             serde_json::from_value(state.extras.clone()).context("parse dblock training state")?;
-        if let (Some(file), Some(current)) = (&state.ema, ema.take()) {
-            let shadow =
-                current.shadow().clone().load_record(
-                    checkpoint::load_record::<TrainBackend<C>, _>(&dir, file, &device)?,
-                );
-            ema = Some(Ema::from_parts(
-                shadow,
-                current.decay(),
-                extras.ema_updates.unwrap_or(0),
-            ));
+        // `take()` only once the shadow file is known present: inside the tuple
+        // pattern it ran first, so enabling `--ema-decay` on a resume whose
+        // state had no shadow dropped the EMA for the whole run.
+        if let Some(file) = &state.ema {
+            if let Some(current) = ema.take() {
+                let shadow = current
+                    .shadow()
+                    .clone()
+                    .load_record(checkpoint::load_record::<TrainBackend<C>, _>(
+                        &dir, file, &device,
+                    )?);
+                ema = Some(Ema::from_parts(
+                    shadow,
+                    current.decay(),
+                    extras.ema_updates.unwrap_or(0),
+                ));
+            }
         }
         scales = extras.scales;
         if importance.is_some() {
@@ -725,6 +786,7 @@ where
         summary.periodic_verifications = extras.periodic_verifications;
         summary.final_lr = extras.final_lr;
         loss_sum = extras.loss_sum;
+        nonfinite_losses = extras.nonfinite_losses;
         elapsed_before = extras.elapsed_secs;
         rng = serde_json::from_value(state.host_rng.clone()).context("restore host RNG")?;
         start_step = state.step;
@@ -808,6 +870,7 @@ where
                       running: &RunningAvg,
                       summary: &TrainSummary,
                       loss_sum: f64,
+                      nonfinite_losses: usize,
                       elapsed: f64,
                       ema: &Option<Ema<DblockClassifier<TrainBackend<C>>>>,
                       sources: &SourceStats| DblockExtras {
@@ -822,6 +885,7 @@ where
         periodic_verifications: summary.periodic_verifications,
         final_lr: summary.final_lr,
         loss_sum,
+        nonfinite_losses,
         elapsed_secs: elapsed,
         ema_updates: ema.as_ref().map(Ema::updates),
         sources: sources.clone(),
@@ -833,6 +897,7 @@ where
         );
     }
 
+    let mut checkpoint_pending = false;
     for step in start_step..config.steps {
         // The device stream is a pure function of (seed, step): see `step_seed`.
         <TrainBackend<C> as burn::tensor::backend::Backend>::seed(
@@ -934,6 +999,15 @@ where
         } else {
             accumulator.skip()
         };
+        // The head's cycle runs in lockstep with the trunk's: same cadence,
+        // same accept/reject decision for this micro-batch.
+        let head_summed = match (logvar_head.as_ref(), head_grads) {
+            (Some(head), Some(head_grads)) if verdict.accepted => {
+                head_accumulator.fold(head_grads, head).into_gradients()
+            }
+            (Some(_), _) => head_accumulator.skip().into_gradients(),
+            (None, _) => None,
+        };
 
         if let Some(mut summed) = cycle.into_gradients() {
             // Clipping applies to the *accumulated* gradient, because that is
@@ -962,7 +1036,7 @@ where
             // inside the tuple pattern would move the head out even when the
             // match fails, silently disabling the feature for the rest of the
             // run while the startup banner still claimed it was on.
-            if let (Some(head_optim), Some(head_grads)) = (logvar_optim.as_mut(), head_grads) {
+            if let (Some(head_optim), Some(head_grads)) = (logvar_optim.as_mut(), head_summed) {
                 if let Some(head) = logvar_head.take() {
                     logvar_head = Some(head_optim.step(lr, head, head_grads));
                 }
@@ -1000,7 +1074,11 @@ where
         health.record(step, block_idx, scalar_loss, &verdict);
         health.record_routing(block_idx, &routing);
         running.push(scalar_loss);
-        loss_sum += scalar_loss as f64;
+        if scalar_loss.is_finite() {
+            loss_sum += scalar_loss as f64;
+        } else {
+            nonfinite_losses += 1;
+        }
         summary.final_loss = scalar_loss;
 
         // --- Phase: periodic ----------------------------------------------
@@ -1074,12 +1152,16 @@ where
         // --- periodic checkpoint (roadmap Phase 28) ------------------------
         // Only at an accumulation-cycle boundary: a half-folded gradient
         // buffer is not part of the saved state, and dropping it would make
-        // the resumed run diverge.
-        let due = config.checkpoint_every > 0
-            && (step + 1) % config.checkpoint_every == 0
-            && step + 1 < config.steps
-            && !accumulator.has_pending();
+        // the resumed run diverge. A checkpoint that falls inside a cycle is
+        // *deferred* to the next boundary, as `checkpoint_every` documents;
+        // testing the boundary only on the exact multiple silently dropped
+        // every such checkpoint instead.
+        if config.checkpoint_every > 0 && (step + 1) % config.checkpoint_every == 0 {
+            checkpoint_pending = true;
+        }
+        let due = checkpoint_pending && step + 1 < config.steps && !accumulator.has_pending();
         if due {
+            checkpoint_pending = false;
             let extras = extras_now(
                 &scales,
                 &importance,
@@ -1087,6 +1169,7 @@ where
                 &running,
                 &summary,
                 loss_sum,
+                nonfinite_losses,
                 elapsed_before + start.elapsed().as_secs_f64(),
                 &ema,
                 &source_stats,
@@ -1108,8 +1191,10 @@ where
     }
 
     // Every micro-batch the loop ran, whether it stepped, was folded into a
-    // pending accumulation cycle, or was rejected.
-    let completed = summary.steps_taken + summary.steps_skipped + summary.steps_accumulated;
+    // pending accumulation cycle, or was rejected -- less the ones whose loss
+    // was non-finite and so never entered `loss_sum`.
+    let completed = (summary.steps_taken + summary.steps_skipped + summary.steps_accumulated)
+        .saturating_sub(nonfinite_losses);
     summary.mean_loss = if completed == 0 {
         0.0
     } else {
@@ -1126,6 +1211,7 @@ where
         &running,
         &summary,
         loss_sum,
+        nonfinite_losses,
         summary.elapsed_secs,
         &ema,
         &source_stats,
@@ -1179,6 +1265,9 @@ struct DblockExtras {
     periodic_verifications: usize,
     final_lr: f64,
     loss_sum: f64,
+    /// Micro-batches left out of `loss_sum` for a non-finite loss.
+    #[serde(default)]
+    nonfinite_losses: usize,
     elapsed_secs: f64,
     ema_updates: Option<usize>,
     #[serde(default)]
@@ -1671,6 +1760,7 @@ where
                 vec![
                     ("loss", jnum(m.loss)),
                     ("ce_loss", jnum(m.ce_loss)),
+                    ("balance_loss", jnum(m.balance_loss)),
                     ("boundary", jnum(m.boundary_loss)),
                     ("self_consistency", jnum(m.self_loss)),
                     ("trajectory", jnum(m.trajectory_loss)),
@@ -1713,7 +1803,7 @@ where
     Ok((loss, fields, Vec::new()))
 }
 
-/// Sliding-window mean over the last `window` values.
+/// Sliding-window mean over the last `window` finite values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunningAvg {
     window: std::collections::VecDeque<f32>,
@@ -1730,7 +1820,13 @@ impl RunningAvg {
         }
     }
 
+    /// Fold `v` in. A non-finite value is ignored: it would enter the running
+    /// sum and stay there after it left the window (`NaN - NaN` is `NaN`), so
+    /// one rejected step made every later average NaN.
     pub fn push(&mut self, v: f32) {
+        if !v.is_finite() {
+            return;
+        }
         if self.window.len() == self.cap {
             if let Some(old) = self.window.pop_front() {
                 self.sum -= old;
@@ -2239,7 +2335,9 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
             ..
         } => LrSchedule::WarmupCosine {
             peak: config.lr,
-            min_lr: *min_lr,
+            // The floor came from whatever peak the schedule was built with;
+            // above the new peak it would make the "decay" a climb.
+            min_lr: min_lr.min(config.lr),
             warmup_steps: *warmup_steps,
             total_steps: config.steps,
         },
@@ -2252,7 +2350,16 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
     // warmup-aware LR, mean-averaged accumulation, post-accumulation
     // clipping, and the bias-corrected EMA shadow returned for evaluation.
     let mut accumulator = GradientAccumulator::new(config.accumulate);
-    let mut ema = config.ema_decay.map(|d| Ema::new(&model, d));
+    let mut ema = config.ema_decay.map(|d| {
+        // The shadow is a clone, and cloning a lazily initialized parameter
+        // draws a second, *different* value under the same id: the "average"
+        // would start from a model nobody trained. Force first, from the
+        // step-0 device stream so the draw is still a function of the seed
+        // (every step reseeds the device, so this perturbs nothing later).
+        <B as burn::tensor::backend::Backend>::seed(device, step_seed(config.seed, 0));
+        crate::tensor_ext::force_initialization(&model);
+        Ema::new(&model, d)
+    });
     if let Some(e) = &ema {
         println!(
             "EMA: decay {:.4} (bias-corrected; the shadow is returned for evaluation)",
@@ -2307,20 +2414,24 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
         report.tokens_seen = extras.tokens_seen;
         loss_sum = extras.loss_sum;
         elapsed_before = extras.elapsed_secs;
-        if let (Some(file), Some(current)) = (&state.ema, ema.take()) {
-            let shadow = current
-                .shadow()
-                .clone()
-                .load_record(checkpoint::load_record::<B, _>(&dir, file, device)?);
-            ema = Some(Ema::from_parts(
-                shadow,
-                current.decay(),
-                extras.ema_updates.unwrap_or(0),
-            ));
-            println!(
-                "resumed EMA shadow ({} updates)",
-                ema.as_ref().map_or(0, Ema::updates)
-            );
+        // `take()` only once the shadow file is known present (see the image
+        // loop): otherwise a resume without a saved shadow disabled the EMA.
+        if let Some(file) = &state.ema {
+            if let Some(current) = ema.take() {
+                let shadow = current
+                    .shadow()
+                    .clone()
+                    .load_record(checkpoint::load_record::<B, _>(&dir, file, device)?);
+                ema = Some(Ema::from_parts(
+                    shadow,
+                    current.decay(),
+                    extras.ema_updates.unwrap_or(0),
+                ));
+                println!(
+                    "resumed EMA shadow ({} updates)",
+                    ema.as_ref().map_or(0, Ema::updates)
+                );
+            }
         }
         rng = serde_json::from_value(state.host_rng.clone()).context("restore host RNG")?;
         start_step = state.step;
@@ -2392,8 +2503,28 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
         Ok(Some(model_path))
     };
 
+    // Per-cycle bookkeeping. With `accumulate > 1` an optimizer step is made
+    // of several micro-batches, and the step's loss is their mean -- not the
+    // last one's, which is all the report used to see. Logging and periodic
+    // checkpoints fall due on micro-batch indices but can only happen once a
+    // step has been taken, so a due one waits for the next completed cycle
+    // instead of being dropped (with `accumulate = 4, log_every = 10` no
+    // step index was ever both, and the run logged nothing).
+    let mut cycle_loss = 0.0f64;
+    let mut cycle_nll = 0.0f64;
+    let mut cycle_micro = 0usize;
+    let mut cycle_last: Option<crate::lm::LmMetrics> = None;
+    let mut cycle_routing: Vec<crate::moe::RoutingStats> = Vec::new();
+    let mut log_pending = false;
+    let mut checkpoint_pending = false;
     for step in start_step..config.steps {
         <B as burn::tensor::backend::Backend>::seed(device, step_seed(config.seed, step));
+        if config.log_every > 0 && (step % config.log_every == 0 || step + 1 == config.steps) {
+            log_pending = true;
+        }
+        if config.checkpoint_every > 0 && (step + 1) % config.checkpoint_every == 0 {
+            checkpoint_pending = true;
+        }
         let (windows, weight_rows, mask_rows, origin) = if mix.any_masks() || mix.any_grades() {
             let (windows, weights, masks, origin) =
                 mix.sample_with_masks(config.batch_size, context - 1, &mut rng)?;
@@ -2413,8 +2544,7 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
         // blowup, and loss/grad-norm miss it until it spikes the run. Probe
         // one truncated sample on log steps (linear layers report None); the
         // tokens are moved into the step below, so the probe input is cut now.
-        let probing =
-            config.log_every > 0 && (step % config.log_every == 0 || step + 1 == config.steps);
+        let probing = log_pending;
         let probe_tokens = probing.then(|| {
             let len = context.min(128);
             tokens.clone().narrow(0, 0, 1).narrow(1, 0, len)
@@ -2481,39 +2611,78 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
             }
         };
 
-        if metrics.tokens_counted == 0 {
-            report.steps_skipped += 1;
-            accumulator.skip();
-            println!("step {step}: window has no supervised target, step discarded");
-            continue;
-        }
-        if !metrics.loss.is_finite() {
-            // The same policy as the image loop: a pathological step is
+        let rejection = if metrics.tokens_counted == 0 {
+            Some("window has no supervised target".to_string())
+        } else if !metrics.loss.is_finite() {
+            // The same policy as the image loop: a pathological micro-batch is
             // discarded, not clipped into something that looks fine.
-            report.steps_skipped += 1;
-            accumulator.skip();
-            println!(
-                "step {step}: non-finite loss {}, step discarded",
-                metrics.loss
-            );
-            continue;
-        }
-
-        // Scale so the accumulated total is the mean over the micro-batches:
-        // exactly what one `accumulate`-times-larger batch would produce.
-        let scaled = if accumulator.every() > 1 {
-            loss.mul_scalar(accumulator.loss_scale() as f32)
+            Some(format!("non-finite loss {}", metrics.loss))
         } else {
-            loss
+            None
         };
-        let grads = trainable.gradients::<B, _>(&mut scaled.backward(), &model);
-        let cycle = accumulator.fold(grads, &model);
+        let accepted = rejection.is_none();
+        let cycle = match rejection {
+            Some(reason) => {
+                report.steps_skipped += 1;
+                println!("step {step}: {reason}, micro-batch discarded");
+                // A rejected micro-batch still advances the cycle. When it is
+                // the one that completes it, the gradients the cycle already
+                // folded are stepped with below; ignoring this `Cycle` (as an
+                // earlier version did) silently threw them away.
+                accumulator.skip()
+            }
+            None => {
+                // Every accepted micro-batch counts toward the run's totals,
+                // not only the one that happens to complete the cycle.
+                report.tokens_seen += metrics.tokens_counted;
+                report.penalized_tokens += metrics.penalized_tokens;
+                report.negative_teacher_tokens += metrics.negative_teacher_tokens;
+                source_stats.record(&origin, metrics.loss);
+                cycle_loss += f64::from(metrics.loss);
+                cycle_nll += f64::from(metrics.perplexity.ln());
+                cycle_micro += 1;
+                cycle_last = Some(metrics);
+                cycle_routing = routing;
+                // Scale so the accumulated total is the mean over the
+                // micro-batches: exactly what one `accumulate`-times-larger
+                // batch would produce.
+                let scaled = if accumulator.every() > 1 {
+                    loss.mul_scalar(accumulator.loss_scale() as f32)
+                } else {
+                    loss
+                };
+                let grads = trainable.gradients::<B, _>(&mut scaled.backward(), &model);
+                accumulator.fold(grads, &model)
+            }
+        };
+        let cycle_done = cycle.is_ready();
         let Some(mut summed) = cycle.into_gradients() else {
-            // Still filling the cycle: no step yet, and the metrics below
-            // describe a micro-batch rather than a step, so wait for the rest.
-            report.steps_accumulated += 1;
+            if cycle_done {
+                // Every micro-batch of the cycle was rejected: nothing to step
+                // with, and nothing carried into the next cycle.
+                cycle_loss = 0.0;
+                cycle_nll = 0.0;
+                cycle_micro = 0;
+                cycle_last = None;
+                cycle_routing.clear();
+            } else if accepted {
+                // Still filling the cycle: no step yet.
+                report.steps_accumulated += 1;
+            }
             continue;
         };
+        // What the step reports: the mean loss (and perplexity) over the
+        // cycle's accepted micro-batches, the last accepted one's diagnostics.
+        let micro = cycle_micro.max(1) as f64;
+        let metrics = crate::lm::LmMetrics {
+            loss: (cycle_loss / micro) as f32,
+            perplexity: (cycle_nll / micro).exp() as f32,
+            ..cycle_last.take().unwrap_or(metrics)
+        };
+        let routing = std::mem::take(&mut cycle_routing);
+        cycle_loss = 0.0;
+        cycle_nll = 0.0;
+        cycle_micro = 0;
         // Clipping applies to the *accumulated* gradient, because that is the
         // step actually taken — bounding micro-batches separately says nothing
         // about the norm of their sum.
@@ -2542,20 +2711,17 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
         report.last_loss = metrics.loss;
         report.last_penalized_prob = metrics.penalized_prob;
         report.last_negative_teacher_prob = metrics.negative_teacher_prob;
-        report.negative_teacher_tokens += metrics.negative_teacher_tokens;
         report.last_distill_loss = metrics.distill_loss;
         if report.steps_taken == 0 {
             report.first_direction_projection = metrics.direction_projection;
         }
         report.last_direction_projection = metrics.direction_projection;
         report.last_mtp_loss = metrics.mtp_loss;
-        source_stats.record(&origin, metrics.loss);
         report.steps_taken += 1;
-        report.penalized_tokens += metrics.penalized_tokens;
-        report.tokens_seen += metrics.tokens_counted;
         loss_sum += f64::from(metrics.loss);
 
-        if config.log_every > 0 && (step % config.log_every == 0 || step + 1 == config.steps) {
+        if log_pending {
+            log_pending = false;
             let mut line = format!(
                 "step {step}: loss {:.4} ppl {:.2}",
                 metrics.loss, metrics.perplexity
@@ -2664,10 +2830,9 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
             }
         }
 
-        if config.checkpoint_every > 0
-            && (step + 1) % config.checkpoint_every == 0
-            && step + 1 < config.steps
-        {
+        // Reached only right after a step, so the cycle is at a boundary.
+        if checkpoint_pending && step + 1 < config.steps {
+            checkpoint_pending = false;
             let elapsed = elapsed_before + started.elapsed().as_secs_f64();
             if let Some(path) = save_state(
                 step + 1,
@@ -2687,7 +2852,9 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
 
     anyhow::ensure!(
         report.steps_taken > 0,
-        "every step produced a non-finite loss"
+        "no optimizer step was taken: every micro-batch was rejected, or the run \
+         ended before an accumulation cycle of {} completed",
+        accumulator.every()
     );
     report.mean_loss = (loss_sum / report.steps_taken as f64) as f32;
     report.elapsed_secs = elapsed_before + started.elapsed().as_secs_f64();
@@ -3218,6 +3385,15 @@ mod tests {
         avg.push(10.0); // evicts the 1.0
         assert!((avg.avg() - 5.0).abs() < 1e-6);
         assert_eq!(avg.len(), 3);
+
+        // A rejected step's NaN must not poison every later average.
+        avg.push(f32::NAN);
+        avg.push(f32::INFINITY);
+        assert_eq!(avg.len(), 3);
+        for v in [4.0, 4.0, 4.0] {
+            avg.push(v);
+        }
+        assert_eq!(avg.avg(), 4.0);
     }
 
     #[test]
@@ -3270,6 +3446,38 @@ mod tests {
             assert_eq!(Objective::parse(name).unwrap().name(), name);
         }
         assert!(Objective::parse("elbo").is_err());
+    }
+
+    #[test]
+    fn test_dblock_only_features_are_refused_under_other_objectives() {
+        // They are wired into the dblock step alone; under flow they used to
+        // be announced and then silently do nothing.
+        for (name, config) in [
+            (
+                "uncertainty",
+                TrainConfig {
+                    objective: Objective::Flow,
+                    uncertainty: 1.0,
+                    steps: 1,
+                    ..TrainConfig::default()
+                },
+            ),
+            (
+                "bias_balance_rate",
+                TrainConfig {
+                    objective: Objective::Flow,
+                    bias_balance_rate: 0.01,
+                    steps: 1,
+                    ..TrainConfig::default()
+                },
+            ),
+        ] {
+            let err = train(&config).unwrap_err().to_string();
+            assert!(
+                err.contains(name) && err.contains("only apply to the `dblock` objective"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
@@ -3407,6 +3615,102 @@ mod tests {
             "the schedule must never exceed its peak, got {}",
             summary.final_lr
         );
+        // "Applied" means the last step ran at the schedule's value for that
+        // step -- a constant 1e-3 passes both bounds above.
+        assert_eq!(summary.steps_taken, 4);
+        assert_eq!(summary.final_lr, config.lr_schedule.at(3));
+        assert!(
+            summary.final_lr < 0.5e-3,
+            "cosine must have decayed by step 3"
+        );
+    }
+
+    #[test]
+    fn test_a_checkpoint_inside_an_accumulation_cycle_is_deferred_not_dropped() {
+        // `checkpoint_every` documents that a checkpoint falling inside a
+        // cycle defers to the next boundary. Due after micro-batch 3 (mid
+        // cycle at accumulate=2), it must be written after micro-batch 4.
+        let dir = std::env::temp_dir().join(format!(
+            "dblocks-train-deferred-ckpt-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (_, summary) = train(&TrainConfig {
+            image_size: 32,
+            num_labels: 10,
+            batch_size: 2,
+            num_blocks: 2,
+            steps: 6,
+            log_every: 100,
+            accumulate: 2,
+            checkpoint_every: 3,
+            out_dir: Some(dir.clone()),
+            checks: TrainingChecks {
+                preflight: false,
+                ..TrainingChecks::default()
+            },
+            ..TrainConfig::default()
+        })
+        .unwrap();
+        let written: Vec<usize> = summary
+            .periodic_checkpoints
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        assert_eq!(written, vec![4]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_lm_accumulation_counts_every_micro_batch_and_defers_checkpoints() {
+        // With accumulate=2 the report used to see only each cycle's last
+        // micro-batch (half the tokens), and a checkpoint due on a filling
+        // micro-batch was never written.
+        use crate::lm::LmConfig;
+        let dir = std::env::temp_dir().join(format!(
+            "dblocks-train-lm-accumulate-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("plain.txt");
+        std::fs::write(&source, "abcabcabcabcabcabcabcabcabcabcabc".repeat(4)).unwrap();
+        let path = dir.join("plain.bin");
+        TokenCorpus::tokenize_file(&source, &path).unwrap();
+        let mut corpus = TokenCorpus::in_memory(&path).unwrap();
+
+        let device = Default::default();
+        let model = LanguageModel::<DefaultTrainBackend>::new(&LmConfig::tiny(), &device).unwrap();
+        let config = LmTrainConfig {
+            steps: 6,
+            batch_size: 2,
+            accumulate: 2,
+            log_every: 0,
+            checkpoint_every: 3,
+            out_dir: Some(dir.join("out")),
+            ..Default::default()
+        };
+        let (_, report) = train_lm(model, &mut corpus, &config, &device).unwrap();
+        assert_eq!(report.steps_taken, 3, "6 micro-batches at accumulate=2");
+        assert_eq!(report.steps_accumulated, 3);
+        assert_eq!(report.steps_skipped, 0);
+        assert_eq!(
+            report.tokens_seen,
+            6 * 2 * (LmConfig::tiny().context - 1),
+            "every micro-batch's targets count"
+        );
+        assert!(report.mean_loss.is_finite() && report.last_loss.is_finite());
+        let written: Vec<usize> = report
+            .periodic_checkpoints
+            .iter()
+            .map(|(s, _)| *s)
+            .collect();
+        assert_eq!(
+            written,
+            vec![4],
+            "due after index 2, written at the boundary"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

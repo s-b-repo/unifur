@@ -122,7 +122,7 @@ impl Task {
 /// The model's output: a unified diff, optionally with a refusal
 /// reason.
 ///
-/// The diff is parsed and validated by `Patch::parse` before
+/// The diff is parsed and applied by [`eval::apply_unified_diff`] before
 /// being scored; an unparseable patch is wrong by construction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Patch {

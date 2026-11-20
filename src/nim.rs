@@ -29,6 +29,25 @@
 //! cost the endpoint actually billed, and [`split_traces`] divides records
 //! into train/validation folds by id hash, so a resumed or extended trace
 //! file never reshuffles the validation set.
+//!
+//! # Providers
+//!
+//! The client speaks to any OpenAI-compatible endpoint; [`Provider`] names
+//! the three it is configured for: NVIDIA's hosted NIM catalogue (the
+//! default), OpenRouter (whose free models are what `dblocks teacher models
+//! --free` discovers), and a custom base URL. The provider sets the default
+//! base URL and key variable; OpenRouter requests also carry the generic
+//! `X-Title: unifur` attribution header and nothing that identifies the user.
+//!
+//! # Rate limits
+//!
+//! Every exchange is captured whole (status, final header block, body) so
+//! [`crate::ratelimit::classify`] can read a 429, a `Retry-After`, the
+//! `X-RateLimit-*` headers, an error object inside a 200, a 402 or an
+//! overload. [`NimClient::complete`] waits out a short limit within its retry
+//! allowance; [`NimClient::generate_traces`] goes through
+//! [`crate::teacher::generate_resumable`], which pauses, rotates and resumes
+//! across process restarts.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -39,8 +58,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, ensure, Context};
 use serde::{Deserialize, Serialize};
 
-use crate::cheat::SnippetLanguage;
-use crate::student::CodeLanguage;
+use crate::ratelimit::{HttpResponse, PausePolicy, PauseVerdict};
 use sha2::{Digest, Sha256};
 
 /// Default endpoint for NVIDIA's hosted NIM catalogue. A local NIM container
@@ -74,6 +92,83 @@ pub const MODEL_ENV: &str = "NIM_MODEL";
 /// external drive; tests never touch it and use unique `/tmp` names instead.
 pub const DEFAULT_TRACE_DIR: &str = "/srv/m-sda/unifur/teacher-traces/";
 
+/// OpenRouter's OpenAI-compatible endpoint.
+pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+/// Environment variable the OpenRouter key is read from by default.
+pub const OPENROUTER_API_KEY_ENV: &str = "OPENROUTER_API_KEY";
+
+/// Environment variable a [`Provider::Custom`] endpoint's key is read from by
+/// default (override with [`NimConfig::api_key_env`]).
+pub const CUSTOM_API_KEY_ENV: &str = "TEACHER_API_KEY";
+
+/// The `X-Title` attribution header OpenRouter requests carry. Generic on
+/// purpose: it names the tool, never the user, their project or their email.
+pub const ATTRIBUTION_TITLE: &str = "unifur";
+
+/// Which OpenAI-compatible service a [`NimClient`] talks to. The provider
+/// decides the default base URL and key variable and whether the
+/// attribution header is sent; the wire protocol is the same for all three.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Provider {
+    /// NVIDIA's hosted NIM catalogue (or a local NIM container).
+    #[default]
+    Nim,
+    /// OpenRouter, including its free (`:free`, zero-priced) models.
+    OpenRouter,
+    /// Any other OpenAI-compatible endpoint; needs an explicit base URL.
+    Custom,
+}
+
+impl Provider {
+    /// Parse `nim`, `openrouter` or `custom` (case-insensitive).
+    pub fn parse(name: &str) -> anyhow::Result<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "nim" | "nvidia" => Ok(Self::Nim),
+            "openrouter" => Ok(Self::OpenRouter),
+            "custom" => Ok(Self::Custom),
+            other => bail!("unknown teacher provider {other:?}: use nim, openrouter or custom"),
+        }
+    }
+
+    /// Stable lower-case name, as recorded in traces.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Nim => "nim",
+            Self::OpenRouter => "openrouter",
+            Self::Custom => "custom",
+        }
+    }
+
+    /// The provider's default base URL; `None` for [`Provider::Custom`].
+    pub fn default_base_url(self) -> Option<&'static str> {
+        match self {
+            Self::Nim => Some(DEFAULT_BASE_URL),
+            Self::OpenRouter => Some(OPENROUTER_BASE_URL),
+            Self::Custom => None,
+        }
+    }
+
+    /// The environment variable the key is read from by default.
+    pub fn default_api_key_env(self) -> &'static str {
+        match self {
+            Self::Nim => DEFAULT_API_KEY_ENV,
+            Self::OpenRouter => OPENROUTER_API_KEY_ENV,
+            Self::Custom => CUSTOM_API_KEY_ENV,
+        }
+    }
+
+    /// Where a key for this provider comes from, for error messages.
+    fn key_source(self) -> &'static str {
+        match self {
+            Self::Nim => "https://build.nvidia.com (free tier is enough for trace generation)",
+            Self::OpenRouter => "https://openrouter.ai/keys (free models need a key too)",
+            Self::Custom => "the operator of your endpoint",
+        }
+    }
+}
+
 /// Sampling temperature used for trace generation: low, because a teacher
 /// trace should be the model's best answer, not a creative one.
 const TRACE_TEMPERATURE: f32 = 0.2;
@@ -103,9 +198,16 @@ pub struct NimConfig {
     #[serde(default = "default_max_retries")]
     pub max_retries: u32,
     /// Base of the exponential backoff between retries, in milliseconds;
-    /// attempt `n` waits `backoff_base_ms * 2^n`.
+    /// retry `n` (1-based) waits `backoff_base_ms * 2^(n-1)`.
     #[serde(default = "default_backoff_base_ms")]
     pub backoff_base_ms: u64,
+    /// Which service this is. Decides the attribution header and is recorded
+    /// as provenance on every trace. Older sidecars have none and are NIM.
+    #[serde(default)]
+    pub provider: Provider,
+    /// How rate limits are waited out (see [`crate::ratelimit::PausePolicy`]).
+    #[serde(default)]
+    pub pause: PausePolicy,
 }
 
 fn default_base_url() -> String {
@@ -136,6 +238,25 @@ impl Default for NimConfig {
             timeout_secs: default_timeout_secs(),
             max_retries: default_max_retries(),
             backoff_base_ms: default_backoff_base_ms(),
+            provider: Provider::default(),
+            pause: PausePolicy::default(),
+        }
+    }
+}
+
+impl NimConfig {
+    /// The defaults for `provider`: its base URL (empty for
+    /// [`Provider::Custom`], which must be given one) and key variable. The
+    /// model is left at [`DEFAULT_MODEL`]; a pool or `--models` replaces it.
+    pub fn for_provider(provider: Provider) -> Self {
+        Self {
+            base_url: provider
+                .default_base_url()
+                .map(str::to_string)
+                .unwrap_or_default(),
+            api_key_env: provider.default_api_key_env().to_string(),
+            provider,
+            ..Self::default()
         }
     }
 }
@@ -207,6 +328,8 @@ pub struct ChatReply {
     /// Model the endpoint says served the request (falls back to the
     /// requested model when the field is absent).
     pub model: String,
+    /// `choices[0].finish_reason` as reported (`stop`, `length`, …).
+    pub finish_reason: Option<String>,
 }
 
 /// One trace-generation prompt: a coding task in a named language.
@@ -268,21 +391,36 @@ pub struct TraceRecord {
     /// serde default is `teacher`.
     #[serde(default = "default_trace_source")]
     pub source: String,
+    /// The provider the request went to ([`Provider::as_str`]): provenance.
+    /// Empty on records written before it was recorded, and on non-teacher
+    /// records, where it is also left off the wire.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub provider: String,
+    /// The exact model id the request named (e.g. an OpenRouter `:free` id).
+    /// [`Self::model`] is what the endpoint *says* served it, which can drop
+    /// the variant suffix; this is what was asked for. Empty on older records.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub requested_model: String,
 }
 
-fn default_trace_source() -> String {
+pub(crate) fn default_trace_source() -> String {
     "teacher".to_string()
 }
 
-/// Hard cap on how many teacher requests one [`NimClient::generate_traces`]
-/// call may make. The default is deliberately tiny (8): a caller that wants a
-/// real run constructs a larger budget explicitly, so a copy-pasted call
-/// cannot quietly spend money.
+/// Hard cap on how many teacher requests may be made for one trace file. The
+/// default is deliberately tiny (8): a caller that wants a real run
+/// constructs a larger budget explicitly, so a copy-pasted call cannot
+/// quietly spend money.
+///
+/// The cap is cumulative across resumes: the requests a file has already cost
+/// are recorded in its journal (`<file>.state.json`, see
+/// [`crate::teacher::RunJournal`]), so rerunning an interrupted command spends
+/// only what is left of the cap rather than the whole cap again.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct TraceBudget {
-    /// Maximum number of HTTP requests (attempts, not successes) this run
-    /// may issue. Prompts past the cap are reported as skipped, not dropped
-    /// silently.
+    /// Maximum number of HTTP requests (attempts, not successes, rate-limited
+    /// ones included) the trace file may cost in total. Prompts past the cap
+    /// are reported as skipped, not dropped silently.
     #[serde(default = "default_budget_max_requests")]
     pub max_requests: usize,
 }
@@ -324,6 +462,23 @@ pub struct TraceReport {
     /// re-gated here — they are gated by the loader that reads them, and
     /// re-running this command must not rewrite or renumber them.
     pub cheat_scan: crate::cheat::ScanSummary,
+    /// The run's journal (`<out_path>.state.json`).
+    pub journal_path: PathBuf,
+    /// HTTP requests this run issued.
+    pub requests_this_run: usize,
+    /// HTTP requests the trace file has cost across every run, this one
+    /// included; what [`TraceBudget::max_requests`] caps.
+    pub requests_spent_total: usize,
+    /// Rate-limit, credit and overload responses this run met.
+    pub rate_limit_events: usize,
+    /// Prompts not attempted because every model in the pool was paused past
+    /// the idle bound (see [`Self::stopped`]); rerunning resumes them.
+    pub skipped_paused: usize,
+    /// Why the run stopped before the end of the prompts, when it did; names
+    /// the earliest time a rerun can make progress.
+    pub stopped: Option<String>,
+    /// Traces written this run, per requested model id.
+    pub served_by_model: std::collections::BTreeMap<String, usize>,
 }
 
 /// Why one HTTP attempt did not produce a parseable body. Internal: the
@@ -333,8 +488,10 @@ enum AttemptError {
     /// curl failed to spawn, exited non-zero, or produced unparseable
     /// output. Retryable.
     Transport(String),
-    /// The server answered with a non-2xx status. Retryable iff 5xx.
-    Http { status: u16, body: String },
+    /// The server answered with a non-2xx status (or a 2xx whose body is a
+    /// rate-limit error object). Retryable iff 5xx, or a rate limit whose
+    /// pause fits the policy.
+    Http(HttpResponse),
 }
 
 /// The teacher client. Construct with [`NimClient::new`] (explicit key, used
@@ -360,8 +517,10 @@ impl NimClient {
         );
         ensure!(
             !api_key.trim().is_empty(),
-            "the NIM API key is empty: export ${} with a key from https://build.nvidia.com",
-            config.api_key_env
+            "the {} API key is empty: export ${} with a key from {}",
+            config.provider.as_str(),
+            config.api_key_env,
+            config.provider.key_source()
         );
         ensure!(
             config.timeout_secs > 0,
@@ -400,6 +559,23 @@ impl NimClient {
         Self::new(config, api_key)
     }
 
+    /// Build a client for an explicit config, reading the key from the
+    /// variable [`NimConfig::api_key_env`] names. The key never appears in
+    /// the error: only the variable's name and where to get a key.
+    pub fn from_env_config(config: NimConfig) -> anyhow::Result<Self> {
+        let api_key = std::env::var(&config.api_key_env).map_err(|_| {
+            anyhow!(
+                "environment variable `{}` is not set: the {} teacher client needs an API key. \
+                 Create one at {}, then `export {}=...` and retry",
+                config.api_key_env,
+                config.provider.as_str(),
+                config.provider.key_source(),
+                config.api_key_env
+            )
+        })?;
+        Self::new(config, api_key)
+    }
+
     /// The configuration this client was built with.
     pub fn config(&self) -> &NimConfig {
         &self.config
@@ -409,12 +585,38 @@ impl NimClient {
     /// `choices[0].message.content` plus `usage`.
     ///
     /// Retries (bounded exponential backoff, [`NimConfig::max_retries`]
-    /// times) happen only on transport failures and HTTP 5xx. A 4xx fails
+    /// times) happen on transport failures and HTTP 5xx. A rate limit (as
+    /// [`crate::ratelimit::classify`] reads it, including an error object in
+    /// a 200) whose pause fits [`NimConfig::pause`] is slept out and retried
+    /// within the same retry count; a daily cap past `max_pause_daily_secs`,
+    /// an account out of credits, or retries running out fail with the
+    /// limit's kind and reset time in the message. Any other 4xx fails
     /// immediately; 401/403 errors name the key's environment variable.
     pub fn complete(&self, request: &ChatRequest) -> anyhow::Result<ChatReply> {
+        let mut unlimited = usize::MAX;
+        self.complete_within(request, &mut unlimited)
+    }
+
+    /// [`Self::complete`], charged against an HTTP-attempt allowance: every
+    /// attempt -- retries included -- costs one, and no attempt (and no retry
+    /// sleep) is made once it is spent. This is what lets
+    /// [`TraceBudget::max_requests`] cap *requests*, as it documents, rather
+    /// than prompts: counting prompts let each one spend `max_retries + 1`
+    /// requests.
+    fn complete_within(
+        &self,
+        request: &ChatRequest,
+        allowance: &mut usize,
+    ) -> anyhow::Result<ChatReply> {
         let body = serde_json::to_vec(request).context("serialize chat request")?;
         let mut retries_used = 0u32;
         loop {
+            ensure!(
+                *allowance > 0,
+                "the request budget ran out after {} attempt(s) at this request",
+                retries_used
+            );
+            *allowance -= 1;
             match self.attempt_once(&body) {
                 Ok(raw) => {
                     let reply = parse_reply(&raw, request)?;
@@ -429,35 +631,84 @@ impl NimClient {
                     return Ok(reply);
                 }
                 Err(AttemptError::Transport(message)) => {
-                    if retries_used >= self.config.max_retries {
+                    if retries_used >= self.config.max_retries || *allowance == 0 {
                         bail!(
-                            "NIM request to {} failed after {} attempt(s): {message}",
+                            "NIM request to {} failed after {} attempt(s){}: {message}",
                             self.config.base_url,
-                            retries_used + 1
+                            retries_used + 1,
+                            budget_note(*allowance, retries_used, self.config.max_retries)
                         );
                     }
                     retries_used += 1;
                     self.sleep_before_retry(retries_used);
                 }
-                Err(AttemptError::Http { status, body }) => {
+                Err(AttemptError::Http(response)) => {
+                    let status = response.status;
                     eprintln!(
                         "[nim] model={} request failed with HTTP {status}",
-                        self.config.model
+                        request.model
                     );
+                    let now = system_now_unix_ms();
+                    if let Some(signal) = crate::ratelimit::classify(&response, now) {
+                        let plan = crate::ratelimit::plan_pause(
+                            &signal,
+                            now,
+                            retries_used,
+                            &self.config.pause,
+                            rand::random::<f64>(),
+                        );
+                        let can_wait = plan.verdict == PauseVerdict::Wait
+                            && retries_used < self.config.max_retries
+                            && *allowance > 0;
+                        if !can_wait {
+                            let usable = if plan.verdict == PauseVerdict::Disable {
+                                "not by waiting".to_string()
+                            } else {
+                                crate::ratelimit::format_unix_ms(plan.until_unix_ms)
+                            };
+                            bail!(
+                                "{} request for model `{}` hit a {} limit after {} attempt(s) \
+                                 (usable again: {usable}; {}): {}",
+                                self.config.provider.as_str(),
+                                request.model,
+                                signal.kind.as_str(),
+                                retries_used + 1,
+                                plan.reason,
+                                signal.evidence
+                            );
+                        }
+                        eprintln!(
+                            "[nim] model={} {} limit: pausing {} ms until {} ({})",
+                            request.model,
+                            signal.kind.as_str(),
+                            plan.wait_ms,
+                            crate::ratelimit::format_unix_ms(plan.until_unix_ms),
+                            signal.evidence
+                        );
+                        std::thread::sleep(Duration::from_millis(plan.wait_ms));
+                        retries_used += 1;
+                        continue;
+                    }
                     let retryable = status >= 500;
-                    if !retryable || retries_used >= self.config.max_retries {
+                    if !retryable || retries_used >= self.config.max_retries || *allowance == 0 {
                         if status == 401 || status == 403 {
                             bail!(
                                 "NIM request rejected with HTTP {status} (authentication): the key in \
                                  ${} is missing, expired or lacks access to model `{}`. Server said: {}",
                                 self.config.api_key_env,
-                                self.config.model,
-                                excerpt(&body)
+                                request.model,
+                                excerpt(&response.body)
                             );
                         }
                         bail!(
-                            "NIM request failed with HTTP {status} (not retried): {}",
-                            excerpt(&body)
+                            "NIM request failed with HTTP {status} after {} attempt(s){}: {}",
+                            retries_used + 1,
+                            if retryable {
+                                budget_note(*allowance, retries_used, self.config.max_retries)
+                            } else {
+                                " (not retried: only a 5xx or a rate limit is)"
+                            },
+                            excerpt(&response.body)
                         );
                     }
                     retries_used += 1;
@@ -470,12 +721,16 @@ impl NimClient {
     /// Generate teacher traces for `prompts`, appending to
     /// `out_dir/traces.jsonl` (created, along with `out_dir`, when absent).
     ///
-    /// The file is one [`TraceRecord`] per line. Writes are atomic: the new
-    /// contents go to a temporary sibling and are renamed over the old file,
-    /// so a crash mid-run cannot leave a half-written line. Re-running with
-    /// the same prompts is safe and cheap: ids already present are skipped
-    /// without a request. At most `budget.max_requests` HTTP requests are
-    /// issued; the rest of the prompts are reported as `skipped_budget`.
+    /// The file is one [`TraceRecord`] per line, appended and flushed to disk
+    /// (`fsync`) as each trace is accepted, with a journal beside it
+    /// (`traces.jsonl.state.json`): a crash or Ctrl-C loses at most the
+    /// request in flight. Re-running with the same prompts is safe and cheap:
+    /// ids already present are skipped without a request, a pause recorded
+    /// by the interrupted run is honoured, and the request count carries
+    /// over. At most `budget.max_requests` HTTP requests are issued for the
+    /// file across all runs; the rest of the prompts are reported as
+    /// `skipped_budget`. Rate limits pause and resume per
+    /// [`NimConfig::pause`] (see [`crate::teacher::generate_resumable`]).
     pub fn generate_traces(
         &self,
         prompts: &[TracePrompt],
@@ -512,109 +767,42 @@ impl NimClient {
     ) -> anyhow::Result<TraceReport> {
         std::fs::create_dir_all(out_dir)
             .with_context(|| format!("create trace output directory {}", out_dir.display()))?;
-        let out_path = out_dir.join("traces.jsonl");
-        let previous = match std::fs::read_to_string(&out_path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(err) => {
-                return Err(err).with_context(|| format!("read trace file {}", out_path.display()))
-            }
+        let pool = crate::teacher::PoolConfig {
+            models: vec![self.config.model.clone()],
+            pause: self.config.pause.clone(),
+            forbid_mixing: false,
         };
-        let existing = existing_ids(&previous, &out_path)?;
-
-        let mut report = TraceReport {
-            out_path: out_path.clone(),
-            ..TraceReport::default()
+        let settings = crate::teacher::GenerationSettings {
+            budget,
+            gate,
+            pool: &pool,
+            max_retries: self.config.max_retries,
+            backoff_base_ms: self.config.backoff_base_ms,
         };
-        let mut requests_made = 0usize;
-        let mut new_lines = String::new();
-        for prompt in prompts {
-            let id = prompt.id();
-            if existing.contains(&id) {
-                report.skipped_existing += 1;
-                continue;
-            }
-            if requests_made >= budget.max_requests {
-                report.skipped_budget += 1;
-                continue;
-            }
-            requests_made += 1;
-            let request = ChatRequest {
-                model: self.config.model.clone(),
-                messages: vec![
-                    ChatMessage::system(format!(
-                        "You are an expert {} programmer. Answer the task with correct, idiomatic \
-                         {} code and its tests. Answer with code only: no prose, no commentary — \
-                         the answer is filtered as training data, and prose around the code gets \
-                         it rejected.",
-                        prompt.language, prompt.language
-                    )),
-                    ChatMessage::user(prompt.prompt.clone()),
-                ],
-                temperature: Some(TRACE_TEMPERATURE),
-                max_tokens: prompt.max_tokens,
-            };
-            match self.complete(&request) {
-                Ok(reply) => {
-                    // The gate runs before the record exists: a rejected reply
-                    // never reaches the file, so `served` stays a count of
-                    // traces that are actually there.
-                    // A language the registry does not know still gets every
-                    // language-independent class (secrets, encoding, blobs,
-                    // brokenness); it just cannot get a language-mixing
-                    // verdict, because there is no declared language to
-                    // contradict.
-                    let snippet_lang = CodeLanguage::parse(&prompt.language)
-                        .map_or(SnippetLanguage::Other, |l| {
-                            crate::langdata::snippet_language(l)
-                        });
-                    let offending =
-                        gate.inspect(None, &reply.content, snippet_lang, &mut report.cheat_scan);
-                    report.cheat_scan.observe(&offending);
-                    if !offending.is_empty() {
-                        eprintln!(
-                            "[nim] trace {id} rejected by the cheat gate: {}",
-                            offending.join(", ")
-                        );
-                        continue;
-                    }
-                    let record = TraceRecord {
-                        id,
-                        language: prompt.language.clone(),
-                        prompt: prompt.prompt.clone(),
-                        completion: reply.content,
-                        model: reply.model,
-                        usage: reply.usage,
-                        seed: prompt.seed,
-                        source: default_trace_source(),
-                    };
-                    let line = serde_json::to_string(&record).context("serialize trace record")?;
-                    new_lines.push_str(&line);
-                    new_lines.push('\n');
-                    report.served += 1;
-                }
-                Err(err) => {
-                    eprintln!("[nim] trace request for prompt id {id} failed: {err:#}");
-                    report.failed += 1;
-                }
-            }
-        }
+        crate::teacher::generate_resumable(
+            self,
+            &crate::teacher::SystemEnv,
+            prompts,
+            &out_dir.join("traces.jsonl"),
+            &settings,
+        )
+    }
 
-        let mut contents = previous;
-        if !contents.is_empty() && !contents.ends_with('\n') {
-            contents.push('\n');
-        }
-        contents.push_str(&new_lines);
-        write_atomic(&out_path, contents.as_bytes())?;
-        eprintln!(
-            "[nim] traces: {} served, {} skipped (existing), {} skipped (budget), {} failed -> {}",
-            report.served,
-            report.skipped_existing,
-            report.skipped_budget,
-            report.failed,
-            out_path.display()
-        );
-        Ok(report)
+    /// One chat-completions exchange, exactly as the server answered it:
+    /// any status, the final header block and the body. No retry, no
+    /// classification; `Err` only when no HTTP response arrived (curl could
+    /// not run, the connection failed, the output was not HTTP). This is the
+    /// transport [`crate::teacher`] builds its pause/rotate loop on.
+    pub fn send_chat(&self, request: &ChatRequest) -> Result<HttpResponse, String> {
+        let body = serde_json::to_vec(request)
+            .map_err(|err| format!("failed to serialize the chat request: {err}"))?;
+        curl_exchange(
+            &self.config,
+            Some(&self.api_key),
+            "POST",
+            &self.completions_url(),
+            Some(&body),
+        )
     }
 
     /// The endpoint URL for one request.
@@ -632,55 +820,217 @@ impl NimClient {
         std::thread::sleep(wait);
     }
 
-    /// Fire one request through curl. Returns the raw response body on 2xx.
+    /// Fire one request through curl. Returns the raw response body on a 2xx
+    /// that is not a rate-limit error object; anything else is an
+    /// [`AttemptError`] carrying the whole exchange.
     fn attempt_once(&self, body: &[u8]) -> Result<String, AttemptError> {
-        let mut child = Command::new("curl")
-            .arg("--silent")
-            .arg("--show-error")
-            .arg("--location")
-            .arg("--include")
-            .arg("--max-time")
-            .arg(self.config.timeout_secs.to_string())
-            .arg("--request")
-            .arg("POST")
-            .arg("--header")
-            .arg("Content-Type: application/json")
-            .arg("--header")
-            .arg(format!("Authorization: Bearer {}", self.api_key))
-            .arg("--data-binary")
-            .arg("@-")
-            .arg(self.completions_url())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|err| AttemptError::Transport(format!("failed to spawn curl: {err}")))?;
-        if let Some(stdin) = child.stdin.as_mut() {
-            stdin.write_all(body).map_err(|err| {
-                AttemptError::Transport(format!("failed to pipe request body to curl: {err}"))
-            })?;
-        }
-        let output = child
-            .wait_with_output()
-            .map_err(|err| AttemptError::Transport(format!("failed to wait for curl: {err}")))?;
-        if !output.status.success() {
-            return Err(AttemptError::Transport(format!(
-                "curl exited with {}: {}",
-                output.status,
-                excerpt(&String::from_utf8_lossy(&output.stderr))
-            )));
-        }
-        let text = String::from_utf8(output.stdout)
-            .map_err(|err| AttemptError::Transport(format!("curl output was not UTF-8: {err}")))?;
-        let (status, body) = split_response(&text)?;
-        if (200..300).contains(&status) {
-            Ok(body.to_string())
+        let response = curl_exchange(
+            &self.config,
+            Some(&self.api_key),
+            "POST",
+            &self.completions_url(),
+            Some(body),
+        )
+        .map_err(AttemptError::Transport)?;
+        if response.is_success()
+            && crate::ratelimit::classify(&response, system_now_unix_ms()).is_none()
+        {
+            Ok(response.body)
         } else {
-            Err(AttemptError::Http {
-                status,
-                body: body.to_string(),
-            })
+            Err(AttemptError::Http(response))
         }
+    }
+}
+
+/// The wall clock as Unix epoch milliseconds (0 if the clock is before 1970).
+pub(crate) fn system_now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+/// The request a trace prompt becomes for `model`: the code-only system
+/// prompt, the task, the low trace temperature and the prompt's token cap.
+pub(crate) fn trace_request(model: &str, prompt: &TracePrompt) -> ChatRequest {
+    ChatRequest {
+        model: model.to_string(),
+        messages: vec![
+            ChatMessage::system(format!(
+                "You are an expert {} programmer. Answer the task with correct, idiomatic \
+                 {} code and its tests. Answer with code only: no prose, no commentary — \
+                 the answer is filtered as training data, and prose around the code gets \
+                 it rejected.",
+                prompt.language, prompt.language
+            )),
+            ChatMessage::user(prompt.prompt.clone()),
+        ],
+        temperature: Some(TRACE_TEMPERATURE),
+        max_tokens: prompt.max_tokens,
+    }
+}
+
+/// `GET {base_url}/{path}` (e.g. `models`) through curl, returning the whole
+/// exchange. The key is optional because some listings (OpenRouter's
+/// `/models`) are public; when given it travels on curl's stdin like every
+/// other request, never on its command line.
+pub fn http_get(
+    config: &NimConfig,
+    api_key: Option<&str>,
+    path: &str,
+) -> anyhow::Result<HttpResponse> {
+    ensure!(
+        !config.base_url.trim().is_empty(),
+        "no base URL for provider {}: pass one explicitly",
+        config.provider.as_str()
+    );
+    ensure_curl()?;
+    let url = format!(
+        "{}/{}",
+        config.base_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    );
+    curl_exchange(config, api_key, "GET", &url, None)
+        .map_err(|message| anyhow!("GET {url} failed: {message}"))
+}
+
+/// One HTTP exchange through curl.
+///
+/// The API key never appears in curl's argv, which every local user can
+/// read (`ps`, `/proc/<pid>/cmdline`): the `Authorization` header is handed
+/// to curl on stdin (`--header @-`). The request body, which is not secret,
+/// goes through a private temporary file instead, since stdin is taken.
+/// `--include` puts the response headers in front of the body, which is how
+/// the rate-limit headers reach [`crate::ratelimit`].
+fn curl_exchange(
+    config: &NimConfig,
+    api_key: Option<&str>,
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+) -> Result<HttpResponse, String> {
+    let body_file = match body {
+        Some(bytes) => Some(
+            BodyFile::create(bytes)
+                .map_err(|err| format!("failed to stage the request body for curl: {err}"))?,
+        ),
+        None => None,
+    };
+    let mut command = Command::new("curl");
+    command
+        .arg("--silent")
+        .arg("--show-error")
+        .arg("--location")
+        .arg("--include")
+        .arg("--max-time")
+        .arg(config.timeout_secs.to_string())
+        .arg("--request")
+        .arg(method);
+    if body_file.is_some() {
+        command.arg("--header").arg("Content-Type: application/json");
+    }
+    if config.provider == Provider::OpenRouter {
+        command
+            .arg("--header")
+            .arg(format!("X-Title: {ATTRIBUTION_TITLE}"));
+    }
+    if api_key.is_some() {
+        command.arg("--header").arg("@-");
+    }
+    if let Some(file) = &body_file {
+        command.arg("--data-binary").arg(file.curl_arg());
+    }
+    let mut child = command
+        .arg(url)
+        .stdin(if api_key.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("failed to spawn curl: {err}"))?;
+    let piped = match (api_key, child.stdin.as_mut()) {
+        (Some(key), Some(stdin)) => {
+            stdin.write_all(format!("Authorization: Bearer {key}\n").as_bytes())
+        }
+        _ => Ok(()),
+    };
+    // Reap curl even when the pipe failed, or it lingers as a zombie;
+    // `wait_with_output` closes stdin first, which is curl's cue that the
+    // header list is complete.
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("failed to wait for curl: {err}"))?;
+    piped.map_err(|err| format!("failed to pipe the auth header to curl: {err}"))?;
+    drop(body_file);
+    if !output.status.success() {
+        return Err(format!(
+            "curl exited with {}: {}",
+            output.status,
+            excerpt(&String::from_utf8_lossy(&output.stderr))
+        ));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|err| format!("curl output was not UTF-8: {err}"))?;
+    let (status, header_block, body) = split_response(&text)?;
+    Ok(HttpResponse::new(
+        status,
+        crate::ratelimit::parse_header_lines(header_block),
+        body,
+    ))
+}
+
+/// A request body staged in a private (`0600`) temporary file for curl's
+/// `--data-binary @path`, removed again on drop.
+struct BodyFile {
+    path: PathBuf,
+}
+
+impl BodyFile {
+    fn create(body: &[u8]) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "dblocks-nim-body-{}-{n}.json",
+            std::process::id()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        // Owned from here on, so a failed write still removes the file.
+        let staged = Self { path };
+        file.write_all(body)?;
+        Ok(staged)
+    }
+
+    /// `@<path>`, curl's "read the data from this file" form.
+    fn curl_arg(&self) -> std::ffi::OsString {
+        let mut arg = std::ffi::OsString::from("@");
+        arg.push(&self.path);
+        arg
+    }
+}
+
+impl Drop for BodyFile {
+    fn drop(&mut self) {
+        // Nothing can act on a failure here: the request already succeeded or
+        // failed on its own terms, and a leftover file holds only the prompt.
+        drop(std::fs::remove_file(&self.path));
+    }
+}
+
+/// Why a failing request stopped retrying, for its error message: the empty
+/// string when the retry limit was reached, a note when the request budget
+/// ran out first.
+fn budget_note(allowance: usize, retries_used: u32, max_retries: u32) -> &'static str {
+    if allowance == 0 && retries_used < max_retries {
+        " (the request budget ran out before the retries did)"
+    } else {
+        ""
     }
 }
 
@@ -703,29 +1053,6 @@ fn ensure_curl() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Ids already recorded in a JSONL trace file. A line that does not parse is
-/// an error naming the line, not a silent skip: appending to a corrupt file
-/// would bury the corruption.
-fn existing_ids(contents: &str, path: &Path) -> anyhow::Result<std::collections::HashSet<String>> {
-    let mut ids = std::collections::HashSet::new();
-    for (index, line) in contents.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let value: serde_json::Value = serde_json::from_str(line).with_context(|| {
-            format!(
-                "trace file {} line {} is not valid JSON; fix or remove it before resuming",
-                path.display(),
-                index + 1
-            )
-        })?;
-        if let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
-            ids.insert(id.to_string());
-        }
-    }
-    Ok(ids)
-}
-
 /// Write `contents` to `path` via a temporary sibling plus rename, so a
 /// reader never observes a partially written trace file. Shared with
 /// [`crate::langdata`], whose pipeline outputs have the same crash-safety
@@ -734,8 +1061,21 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_extension(format!("tmp-{}-{n}", std::process::id()));
-    std::fs::write(&tmp, contents)
-        .with_context(|| format!("write temporary trace file {}", tmp.display()))?;
+    // The temporary file is flushed to disk *before* the rename. Without the
+    // `sync_all`, a crash soon after the rename can leave `path` naming an
+    // empty or partial file -- and since the new contents include every
+    // earlier trace, that loses the paid-for traces of every previous run, not
+    // just this one's.
+    let written = std::fs::File::create(&tmp).and_then(|mut file| {
+        file.write_all(contents)?;
+        file.sync_all()
+    });
+    if let Err(err) = written {
+        // The write already failed; a leftover temporary is clutter, and the
+        // write error is the one worth reporting.
+        drop(std::fs::remove_file(&tmp));
+        return Err(err).with_context(|| format!("write temporary trace file {}", tmp.display()));
+    }
     std::fs::rename(&tmp, path).with_context(|| {
         format!(
             "rename temporary trace file {} over {}",
@@ -743,6 +1083,14 @@ pub(crate) fn write_atomic(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
             path.display()
         )
     })?;
+    // And the rename itself is made durable by syncing the directory.
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    std::fs::File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .with_context(|| format!("flush directory {} to disk", dir.display()))?;
     Ok(())
 }
 
@@ -773,53 +1121,81 @@ struct RawMessage {
     content: Option<String>,
 }
 
-fn parse_reply(raw: &str, request: &ChatRequest) -> anyhow::Result<ChatReply> {
+/// A chat-completions body read leniently: `content` may be absent (a
+/// reasoning model that spent its whole token cap thinking answers with
+/// `content: null`), which [`NimClient::complete`] reports as an error and
+/// the teacher evaluation counts as a truncation.
+#[derive(Clone, Debug, Default)]
+pub struct ParsedChat {
+    /// `choices[0].message.content`, when present.
+    pub content: Option<String>,
+    /// `choices[0].finish_reason`, when reported.
+    pub finish_reason: Option<String>,
+    /// Token usage (zeros when not reported).
+    pub usage: Usage,
+    /// The model the endpoint says served the request.
+    pub model: Option<String>,
+}
+
+/// Parse a chat-completions body. Errors only when the body is not JSON or
+/// carries no choice at all.
+pub fn parse_chat_body(raw: &str) -> anyhow::Result<ParsedChat> {
     let response: RawResponse = serde_json::from_str(raw)
         .with_context(|| format!("NIM response was not valid JSON: {}", excerpt(raw)))?;
     let choice = response
         .choices
         .first()
         .ok_or_else(|| anyhow!("NIM response contained no choices: {}", excerpt(raw)))?;
-    let content = choice.message.content.clone().ok_or_else(|| {
+    Ok(ParsedChat {
+        content: choice.message.content.clone(),
+        finish_reason: choice.finish_reason.clone(),
+        usage: response.usage,
+        model: response.model,
+    })
+}
+
+fn parse_reply(raw: &str, request: &ChatRequest) -> anyhow::Result<ChatReply> {
+    let parsed = parse_chat_body(raw)?;
+    let content = parsed.content.ok_or_else(|| {
         anyhow!(
             "NIM response carried no content (finish_reason: {}): the model spent its {}-token \
              cap without producing an answer — reasoning models need a larger max_tokens",
-            choice.finish_reason.as_deref().unwrap_or("unreported"),
+            parsed.finish_reason.as_deref().unwrap_or("unreported"),
             request.max_tokens
         )
     })?;
     Ok(ChatReply {
         content,
-        usage: response.usage,
-        model: response.model.unwrap_or_else(|| request.model.clone()),
+        usage: parsed.usage,
+        model: parsed.model.unwrap_or_else(|| request.model.clone()),
+        finish_reason: parsed.finish_reason,
     })
 }
 
-/// Split a `curl --include` output into the final status code and the body.
-/// Redirects and `100 Continue` each leave their own header block in the
-/// output, so blocks are stripped while the next one still starts with
-/// `HTTP/`.
-fn split_response(raw: &str) -> Result<(u16, &str), AttemptError> {
+/// Split a `curl --include` output into the final status code, the final
+/// header block and the body. Redirects and `100 Continue` each leave their
+/// own header block in the output, so blocks are stripped while the next one
+/// still starts with `HTTP/`.
+fn split_response(raw: &str) -> Result<(u16, &str, &str), String> {
     let mut rest = raw;
     loop {
         if !rest.starts_with("HTTP/") {
-            return Err(AttemptError::Transport(format!(
+            return Err(format!(
                 "curl output did not start with an HTTP status line: {}",
                 excerpt(rest)
-            )));
+            ));
         }
         let Some((delim_at, delim_len)) = find_header_end(rest) else {
-            return Err(AttemptError::Transport(
-                "curl output ended inside the HTTP headers".to_string(),
-            ));
+            return Err("curl output ended inside the HTTP headers".to_string());
         };
-        let status = parse_status(&rest[..delim_at])?;
+        let header_block = &rest[..delim_at];
+        let status = parse_status(header_block)?;
         let body = &rest[delim_at + delim_len..];
         if body.starts_with("HTTP/") {
             rest = body;
             continue;
         }
-        return Ok((status, body));
+        return Ok((status, header_block, body));
     }
 }
 
@@ -835,14 +1211,12 @@ fn find_header_end(raw: &str) -> Option<(usize, usize)> {
 }
 
 /// The status code of a header block's first line (`HTTP/1.1 200 OK`).
-fn parse_status(header_block: &str) -> Result<u16, AttemptError> {
+fn parse_status(header_block: &str) -> Result<u16, String> {
     let line = header_block.lines().next().unwrap_or("");
     line.split_whitespace()
         .nth(1)
         .and_then(|token| token.parse::<u16>().ok())
-        .ok_or_else(|| {
-            AttemptError::Transport(format!("could not parse an HTTP status from {line:?}"))
-        })
+        .ok_or_else(|| format!("could not parse an HTTP status from {line:?}"))
 }
 
 /// A single-line, length-bounded excerpt of a server response for error
@@ -1010,6 +1384,8 @@ mod tests {
         stop: Arc<std::sync::atomic::AtomicBool>,
         handle: Option<std::thread::JoinHandle<()>>,
         requests: Arc<AtomicCounter>,
+        /// The raw header block of every request received, in order.
+        heads: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl MockServer {
@@ -1021,14 +1397,16 @@ mod tests {
             let addr = listener.local_addr().expect("local addr");
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let requests = Arc::new(AtomicCounter::new(0));
+            let heads = Arc::new(std::sync::Mutex::new(Vec::new()));
             let thread_stop = Arc::clone(&stop);
             let thread_requests = Arc::clone(&requests);
+            let thread_heads = Arc::clone(&heads);
             let handle = std::thread::spawn(move || {
                 while !thread_stop.load(AtomicOrdering::SeqCst) {
                     match listener.accept() {
                         Ok((stream, _)) => {
                             let n = thread_requests.fetch_add(1, AtomicOrdering::SeqCst) + 1;
-                            serve_connection(stream, &responder, n);
+                            serve_connection(stream, &responder, n, &thread_heads);
                         }
                         Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                             std::thread::sleep(Duration::from_millis(2));
@@ -1042,7 +1420,12 @@ mod tests {
                 stop,
                 handle: Some(handle),
                 requests,
+                heads,
             }
+        }
+
+        fn heads(&self) -> Vec<String> {
+            self.heads.lock().expect("heads lock").clone()
         }
 
         fn url(&self) -> String {
@@ -1067,6 +1450,7 @@ mod tests {
         mut stream: std::net::TcpStream,
         responder: &dyn Fn(usize) -> (u16, String),
         n: usize,
+        heads: &std::sync::Mutex<Vec<String>>,
     ) {
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
@@ -1079,6 +1463,10 @@ mod tests {
                 _ => return,
             }
         }
+        heads
+            .lock()
+            .expect("heads lock")
+            .push(String::from_utf8_lossy(&head).into_owned());
         let head_text = String::from_utf8_lossy(&head).to_lowercase();
         let content_length = head_text
             .find("content-length:")
@@ -1115,6 +1503,11 @@ mod tests {
             timeout_secs: 15,
             max_retries: 2,
             backoff_base_ms: 1,
+            provider: Provider::Nim,
+            pause: PausePolicy {
+                jitter_max_ms: 0,
+                ..PausePolicy::default()
+            },
         }
     }
 
@@ -1300,6 +1693,66 @@ mod tests {
         assert_eq!(record.usage.total_tokens, 18);
     }
 
+    /// The budget caps HTTP *requests*, retries included, as its doc says. A
+    /// prompt-counting budget let every prompt spend `max_retries + 1`
+    /// requests: here that was 6 requests against a budget of 2.
+    #[test]
+    fn budget_counts_retries_as_requests() {
+        let server = MockServer::spawn(|_| (500, "{\"error\":\"down\"}".to_string()));
+        let client = test_client(&server.url()); // max_retries: 2
+        let dir = unique_tmp_dir("budget-retries");
+        let report = client
+            .generate_traces(&sample_prompts(3), &dir, TraceBudget { max_requests: 2 })
+            .expect("generate traces");
+        assert_eq!(server.request_count(), 2, "the budget is a request cap");
+        assert_eq!(report.failed, 1, "the first prompt spent the budget retrying");
+        assert_eq!(report.skipped_budget, 2);
+        assert_eq!(report.served, 0);
+    }
+
+    /// The key reaches the server, and it reaches it through curl's stdin,
+    /// not its command line: the request carries exactly one Authorization
+    /// header, and the body arrives intact from the staged file.
+    #[test]
+    fn the_api_key_is_sent_as_a_header_and_the_body_intact() {
+        let server = MockServer::spawn(|_| (200, ok_body("ok")));
+        let client = test_client(&server.url());
+        client.complete(&chat_request()).expect("completion");
+        let heads = server.heads();
+        assert_eq!(heads.len(), 1);
+        let lower = heads[0].to_lowercase();
+        assert_eq!(
+            lower.matches("authorization: bearer test-key").count(),
+            1,
+            "header block: {}",
+            heads[0]
+        );
+        let body_len = serde_json::to_vec(&chat_request()).unwrap().len();
+        assert!(
+            lower.contains(&format!("content-length: {body_len}")),
+            "the body did not arrive whole: {}",
+            heads[0]
+        );
+    }
+
+    /// The staged body is private to the user, holds exactly the body, and is
+    /// gone once the attempt that staged it is over.
+    #[test]
+    fn a_staged_body_is_private_exact_and_removed() {
+        use std::os::unix::fs::PermissionsExt;
+        let staged = BodyFile::create(b"{\"k\":1}").expect("stage");
+        let path = staged.path.clone();
+        assert_eq!(std::fs::read(&path).unwrap(), b"{\"k\":1}");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the staged body is readable by others");
+        assert_eq!(
+            staged.curl_arg(),
+            std::ffi::OsString::from(format!("@{}", path.display()))
+        );
+        drop(staged);
+        assert!(!path.exists(), "the staged body outlived its attempt");
+    }
+
     #[test]
     fn default_budget_is_tiny() {
         assert_eq!(TraceBudget::default().max_requests, 8);
@@ -1432,6 +1885,8 @@ mod tests {
             usage: Usage::default(),
             seed: 0,
             source: "teacher".to_string(),
+            provider: String::new(),
+            requested_model: String::new(),
         })
         .expect("serialize record");
         std::fs::write(&path, format!("{good}\ngarbage\n")).expect("write file");
@@ -1457,6 +1912,8 @@ mod tests {
             usage: Usage::default(),
             seed: 0,
             source: "teacher".to_string(),
+            provider: String::new(),
+            requested_model: String::new(),
         };
         let line = serde_json::to_string(&record).expect("serialize record");
         std::fs::write(&path, format!("{line}\n{line}\n")).expect("write file");
@@ -1483,6 +1940,8 @@ mod tests {
                     },
                     seed: 0,
                     source: "teacher".to_string(),
+                    provider: String::new(),
+                    requested_model: String::new(),
                 }
             };
         let records = vec![
@@ -1607,6 +2066,8 @@ mod tests {
                 usage: Usage::default(),
                 seed: p.seed,
                 source: "teacher".to_string(),
+                provider: String::new(),
+                requested_model: String::new(),
             })
             .collect();
         let (train, val) = split_traces(records.clone(), 0).expect("split 0");
@@ -1614,6 +2075,94 @@ mod tests {
         let (train, val) = split_traces(records.clone(), 100).expect("split 100");
         assert_eq!((train.len(), val.len()), (0, 5));
         assert!(split_traces(records, 101).is_err(), "101 is out of range");
+    }
+
+    /// A short 429 is waited out inside `complete` (the retry-after is 0 and
+    /// the test policy has no jitter), and the retry succeeds.
+    #[test]
+    fn a_short_rate_limit_is_waited_out_and_retried() {
+        let server = MockServer::spawn(|n| {
+            if n == 1 {
+                (
+                    429,
+                    "{\"error\":{\"code\":429,\"message\":\"Rate limit exceeded: free-models-per-min.\",\"retry_after\":0}}"
+                        .to_string(),
+                )
+            } else {
+                (200, ok_body("after the pause"))
+            }
+        });
+        let client = test_client(&server.url());
+        let reply = client.complete(&chat_request()).expect("completion after pause");
+        assert_eq!(reply.content, "after the pause");
+        assert_eq!(server.request_count(), 2);
+    }
+
+    /// A daily cap whose reset is hours away is not slept through by
+    /// `complete`: it fails at once, naming the kind and the reset.
+    #[test]
+    fn a_far_daily_cap_fails_fast_with_its_reset() {
+        let reset = system_now_unix_ms() + 6 * 3_600_000;
+        let server = MockServer::spawn(move |_| {
+            (
+                200,
+                format!(
+                    "{{\"error\":{{\"code\":429,\"message\":\"Rate limit exceeded: free-models-per-day\",\"metadata\":{{\"headers\":{{\"X-RateLimit-Reset\":\"{reset}\"}}}}}}}}"
+                ),
+            )
+        });
+        let client = test_client(&server.url());
+        let err = client.complete(&chat_request()).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("daily limit"), "{message}");
+        assert!(
+            message.contains(&crate::ratelimit::format_unix_ms(reset)),
+            "names the reset: {message}"
+        );
+        assert_eq!(server.request_count(), 1);
+    }
+
+    /// OpenRouter requests carry the generic attribution header, and a NIM
+    /// request does not; the exchange's headers reach the caller.
+    #[test]
+    fn openrouter_requests_carry_the_attribution_header() {
+        let server = MockServer::spawn(|_| (200, ok_body("ok")));
+        let client = NimClient::new(
+            NimConfig {
+                provider: Provider::OpenRouter,
+                ..test_config(&server.url())
+            },
+            "test-key",
+        )
+        .expect("client");
+        let response = client.send_chat(&chat_request()).expect("exchange");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.header("content-type"), Some("application/json"));
+        let nim = test_client(&server.url());
+        nim.send_chat(&chat_request()).expect("exchange");
+        let heads = server.heads();
+        assert!(heads[0].to_lowercase().contains("x-title: unifur"), "{}", heads[0]);
+        assert!(!heads[1].to_lowercase().contains("x-title"), "{}", heads[1]);
+        assert_eq!(heads[0].to_lowercase().matches("authorization: bearer test-key").count(), 1);
+    }
+
+    #[test]
+    fn providers_parse_and_default() {
+        assert_eq!(Provider::parse("OpenRouter").unwrap(), Provider::OpenRouter);
+        assert_eq!(Provider::parse("nim").unwrap(), Provider::Nim);
+        assert!(Provider::parse("other").is_err());
+        let open = NimConfig::for_provider(Provider::OpenRouter);
+        assert_eq!(open.base_url, OPENROUTER_BASE_URL);
+        assert_eq!(open.api_key_env, OPENROUTER_API_KEY_ENV);
+        assert!(NimConfig::for_provider(Provider::Custom).base_url.is_empty());
+        // An old sidecar without the new fields still parses, as NIM.
+        let old: NimConfig = serde_json::from_str("{\"model\":\"m\"}").unwrap();
+        assert_eq!(old.provider, Provider::Nim);
+        // An old trace line without provenance still parses.
+        let line = "{\"id\":\"a\",\"language\":\"rust\",\"prompt\":\"p\",\"completion\":\"c\",\"model\":\"m\",\"usage\":{},\"seed\":0}";
+        let record: TraceRecord = serde_json::from_str(line).unwrap();
+        assert!(record.provider.is_empty() && record.requested_model.is_empty());
+        assert!(!serde_json::to_string(&record).unwrap().contains("provider"), "empty provenance stays off the wire");
     }
 
     /// Real-API smoke test. Ignored by default AND gated on the key: without

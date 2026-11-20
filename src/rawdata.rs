@@ -122,8 +122,42 @@ impl RawImageFormat {
         Ok(label)
     }
 
+    /// Check the layout itself, before any byte is read against it.
+    ///
+    /// The fields are public, so a hand-built format can put the label outside
+    /// the header (it would then be read out of the pixel planes, or past the
+    /// end of the record), name an unsupported label width, or describe a
+    /// zero-byte record (a division by zero in [`Self::record_count`]).
+    fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.label_width == 1 || self.label_width == 2,
+            "unsupported label width {} (expected 1 or 2)",
+            self.label_width
+        );
+        anyhow::ensure!(
+            self.label_offset
+                .checked_add(self.label_width)
+                .is_some_and(|end| end <= self.header_bytes),
+            "the {}-byte label at offset {} does not fit the {}-byte record header",
+            self.label_width,
+            self.label_offset,
+            self.header_bytes
+        );
+        anyhow::ensure!(
+            self.pixel_bytes() > 0,
+            "a record needs pixels: {} channel(s) of {}x{}",
+            self.channels,
+            self.image_size,
+            self.image_size
+        );
+        anyhow::ensure!(self.num_classes > 0, "a format needs at least one class");
+        Ok(())
+    }
+
     /// Validate a file length against the record size.
     fn record_count(&self, len: u64, path: &Path) -> anyhow::Result<usize> {
+        self.validate()
+            .with_context(|| format!("record format for {}", path.display()))?;
         let record = self.record_bytes() as u64;
         if len == 0 {
             anyhow::bail!("{} is empty", path.display());
@@ -284,6 +318,7 @@ impl StreamingSplit {
     /// but never reallocated once it is large enough, which is what keeps
     /// steady-state batching allocation-free.
     pub fn fetch_into(&mut self, indices: &[usize], out: &mut Vec<u8>) -> anyhow::Result<()> {
+        check_indices(indices, self.len())?;
         let pixel_bytes = self.format.pixel_bytes();
         let record_bytes = self.format.record_bytes();
         out.resize(indices.len() * pixel_bytes, 0);
@@ -316,6 +351,20 @@ impl StreamingSplit {
             i = j;
         }
         Ok(())
+    }
+}
+
+/// Refuse a record index past the end of the split before any byte offset is
+/// computed from it.
+///
+/// Without this, an out-of-range index only failed if its offset happened to
+/// land past the end of the file: `index * record_bytes` wraps for a large
+/// enough index, and a wrapped offset reads a *different, valid* record
+/// without complaint.
+fn check_indices(indices: &[usize], len: usize) -> anyhow::Result<()> {
+    match indices.iter().find(|&&index| index >= len) {
+        Some(bad) => anyhow::bail!("record index {bad} is past the end of the {len}-record split"),
+        None => Ok(()),
     }
 }
 
@@ -381,6 +430,22 @@ impl MirroredSplit {
         let file = File::open(first).with_context(|| format!("open {}", first.display()))?;
         let len = file.metadata()?.len();
         let n = format.record_count(len, first)?;
+        // The one divergence that is free to detect: a replica of a different
+        // length is certainly not a mirror. Content is not compared (that would
+        // mean reading every replica to open any of them), so a same-length
+        // replica with different bytes still gets through -- see the
+        // `a_replica_that_is_not_a_mirror_is_caught` test.
+        for replica in &paths[1..] {
+            let replica_len = std::fs::metadata(replica)
+                .with_context(|| format!("stat replica {}", replica.display()))?
+                .len();
+            anyhow::ensure!(
+                replica_len == len,
+                "replica {} is {replica_len} bytes but {} is {len}: it is not a mirror",
+                replica.display(),
+                first.display()
+            );
+        }
 
         let mut labels = Vec::with_capacity(n);
         let record_bytes = format.record_bytes();
@@ -437,9 +502,13 @@ impl MirroredSplit {
     /// Fetch the pixel bytes of `indices` into `out`, in the order given.
     ///
     /// The contract is exactly [`StreamingSplit::fetch_into`]: same order, same
-    /// coalescing, same reusable buffer. The runs that coalescing found are the
-    /// regions that get striped, so the two optimizations stack.
+    /// coalescing, same reusable `out`. The runs that coalescing found are the
+    /// regions that get striped, so the two optimizations stack. Unlike the
+    /// single-file path, each striped run is read into a freshly allocated
+    /// buffer (`MirrorSet::read_striped` returns one), so this path is not
+    /// allocation-free in steady state.
     pub fn fetch_into(&mut self, indices: &[usize], out: &mut Vec<u8>) -> anyhow::Result<()> {
+        check_indices(indices, self.len())?;
         let pixel_bytes = self.format.pixel_bytes();
         let record_bytes = self.format.record_bytes();
         out.resize(indices.len() * pixel_bytes, 0);
@@ -652,6 +721,18 @@ impl<B: Backend> TrainDataset<B> for RawImageDataset {
         let pixel_bytes = format.pixel_bytes();
         let n = self.len();
         anyhow::ensure!(n > 0, "cannot sample from an empty split");
+        // The normalization below is per-channel with three statistics; any
+        // other channel count would broadcast into the wrong shape.
+        anyhow::ensure!(
+            format.channels == 3,
+            "the dataset normalizes three channels, the format has {}",
+            format.channels
+        );
+        // `batch_size` is public; the staging buffers were sized for the value
+        // it had at construction, and the in-memory gather indexes them.
+        self.labels.resize(self.batch_size, 0);
+        self.bytes.resize(self.batch_size * pixel_bytes, 0);
+        self.floats.resize(self.batch_size * pixel_bytes, 0.0);
 
         self.indices.clear();
         for _ in 0..self.batch_size {
@@ -888,14 +969,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A mirror that is *not* a mirror is a real failure mode, so the dataset
-    /// surfaces it: a striped read over diverging replicas returns different
-    /// bytes than replica 0 alone, which is exactly the corruption the oracle
-    /// test exists to catch.
+    /// A mirror that is *not* a mirror is a real failure mode, and this test
+    /// pins down how far the reader is from catching it: **it does not**. A
+    /// striped read over a same-length replica with different bytes returns
+    /// those bytes without an error; the divergence is only visible to a
+    /// byte-for-byte comparison against replica 0 alone (what the oracle tests
+    /// and `dblocks io` do), and the assertion below is that comparison.
     ///
-    /// The replica here is the same *length* as the good one -- a short file
-    /// would be caught by the bounds check, which is a different (and easier)
-    /// failure. Same length, different content is the case that gets through.
+    /// The replica here is the same *length* as the good one -- a replica of a
+    /// different length is refused by `MirroredSplit::open` (see
+    /// `mirrored_open_refuses_a_replica_of_a_different_length`). Same length,
+    /// different content is the case that gets through.
     #[test]
     fn a_replica_that_is_not_a_mirror_is_caught() {
         let dir = scratch_dir("mirror-bad");
@@ -963,9 +1047,76 @@ mod tests {
             .fetch_into(&[0, 1, 99], &mut out)
             .expect_err("must refuse");
         assert!(
-            format!("{err:#}").contains("end of file") || format!("{err:#}").contains("failed"),
+            format!("{err:#}").contains("record index 99 is past the end of the 8-record split"),
             "unhelpful error: {err:#}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The single-file reader refuses an out-of-range index by name too. An
+    /// index whose byte offset wraps (`index * record_bytes` overflowing) used
+    /// to read a different, valid record instead of failing.
+    #[test]
+    fn streaming_read_of_an_out_of_range_index_is_refused() {
+        let dir = scratch_dir("stream-oob");
+        let format = RawImageFormat::CIFAR100;
+        let path = dir.join("small.bin");
+        write_fixture(&path, format, 8);
+        let mut split = StreamingSplit::open(&path, format).unwrap();
+        let mut out = Vec::new();
+        for bad in [8usize, usize::MAX / format.record_bytes() + 1] {
+            let err = split
+                .fetch_into(&[0, bad], &mut out)
+                .expect_err("must refuse");
+            assert!(
+                format!("{err:#}").contains(&format!("record index {bad} is past the end")),
+                "unhelpful error: {err:#}"
+            );
+        }
+        assert_eq!(split.reads_issued(), 0, "no read was issued for a bad batch");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A replica whose length differs from the primary's cannot be a mirror,
+    /// and that is checked at open, where it costs one `stat`.
+    #[test]
+    fn mirrored_open_refuses_a_replica_of_a_different_length() {
+        let dir = scratch_dir("mirror-len");
+        let format = RawImageFormat::CIFAR100;
+        let good = dir.join("good.bin");
+        let short = dir.join("short.bin");
+        write_fixture(&good, format, 16);
+        write_fixture(&short, format, 15);
+        let err = MirroredSplit::open(
+            &[good.clone(), short],
+            format,
+            crate::peregrine::Backend::Threaded,
+        )
+        .expect_err("a shorter replica must be refused");
+        assert!(format!("{err:#}").contains("not a mirror"), "{err:#}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hand-built format whose label does not fit its header is refused
+    /// before a byte is read, instead of reading the label out of the pixels
+    /// or indexing past the record.
+    #[test]
+    fn a_format_whose_label_leaves_the_header_is_refused() {
+        let dir = scratch_dir("bad-format");
+        let path = dir.join("train.bin");
+        write_fixture(&path, RawImageFormat::CIFAR100, 4);
+        let outside = RawImageFormat {
+            label_offset: 2,
+            ..RawImageFormat::CIFAR100
+        };
+        let err = RawImageSplit::read_file(&path, outside).expect_err("label outside header");
+        assert!(format!("{err:#}").contains("does not fit"), "{err:#}");
+        assert!(StreamingSplit::open(&path, outside).is_err());
+        let wide = RawImageFormat {
+            label_width: 3,
+            ..RawImageFormat::CIFAR100
+        };
+        assert!(RawImageSplit::read_file(&path, wide).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

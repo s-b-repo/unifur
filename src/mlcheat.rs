@@ -143,7 +143,8 @@ pub struct MlCheatConfig {
     /// Whether to add word unigram features alongside the char n-grams.
     pub word_unigrams: bool,
     /// Log2 of the hash-bin count per language block. Total weight count is
-    /// `(NUM_LANGS + 2) << hash_bits`. Validated to `4..=20`.
+    /// `(NUM_LANGS + 2) << hash_bits` (9.4M floats at the cap). Validated to
+    /// `4..=20`.
     pub hash_bits: u32,
     /// SGD learning rate (constant; the dataset this trains on is tens of
     /// samples, so a schedule would be decoration).
@@ -182,7 +183,7 @@ impl MlCheatConfig {
     fn validate(&self) -> Result<()> {
         if !(4..=20).contains(&self.hash_bits) {
             bail!(
-                "hash_bits must be in 4..=20 (got {}): below 4 the bins collapse, above 20 the weight vector exceeds 32M floats",
+                "hash_bits must be in 4..=20 (got {}): below 4 the bins collapse, above 20 the weight vector exceeds 9.4M floats",
                 self.hash_bits
             );
         }
@@ -301,7 +302,10 @@ pub struct TrainReport {
     pub positives: usize,
     /// How many were labeled clean (`false`).
     pub negatives: usize,
-    /// Mean binary cross-entropy after each epoch, in order.
+    /// Mean binary cross-entropy per epoch, in order. This is the *online*
+    /// (progressive) loss: each sample's loss is taken just before that
+    /// sample's own SGD step, so it lags the end-of-epoch weights by up to one
+    /// epoch of updates. It is a convergence trace, not a held-out number.
     pub loss_curve: Vec<f64>,
     /// Accuracy on the training set at threshold 0.5 after the final epoch.
     /// This is a convergence check, not a generalization claim — use
@@ -448,8 +452,14 @@ impl MlCheatModel {
         serde_json::to_string(self).context("serialize mlcheat model")
     }
 
-    /// Parse from JSON, rejecting a newer format version and any config whose
-    /// weight count does not match the vector on disk.
+    /// Parse from JSON, rejecting a newer format version, any config whose
+    /// weight count does not match the vector on disk, and any non-finite
+    /// weight or bias.
+    ///
+    /// The last check matters because serde reads an out-of-range JSON number
+    /// into an `f32` as infinity rather than failing: one such weight makes
+    /// every score that touches it NaN, `NaN >= threshold` is false, and the
+    /// learned layer would silently drop nothing while reporting that it ran.
     pub fn from_json(text: &str) -> Result<Self> {
         let model: Self = serde_json::from_str(text).context("parse mlcheat model JSON")?;
         if model.version > MODEL_VERSION {
@@ -466,12 +476,25 @@ impl MlCheatModel {
                 model.weights.len()
             );
         }
+        if !model.bias.is_finite() {
+            bail!("mlcheat model bias is {}, not a finite number", model.bias);
+        }
+        if let Some((i, w)) = model
+            .weights
+            .iter()
+            .enumerate()
+            .find(|(_, w)| !w.is_finite())
+        {
+            bail!("mlcheat model weight {i} is {w}, not a finite number");
+        }
         Ok(model)
     }
 
-    /// Save to `path` as JSON.
+    /// Save to `path` as JSON, atomically (temporary sibling, then rename), so
+    /// a crash mid-write leaves the previous model rather than a truncated
+    /// file the next gate refuses to load.
     pub fn save(&self, path: &Path) -> Result<()> {
-        std::fs::write(path, self.to_json()?)
+        crate::interop::write_atomic(path, self.to_json()?.as_bytes())
             .with_context(|| format!("write mlcheat model to {}", path.display()))
     }
 
@@ -824,6 +847,29 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("newer"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_non_finite_weight_is_rejected_at_load() {
+        // 1e300 does not fit an f32; serde reads it as infinity rather than
+        // failing, and an infinite weight turns every score it touches into
+        // NaN — a learned layer that silently never drops anything.
+        let model = MlCheatModel::new(MlCheatConfig::default()).expect("config");
+        let mut value: serde_json::Value =
+            serde_json::from_str(&model.to_json().expect("json")).expect("parse own json");
+        value["weights"][3] = serde_json::json!(1e300);
+        let err = MlCheatModel::from_json(&value.to_string())
+            .expect_err("an infinite weight must not load")
+            .to_string();
+        assert!(err.contains("finite"), "unexpected error: {err}");
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&model.to_json().expect("json")).expect("parse own json");
+        value["bias"] = serde_json::json!(-1e300);
+        let err = MlCheatModel::from_json(&value.to_string())
+            .expect_err("an infinite bias must not load")
+            .to_string();
+        assert!(err.contains("finite"), "unexpected error: {err}");
     }
 
     #[test]

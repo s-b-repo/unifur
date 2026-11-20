@@ -137,6 +137,9 @@ impl Default for ConsistencyConfig {
 pub struct ConsistencyMetrics {
     pub loss: f32,
     pub ce_loss: f32,
+    /// The executed span's MoE load-balancing loss (unweighted; inside
+    /// `loss` at the model's `moe_aux_weight`). `0.0` for a dense trunk.
+    pub balance_loss: f32,
     pub boundary_loss: f32,
     pub self_loss: f32,
     pub trajectory_loss: f32,
@@ -148,8 +151,9 @@ pub struct ConsistencyMetrics {
 }
 
 impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
-    /// One training step = standard EDM-weighted cross-entropy plus the
-    /// enabled consistency terms (all differentiable).
+    /// One training step = [`DblockClassifier::training_step`]'s loss
+    /// (EDM-weighted cross-entropy plus a sparse trunk's balance and z
+    /// terms) plus the enabled consistency terms (all differentiable).
     pub fn consistency_step<R: Rng>(
         &self,
         pixel_values: &Tensor<B, 4>,
@@ -158,40 +162,24 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
         step: usize,
         rng: &mut R,
     ) -> (Tensor<B, 1>, ConsistencyMetrics) {
-        use burn::tensor::{activation::log_softmax, Distribution};
+        use burn::tensor::Distribution;
 
         let device = pixel_values.device();
         let b = pixel_values.dims()[0];
 
         // --- Standard dblock loss on a random block ----------------------
+        //
+        // This *is* `training_step`: the same RNG draws, the same
+        // EDM-weighted cross-entropy, and -- for a sparse trunk -- the same
+        // load-balancing and router z terms. Recomputing the CE through
+        // `denoise` instead silently dropped those auxiliaries (`denoise`
+        // discards them by design), which leaves a MoE router free to
+        // collapse onto one expert under this objective.
         let z = self.model().normalized_label_embeds(labels.clone());
         let block_idx = rng.random_range(0..self.num_blocks());
         let sigmas = self.sampler(config.gamma).sample(rng, block_idx, b);
-
-        let eps = Tensor::<B, 2>::random(z.dims(), Distribution::Normal(0.0, 1.0), &device);
-        let s_t = Tensor::<B, 1>::from_floats(
-            sigmas
-                .iter()
-                .map(|&v| v as f32)
-                .collect::<Vec<_>>()
-                .as_slice(),
-            &device,
-        );
-        let zt = z.clone() + eps * s_t.unsqueeze_dim::<2>(1);
-
-        let logits = self.denoise(pixel_values.clone(), zt.clone(), &sigmas, Some(block_idx));
-        let log_probs = log_softmax(logits, 1);
-        let nll = -log_probs
-            .gather(1, labels.unsqueeze_dim::<2>(1))
-            .squeeze_dim::<1>(1);
-        let ce_loss = nll.clone().mean();
-
-        let weights: Vec<f32> = sigmas
-            .iter()
-            .map(|&sg| crate::sigma::edm_loss_weight(sg, self.sigma_data()) as f32)
-            .collect();
-        let w = Tensor::<B, 1>::from_floats(weights.as_slice(), &device);
-        let mut loss = (nll * w).mean();
+        let base = self.training_step_on(pixel_values.clone(), labels, &sigmas, block_idx, None);
+        let mut loss = base.loss;
 
         // --- Consistency terms -------------------------------------------
         //
@@ -307,7 +295,8 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
 
         let metrics = ConsistencyMetrics {
             loss: loss.clone().into_scalar(),
-            ce_loss: ce_loss.into_scalar(),
+            ce_loss: base.metrics.ce_loss,
+            balance_loss: base.metrics.balance_loss,
             boundary_loss: m_boundary,
             self_loss: m_self,
             trajectory_loss: m_traj,
@@ -373,6 +362,57 @@ mod tests {
         assert!((s.weight_at(5) - 5.0 / 9.0).abs() < 1e-12);
         // Clamped beyond the horizon.
         assert!((s.weight_at(50) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_consistency_step_keeps_the_sparse_trunks_balance_term() {
+        // With every consistency term off, the step is `training_step`, and
+        // for a MoE trunk that includes the load-balancing loss. Recomputing
+        // the CE through `denoise` used to drop it: a dense and a sparse
+        // trunk then both reported 0 here, and the router trained unbalanced.
+        use crate::{
+            dblock::DblockConfig,
+            vit::{MoeTrunkConfig, ViTDiTConfig},
+        };
+        use burn::backend::NdArray;
+        use rand::{rngs::StdRng, SeedableRng};
+        type B = NdArray<f32>;
+
+        let device = Default::default();
+        let pixels = Tensor::<B, 4>::ones([2, 3, 32, 32], &device);
+        let labels = || Tensor::<B, 1, Int>::from_ints([1i64, 4].as_slice(), &device);
+        let config = ConsistencyConfig {
+            weights: ConsistencyWeights::none(),
+            ..ConsistencyConfig::default()
+        };
+        let dblock = DblockConfig {
+            num_blocks: 2,
+            ..DblockConfig::default()
+        };
+
+        let sparse = DblockClassifier::<B>::new(
+            &ViTDiTConfig::tiny(10).with_moe(MoeTrunkConfig::default()),
+            &dblock,
+            &device,
+        )
+        .unwrap();
+        let mut rng = StdRng::seed_from_u64(7);
+        let (loss, m) = sparse.consistency_step(&pixels, labels(), &config, 0, &mut rng);
+        assert!(m.loss.is_finite() && loss.into_scalar().is_finite());
+        // Every block of a 4-layer, 2-block trunk with every second layer
+        // sparse holds one sparse layer, whose balance loss is positive.
+        assert!(
+            m.balance_loss.is_finite() && m.balance_loss > 0.0,
+            "the sparse trunk's balance loss must reach the objective, got {}",
+            m.balance_loss
+        );
+        assert_eq!(m.boundary_loss, 0.0);
+        assert_eq!(m.cross_fork_loss, 0.0);
+
+        let dense = DblockClassifier::<B>::new(&ViTDiTConfig::tiny(10), &dblock, &device).unwrap();
+        let mut rng = StdRng::seed_from_u64(7);
+        let (_, m) = dense.consistency_step(&pixels, labels(), &config, 0, &mut rng);
+        assert_eq!(m.balance_loss, 0.0, "a dense trunk has no balance term");
     }
 
     #[test]

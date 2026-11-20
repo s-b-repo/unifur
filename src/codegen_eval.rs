@@ -77,17 +77,17 @@ pub const KNOWN_CONTAMINATED: &[(&str, &str)] = &[
     ("codecontests", "DeepMind, 2021; scraped from public judges"),
     (
         "bigcodebench",
-        "ICLR 2024; released after most frontier cutoffs",
+        "Zhuo et al., 2024; public since mid-2024, so inside any later pretraining mix",
     ),
     (
         "ds-1000",
-        "XCodeEval, 2023; data-science notebooks in pretraining",
+        "Lai et al., 2022; data-science problems scraped from StackOverflow",
     ),
     ("leetcode", "scraped from a public site since 2010"),
     ("codeforces", "scraped from a public site since 2010"),
     (
         "cruxeval",
-        "cruxeval.io, 2022; Python transpiled to 32 languages",
+        "Gu et al., 2024; public Python input/output-prediction tasks",
     ),
 ];
 
@@ -149,9 +149,10 @@ impl CorpusIndex {
     /// Build an index over labelled training samples.
     ///
     /// `grams_by_task` records how many distinct n-grams each sample
-    /// contributes, which is what makes the overlap a *fraction of the task*
-    /// rather than a fraction of the whole corpus — otherwise a large corpus
-    /// makes every task look clean.
+    /// contributes, for reporting ([`Self::task_count`]). The overlap is a
+    /// *fraction of the task* rather than of the corpus because
+    /// [`Self::overlap_fraction`] divides by the task's own n-gram count;
+    /// a corpus-sized denominator would make every task look clean.
     pub fn build<'a, I>(samples: I) -> Self
     where
         I: IntoIterator<Item = (&'a str, &'a str)>,
@@ -354,11 +355,32 @@ pub fn admit(tasks: &[Task], index: &CorpusIndex) -> EvalReport {
             text.push_str(t);
             text.push('\n');
         }
-        let c = decontaminate(index, &text, "training corpus n-gram index");
-        if c.is_contaminated {
+        let tests_text = task.tests.join("\n");
+        // Each part is also checked on its own. The overlap is a fraction of
+        // the text checked, so over the concatenation a long original prompt
+        // dilutes a verbatim leaked test below the threshold (and long
+        // original tests dilute a leaked prompt). A part too short to form one
+        // n-gram cannot be measured alone; the combined check covers it, and
+        // refuses the whole task if even that is too short.
+        let parts = [
+            (text.as_str(), "prompt and tests"),
+            (task.prompt.as_str(), "prompt"),
+            (tests_text.as_str(), "tests"),
+        ];
+        let flagged = parts.iter().enumerate().find_map(|(i, (part, what))| {
+            if i > 0 && ngrams(&normalise_tokens(part), NGRAM).is_empty() {
+                return None;
+            }
+            let c = decontaminate(index, part, "training corpus n-gram index");
+            c.is_contaminated.then_some((c, *what))
+        });
+        if let Some((c, what)) = flagged {
             report.rejected.push(RejectedTask {
                 id: task.id.clone(),
-                reason: "n-gram overlap with the training corpus exceeds the threshold".to_string(),
+                reason: format!(
+                    "n-gram overlap of the task's {what} with the training corpus exceeds the \
+                     threshold"
+                ),
                 overlap: c.overlap,
                 example: c.example,
             });
@@ -505,18 +527,24 @@ pub fn write_tasks(path: &Path, tasks: &[Task]) -> Result<()> {
 /// only if the response is part of what the model conditions on. For an SFT
 /// set the response is the label, and a task sharing a label with a training
 /// row is not thereby contaminated; sharing a *problem* is.
+///
+/// Strict, because this index is what certifies a task clean: a row that is
+/// not JSON, or carries no `instruction` string, is an error naming its line.
+/// Skipping such rows (as an earlier version did) left them out of the index,
+/// and a file in another schema (`prompt`, chat `messages`) indexed as all
+/// empty strings — an index that matches nothing, under which every task reads
+/// as uncontaminated. An index with no n-grams at all is refused for the same
+/// reason.
 pub fn index_sft(path: &Path) -> Result<CorpusIndex> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut pairs: Vec<(String, String)> = Vec::new();
-    for line in text.lines() {
+    for (n, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let v: serde_json::Value = match serde_json::from_str(line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        let v: serde_json::Value = serde_json::from_str(line)
+            .with_context(|| format!("{}:{}: not a JSON row", path.display(), n + 1))?;
         let label = v
             .get("id")
             .and_then(|x| x.as_str())
@@ -525,7 +553,14 @@ pub fn index_sft(path: &Path) -> Result<CorpusIndex> {
         let prompt = v
             .get("instruction")
             .and_then(|x| x.as_str())
-            .unwrap_or_default();
+            .with_context(|| {
+                format!(
+                    "{}:{}: row has no `instruction` string; a row the index cannot read is a \
+                     row it cannot check against",
+                    path.display(),
+                    n + 1
+                )
+            })?;
         pairs.push((label, prompt.to_string()));
     }
     if pairs.is_empty() {
@@ -535,7 +570,15 @@ pub fn index_sft(path: &Path) -> Result<CorpusIndex> {
         .iter()
         .map(|(l, t)| (l.as_str(), t.as_str()))
         .collect();
-    Ok(CorpusIndex::build(borrowed))
+    let index = CorpusIndex::build(borrowed);
+    if index.is_empty() {
+        bail!(
+            "{}: every instruction is shorter than one {NGRAM}-gram, so the index is empty and \
+             would certify every task clean",
+            path.display()
+        );
+    }
+    Ok(index)
 }
 
 #[cfg(test)]
@@ -657,6 +700,61 @@ mod tests {
         t.tests = vec![test_text.into()];
         let report = admit(&[t], &index);
         assert_eq!(report.rejected.len(), 1, "leaked tests were not caught");
+    }
+
+    #[test]
+    fn a_leaked_test_is_not_diluted_by_a_long_original_prompt() {
+        // The tests are verbatim in the corpus, but the prompt is long enough
+        // that the leaked n-grams are under 10% of the concatenation.
+        let test_text = "assert_eq!(binary_search(&[1, 2, 3, 5, 8, 13, 21], 13), Ok(5));";
+        let index = CorpusIndex::build([("train", test_text)]);
+        let long_prompt = [MARINE, DIFF, SCHED, CSV].join(" ");
+        let mut t = task("t1", &long_prompt);
+        t.tests = vec![test_text.into()];
+        let mut combined = long_prompt.clone();
+        combined.push('\n');
+        combined.push_str(test_text);
+        assert!(
+            !decontaminate(&index, &combined, "corpus").is_contaminated,
+            "the fixture must be one the concatenated check alone misses"
+        );
+        let report = admit(&[t], &index);
+        assert_eq!(report.rejected.len(), 1, "diluted test leak was admitted");
+        assert!(report.rejected[0].reason.contains("tests"));
+    }
+
+    #[test]
+    fn index_sft_refuses_rows_it_cannot_index() -> Result<()> {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("codegen-eval-sft-{}.jsonl", std::process::id()));
+
+        // Another schema: no `instruction` field anywhere. Indexing this as
+        // empty strings would certify every task clean.
+        std::fs::write(&path, "{\"prompt\": \"a\", \"response\": \"b\"}\n")?;
+        assert!(index_sft(&path).is_err());
+
+        // A malformed line is named, not skipped.
+        let row = format!("{{\"instruction\": \"{SEARCH}\"}}");
+        std::fs::write(&path, format!("{row}\nnot json\n"))?;
+        let err = index_sft(&path)
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default();
+        assert!(
+            err.contains(":2:"),
+            "the refusal must name line 2, got: {err}"
+        );
+
+        // Instructions too short to form one n-gram leave an empty index.
+        std::fs::write(&path, "{\"instruction\": \"sort\"}\n")?;
+        assert!(index_sft(&path).is_err());
+
+        // A well-formed file indexes.
+        std::fs::write(&path, format!("{row}\n"))?;
+        let index = index_sft(&path)?;
+        assert!(!index.is_empty());
+        std::fs::remove_file(&path)?;
+        Ok(())
     }
 
     #[test]

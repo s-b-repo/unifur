@@ -16,7 +16,15 @@
 //! 3. **External analyzers** (clippy, ruff, eslint, golangci-lint, ...), when
 //!    the `codequality-external` feature is enabled and the tool is
 //!    installed. The output is parsed into a `(warning_count, total_lines)`
-//!    pair and converted to a density score.
+//!    pair and converted to a density score. [`ExternalAnalyzer::lint_runner`]
+//!    backs the same dimension with [`crate::lintrunner::lint_all`] instead of
+//!    one configured command: every installed linter for the language runs in
+//!    isolation, and a tool that is not installed, refused or failed
+//!    contributes nothing — never a clean score.
+//! 4. **Suppression density** (opt-in, [`CompositeAnalyzer::with_polyglot`]):
+//!    lint suppressions, skipped or weakened tests and stubs per line, read by
+//!    [`crate::cheat`]'s family passes and the [`crate::polyglot`] catalog —
+//!    see [`polyglot_density`].
 //!
 //! The dimensions are independent by design: a run that disables one keeps
 //! the others, and a run that disables all is exactly the identity
@@ -127,17 +135,27 @@ pub struct Dimension {
 }
 
 impl Dimension {
+    /// A score clamped into `[0, 1]`. A NaN is recorded as `0.0`: `clamp`
+    /// passes NaN through, the geometric mean would turn it into a NaN
+    /// `overall`, and `NaN < threshold` is false — so a broken measurement
+    /// would have survived every drop policy. Failing closed is the only
+    /// reading of "this dimension could not be measured" that a filter can act
+    /// on safely.
     pub fn new(name: impl Into<String>, score: f32) -> Self {
         Self {
             name: name.into(),
-            score: score.clamp(0.0, 1.0),
+            score: if score.is_nan() {
+                0.0
+            } else {
+                score.clamp(0.0, 1.0)
+            },
         }
     }
 }
 
 /// Per-window quality report.
 ///
-/// `overall` is a weighted geometric mean of the per-dimension scores: any
+/// `overall` is the (unweighted) geometric mean of the per-dimension scores: any
 /// single dimension at `0.0` pulls the overall score to `0.0`, which is the
 /// behavior the filter wants — one bad dimension should not be averaged away
 /// by three good ones.
@@ -164,7 +182,7 @@ impl QualityScore {
         }
     }
 
-    /// Weighted geometric mean of the dimensions, or `1.0` if there are none.
+    /// Geometric mean of the dimensions, or `1.0` if there are none.
     /// A dimension at `0.0` makes the product `0.0`, so the filter sees a
     /// clearly bad window rather than a barely-bad one. The
     /// `lexical_density` function is responsible for keeping its own score
@@ -215,6 +233,10 @@ pub struct CompositeAnalyzer<L: CodeAnalyzer> {
     /// Optional external tool, behind the `codequality-external` feature.
     #[cfg_attr(not(feature = "codequality-external"), allow(dead_code))]
     external: Option<ExternalAnalyzer>,
+    /// Suppression/skip/stub density ([`polyglot_density`]). Off unless
+    /// [`Self::with_polyglot`] turns it on, so every existing score is
+    /// unchanged.
+    polyglot: bool,
     _language_phantom: std::marker::PhantomData<L>,
 }
 
@@ -234,8 +256,17 @@ impl<L: CodeAnalyzer> CompositeAnalyzer<L> {
             lexical,
             structural,
             external,
+            polyglot: false,
             _language_phantom: std::marker::PhantomData,
         }
+    }
+
+    /// Add the suppression-density dimension (`"polyglot"`). A language with no
+    /// [`polyglot_lang`] (`Generic`) still has no such dimension: "not
+    /// measured" is not "measured clean".
+    pub fn with_polyglot(mut self) -> Self {
+        self.polyglot = true;
+        self
     }
 }
 
@@ -254,6 +285,11 @@ impl<L: CodeAnalyzer> CodeAnalyzer for CompositeAnalyzer<L> {
         if let Some(s) = &self.structural {
             dimensions.push(Dimension::new("structural", s.score(source)));
         }
+        if self.polyglot {
+            if let Some(lang) = polyglot_lang(self.language) {
+                dimensions.push(Dimension::new("polyglot", polyglot_density(lang, source)));
+            }
+        }
         #[cfg(feature = "codequality-external")]
         if let Some(ext) = &self.external {
             match ext.score(source) {
@@ -267,14 +303,15 @@ impl<L: CodeAnalyzer> CodeAnalyzer for CompositeAnalyzer<L> {
     }
 }
 
-/// Lexical anti-pattern density, in `[0, 1]`.
+/// Lexical anti-pattern density, in `[1/16, 1]`.
 ///
-/// A window with no flagged tokens scores `1.0`. The score falls to `0.0`
-/// as the flagged-token fraction grows; the half-life is set so that a
-/// window where one in four tokens is flagged scores `0.5`. This keeps a
-/// pathologically bad window (`flagged == 1.0`) at `0.0` — the only number
-/// the filter treats as "drop me" — while a mildly bad one still has a
-/// chance to survive with a lower weight.
+/// A window with no flagged tokens scores `1.0`. The score falls as the
+/// flagged-token fraction grows; the half-life is set so that a window where
+/// one in four tokens is flagged scores `0.5`, and a window where *every*
+/// token is flagged bottoms out at `2^-4 = 0.0625`. It never reaches `0.0`,
+/// so this dimension alone never makes [`QualityScore::is_zero`] true: a
+/// [`filter::Policy::Drop`] threshold above `0.0625` is what drops a
+/// lexically pathological window.
 pub fn lexical_density(labeler: &crate::antipattern::Labeler, source: &str) -> f32 {
     let tokens = crate::antipattern::text_tokens(source);
     if tokens.is_empty() {
@@ -294,17 +331,90 @@ pub fn lexical_density(labeler: &crate::antipattern::Labeler, source: &str) -> f
     exponent.exp2().clamp(1e-6, 1.0)
 }
 
+/// The [`crate::polyglot::Lang`] a quality language is read as. `Generic` has
+/// none: there is no catalog for an unknown language.
+pub fn polyglot_lang(language: Language) -> Option<crate::polyglot::Lang> {
+    use crate::polyglot::Lang;
+    match language {
+        Language::Rust => Some(Lang::Rust),
+        Language::Python => Some(Lang::Python),
+        Language::JavaScript => Some(Lang::JavaScript),
+        Language::TypeScript => Some(Lang::TypeScript),
+        Language::Go => Some(Lang::Go),
+        Language::Java => Some(Lang::Java),
+        Language::C => Some(Lang::C),
+        Language::Cpp => Some(Lang::Cpp),
+        Language::Generic => None,
+    }
+}
+
+/// Suppression, skip and stub density, in `[0, 1]`:
+///
+/// `score = 1 - min(weighted / max(lines, 1), 1)`
+///
+/// where `weighted` sums, over every distinct `(class, line)` that
+/// [`crate::cheat::scan_snippet_native`] (the family passes) or
+/// [`crate::polyglot::scan`] (the catalog for `lang`) reports as
+/// [`crate::cheat::CheatClass::DataSuppression`],
+/// [`crate::cheat::CheatClass::DataEvalGaming`] or
+/// [`crate::cheat::CheatClass::DataStub`], a weight by severity: a note (a
+/// reasoned suppression) `0`, quarantine grade `0.5`, reject grade and fraud
+/// `1`. A window with none scores `1.0`; one suppression in a 20-line window
+/// scores `0.95`; a window with a reject-grade hit on every line scores `0.0`,
+/// which [`QualityScore::from_dimensions`] makes the overall score — the
+/// filter should drop a window that is all suppressions.
+pub fn polyglot_density(lang: crate::polyglot::Lang, source: &str) -> f32 {
+    use crate::cheat::{CheatClass, Severity};
+    let lines = source.lines().count().max(1);
+    let (native, _) = crate::cheat::scan_snippet_native(
+        source,
+        lang.snippet_family(),
+        &crate::cheat::MixingPolicy::default(),
+    );
+    let mut strongest: std::collections::BTreeMap<(&'static str, usize), Severity> =
+        std::collections::BTreeMap::new();
+    let findings = native.findings.into_iter().chain(
+        crate::polyglot::scan(source, lang)
+            .iter()
+            .map(crate::cheat::from_polyglot)
+            .collect::<Vec<_>>(),
+    );
+    for f in findings {
+        if !matches!(
+            f.class,
+            CheatClass::DataSuppression | CheatClass::DataEvalGaming | CheatClass::DataStub
+        ) {
+            continue;
+        }
+        let slot = strongest
+            .entry((f.class.as_str(), f.line.unwrap_or(0)))
+            .or_insert(Severity::Note);
+        *slot = (*slot).max(f.severity);
+    }
+    let weighted: f32 = strongest
+        .values()
+        .map(|s| match s {
+            Severity::Note => 0.0,
+            Severity::Evasion => 0.5,
+            Severity::Suppression | Severity::Fraud => 1.0,
+        })
+        .sum();
+    1.0 - (weighted / lines as f32).min(1.0)
+}
+
 /// Cheap structural heuristics. None of them is a defect on its own; the
 /// point is to penalize windows where they all fire together.
 ///
 /// - **nesting depth**: capped at `8`, then scaled. Deeply nested code is
 ///   harder to read; a window that stays shallow scores `1.0`.
-/// - **line length**: fraction of lines longer than `120` characters.
-/// - **blank-line ratio**: a window that is half blank lines scores `0.5`
-///   on this dimension (the heuristic expects roughly 1 blank in 6).
-/// - **identifier naming**: fraction of identifiers in snake_case that are
-///   not actually snake_case, and likewise for camelCase. Surfaces code
-///   that mixes conventions in one window.
+/// - **line length**: fraction of lines longer than `max_line_length`
+///   characters.
+/// - **blank-line ratio**: `1 - |ratio - blank_ratio_target|`; with the
+///   default target of `0.15` a window that is half blank lines scores `0.65`.
+/// - **identifier naming**: fraction of identifiers that mix the two
+///   conventions — an underscore *and* both letter cases (`snake_Mixed`,
+///   `Pascal_Snake`). `SCREAMING_SNAKE` constants are single-case and are not
+///   counted.
 #[derive(Debug, Clone, Copy)]
 pub struct StructuralAnalyzer {
     pub max_nesting: usize,
@@ -332,9 +442,11 @@ impl StructuralAnalyzer {
             return 1.0;
         }
         let depth = max_indent_depth(source);
-        let depth_score = (1.0 - depth as f32 / self.max_nesting as f32).clamp(0.0, 1.0);
+        // `max(1)`: a zero cap is "no nesting allowed", not a 0/0 NaN that
+        // the clamps below would carry straight into the score.
+        let depth_score = (1.0 - depth as f32 / self.max_nesting.max(1) as f32).clamp(0.0, 1.0);
 
-        let (total_lines, long_lines) = line_lengths(source);
+        let (total_lines, long_lines) = line_lengths(source, self.max_line_length);
         let length_score = if total_lines == 0 {
             1.0
         } else {
@@ -387,12 +499,16 @@ fn max_indent_depth(source: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn line_lengths(source: &str) -> (usize, usize) {
+/// `(lines, lines longer than max_chars characters)`. Counted in characters,
+/// not bytes, so a line of non-ASCII text is not "long" at a third of the
+/// limit; and the limit is the analyzer's configured one — it used to be a
+/// hardcoded `120` that silently ignored `max_line_length`.
+fn line_lengths(source: &str, max_chars: usize) -> (usize, usize) {
     let mut total = 0usize;
     let mut long = 0usize;
     for line in source.lines() {
         total += 1;
-        if line.len() > 120 {
+        if line.chars().count() > max_chars {
             long += 1;
         }
     }
@@ -433,19 +549,29 @@ fn naming_consistency(source: &str) -> (usize, usize, usize) {
         let has_upper = word.chars().any(|c| c.is_ascii_uppercase());
         let has_underscore = word.contains('_');
 
+        let has_lower = word.chars().any(|c| c.is_ascii_lowercase());
+
         // Convention (a deliberately simple one): identifiers in code are
-        // either snake_case or camelCase. We don't know which one this
-        // window "should" use -- that depends on the language -- so we
-        // penalize mixed signals: an underscore-bearing identifier that
-        // also has uppercase letters (SNAKE_case_with_Mixed) is the
-        // clearest violation.
-        if has_underscore && has_upper {
-            snake_violations += 1;
-        } else if has_upper
-            && word.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-            && has_underscore
-        {
-            camel_violations += 1;
+        // snake_case, SCREAMING_SNAKE_CASE, or camel/PascalCase. We don't know
+        // which one this window "should" use -- that depends on the language
+        // -- so we penalize only an identifier that mixes them: an underscore
+        // together with *both* letter cases. A single-case identifier with
+        // underscores (`snake_case`, `MAX_LEN`) is consistent. The mixed ones
+        // are split by their first letter: `snake_Mixed` is a snake_case name
+        // that grew capitals, `Pascal_Snake` a PascalCase name that grew
+        // underscores. (The previous code counted every SCREAMING_SNAKE
+        // constant as a violation, and its camel branch was unreachable.)
+        if has_underscore && has_upper && has_lower {
+            let leading_upper = word
+                .trim_start_matches('_')
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase());
+            if leading_upper {
+                camel_violations += 1;
+            } else {
+                snake_violations += 1;
+            }
         }
     }
     (snake_violations, camel_violations, total)
@@ -462,6 +588,9 @@ pub struct ExternalAnalyzer {
     pub name: String,
     /// Command to invoke, including the flag that produces JSON output.
     pub command: Vec<String>,
+    /// Run every installed linter [`crate::lintrunner`] registers for this
+    /// language instead of `command` (see [`Self::lint_runner`]).
+    pub runner: Option<(crate::polyglot::Lang, crate::lintrunner::RunOptions)>,
 }
 
 impl ExternalAnalyzer {
@@ -469,6 +598,31 @@ impl ExternalAnalyzer {
         Self {
             name: name.into(),
             command,
+            runner: None,
+        }
+    }
+
+    /// Back the external dimension with [`crate::lintrunner::lint_all`]: every
+    /// registered linter for `lang` that is installed runs in a private
+    /// directory, and the score is the density of the diagnostics the tools
+    /// that *completed* reported. A tool that is not installed, refused,
+    /// timed out or failed contributes nothing, and when no tool completed the
+    /// dimension is absent — never a clean `1.0`. Linters that execute the code
+    /// they read are never run from here, whatever `options` says.
+    pub fn lint_runner(
+        lang: crate::polyglot::Lang,
+        options: crate::lintrunner::RunOptions,
+    ) -> Self {
+        Self {
+            name: "lintrunner".to_string(),
+            command: Vec::new(),
+            runner: Some((
+                lang,
+                crate::lintrunner::RunOptions {
+                    allow_executing: false,
+                    ..options
+                },
+            )),
         }
     }
 
@@ -557,11 +711,73 @@ mod tests {
     fn test_lexical_density_clamps_above_zero_for_a_pathological_window() {
         // A window where every token is flagged: score must still be > 0
         // so the geometric mean does not collapse to an exact zero. The
-        // floor at 1e-6 is the contract with `QualityScore::from_dimensions`.
-        let labeler = crate::antipattern::Labeler::builtin().expect("built-in rules");
-        let score = lexical_density(&labeler, "pass");
+        // built-in rules need a context (`except:`) before any body, so a
+        // rule with an empty context is used to flag *every* token.
+        use crate::antipattern::{Category, Labeler, Rule, RuleSet};
+        let labeler = Labeler::new(RuleSet {
+            categories: vec![Category {
+                name: "everything".into(),
+                weight: 1.0,
+                description: String::new(),
+            }],
+            rules: vec![Rule {
+                name: "x-run".into(),
+                category: "everything".into(),
+                language: String::new(),
+                context: String::new(),
+                body: "x+".into(),
+                examples: vec!["xxx".into()],
+                counterexamples: vec!["y".into()],
+            }],
+        })
+        .expect("a valid one-rule set");
+        let tokens = crate::antipattern::text_tokens("xxxxxxxx");
+        assert!(
+            labeler.label(&tokens).iter().all(|l| *l != 0),
+            "the fixture must flag every token"
+        );
+        let score = lexical_density(&labeler, "xxxxxxxx");
+        assert!(
+            (score - 0.0625).abs() < 1e-6,
+            "2^-4 at frac = 1, got {score}"
+        );
         assert!(score > 0.0);
-        assert!(score <= 1.0);
+    }
+
+    #[test]
+    fn test_naming_counts_mixed_identifiers_only() {
+        // Constants and plain snake_case are consistent; only an identifier
+        // with an underscore *and* both cases is a violation, and both
+        // branches are reachable.
+        let (snake, camel, total) =
+            naming_consistency("MAX_LEN snake_case camelCase snake_Mixed Pascal_Snake");
+        assert_eq!(total, 5);
+        assert_eq!(snake, 1, "snake_Mixed");
+        assert_eq!(camel, 1, "Pascal_Snake");
+        let (snake, camel, _) = naming_consistency("const MAX_CATEGORIES: usize = MIN_LEN;");
+        assert_eq!((snake, camel), (0, 0), "SCREAMING_SNAKE is not mixed");
+    }
+
+    #[test]
+    fn test_structural_honours_max_line_length_and_a_zero_nesting_cap() {
+        let line = "x".repeat(100);
+        let strict = StructuralAnalyzer {
+            max_line_length: 80,
+            ..StructuralAnalyzer::default()
+        };
+        let lax = StructuralAnalyzer::default();
+        assert!(
+            strict.score(&line) < lax.score(&line),
+            "a 100-char line is long at 80 and not at 120"
+        );
+        // Non-ASCII text is measured in characters, not bytes.
+        assert_eq!(line_lengths(&"é".repeat(100), 120), (1, 0));
+        let zero = StructuralAnalyzer {
+            max_nesting: 0,
+            ..StructuralAnalyzer::default()
+        };
+        assert!(zero.score("    x = 1\n").is_finite());
+        assert_eq!(Dimension::new("nan", f32::NAN).score, 0.0);
     }
 
     #[test]
@@ -708,6 +924,83 @@ mod tests {
         // not contribute, regardless of what command was configured.
         let ext = ExternalAnalyzer::new("clippy", vec!["cargo".into(), "clippy".into()]);
         assert!(matches!(ext.score("fn main() {}"), Ok(None)));
+    }
+
+    #[test]
+    fn test_the_polyglot_dimension_is_off_by_default_and_changes_no_existing_score() {
+        let labeler = crate::antipattern::Labeler::builtin().expect("built-in rules");
+        let text = "import pytest\n@pytest.mark.skipif(True, reason=\"flaky\")\ndef test_add():\n    assert add(1, 1) == 2  # noqa\n";
+        let base = CompositeAnalyzer::<LexicalOnly>::new(
+            Language::Python,
+            Some(labeler.clone()),
+            Some(StructuralAnalyzer::default()),
+            None,
+        );
+        let before = base.analyze(text);
+        // The default composite is exactly lexical and structural, computed
+        // the way it always was.
+        let expected = QualityScore::from_dimensions(
+            Language::Python,
+            vec![
+                Dimension::new("lexical", lexical_density(&labeler, text)),
+                Dimension::new("structural", StructuralAnalyzer::default().score(text)),
+            ],
+            text.lines().count(),
+        );
+        assert_eq!(before, expected);
+        assert!(before.dimensions.iter().all(|d| d.name != "polyglot"));
+        // Turned on, the dimension is present and lowers the score.
+        let with = CompositeAnalyzer::<LexicalOnly>::new(
+            Language::Python,
+            Some(labeler.clone()),
+            Some(StructuralAnalyzer::default()),
+            None,
+        )
+        .with_polyglot()
+        .analyze(text);
+        let poly = with
+            .dimensions
+            .iter()
+            .find(|d| d.name == "polyglot")
+            .expect("polyglot dimension");
+        assert!(poly.score < 1.0, "{poly:?}");
+        assert!(with.overall < before.overall);
+        // Generic has no catalog: no dimension, not a clean one.
+        let generic = CompositeAnalyzer::<LexicalOnly>::new(Language::Generic, None, None, None)
+            .with_polyglot()
+            .analyze(text);
+        assert!(generic.dimensions.is_empty());
+    }
+
+    #[test]
+    fn test_polyglot_density_matches_its_formula() {
+        use crate::polyglot::Lang;
+        assert_eq!(
+            polyglot_density(Lang::Python, "def add(a, b):\n    return a + b\n"),
+            1.0
+        );
+        // One reject-grade suppression in four lines.
+        let one = "x = f()  # noqa\ny = 2\nz = 3\nw = 4\n";
+        assert!((polyglot_density(Lang::Python, one) - 0.75).abs() < 1e-6);
+        // A reasoned suppression is a note and costs nothing.
+        let reasoned = "x = f()  # noqa  # reason: generated code we do not own\ny = 2\n";
+        assert_eq!(polyglot_density(Lang::Python, reasoned), 1.0);
+        // Every line a suppression: zero.
+        assert_eq!(polyglot_density(Lang::Python, "x = f()  # noqa\n"), 0.0);
+    }
+
+    #[test]
+    fn test_the_lint_runner_never_runs_code_executing_tools() {
+        let ext = ExternalAnalyzer::lint_runner(
+            crate::polyglot::Lang::Python,
+            crate::lintrunner::RunOptions {
+                allow_executing: true,
+                ..crate::lintrunner::RunOptions::default()
+            },
+        );
+        let (_, options) = ext.runner.expect("runner configured");
+        assert!(!options.allow_executing);
+        assert!(ext.command.is_empty());
     }
 
     #[test]

@@ -272,7 +272,10 @@ impl Default for RefusalDetector {
 
 impl RefusalDetector {
     pub fn is_refusal(&self, text: &str) -> bool {
-        let lower = text.to_lowercase();
+        // Typographic apostrophes are folded to ASCII first: the phrases are
+        // written with `'`, and "I can’t" (U+2019) would otherwise read as
+        // compliance and undercount the rate the search is scored on.
+        let lower = text.to_lowercase().replace(['\u{2019}', '\u{2018}'], "'");
         self.phrases.iter().any(|p| lower.contains(p.as_str()))
     }
 
@@ -501,8 +504,13 @@ impl HereticConfig {
 pub struct HereticReport {
     pub directions: Vec<Direction>,
     pub trials: Vec<Trial>,
+    /// The trial that was applied: the lowest-scoring one, and only if it
+    /// scores strictly better than the untouched model does on the same
+    /// objective (`baseline_refusals`, since its KL from itself is 0).
+    /// `None` means the input model was returned unchanged.
     pub best: Option<Trial>,
-    /// Refusal rate and KL of the untouched model, for reference.
+    /// Refusal rate of the untouched model (its KL from itself is 0), for
+    /// reference and as the score every applied trial must beat.
     pub baseline_refusals: f64,
 }
 
@@ -590,7 +598,15 @@ pub fn decensor<B: Backend<FloatElem = f32>>(
         }
         Ok((refusals, kl / config.baseline.len() as f64, touched))
     })?;
-    let chosen = best(&trials).cloned();
+    // The untouched model is a point of the search space (`HereticParams::
+    // identity`) with KL 0, so its score is `baseline_refusals`. The search
+    // never evaluates it, so without this comparison a run in which every
+    // trial raised KL without lowering refusals still shipped the "best"
+    // ablation — a model strictly worse, on the run's own objective, than
+    // the one it was given.
+    let chosen = best(&trials)
+        .filter(|t| t.score < baseline_refusals)
+        .cloned();
     let final_model = match &chosen {
         Some(t) => apply::<B, _>(model, &directions, &t.params, Some(&gates))?.0,
         None => model,
@@ -732,6 +748,10 @@ mod tests {
 
         let det = RefusalDetector::default();
         assert!(det.is_refusal("I'm sorry, but I can't help with that"));
+        assert!(
+            det.is_refusal("I\u{2019}m afraid I can\u{2019}t do that"),
+            "a typographic apostrophe must not hide a refusal"
+        );
         assert!(!det.is_refusal("Sure, here is the plan"));
         assert_eq!(det.rate(&["I cannot".into(), "ok".into()]), 0.5);
 

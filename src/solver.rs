@@ -1,5 +1,6 @@
 //! Inference solvers for the dblock probability-flow ODE
-//! `dz/dsigma = (x0(z, sigma) - z) / sigma` (roadmap Phase 4).
+//! `dz/dsigma = (z - x0(z, sigma)) / sigma` (roadmap Phase 4; k-diffusion's
+//! `to_d`).
 //!
 //! Every solver is expressed through an `x0`-prediction oracle (the trained
 //! denoiser projected through the label-embedding table), following the
@@ -41,9 +42,12 @@
 //!   bit-faithful to the reference implementations so published results
 //!   reproduce.
 //! - [`SolverKind::DpmPlusPlus3M`] integrates the quadratic interpolant
-//!   against the exact kernel, so it reproduces *any* `x0` that is quadratic
-//!   in `lambda` to machine precision at any step size. That exactness is
-//!   asserted as a certificate rather than assumed (see [`crate::verify`]).
+//!   against the exact kernel, so once its two-step history is filled every
+//!   step reproduces *any* `x0` that is quadratic in `lambda` to machine
+//!   precision at any step size (the first two steps are the lower-order
+//!   warm-up). That exactness is asserted as a certificate rather than
+//!   assumed (`solver::dpmpp3m_exact_on_quadratic_after_warmup` in
+//!   [`crate::verify`]).
 
 use burn::tensor::{backend::Backend, Tensor};
 use rand::Rng;
@@ -184,6 +188,11 @@ impl<B: Backend> SolverState<B> {
     /// caller owns that evaluation so it can choose the layer span. Only
     /// [`SolverKind::Heun`] needs the extra `predictor` call (at the step's
     /// endpoint); the other kinds ignore it.
+    ///
+    /// A final step to `s_next == 0` returns `x0` for every kind -- the exact
+    /// limit of each update and what k-diffusion does there. The general
+    /// formulas divide by `s_next` (Heun) or take `ln 0` (DPM-Solver++), and
+    /// would return NaN instead.
     pub fn step<F>(
         &mut self,
         s: f64,
@@ -197,6 +206,7 @@ impl<B: Backend> SolverState<B> {
         F: FnMut(f64, &Tensor<B, 2>) -> Tensor<B, 2>,
     {
         let out = match self.kind {
+            _ if s_next == 0.0 => x0.clone(),
             SolverKind::Euler => self.step_euler(s, s_next, z, x0, None, rng),
             SolverKind::Ddim { eta } => self.step_euler(s, s_next, z, x0, Some(eta), rng),
             SolverKind::Heun => {
@@ -488,7 +498,9 @@ mod tests {
         let b = 4usize;
         let h_dim = 8usize;
         let z0 = Tensor::<B, 2>::ones([b, h_dim], &device);
-        let c = 0.0f64;
+        // Non-zero on purpose: with c = 0 the x0 term of every update is
+        // multiplied by zero, so a wrong x0 coefficient would go unseen.
+        let c = 0.3f64;
 
         let mut rng = StdRng::seed_from_u64(0);
         let z_end = integrate(
@@ -499,7 +511,8 @@ mod tests {
             &mut rng,
         );
 
-        let expected = (z0 - c as f32) * (SCHEDULE[SCHEDULE.len() - 1] / SCHEDULE[0]) as f32;
+        let expected =
+            (z0 - c as f32) * (SCHEDULE[SCHEDULE.len() - 1] / SCHEDULE[0]) as f32 + c as f32;
         (z_end - expected).abs().max().into_scalar()
     }
 
@@ -616,6 +629,31 @@ mod tests {
             assert!(
                 err < 1e-4,
                 "{} drifted off the closed form: {err}",
+                kind.name()
+            );
+        }
+    }
+
+    #[test]
+    fn test_final_step_to_sigma_zero_is_the_denoised_estimate() {
+        // Heun divides by s_next and DPM-Solver++ takes ln(s_next); a step to
+        // exactly zero must return x0 (the limit of every update) instead of
+        // NaN, with or without multistep history.
+        let device = Default::default();
+        let x0 = Tensor::<B, 2>::full([1, 3], -0.4, &device);
+        let mut rng = StdRng::seed_from_u64(0);
+        for kind in SolverKind::all() {
+            let mut state = SolverState::<B>::new(kind);
+            let mut predictor = |_s: f64, zz: &Tensor<B, 2>| zz.clone().mul_scalar(0.5);
+            let mut z = Tensor::<B, 2>::full([1, 3], 1.7, &device);
+            for (s, s_next) in [(5.0, 2.0), (2.0, 0.5)] {
+                z = state.step(s, s_next, z, &x0, &mut predictor, &mut rng);
+            }
+            let out = state.step(0.5, 0.0, z, &x0, &mut predictor, &mut rng);
+            let got: Vec<f32> = out.into_data().convert::<f32>().iter::<f32>().collect();
+            assert!(
+                got.iter().all(|v| *v == -0.4f32),
+                "{} did not land on x0: {got:?}",
                 kind.name()
             );
         }

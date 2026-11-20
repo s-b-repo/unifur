@@ -457,6 +457,15 @@ impl ViTDiTConfig {
             "rotary fraction must be in (0, 1], got {}",
             self.rotary_fraction
         );
+        // Rotary turns column pairs, so an odd head dimension cannot be
+        // rotated; `Attention::new` would otherwise abort on it mid-build.
+        anyhow::ensure!(
+            !self.rotary || self.head_dim() % 2 == 0,
+            "rotary positions need an even head dimension, got {} ({} / {} heads)",
+            self.head_dim(),
+            self.hidden_size,
+            self.num_attention_heads
+        );
         Ok(())
     }
 
@@ -1520,7 +1529,9 @@ impl<B: Backend> DbLayer<B> {
             )),
         };
         let mode = config.attention_mode(layer_idx);
-        assert!(
+        // A config error, so it is reported rather than raised: this
+        // constructor is fallible precisely so a bad config names its field.
+        anyhow::ensure!(
             config.causal || mode == AttentionMode::Dense,
             "layer {layer_idx} asks for {} attention, which is only defined causally",
             mode.name()
@@ -2634,6 +2645,15 @@ mod tests {
             .with_mosme(MosmeTrunkConfig::new(MosmeSpec::flat(2)).with_every_n_layers(1));
         let model = ViTDiTForImageClassification::<B>::new(&cfg, &device).unwrap();
 
+        // The layout itself, not a loss magnitude a flat layer could also
+        // reach: every layer must have been built hierarchical.
+        for (i, layer) in model.vit().layers.iter().enumerate() {
+            assert!(
+                matches!(layer.mlp, FeedForward::Hierarchical(_)),
+                "layer {i} must be hierarchical when both are configured"
+            );
+        }
+
         // A single-box hierarchical layer reports a box loss of exactly 1 on
         // top of its expert loss, which a flat layer would not.
         let out = model.vit().forward_block(
@@ -2727,6 +2747,90 @@ mod tests {
     }
 
     #[test]
+    fn test_every_attention_mode_decodes_from_state_like_the_full_forward() {
+        // The decode path (`forward_state`) must reproduce the full causal
+        // forward for every mode, whatever the chunking -- including a window
+        // of 1 (which trims the cache to nothing) and windows/top-k smaller
+        // than the sequence, with partial rotary, GQA, QK-norm and the output
+        // gate all switched on so the per-step offsets are exercised. And every
+        // non-dense mode must actually differ from dense on the same weights,
+        // or a mode that silently fell back to dense would pass the first half.
+        let device = Default::default();
+        let base = Attention::<B>::new(
+            AttentionConfig {
+                hidden_size: 32,
+                num_heads: 4,
+                num_kv_heads: 2,
+                attn_dropout: 0.0,
+                output_dropout: 0.0,
+                mode: AttentionMode::Dense,
+                rotary: true,
+                rotary_dim: crate::hybrid::rotary_dim_for(0.5, 8),
+                gated: true,
+                qk_norm: true,
+            },
+            &device,
+        );
+        crate::tensor_ext::force_initialization(&base);
+        let n = 7usize;
+        let x = Tensor::<B, 3>::random([2, n, 32], Distribution::Uniform(-1.0, 1.0), &device);
+        let dense_full = base.forward(x.clone(), true, 0);
+
+        let modes = [
+            AttentionMode::Dense,
+            AttentionMode::Sliding { window: 1 },
+            AttentionMode::Sliding { window: 3 },
+            AttentionMode::Retrieval { top_k: 2 },
+            AttentionMode::Linear,
+            AttentionMode::Learned,
+        ];
+        for mode in modes {
+            let mut attention = base.clone();
+            attention.mode = mode;
+            let full = attention.forward(x.clone(), true, 0);
+            let reference: Vec<f32> = full
+                .clone()
+                .into_data()
+                .convert::<f32>()
+                .iter::<f32>()
+                .collect();
+            if mode != AttentionMode::Dense {
+                let apart = (full - dense_full.clone()).abs().max().into_scalar();
+                assert!(
+                    apart > 1e-4,
+                    "{mode:?} produced the dense output: it is not a distinct mode"
+                );
+            }
+            for chunks in [vec![n], vec![1; n], vec![3, 1, 3], vec![2, 5]] {
+                let mut state = LayerState::<B>::new();
+                let mut outputs = Vec::new();
+                let mut at = 0;
+                for size in chunks.iter().copied() {
+                    outputs.push(attention.forward_state(x.clone().narrow(1, at, size), &mut state));
+                    at += size;
+                }
+                assert_eq!(state.positions, n);
+                if let AttentionMode::Sliding { window } = mode {
+                    assert_eq!(state.len(), window - 1, "{mode:?} keeps w - 1 keys");
+                    assert_eq!(state.first_key_position, n - (window - 1));
+                }
+                let produced: Vec<f32> = Tensor::cat(outputs, 1)
+                    .into_data()
+                    .convert::<f32>()
+                    .iter::<f32>()
+                    .collect();
+                assert_eq!(produced.len(), reference.len());
+                for (i, (a, b)) in produced.iter().zip(&reference).enumerate() {
+                    assert!(
+                        (a - b).abs() <= 1e-5 * b.abs().max(1.0),
+                        "{mode:?} chunks {chunks:?} element {i}: decode {a} vs full {b}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_causal_mask_shape_and_values() {
         let device = Default::default();
         let mask = causal_mask::<B>(4, &device);
@@ -2759,9 +2863,48 @@ mod tests {
         let pixels = Tensor::<B, 4>::zeros([1, 3, 32, 32], &device);
         let zt = Tensor::<B, 2>::zeros([1, 32], &device);
         let t = Tensor::<B, 1>::zeros([1], &device);
-        let logits = model.forward_all(pixels, zt, t);
+        let logits = model.forward_all(pixels.clone(), zt.clone(), t);
         let max_abs = logits.abs().max().into_scalar();
         assert_eq!(max_abs, 0.0, "zero-init classifier must give zero logits");
+
+        // adaLN-zero: every layer's modulation is exactly zero for *any*
+        // conditioning, so both residual gates vanish and each block starts
+        // as the identity. The zero logits above cannot show this -- the
+        // zeroed classifier alone produces them.
+        let cond = Tensor::<B, 2>::random(
+            [3, cfg.cond_hidden_size],
+            Distribution::Uniform(-3.0, 3.0),
+            &device,
+        );
+        for (i, layer) in model.vit().layers.iter().enumerate() {
+            let mods = layer.ada_ln.forward(cond.clone());
+            assert_eq!(mods.dims(), [3, 6 * cfg.hidden_size]);
+            assert_eq!(
+                mods.abs().max().into_scalar(),
+                0.0,
+                "layer {i}: adaLN modulation must be zero-initialized"
+            );
+            let (gate_msa, gate_mlp) = layer.gates(&cond);
+            assert_eq!(gate_msa.abs().max().into_scalar(), 0.0);
+            assert_eq!(gate_mlp.abs().max().into_scalar(), 0.0);
+        }
+        let head_mods = model.head.ada_ln.forward(cond);
+        assert_eq!(head_mods.abs().max().into_scalar(), 0.0, "head adaLN");
+        // ...so the trunk is the identity on its embeddings, up to the final
+        // norm: every block's residual branches are gated by zero.
+        let t = Tensor::<B, 1>::from_floats([0.3f32], &device);
+        let (emb, cond) = model.vit().embed(pixels.clone(), zt.clone(), t.clone());
+        let through = model.vit().forward_block(0..cfg.num_hidden_layers, pixels, zt, t);
+        let expected = model.vit().final_layernorm.forward(emb);
+        assert_eq!(
+            (through.last_hidden_state - expected)
+                .abs()
+                .max()
+                .into_scalar(),
+            0.0,
+            "zero-gated blocks must pass their input through unchanged"
+        );
+        assert_eq!(through.conditioning.dims(), cond.dims());
 
         // Label embeddings must be non-trivial after init.
         let w = model.label_embedding_weight();

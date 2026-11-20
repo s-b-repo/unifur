@@ -345,13 +345,25 @@ pub(crate) fn spectral_norm<B: Backend<FloatElem = f32>>(
 /// The relaxation step size: one over the closed-form Lipschitz bound of the
 /// energy's gradient, `L = 2 (1 + 2 lambda K) lambda_max(G)`, computed on a
 /// 10%-inflated power-iteration estimate of the metric's top eigenvalue.
+///
+/// The bound used is `2 (1 + 2 lambda K) * lam * max(lam, 1)` with `lam` the
+/// inflated estimate. It is never below the estimated `L`, so the step never
+/// exceeds `1/L` (as far as the 10% inflation covers the power iteration's
+/// undershoot) and descent stays monotone for a metric of any scale. The
+/// `max(lam, 1)` factor
+/// keeps the step bit-identical to the earlier `lam * lam` bound wherever
+/// `lam >= 1` (every fresh metric, and the certificates' identity landscape),
+/// so checkpoints trained there relax exactly as before. The squared bound
+/// alone was wrong for a contracted metric: at `lambda_max(G) = 0.25` it gave
+/// a step `~3.3 / L`, past the descent lemma's `2 / L` stability edge, and
+/// the "certified" relaxation raised the energy every step.
 pub(crate) fn lipschitz_step<B: Backend<FloatElem = f32>>(
     metric: &Tensor<B, 2>,
     lambda: f32,
     slots: usize,
 ) -> f32 {
     let lambda_max = spectral_norm(metric, 24) * 1.1;
-    let bound = 2.0 * (1.0 + 2.0 * lambda * slots as f32) * lambda_max * lambda_max;
+    let bound = 2.0 * (1.0 + 2.0 * lambda * slots as f32) * lambda_max * lambda_max.max(1.0);
     1.0 / bound.max(1e-8)
 }
 
@@ -573,6 +585,23 @@ pub(crate) fn answer_ce<B: Backend<FloatElem = f32>>(
     (ce, ce_value, accuracy)
 }
 
+/// The per-token half of a [`GeomBlock`]'s landscape
+/// ([`GeomBlock::landscape`]): what the slots read, before any slot is
+/// involved.
+pub(crate) struct Landscape<B: Backend> {
+    /// The FiLM-conditioned symbolic stream `[batch, n, hidden]`.
+    pub(crate) stream: Tensor<B, 3>,
+    /// Geodesic-attention keys `[batch, n, dim]`.
+    pub(crate) keys: Tensor<B, 3>,
+    /// Geodesic-attention values `[batch, n, dim]`: what a slot's context is
+    /// a convex combination of.
+    pub(crate) values: Tensor<B, 3>,
+    /// The bounded attention temperature ([`bounded_temperature`]).
+    pub(crate) tau: f32,
+    /// The repulsion coefficient, `softplus(raw) > 0`.
+    pub(crate) lambda: f32,
+}
+
 /// One refinement block: geodesic attention under the block's own learned
 /// metric, a certified energy relaxation of the geometric stream, and the
 /// experience-into-structure write back into the symbolic stream. The block's
@@ -658,6 +687,55 @@ impl<B: Backend<FloatElem = f32>> GeomBlock<B> {
         &self.metric
     }
 
+    /// The per-token half of the block's landscape at noise scale `sigma`:
+    /// the FiLM-conditioned symbolic stream, the keys and values the slots
+    /// read, and the two learned scalars (attention temperature, repulsion).
+    /// Every tensor here is a per-position function of `h`, so it is causal
+    /// whenever `h` is. [`Self::refine`] is built on it; a caller that needs a
+    /// different attention pattern over the same keys (the causal student
+    /// stream, [`crate::student`]) composes it with [`Self::slot_queries`],
+    /// [`Self::step_size`] and the metric instead of re-deriving the block.
+    pub(crate) fn landscape(&self, h: Tensor<B, 3>, sigma: f64) -> Landscape<B> {
+        let device = h.device();
+        let [batch, _, _] = h.dims();
+
+        let sigma_t = Tensor::<B, 1>::ones([batch], &device).mul_scalar(sigma as f32);
+        let cond = crate::vit::silu_public(self.sigma_embedder.forward(sigma_t));
+        let gamma = self.film_scale.forward(cond.clone());
+        let beta = self.film_shift.forward(cond);
+        let stream = h
+            .mul(gamma.add_scalar(1.0).unsqueeze_dim::<3>(1))
+            .add(beta.unsqueeze_dim::<3>(1));
+
+        let hn = self.norm_tokens.forward(stream.clone());
+        let keys = self.k_proj.forward(hn.clone());
+        let values = self.v_proj.forward(hn);
+        // The keys' width is the geometric dim the queries live in too.
+        let [_, _, dim] = keys.dims();
+        // Host reads of the two learned scalars; they add no graph nodes, so
+        // reading them here rather than after the queries changes nothing.
+        let tau = bounded_temperature(self.attn_tau.val().into_scalar(), dim);
+        let lambda = (1.0 + self.repulsion.val().into_scalar().exp()).ln();
+        Landscape {
+            stream,
+            keys,
+            values,
+            tau,
+            lambda,
+        }
+    }
+
+    /// The geodesic-attention queries of slot states `z` `[batch, k, dim]`.
+    pub(crate) fn slot_queries(&self, z: Tensor<B, 3>) -> Tensor<B, 3> {
+        self.q_proj.forward(z)
+    }
+
+    /// The certified relaxation step size for metric `g` at repulsion
+    /// `lambda`, over this block's slot count ([`lipschitz_step`]).
+    pub(crate) fn step_size(&self, g: &Tensor<B, 2>, lambda: f32) -> f32 {
+        lipschitz_step(g, lambda, self.slots)
+    }
+
     /// Refine `(h, z)` for `refine_steps` iterations at noise scale `sigma`.
     ///
     /// The landscape is fixed: the context each slot is drawn toward, the
@@ -672,29 +750,20 @@ impl<B: Backend<FloatElem = f32>> GeomBlock<B> {
         sigma: f64,
         refine_override: Option<usize>,
     ) -> (Tensor<B, 3>, Tensor<B, 3>, RefineTrace) {
-        let device = h.device();
-        let [batch, _, _] = h.dims();
         let steps = refine_override.unwrap_or(self.refine_steps);
 
-        let sigma_t = Tensor::<B, 1>::ones([batch], &device).mul_scalar(sigma as f32);
-        let cond = crate::vit::silu_public(self.sigma_embedder.forward(sigma_t));
-        let gamma = self.film_scale.forward(cond.clone());
-        let beta = self.film_shift.forward(cond);
-        let mut h = h
-            .mul(gamma.add_scalar(1.0).unsqueeze_dim::<3>(1))
-            .add(beta.unsqueeze_dim::<3>(1));
-
-        let hn = self.norm_tokens.forward(h.clone());
-        let keys = self.k_proj.forward(hn.clone());
-        let values = self.v_proj.forward(hn);
-        let queries = self.q_proj.forward(z_in.clone());
-        let dim = queries.dims()[2];
+        let Landscape {
+            stream: mut h,
+            keys,
+            values,
+            tau,
+            lambda,
+        } = self.landscape(h, sigma);
+        let queries = self.slot_queries(z_in.clone());
         let d2 = self.metric.sq_dist(queries, keys.clone());
 
-        let tau = bounded_temperature(self.attn_tau.val().into_scalar(), dim);
-        let lambda = (1.0 + self.repulsion.val().into_scalar().exp()).ln();
         let g = self.metric.metric();
-        let eta = lipschitz_step(&g, lambda, self.slots);
+        let eta = self.step_size(&g, lambda);
 
         let context = softmax(d2.clone().mul_scalar(-1.0 / tau), 2).matmul(values);
 
@@ -1496,6 +1565,11 @@ fn extreme_point(coords: &[(i32, i32)], reference: usize, farthest: bool) -> Opt
 
 /// A reference whose nearest/farthest other point is unique: retried rather
 /// than emit an ambiguous label.
+///
+/// When *every* reference is tied (a lattice square, say) this falls back to
+/// an arbitrary `(reference, other)` pair whose `other` is NOT the unique
+/// extremum. Corpus generation therefore goes through
+/// [`unambiguous_extreme_query`], which rejects that fallback.
 pub(crate) fn extreme_query(
     coords: &[(i32, i32)],
     rng: &mut StdRng,
@@ -1511,6 +1585,34 @@ pub(crate) fn extreme_query(
     }
     let fallback = (0..points).find(|&i| i != start).unwrap_or(start);
     (start, fallback)
+}
+
+/// [`extreme_query`], or `None` when the pair it returned is its all-tied
+/// fallback rather than a unique extremum. The label of that fallback pair is
+/// an arbitrary point, not the answer to the question, so a caller that
+/// writes labels must redraw the scene instead of emitting it.
+pub(crate) fn unambiguous_extreme_query(
+    coords: &[(i32, i32)],
+    rng: &mut StdRng,
+    farthest: bool,
+) -> Option<(usize, usize)> {
+    let (reference, idx) = extreme_query(coords, rng, farthest);
+    (extreme_point(coords, reference, farthest) == Some(idx)).then_some((reference, idx))
+}
+
+/// `points` distinct grid points, drawn uniformly.
+fn draw_coords(rng: &mut StdRng, points: usize) -> Vec<(i32, i32)> {
+    let mut coords: Vec<(i32, i32)> = Vec::with_capacity(points);
+    while coords.len() < points {
+        let candidate = (
+            rng.random_range(0..=GRID_MAX),
+            rng.random_range(0..=GRID_MAX),
+        );
+        if !coords.contains(&candidate) {
+            coords.push(candidate);
+        }
+    }
+    coords
 }
 
 /// A collinear triple: axis-aligned half the time, slope +/-1 the other half;
@@ -1846,7 +1948,7 @@ fn render_scene(coords: &[(i32, i32)], kind_letter: u8, refs: &[usize], answer: 
 
 /// Generate the synthetic geometric-question corpus: scenes of uniquely
 /// placed points on a fixed grid, one question each, rendered at a fixed
-/// width so every document is exactly `10 + 3 * points` tokens and ends in
+/// width so every document is exactly `10 + 5 * points` tokens and ends in
 /// its answer token. Returns the token stream (one contiguous run of scenes)
 /// and the metadata sidecar. Kinds cycle round-robin, exactly reproducing
 /// every corpus written before kind weights existed.
@@ -1878,7 +1980,13 @@ pub fn generate_corpus_weighted(
     seed: u64,
     augment: usize,
 ) -> anyhow::Result<(Vec<u16>, GeomMeta)> {
-    anyhow::ensure!((1..=26).contains(&points), "points must be in [1, 26]");
+    // Every kind asks about at least two points: with one, `direction` would
+    // spin forever drawing a second reference distinct from the first, and
+    // `nearest`/`farthest` would label the reference as its own extremum.
+    anyhow::ensure!(
+        (2..=26).contains(&points),
+        "points must be in [2, 26], not {points}"
+    );
     anyhow::ensure!(!kinds.is_empty(), "at least one question kind is required");
     for kind in kinds {
         anyhow::ensure!(
@@ -1937,25 +2045,41 @@ pub fn generate_corpus_weighted(
             }
         };
         let kind = kinds[kind_idx];
-        let mut coords: Vec<(i32, i32)> = Vec::with_capacity(points);
-        while coords.len() < points {
-            let candidate = (
-                rng.random_range(0..=GRID_MAX),
-                rng.random_range(0..=GRID_MAX),
-            );
-            if !coords.contains(&candidate) {
-                coords.push(candidate);
-            }
-        }
+        let mut coords = draw_coords(&mut rng, points);
         let kind_letter = kind_letter(kind)?;
+        // Which y/n label the inside/collinear constructions aim for. It must
+        // alternate *within each kind*: keyed on `scene_idx` alone, a
+        // round-robin over an even number of kinds puts each kind on one
+        // parity forever (`inside,collinear` made every inside scene 'y' and
+        // every collinear scene 'n'), so the kind letter alone predicts the
+        // answer. `kind_idx + scene_idx / n` is that kind's occurrence parity,
+        // and equals `scene_idx`'s parity whenever `n` is odd, so every
+        // odd-kind-count corpus (the 5-kind default included) is unchanged.
+        let desired = match &cumulative {
+            None => (kind_idx + scene_idx / kinds.len()) % 2 == 0,
+            Some(_) => scene_idx % 2 == 0,
+        };
         let (refs, answer): (Vec<usize>, u8) = match kind {
-            "nearest" => {
-                let (reference, idx) = extreme_query(&coords, &mut rng, false);
-                (vec![reference], b'A' + idx as u8)
-            }
-            "farthest" => {
-                let (reference, idx) = extreme_query(&coords, &mut rng, true);
-                (vec![reference], b'A' + idx as u8)
+            "nearest" | "farthest" => {
+                let farthest = kind == "farthest";
+                let mut redraws = 0usize;
+                loop {
+                    // An all-tied scene has no unique answer; emitting the
+                    // fallback pair would write an arbitrary point as the
+                    // label. Redraw the points instead.
+                    if let Some((reference, idx)) =
+                        unambiguous_extreme_query(&coords, &mut rng, farthest)
+                    {
+                        break (vec![reference], b'A' + idx as u8);
+                    }
+                    redraws += 1;
+                    anyhow::ensure!(
+                        redraws <= 64,
+                        "scene {scene_idx}: 64 draws of {points} points all tied at every \
+                         {kind} reference; refusing to emit an ambiguous label"
+                    );
+                    coords = draw_coords(&mut rng, points);
+                }
             }
             "direction" => {
                 let a = rng.random_range(0..points);
@@ -1968,7 +2092,6 @@ pub fn generate_corpus_weighted(
                 (vec![a, b], compass_byte(dx, dy))
             }
             "inside" => {
-                let desired = scene_idx % 2 == 0;
                 match inside_scenes(&mut rng, desired, &coords[4..]) {
                     Some([a, b, c, d]) => {
                         coords[0] = a;
@@ -1983,7 +2106,6 @@ pub fn generate_corpus_weighted(
                 }
             }
             "collinear" => {
-                let desired = scene_idx % 2 == 0;
                 let arranged = if desired {
                     collinear_triple(&mut rng, &coords[3..])
                 } else {
@@ -2361,26 +2483,33 @@ pub fn train_geom<B: AutodiffBackend<FloatElem = f32>>(
                 ))
             }
         }?;
-        if !metrics.loss.is_finite() {
+        let skipped = !metrics.loss.is_finite();
+        let cycle = if skipped {
             // The same policy as every loop in this crate: a pathological step
             // is discarded, not clipped into something that looks fine.
             report.steps_skipped += 1;
-            accumulator.skip();
             println!(
                 "step {step}: non-finite loss {}, step discarded",
                 metrics.loss
             );
-            continue;
-        }
-        let scaled = if accumulator.every() > 1 {
-            loss.mul_scalar(accumulator.loss_scale() as f32)
+            // A skip still advances the cycle, and on the k-th micro-batch it
+            // is the call that completes it: its `Ready` carries the gradients
+            // the earlier micro-batches folded. Ignoring it threw the whole
+            // step away whenever the *last* micro-batch was the bad one.
+            accumulator.skip()
         } else {
-            loss
+            let scaled = if accumulator.every() > 1 {
+                loss.mul_scalar(accumulator.loss_scale() as f32)
+            } else {
+                loss
+            };
+            let grads = GradientsParams::from_grads(scaled.backward(), &model);
+            accumulator.fold(grads, &model)
         };
-        let grads = GradientsParams::from_grads(scaled.backward(), &model);
-        let cycle = accumulator.fold(grads, &model);
         let Some(summed) = cycle.into_gradients() else {
-            report.steps_accumulated += 1;
+            if !skipped {
+                report.steps_accumulated += 1;
+            }
             continue;
         };
         let mut grads = summed;
@@ -2410,6 +2539,11 @@ pub fn train_geom<B: AutodiffBackend<FloatElem = f32>>(
         model = optim.step(lr_schedule.at(step), model, grads);
         if let Some(ema) = ema.as_mut() {
             ema.update::<B>(&model);
+        }
+        if skipped {
+            // The step applied the earlier micro-batches' gradients; this
+            // micro-batch's own metrics are non-finite and are not recorded.
+            continue;
         }
 
         if report.steps_taken == 0 {
@@ -2933,5 +3067,128 @@ mod tests {
         assert_eq!(compass_byte(-5, -5), b'5');
         assert_eq!(compass_byte(-5, 0), b'6');
         assert_eq!(compass_byte(-5, 5), b'7');
+    }
+
+    #[test]
+    fn test_energy_descent_is_monotone_for_a_contracted_metric() {
+        // The identity-metric descent test above cannot see a step-size bound
+        // that is wrong by a power of `lambda_max`: at `lambda_max = 1` every
+        // power agrees. A learned metric is not the identity. With
+        // `G = 0.25 I` the old `lambda_max^2` bound stepped ~3.3x past `1/L`
+        // and the energy grew every step; with a random non-diagonal factor
+        // the same holds for any contracted metric.
+        let device = Default::default();
+        let lambda = 0.5f32;
+        let slots = 6usize;
+        let mut metrics = Vec::new();
+        let mut diagonal = MetricField::<B>::new(4, &device);
+        diagonal.log_diag =
+            Param::from_tensor(Tensor::<B, 1>::ones([4], &device).mul_scalar(0.5f32.ln()));
+        metrics.push(diagonal);
+        let mut skewed = MetricField::<B>::new(4, &device);
+        skewed.lower = Param::from_tensor(Tensor::<B, 2>::random(
+            [4, 4],
+            Distribution::Normal(0.0, 0.1),
+            &device,
+        ));
+        skewed.log_diag = Param::from_tensor(
+            Tensor::<B, 1>::random([4], Distribution::Normal(0.0, 0.1), &device)
+                .add_scalar(0.4f32.ln()),
+        );
+        metrics.push(skewed);
+        for (case, metric) in metrics.iter().enumerate() {
+            let g = metric.metric();
+            assert!(spectral_norm(&g, 24) < 0.5, "case {case}: not contracted");
+            let eta = lipschitz_step(&g, lambda, slots);
+            let mut z =
+                Tensor::<B, 3>::random([2, slots, 4], Distribution::Normal(0.0, 1.0), &device);
+            let c = Tensor::<B, 3>::random([2, slots, 4], Distribution::Normal(0.0, 1.0), &device);
+            let start = energy_value(&g, &z, &c, lambda, slots);
+            let mut previous = start;
+            let mut worst = 0.0f32;
+            for _ in 0..64 {
+                z = energy_grad_step(&g, &z, &c, lambda, slots, eta);
+                let current = energy_value(&g, &z, &c, lambda, slots);
+                worst = worst.max(current - previous);
+                previous = current;
+            }
+            assert!(
+                worst <= 1e-4,
+                "case {case}: energy increased by {worst} under the certified step"
+            );
+            assert!(
+                previous < start,
+                "case {case}: 64 steps did not lower the energy ({start} -> {previous})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_an_all_tied_scene_is_never_labelled() {
+        // A lattice square: every corner's nearest other corner is tied, so
+        // `extreme_query` can only return its fallback pair, whose "answer"
+        // is an arbitrary point. The generator must see that as no answer.
+        let square = [(0, 0), (2, 0), (0, 2), (2, 2)];
+        let mut rng = StdRng::seed_from_u64(1);
+        assert_eq!(unambiguous_extreme_query(&square, &mut rng, false), None);
+        // the farthest corner (the diagonal) is unique, and is the label
+        let (reference, idx) = unambiguous_extreme_query(&square, &mut rng, true).unwrap();
+        assert_eq!(
+            answer_for("farthest", &square, &[reference]),
+            Some(b'A' + idx as u8)
+        );
+        // and every emitted nearest/farthest scene recomputes its own label
+        let (tokens, meta) = generate_corpus(4, &["nearest", "farthest"], 400, 11).unwrap();
+        for scene in tokens.chunks(meta.scene_len) {
+            let coords: Vec<(i32, i32)> = (0..meta.points)
+                .map(|i| {
+                    let at = 3 + 5 * i;
+                    let digit = |k: usize| i32::from(scene[at + k] - u16::from(b'0'));
+                    (digit(1) * 10 + digit(2), digit(3) * 10 + digit(4))
+                })
+                .collect();
+            let kind_at = 3 + 5 * meta.points;
+            let kind = if scene[kind_at] == u16::from(b'n') {
+                "nearest"
+            } else {
+                "farthest"
+            };
+            let reference = usize::from(scene[kind_at + 1] - u16::from(b'A'));
+            assert_eq!(
+                answer_for(kind, &coords, &[reference]).map(u16::from),
+                Some(scene[meta.scene_len - 1]),
+                "a {kind} scene stores a label its coordinates do not give"
+            );
+        }
+    }
+
+    #[test]
+    fn test_yes_no_labels_alternate_within_each_kind() {
+        // With an even number of round-robin kinds, a parity keyed on the
+        // scene index alone gave every inside scene 'y' and every collinear
+        // scene 'n': the kind letter answered the question. Each binary kind
+        // must carry both labels.
+        let (tokens, meta) = generate_corpus(4, &["inside", "collinear"], 40, 3).unwrap();
+        let kind_at = 3 + 5 * meta.points;
+        for letter in [b'i', b'c'] {
+            let answers: BTreeSet<u16> = tokens
+                .chunks(meta.scene_len)
+                .filter(|scene| scene[kind_at] == u16::from(letter))
+                .map(|scene| scene[meta.scene_len - 1])
+                .collect();
+            assert!(
+                answers.contains(&u16::from(b'y')) && answers.contains(&u16::from(b'n')),
+                "kind {:?} carries only {answers:?}",
+                char::from(letter)
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_one_point_corpus_is_refused() {
+        // `direction` with one point looped forever looking for a second
+        // reference; `nearest` labelled the reference as its own nearest.
+        assert!(generate_corpus(1, &["direction"], 1, 0).is_err());
+        assert!(generate_corpus(1, &["nearest"], 1, 0).is_err());
     }
 }

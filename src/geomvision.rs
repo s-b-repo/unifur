@@ -395,7 +395,9 @@ impl Stroke {
 pub struct Arc {
     pub center: (f64, f64),
     pub radius: f64,
-    /// The swept angle, in degrees; negative sweeps clockwise.
+    /// The swept angle, in degrees, measured from `+x` toward `+y` in the
+    /// figure's own frame (see [`Arc::end`]). In the image frame `y` points
+    /// down, so a positive sweep is clockwise *on screen*.
     pub sweep_degrees: f64,
     pub evidence: Evidence,
 }
@@ -408,7 +410,7 @@ impl Arc {
     }
 
     /// Where the sweep starts, on the convention SVG uses (zero degrees at
-    /// three o'clock, positive anticlockwise).
+    /// three o'clock, positive angles turning from `+x` toward `+y`).
     pub fn start(&self) -> (f64, f64) {
         (self.center.0 + self.radius, self.center.1)
     }
@@ -1285,7 +1287,24 @@ fn ground(
             EntityRef::Point(wanted) => match locate(&clusters, assoc.label.at) {
                 Some(slot) => {
                     let at = clusters[slot].raw;
-                    if clusters[slot].name.is_empty() {
+                    if clusters[slot].name.is_empty() && taken.contains(wanted) {
+                        // Two labels reading the same letter at two different
+                        // points (a misread, or a duplicate in the figure).
+                        // Naming both would put two points called `wanted` in
+                        // the scene, which `add_point` refuses -- taking the
+                        // whole figure down with one bad OCR read. The second
+                        // binding goes on the ledger instead and the point is
+                        // left for the name-mint.
+                        ledger.push(format!(
+                            "label '{}' at ({}, {}) names the point at ({}, {}) '{}', a name another point already carries; the binding is not applied",
+                            assoc.label.text,
+                            assoc.label.at.0,
+                            assoc.label.at.1,
+                            at.0,
+                            at.1,
+                            wanted
+                        ));
+                    } else if clusters[slot].name.is_empty() {
                         clusters[slot].name = wanted.clone();
                         taken.push(wanted.clone());
                         ledger.push(format!(
@@ -1626,15 +1645,37 @@ pub fn render_svg(scene: &GroundedScene) -> String {
     for (index, arc) in scene.arcs.iter().enumerate() {
         let (start, end) = (arc.start(), arc.end());
         let large = i32::from(arc.sweep_degrees.abs() > 180.0);
-        let clockwise = i32::from(arc.sweep_degrees < 0.0);
+        // SVG's sweep-flag 1 is the *positive-angle* direction of the drawing
+        // frame, which is the direction `Arc::end` steps (`+sweep` from `+x`
+        // toward `+y`). The flag used to be set for negative sweeps instead,
+        // which drew every partial arc on the mirror-image circle through the
+        // same two endpoints.
+        let positive = i32::from(arc.sweep_degrees > 0.0);
+        // A closed arc starts and ends at the same point, and SVG omits an arc
+        // segment whose endpoints coincide -- so a full circle rendered as
+        // nothing at all. Draw it as two half turns through the antipode.
+        let segment = if arc.is_closed() {
+            let antipode = (arc.center.0 - arc.radius, arc.center.1);
+            format!(
+                "A {r} {r} 0 1 {positive} {} {} A {r} {r} 0 1 {positive} {} {}",
+                num(antipode.0),
+                num(antipode.1),
+                num(start.0),
+                num(start.1),
+                r = num(arc.radius),
+            )
+        } else {
+            format!(
+                "A {r} {r} 0 {large} {positive} {} {}",
+                num(end.0),
+                num(end.1),
+                r = num(arc.radius),
+            )
+        };
         out.push_str(&format!(
-            "  <path id=\"a{index}\" d=\"M {} {} A {} {} 0 {large} {clockwise} {} {}\" fill=\"none\" stroke=\"#101010\" data-center-x=\"{}\" data-center-y=\"{}\" data-radius=\"{}\" data-sweep=\"{}\"{}/>\n",
+            "  <path id=\"a{index}\" d=\"M {} {} {segment}\" fill=\"none\" stroke=\"#101010\" data-center-x=\"{}\" data-center-y=\"{}\" data-radius=\"{}\" data-sweep=\"{}\"{}/>\n",
             num(start.0),
             num(start.1),
-            num(arc.radius),
-            num(arc.radius),
-            num(end.0),
-            num(end.1),
             num(arc.center.0),
             num(arc.center.1),
             num(arc.radius),
@@ -2379,6 +2420,71 @@ mod tests {
                 "V2".to_string(),
                 "V3".to_string()
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_a_repeated_label_goes_to_the_ledger_instead_of_failing() -> anyhow::Result<()> {
+        // Two labels read 'A' beside two different corners: the figure must
+        // still ground, the first binding stands, and the second is reported.
+        let scene = GroundedScene::new(
+            vec![stroke((0.25, 0.25), (0.75, 0.25), measured(0.2))],
+            Vec::new(),
+            vec![
+                point_label("A", (0.25, 0.25), "A"),
+                point_label("A", (0.75, 0.25), "A"),
+            ],
+            Vec::new(),
+        )?;
+        let names = scene.grounding()?.point_names();
+        assert_eq!(names, vec!["A".to_string(), "V1".to_string()]);
+        assert!(scene
+            .scene
+            .not_established
+            .iter()
+            .any(|line| line.contains("a name another point already carries")));
+        Ok(())
+    }
+
+    #[test]
+    fn test_svg_arcs_are_drawn_on_their_own_circle() -> anyhow::Result<()> {
+        // a quarter arc from (r, 0) to (0, r) about the origin steps in the
+        // positive-angle direction, so SVG's sweep-flag must be 1 -- with 0 the
+        // path is the mirror arc about (r, r)
+        let quarter = Arc {
+            center: (0.5, 0.5),
+            radius: 0.25,
+            sweep_degrees: 90.0,
+            evidence: measured(0.1),
+        };
+        let svg = render_svg(&GroundedScene::new(
+            Vec::new(),
+            vec![quarter],
+            Vec::new(),
+            Vec::new(),
+        )?);
+        assert!(
+            svg.contains("d=\"M 0.75 0.5 A 0.25 0.25 0 0 1 0.5 0.75\""),
+            "{svg}"
+        );
+        // a full circle must not collapse to a zero-length arc, which SVG
+        // drops: it is drawn through the antipode and back
+        let full = Arc {
+            center: (0.5, 0.5),
+            radius: 0.25,
+            sweep_degrees: 360.0,
+            evidence: measured(0.1),
+        };
+        let svg = render_svg(&GroundedScene::new(
+            Vec::new(),
+            vec![full],
+            Vec::new(),
+            Vec::new(),
+        )?);
+        assert!(
+            svg.contains("d=\"M 0.75 0.5 A 0.25 0.25 0 1 1 0.25 0.5 A 0.25 0.25 0 1 1 0.75 0.5\""),
+            "{svg}"
         );
         Ok(())
     }

@@ -63,10 +63,29 @@ pub fn save_content_addressed<B: Backend, M: Module<B>>(
         // save_file appends the recorder extension via set_extension, which
         // *replaces* any existing suffix, so resolve the actual written path.
         let tmp = tmp.with_extension(ext);
-        fs::rename(&tmp, &final_path)
-            .with_context(|| format!("move {} to {}", tmp.display(), final_path.display()))?;
+        publish(&tmp, &final_path, dir)?;
     }
     Ok(final_path)
+}
+
+/// Make a fully written temporary file durable, rename it over `dest`, and
+/// make the rename durable.
+///
+/// Without the `fsync` before the rename, a crash shortly after it can leave
+/// `dest` naming a zero-length or partial file -- and for a content-addressed
+/// checkpoint that is worse than a lost write, because the dedupe in
+/// [`save_content_addressed`] then sees the name, trusts it, and never writes
+/// the real bytes again. The directory `fsync` after the rename is what makes
+/// the new name itself survive the crash.
+fn publish(tmp: &Path, dest: &Path, dir: &Path) -> anyhow::Result<()> {
+    fs::File::open(tmp)
+        .and_then(|file| file.sync_all())
+        .with_context(|| format!("flush {} to disk", tmp.display()))?;
+    fs::rename(tmp, dest)
+        .with_context(|| format!("move {} to {}", tmp.display(), dest.display()))?;
+    fs::File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .with_context(|| format!("flush directory {} to disk", dir.display()))
 }
 
 /// Save on a background thread (roadmap item 13.2): the training loop keeps
@@ -138,15 +157,24 @@ where
     let paths = paths.to_vec();
     // `modules` is consumed by the closure, which must be `'static` because a
     // pooled job outlives the call that queued it.
-    let modules = std::sync::Arc::new(std::sync::Mutex::new(modules.into_iter()));
+    //
+    // Each job takes the module *at its own index*. Taking "the next one" from
+    // a shared iterator paired module k with whichever path index happened to
+    // lock first -- harmless only while every module has the same shape -- and
+    // holding that lock across the load serialized every "parallel" mode.
+    let modules = std::sync::Arc::new(std::sync::Mutex::new(
+        modules.into_iter().map(Some).collect::<Vec<Option<M>>>(),
+    ));
     mode.map(count, move |index| {
-        let mut slot = modules
+        let module = modules
             .lock()
-            .map_err(|_| anyhow::anyhow!("the module queue was poisoned by a failed load"))?;
-        let module = slot
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("ran out of modules at index {index}"))?;
-        let path = &paths[index];
+            .map_err(|_| anyhow::anyhow!("the module table was poisoned by a failed load"))?
+            .get_mut(index)
+            .and_then(Option::take)
+            .ok_or_else(|| anyhow::anyhow!("no module left at index {index}"))?;
+        let path = paths
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("no checkpoint path at index {index}"))?;
         load(module, path, &device)
             .with_context(|| format!("load checkpoint {index} from {}", path.display()))
     })
@@ -505,15 +533,18 @@ impl TrainState {
         Ok(state)
     }
 
-    /// Write atomically: to a temporary name, then renamed into place.
+    /// Write atomically and durably: to a unique temporary name, flushed to
+    /// disk, then renamed into place (see [`publish`]).
     pub fn write(&self, dir: &Path) -> anyhow::Result<PathBuf> {
         fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         let path = Self::json_path(dir);
-        let tmp = dir.join(format!(".state.{}.tmp", std::process::id()));
+        // Unique per call, not just per process: two writes into one state
+        // directory from the same process must not share a temporary file.
+        let unique = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = dir.join(format!(".state.{}.{unique}.tmp", std::process::id()));
         let text = serde_json::to_string_pretty(self).context("serialize training state")?;
         fs::write(&tmp, format!("{text}\n")).with_context(|| format!("write {}", tmp.display()))?;
-        fs::rename(&tmp, &path)
-            .with_context(|| format!("move {} to {}", tmp.display(), path.display()))?;
+        publish(&tmp, &path, dir)?;
         Ok(path)
     }
 
@@ -523,20 +554,37 @@ impl TrainState {
     /// overwritten, or paired with the wrong sidecar fails here by name
     /// instead of loading into a model that is subtly wrong.
     pub fn verify_files(&self, dir: &Path) -> anyhow::Result<()> {
-        let check = |file: &StateFile, what: &str| -> anyhow::Result<()> {
-            let path = resolve(dir, &file.path);
+        let check_at = |path: &Path, file: &StateFile, what: &str| -> anyhow::Result<()> {
             anyhow::ensure!(path.exists(), "{what} file {} is missing", path.display());
-            let actual = file_sha256_hex(&path)?;
+            let actual = file_sha256_hex(path)?;
+            // `file.sha256` comes from a JSON file on disk: a truncated or
+            // hand-edited entry shorter than 16 bytes (or not ASCII) must be
+            // reported as a mismatch, not panic the slice that prints it.
+            let short = |hash: &str| hash.get(..16).unwrap_or(hash).to_string();
             anyhow::ensure!(
                 actual == file.sha256,
                 "{what} file {} is corrupted: sha256 {} does not match the recorded {}",
                 path.display(),
-                &actual[..16],
-                &file.sha256[..16]
+                short(&actual),
+                short(&file.sha256)
             );
             Ok(())
         };
-        check(&self.model, "model")?;
+        let check = |file: &StateFile, what: &str| check_at(&resolve(dir, &file.path), file, what);
+        // The model is verified where it is actually loaded from. Every caller
+        // passes `dir_for(model)`, i.e. `model.with_extension("state")`, so the
+        // loaded file is that directory's sibling. The *recorded* path is where
+        // the model was written: relative to the writer's working directory
+        // (resolving it against `dir` then pointed at a file that never exists,
+        // so resuming a run saved under a relative `--out` always failed), or
+        // absolute (a copied run directory then verified the original file and
+        // loaded an unverified copy).
+        let model_path = if dir.extension().is_some_and(|e| e == "state") {
+            dir.with_extension(Path::new(&self.model.path).extension().unwrap_or_default())
+        } else {
+            resolve(dir, &self.model.path)
+        };
+        check_at(&model_path, &self.model, "model")?;
         for (file, what) in [
             (&self.optimizer, "optimizer"),
             (&self.ema, "EMA shadow"),
@@ -596,16 +644,18 @@ pub fn save_record<B: Backend, R: Record<B>>(
     fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     let recorder = MpkRecorder::new();
     let ext = <MpkRecorder as FileRecorder<B>>::file_extension();
-    // The recorder appends its own extension; give it a name without one so
-    // nothing of ours gets replaced.
+    // The recorder sets its own extension with `set_extension`, which
+    // *replaces* the last `.suffix`. A sacrificial `.tmp` suffix is what gets
+    // replaced; without it the `.{unique}` counter itself was the "extension"
+    // and was overwritten, so every save of one `name` in a process shared a
+    // single temporary path.
     let unique = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dir.join(format!(".{name}.{}.{unique}", std::process::id()));
+    let tmp = dir.join(format!(".{name}.{}.{unique}.tmp", std::process::id()));
     <MpkRecorder as Recorder<B>>::record(&recorder, record, tmp.clone())
         .map_err(|err| anyhow::anyhow!("serialize {name}: {err}"))?;
     let tmp = tmp.with_extension(ext);
     let final_path = dir.join(format!("{name}.{ext}"));
-    fs::rename(&tmp, &final_path)
-        .with_context(|| format!("move {} to {}", tmp.display(), final_path.display()))?;
+    publish(&tmp, &final_path, dir)?;
     Ok(StateFile {
         path: format!("{name}.{ext}"),
         sha256: file_sha256_hex(&final_path)?,
@@ -704,24 +754,41 @@ mod tests {
     /// in the same order. This is the property that makes the mode a
     /// performance decision: a load that came back permuted would pair a model
     /// with the wrong weights, and nothing downstream would notice.
+    fn tiny_model_with_blocks(device: &Device, num_blocks: usize) -> DblockClassifier<B> {
+        DblockClassifier::<B>::new(
+            &tiny_vit_config(),
+            &DblockConfig {
+                num_blocks,
+                ..DblockConfig::default()
+            },
+            device,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn load_all_is_order_preserving_in_every_mode() {
         use crate::blockexec::BlockExecMode;
         let device = Default::default();
         let dir = scratch_dir("load-all");
+        // The modules differ in a non-parameter setting, so a module handed
+        // the wrong index is visible even though loading overwrites every
+        // weight: module i must come back still carrying `blocks[i]`.
+        let blocks = [1usize, 2, 4];
 
         // Three distinct checkpoints, so a permutation would be visible.
         let mut paths = Vec::new();
         for i in 0..3 {
             let sub = dir.join(format!("m{i}"));
-            let model = tiny_model(&device);
+            let model = tiny_model_with_blocks(&device, blocks[i]);
             paths.push(save_content_addressed(model, &sub, "ckpt").expect("save"));
         }
 
         // Reference: load them one at a time and record each model's output.
         let mut reference = Vec::new();
-        for path in &paths {
-            let loaded = load(tiny_model(&device), path, &device).expect("serial load");
+        for (i, path) in paths.iter().enumerate() {
+            let loaded = load(tiny_model_with_blocks(&device, blocks[i]), path, &device)
+                .expect("serial load");
             reference.push(
                 probe_logits(&loaded, &device)
                     .to_data()
@@ -735,7 +802,10 @@ mod tests {
             BlockExecMode::MultiThread,
             BlockExecMode::Parallel,
         ] {
-            let modules: Vec<DblockClassifier<B>> = (0..3).map(|_| tiny_model(&device)).collect();
+            let modules: Vec<DblockClassifier<B>> = blocks
+                .iter()
+                .map(|&b| tiny_model_with_blocks(&device, b))
+                .collect();
             let loaded = load_all(modules, &paths, &device, mode)
                 .unwrap_or_else(|e| panic!("{} load_all failed: {e:#}", mode.as_str()));
             assert_eq!(
@@ -745,6 +815,12 @@ mod tests {
                 mode.as_str()
             );
             for (i, model) in loaded.iter().enumerate() {
+                assert_eq!(
+                    model.num_blocks(),
+                    blocks[i],
+                    "{} handed module {i} another index's slot",
+                    mode.as_str()
+                );
                 let got = probe_logits(model, &device)
                     .to_data()
                     .to_vec::<f32>()
@@ -805,6 +881,121 @@ mod tests {
             "the error does not name an index: {text}"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A sidecar whose recorded hash is shorter than the 16 characters the
+    /// error message prints (a truncated or hand-edited `state.json`) is a
+    /// reported mismatch, not a slice panic.
+    #[test]
+    fn verify_files_reports_a_short_recorded_hash_without_panicking() {
+        let base = scratch_dir("short-hash");
+        fs::create_dir_all(&base).unwrap();
+        let model = base.join("model.mpk");
+        fs::write(&model, b"weights").unwrap();
+        let dir = TrainState::dir_for(&model);
+        fs::create_dir_all(&dir).unwrap();
+        let mut state = TrainState {
+            format_version: STATE_FORMAT_VERSION,
+            kind: "dblock".into(),
+            step: 0,
+            seed: 0,
+            host_rng: serde_json::Value::Null,
+            config: serde_json::Value::Null,
+            build: BuildInfo::current(),
+            datasets: Vec::new(),
+            model: StateFile {
+                path: model.display().to_string(),
+                sha256: "abc".into(),
+            },
+            optimizer: None,
+            ema: None,
+            head: None,
+            head_optimizer: None,
+            extras: serde_json::Value::Null,
+            saved_unix_secs: 0,
+        };
+        let err = state.verify_files(&dir).expect_err("a wrong hash must fail");
+        assert!(format!("{err}").contains("corrupted"), "{err}");
+
+        // ...and the real hash passes, so the check is a comparison and not a
+        // refusal of everything.
+        state.model.sha256 = file_sha256_hex(&model).unwrap();
+        state.verify_files(&dir).expect("the recorded hash matches");
+        let written = state.write(&dir).unwrap();
+        let back = TrainState::read(&written).unwrap();
+        assert_eq!(back.model, state.model);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The model is verified where it is loaded from, not where it was
+    /// written: a run saved under a relative path resumes, and a copied run
+    /// directory with a tampered model is refused even though the original
+    /// recorded file is intact.
+    #[test]
+    fn verify_files_checks_the_loaded_model_not_the_recorded_path() {
+        let base = scratch_dir("loaded-model");
+        let original = base.join("orig");
+        let copy = base.join("copy");
+        fs::create_dir_all(&original).unwrap();
+        fs::create_dir_all(&copy).unwrap();
+        let model = original.join("model.mpk");
+        fs::write(&model, b"weights").unwrap();
+        let state = TrainState {
+            format_version: STATE_FORMAT_VERSION,
+            kind: "dblock".into(),
+            step: 0,
+            seed: 0,
+            host_rng: serde_json::Value::Null,
+            config: serde_json::Value::Null,
+            build: BuildInfo::current(),
+            datasets: Vec::new(),
+            // A relative recorded path, as `model_entry` writes for `--out runs`.
+            model: StateFile {
+                path: "runs/model.mpk".into(),
+                sha256: file_sha256_hex(&model).unwrap(),
+            },
+            optimizer: None,
+            ema: None,
+            head: None,
+            head_optimizer: None,
+            extras: serde_json::Value::Null,
+            saved_unix_secs: 0,
+        };
+        state
+            .verify_files(&TrainState::dir_for(&model))
+            .expect("a relative recorded path must not make resume impossible");
+
+        let copied = copy.join("model.mpk");
+        fs::write(&copied, b"tampered").unwrap();
+        let mut absolute = state.clone();
+        absolute.model.path = model.display().to_string();
+        let err = absolute
+            .verify_files(&TrainState::dir_for(&copied))
+            .expect_err("the copy that is loaded is not the file that was hashed");
+        assert!(format!("{err}").contains("corrupted"), "{err}");
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Two records saved under one name land in the final file, and no
+    /// temporary file is left behind; the temp name keeps its per-call
+    /// counter (it used to be erased by the recorder's `set_extension`).
+    #[test]
+    fn save_record_publishes_and_leaves_no_temporaries() {
+        let device = Default::default();
+        let dir = scratch_dir("save-record");
+        let first = save_record::<B, _>(tiny_model(&device).into_record(), &dir, "rec").unwrap();
+        let second = save_record::<B, _>(tiny_model(&device).into_record(), &dir, "rec").unwrap();
+        assert_eq!(first.path, second.path);
+        assert_eq!(
+            file_sha256_hex(&resolve(&dir, &second.path)).unwrap(),
+            second.sha256
+        );
+        let names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![second.path.clone()], "leftovers: {names:?}");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

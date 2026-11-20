@@ -201,7 +201,9 @@ impl DblockSigmaSampler {
 
 /// Maps per-sample sigmas to their target block index
 /// (`estimate_target_layer`). Each sigma is bucketized against the ascending
-/// block boundaries (`torch.bucketize(..., right=True)` semantics), the raw
+/// block boundaries into the half-open window `(lo, hi]` that contains it --
+/// a sigma exactly on a boundary belongs to the *lower* window, matching
+/// [`block_window`] (this is `torch.bucketize(..., right=False)`), the raw
 /// window index is reversed so that **block 0 sees the noisiest states**
 /// (it holds the first transformer layers), and the majority block across
 /// the batch is returned.
@@ -210,7 +212,7 @@ pub fn estimate_target_layer(block_bounds: &[f64], sigmas: &[f64]) -> usize {
     assert!(n >= 1, "block_bounds must contain num_blocks + 1 entries");
     let mut counts = vec![0usize; n];
     for &s in sigmas {
-        // First index whose boundary is >= s (right=True bucketize).
+        // First index whose boundary is >= s, i.e. bounds[idx-1] < s <= bounds[idx].
         let idx = block_bounds.partition_point(|&b| b < s);
         // Window index containing s.
         let raw = idx.saturating_sub(1).min(n - 1);
@@ -419,8 +421,27 @@ mod tests {
         assert_relative_eq!(p.c_in, 2.0_f64.sqrt(), epsilon = 1e-12);
         assert_relative_eq!(p.c_noise, 0.25 * (0.5f64).ln(), epsilon = 1e-12);
 
-        // Identity check: D(x) = c_out * F(c_in * zt) + c_skip * zt reproduces
-        // x when F is exact at any sigma.
+        // The properties the coefficients are *derived* from (Karras et al.
+        // 2022, App. B.6), checked independently of the formulas above: for
+        // x with variance sd^2 and z = x + sigma n, c_skip is the stationary
+        // point of Var[x - c z] = (1 - c)^2 sd^2 + c^2 sigma^2, and c_out is
+        // that residual's std, so the network target (x - c_skip z) / c_out
+        // has unit variance and c_in z has unit variance.
+        let sd = 0.5f64;
+        for sigma in [0.002f64, 0.1, 0.5, 3.0, 80.0] {
+            let p = EdmPreconditioning::new(sigma, sd);
+            let stationarity = -(1.0 - p.c_skip) * sd * sd + p.c_skip * sigma * sigma;
+            assert!(stationarity.abs() <= 1e-12 * (sd * sd + sigma * sigma));
+            let target_var = ((1.0 - p.c_skip).powi(2) * sd * sd
+                + p.c_skip.powi(2) * sigma * sigma)
+                / (p.c_out * p.c_out);
+            assert_relative_eq!(target_var, 1.0, max_relative = 1e-12);
+            assert_relative_eq!(
+                p.c_in * p.c_in * (sd * sd + sigma * sigma),
+                1.0,
+                max_relative = 1e-12
+            );
+        }
     }
 
     #[test]
@@ -445,7 +466,7 @@ mod tests {
         assert_eq!(estimate_target_layer(&bounds, &[0.5]), 1);
         // Majority vote across mixed sigmas (2x high noise vs 1x low).
         assert_eq!(estimate_target_layer(&bounds, &[50.0, 60.0, 0.1]), 0);
-        // Boundary value belongs to the lower window (right=True semantics):
+        // Boundary value belongs to the lower window, (lo, hi]:
         // s == bounds[2] -> raw window 1 -> block 3-1-1 = 1.
         assert_eq!(estimate_target_layer(&bounds, &[bounds[2]]), 1);
     }

@@ -152,7 +152,7 @@ impl BlockExecMode {
     {
         anyhow::ensure!(items > 0, "a block batch needs at least one item");
         match self {
-            Self::Sync => (0..items).map(&f).collect(),
+            Self::Sync => (0..items).map(|index| run_item(index, &f)).collect(),
             Self::MultiThread => map_threaded(items, &f),
             Self::Parallel => map_pooled(items, f),
         }
@@ -272,6 +272,21 @@ fn take_slot<T>(mutex: Mutex<Option<T>>) -> Option<T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Run one item, turning both an error and a panic into an error that names
+/// the item. Every mode goes through this, so a failing or panicking item
+/// surfaces identically whichever mode ran it -- the mode stays a pure
+/// performance decision even on the failure path.
+fn run_item<T, F>(index: usize, f: &F) -> anyhow::Result<T>
+where
+    F: Fn(usize) -> anyhow::Result<T>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(index))) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => Err(e.context(format!("item {index} failed"))),
+        Err(_) => Err(anyhow::anyhow!("item {index} panicked")),
+    }
+}
+
 /// One item per thread, joined at the end of the batch.
 fn map_threaded<T, F>(items: usize, f: &F) -> anyhow::Result<Vec<T>>
 where
@@ -286,20 +301,21 @@ where
         let handles: Vec<_> = (0..items)
             .map(|index| {
                 let slots = &slots;
-                scope.spawn(move || match f(index) {
+                scope.spawn(move || match run_item(index, f) {
                     Ok(value) => {
                         *lock(&slots[index], "slot lock") = Some(value);
                         None
                     }
-                    Err(e) => Some(e.context(format!("item {index} failed"))),
+                    Err(e) => Some(e),
                 })
             })
             .collect();
         handles
             .into_iter()
-            .filter_map(|handle| match handle.join() {
+            .enumerate()
+            .filter_map(|(index, handle)| match handle.join() {
                 Ok(result) => result,
-                Err(_) => Some(anyhow::anyhow!("a worker thread panicked")),
+                Err(_) => Some(anyhow::anyhow!("item {index}: its worker thread panicked")),
             })
             .collect()
     });
@@ -428,23 +444,13 @@ where
                 // count is bumped on every path -- including the failing and
                 // panicking ones. A counter that skipped a failure would leave
                 // the caller waiting for a slot that will never be filled.
-                let outcome = {
-                    let result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(index)));
-                    match result {
-                        Ok(Ok(value)) => {
-                            *lock(&slots[index], "slot lock") = Some(value);
-                            Ok(())
-                        }
-                        Ok(Err(e)) => Err(e.context(format!("item {index} failed"))),
-                        // A panic inside a pool worker must not kill the
-                        // worker: `catch_unwind` keeps one bad item from
-                        // turning into a dead pool for the rest of the run.
-                        Err(_) => Err(anyhow::anyhow!("item {index} panicked")),
-                    }
-                };
-                if let Err(e) = outcome {
-                    lock(&failures, "failure lock").push((index, e));
+                //
+                // A panic inside a pool worker must not kill the worker:
+                // `run_item`'s `catch_unwind` keeps one bad item from turning
+                // into a dead pool for the rest of the run.
+                match run_item(index, &*f) {
+                    Ok(value) => *lock(&slots[index], "slot lock") = Some(value),
+                    Err(e) => lock(&failures, "failure lock").push((index, e)),
                 }
                 done.fetch_add(1, Ordering::Release);
             })
@@ -479,12 +485,12 @@ where
         std::thread::sleep(std::time::Duration::from_micros(50));
     }
 
-    let mut failures = Arc::try_unwrap(failures)
-        .map(|m| {
-            m.into_inner()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-        })
-        .unwrap_or_default();
+    // The contents are *taken* under their locks rather than by unwrapping the
+    // `Arc`s: a worker bumps `done` before its job closure -- and the `Arc`
+    // clones it captured -- is dropped, so `Arc::try_unwrap` here could still
+    // see a second owner. Unwrapping would then have silently dropped every
+    // recorded failure, or reported a spurious error, depending on timing.
+    let mut failures = std::mem::take(&mut *lock(&failures, "failure lock"));
     if !failures.is_empty() {
         // Report the *lowest-indexed* failure, so the error a run shows is
         // reproducible rather than whichever worker lost the race to the lock.
@@ -492,11 +498,14 @@ where
         return Err(failures.remove(0).1);
     }
 
-    let slots =
-        Arc::try_unwrap(slots).map_err(|_| anyhow::anyhow!("a pooled item outlived its batch"))?;
     slots
-        .into_iter()
-        .map(|slot| take_slot(slot).ok_or_else(|| anyhow::anyhow!("an item produced no result")))
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| {
+            lock(slot, "slot lock")
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("item {index} produced no result"))
+        })
         .collect()
 }
 
@@ -631,17 +640,39 @@ mod tests {
     fn a_panicking_item_becomes_an_error() {
         // The panic message is printed by the default hook; the assertion is
         // that `map` returns rather than unwinding.
+        //
+        // Every mode, not just the pool: a mode that let the panic unwind
+        // through the caller would make the mode choice change the program.
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let result: anyhow::Result<Vec<usize>> = BlockExecMode::Parallel.map(4, |i| {
-            if i == 2 {
-                panic!("worker panic");
-            }
-            Ok(i)
-        });
+        let results: Vec<(BlockExecMode, anyhow::Result<Vec<usize>>)> = [
+            BlockExecMode::Sync,
+            BlockExecMode::MultiThread,
+            BlockExecMode::Parallel,
+        ]
+        .into_iter()
+        .map(|mode| {
+            let result = std::panic::catch_unwind(|| {
+                mode.map(4, |i| {
+                    if i == 2 {
+                        panic!("worker panic");
+                    }
+                    Ok(i)
+                })
+            });
+            (mode, result.unwrap_or_else(|_| Err(anyhow::anyhow!("map itself unwound"))))
+        })
+        .collect();
         std::panic::set_hook(previous);
-        let err = result.expect_err("a panicking item must surface");
-        assert!(format!("{err:#}").contains("item 2"), "unhelpful: {err:#}");
+        for (mode, result) in results {
+            let err = result.expect_err("a panicking item must surface");
+            let text = format!("{err:#}");
+            assert!(
+                text.contains("item 2") && text.contains("panicked"),
+                "{} did not capture the panic as an error naming the item: {text}",
+                mode.as_str()
+            );
+        }
     }
 
     /// An empty batch is refused rather than returning an empty vector that a
@@ -671,23 +702,40 @@ mod tests {
     /// executed on a pool worker.
     #[test]
     fn the_pool_is_reused_across_batches() {
-        let on_pool = |batch: usize| -> usize {
+        // Each item reports whether it ran on a pool worker and on which
+        // thread. (An earlier version or-ed the name check with `i == i`,
+        // which made every item "on the pool" and the test unfalsifiable.)
+        let run = |batch: usize| -> Vec<(bool, String)> {
             BlockExecMode::Parallel
-                .map(batch, |i| {
-                    Ok(std::thread::current().name() == Some("blockexec") || i == i)
+                .map(batch, |_| {
+                    let current = std::thread::current();
+                    Ok((
+                        current.name() == Some("blockexec"),
+                        format!("{:?}", current.id()),
+                    ))
                 })
                 .expect("batch")
-                .into_iter()
-                .filter(|used_pool| *used_pool)
-                .count()
         };
-        let first = on_pool(16);
-        let second = on_pool(16);
+        let first = run(16);
+        let second = run(16);
         assert!(
-            first > 0,
-            "no work ran on a pool worker: the pool was bypassed"
+            first.iter().all(|(on_pool, _)| *on_pool),
+            "work ran off the pool: the pool was bypassed"
         );
-        assert!(second > 0, "the second batch did not reach the pool either");
+        assert!(
+            second.iter().all(|(on_pool, _)| *on_pool),
+            "the second batch did not reach the pool"
+        );
+        // Reuse, not respawn: item `i` goes to worker `i % threads` in both
+        // batches, so the second batch must land on exactly the same threads.
+        let threads = |batch: &[(bool, String)]| -> std::collections::BTreeSet<String> {
+            batch.iter().map(|(_, id)| id.clone()).collect()
+        };
+        assert_eq!(
+            threads(&first),
+            threads(&second),
+            "the second batch ran on different threads: the pool was rebuilt"
+        );
         assert!(
             pool().is_some(),
             "the pool should exist on a normal machine"

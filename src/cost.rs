@@ -255,7 +255,11 @@ impl TrunkCost {
 
     /// Cost of executing only `span` of the layers.
     pub fn span(&self, span: std::ops::Range<usize>) -> LayerCost {
-        self.layers[span.start.min(self.layers.len())..span.end.min(self.layers.len())]
+        // Clamp both ends, and the start to the end: a reversed range is an
+        // empty span, not a slice-index panic.
+        let end = span.end.min(self.layers.len());
+        let start = span.start.min(end);
+        self.layers[start..end]
             .iter()
             .fold(LayerCost::default(), |acc, l| acc.plus(*l))
     }
@@ -393,6 +397,8 @@ mod tests {
         );
         assert_eq!(trunk.span(1..2).active_params, two.active_params);
         assert_eq!(trunk.span(0..9).flops, trunk.total().flops);
+        let top = trunk.num_layers();
+        assert_eq!(trunk.span(top..top - 1), LayerCost::default());
     }
 
     #[test]

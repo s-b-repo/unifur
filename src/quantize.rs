@@ -42,6 +42,10 @@ pub const BLOCK_SIZE: usize = 64;
 /// Exact representation of zero matters: padding, masked entries and pruned
 /// weights must survive a round trip unchanged, which a symmetric 16-level
 /// grid without a zero would not guarantee.
+///
+/// These are the QLoRA paper's / bitsandbytes' published NF4 values
+/// (`create_normal_map(offset=0.9677083)`), so a code here means what it means
+/// in every other NF4 implementation.
 pub const NF4_LEVELS: [f32; 16] = [
     -1.0,
     -0.696_192_8,
@@ -51,12 +55,12 @@ pub const NF4_LEVELS: [f32; 16] = [
     -0.184_773_43,
     -0.091_050_036,
     0.0,
-    0.079_580_51,
-    0.160_930_6,
+    0.079_580_3,
+    0.160_930_2,
     0.246_112_3,
-    0.337_665_43,
+    0.337_915_24,
     0.440_709_83,
-    0.562_617_6,
+    0.562_617,
     0.722_956_84,
     1.0,
 ];
@@ -830,6 +834,35 @@ mod tests {
             "zero must be exactly representable"
         );
         assert_eq!(NF4_LEVELS.len(), 16, "NF4 is a 4-bit code");
+    }
+
+    #[test]
+    fn test_levels_are_the_published_nf4_codebook() {
+        // bitsandbytes `get_4bit_type("nf4")` / QLoRA appendix E, verbatim.
+        // A level that drifts (one was 0.33766543 instead of 0.33791524)
+        // moves the decision boundaries and makes the codes mean something
+        // other than NF4 while every structural test still passes.
+        let published: [f64; 16] = [
+            -1.0,
+            -0.6961928009986877,
+            -0.5250730514526367,
+            -0.39491748809814453,
+            -0.28444138169288635,
+            -0.18477343022823334,
+            -0.09105003625154495,
+            0.0,
+            0.07958029955625534,
+            0.16093020141124725,
+            0.24611230194568634,
+            0.33791524171829224,
+            0.44070982933044434,
+            0.5626170039176941,
+            0.7229568362236023,
+            1.0,
+        ];
+        for (i, (&ours, &theirs)) in NF4_LEVELS.iter().zip(&published).enumerate() {
+            assert_eq!(ours, theirs as f32, "level {i}: {ours} != {theirs}");
+        }
     }
 
     #[test]

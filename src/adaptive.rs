@@ -49,25 +49,49 @@ impl<B: Backend> HaltingHead<B> {
         burn::tensor::activation::sigmoid(self.linear.forward(hidden).squeeze_dim::<1>(1))
     }
 
-    /// Expected depth (ponder cost): mean over samples of the summed
-    /// halting probabilities across blocks. Minimizing it encourages early
-    /// exits; combine with a task loss weighted by [`HaltingConfig::ponder_weight`].
+    /// Expected depth (ponder cost): the expected number of blocks executed
+    /// when block `n` halts with probability `p_n`, i.e. the sum of the
+    /// survival probabilities `sum_n prod_{k<n} (1 - p_k)`, averaged over
+    /// samples. It lies in `[1, N]` for `N` blocks and *falls* as the early
+    /// halting probabilities rise, so minimizing it encourages early exits;
+    /// combine with a task loss weighted by [`HaltingConfig::ponder_weight`].
+    ///
+    /// (Summing the halting probabilities themselves, as this once did, has
+    /// the opposite gradient: minimizing it drives every `p_n` to zero, so
+    /// the cumulative halting probability never reaches the exit threshold
+    /// and every sample runs at full depth.)
     pub fn expected_depth(&self, block_hiddens: &[Tensor<B, 2>]) -> Tensor<B, 1> {
-        let mut acc = None;
-        for h in block_hiddens {
-            let p = self.halt_probability(h.clone());
-            acc = Some(match acc {
-                None => p,
-                Some(a) => a + p,
-            });
-        }
-        match acc {
-            Some(total) => total.mean(),
+        let probs: Vec<Tensor<B, 1>> = block_hiddens
+            .iter()
+            .map(|h| self.halt_probability(h.clone()))
+            .collect();
+        match expected_depth_from_probs(&probs) {
+            Some(depth) => depth,
             // No blocks were supplied: the expected depth is zero, on the
             // head's own device rather than the backend default.
             None => Tensor::zeros([1], &self.linear.weight.device()),
         }
     }
+}
+
+/// `mean_b sum_n prod_{k<n} (1 - p_k[b])` over per-block halting
+/// probabilities `[b]`; `None` for no blocks.
+fn expected_depth_from_probs<B: Backend>(probs: &[Tensor<B, 1>]) -> Option<Tensor<B, 1>> {
+    let mut survival: Option<Tensor<B, 1>> = None;
+    let mut depth: Option<Tensor<B, 1>> = None;
+    for p in probs {
+        // Probability that block `n` runs at all: no earlier block halted.
+        let alive = match &survival {
+            None => p.ones_like(),
+            Some(s) => s.clone(),
+        };
+        depth = Some(match depth {
+            None => alive.clone(),
+            Some(d) => d + alive.clone(),
+        });
+        survival = Some(alive * (p.clone().neg() + 1.0));
+    }
+    depth.map(|d| d.mean())
 }
 
 /// First step where the running halting probability reaches `threshold`.
@@ -146,8 +170,28 @@ mod tests {
         assert_eq!(expected.dims(), [1]);
         let v: f32 = expected.into_scalar();
         assert!(
-            v.is_finite() && (0.0..=3.0 + 1e-5).contains(&v),
+            v.is_finite() && (1.0 - 1e-5..=3.0 + 1e-5).contains(&v),
             "expected depth {v} out of range"
         );
+    }
+
+    #[test]
+    fn test_expected_depth_falls_as_halting_rises() {
+        // The regularizer is only useful if minimizing it means exiting
+        // early: always halting at block 1 is depth 1, never halting is the
+        // full depth, and p = 0.5 over three blocks is 1 + 0.5 + 0.25.
+        let device = Default::default();
+        let depth = |p: f32| -> f32 {
+            let probs: Vec<Tensor<B, 1>> = (0..3)
+                .map(|_| Tensor::<B, 1>::from_floats([p, p].as_slice(), &device))
+                .collect();
+            expected_depth_from_probs(&probs).unwrap().into_scalar()
+        };
+        assert!((depth(1.0) - 1.0).abs() < 1e-6);
+        assert!((depth(0.0) - 3.0).abs() < 1e-6);
+        assert!((depth(0.5) - 1.75).abs() < 1e-6);
+        assert!(depth(0.9) < depth(0.5) && depth(0.5) < depth(0.1));
+        let empty: Vec<Tensor<B, 1>> = Vec::new();
+        assert!(expected_depth_from_probs(&empty).is_none());
     }
 }

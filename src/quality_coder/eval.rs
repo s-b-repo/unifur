@@ -46,8 +46,9 @@ use crate::codequality::{
 pub enum Metric {
     /// Fraction of patches that apply cleanly to the source.
     ApplyPatchSuccess,
-    /// Fraction of applied patches that improve quality without
-    /// regressing any dimension below 0.5.
+    /// Fraction of *all* evaluated examples whose patch applied and
+    /// improved quality without regressing any dimension below 0.5 (an
+    /// unapplied patch counts as not improved).
     LintCleanRate,
     /// Fraction of patches whose diff touches only lines within the
     /// defect span (a proxy for "did not delete unrelated code").
@@ -291,14 +292,15 @@ pub fn apply_unified_diff(prompt: &str, patch: &Patch) -> Option<String> {
     }
     // Whole-file rewrite marker from the dataset adapter: bypass the
     // diff parser and use the payload directly.
-    if let Some(payload) = patch
-        .diff
-        .strip_prefix("# quality-coder: whole-file-rewrite\n")
-    {
+    if let Some(payload) = patch.diff.strip_prefix(WHOLE_FILE_REWRITE) {
         return Some(payload.to_string());
     }
     apply_unified_diff_inner(&extract_source_from_prompt(prompt), &patch.diff)
 }
+
+/// The marker the dataset adapters put in front of a whole-file rewrite
+/// (see `super::dataset`).
+const WHOLE_FILE_REWRITE: &str = "# quality-coder: whole-file-rewrite\n";
 
 fn apply_unified_diff_inner(source: &str, diff: &str) -> Option<String> {
     let hunks = parse_hunks(diff)?;
@@ -469,40 +471,102 @@ fn regressed_below_threshold(before: &QualityScore, after: &QualityScore) -> boo
     false
 }
 
-/// Structural proxy for "did not delete unrelated code": the patch
-/// is more likely to have removed real functionality if its hunk
-/// headers reference line ranges far from the defect span. This is a
-/// rough heuristic, not the full test runner.
+/// Structural proxy for "did not delete unrelated code": whether the
+/// patch changes any source line outside the reported defect spans. This
+/// is a heuristic, not the full test runner.
+///
+/// Each defect's byte span (rendered into the prompt as `at bytes S..E`)
+/// is mapped to the 1-based source lines it covers. A removed line must
+/// lie inside some span; an added line must be inserted inside a span or
+/// directly after its last line. A whole-file rewrite touches every line.
+/// With no defects reported, any change at all is outside; a diff whose
+/// hunks do not parse counts as outside.
+///
+/// (This used to flag only hunks starting past twice the file's length,
+/// which no patch that applies can do -- so the metric was, in effect,
+/// a second copy of `apply_patch_success`.)
 fn touches_lines_outside_defect(patch: &Patch, prompt: &str) -> bool {
-    // The defect span is in the prompt as "(severity X.YY)"; the
-    // prompt's source block is the same length as the original. The
-    // proxy is conservative: a patch that mentions any hunk header
-    // whose old_start is well past the source length is suspicious.
-    let source_block = extract_source_from_prompt(prompt);
-    let source_line_count = source_block.lines().count().max(1);
-    for line in patch.diff.lines() {
-        if let Some(rest) = line.strip_prefix("@@") {
-            let header = rest.trim().trim_end_matches("@@").trim();
-            let parts: Vec<&str> = header.split_whitespace().collect();
-            if parts.len() < 2 {
-                continue;
-            }
-            let old_part = parts[0].trim_start_matches('-');
-            let old_start: usize = old_part
-                .split(',')
-                .next()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            // A hunk that starts past 2x the source line count is
-            // almost certainly touching lines that were never in the
-            // file — a sign the patch deleted the original and
-            // appended new content.
-            if old_start > 2 * source_line_count {
-                return true;
+    let source = extract_source_from_prompt(prompt);
+    let spans: Vec<(usize, usize)> = defect_spans(prompt)
+        .into_iter()
+        .map(|(start, end)| line_range(&source, start, end))
+        .collect();
+    let removable = |line: usize| {
+        spans
+            .iter()
+            .any(|&(first, last)| first <= line && line <= last)
+    };
+    let insertable = |at: usize| {
+        spans
+            .iter()
+            .any(|&(first, last)| first <= at && at <= last + 1)
+    };
+
+    if patch.diff.starts_with(WHOLE_FILE_REWRITE) {
+        return (1..=source.lines().count()).any(|line| !removable(line));
+    }
+    let Some(hunks) = parse_hunks(&patch.diff) else {
+        return true;
+    };
+    for hunk in &hunks {
+        // `line` is the old-file line the next hunk line refers to; an
+        // added line is inserted before it.
+        let mut line = hunk.old_start.max(1);
+        for l in &hunk.lines {
+            match l.kind {
+                LineKind::Context => line += 1,
+                LineKind::Remove => {
+                    if !removable(line) {
+                        return true;
+                    }
+                    line += 1;
+                }
+                LineKind::Add => {
+                    if !insertable(line) {
+                        return true;
+                    }
+                }
             }
         }
     }
     false
+}
+
+/// The `(start, end)` byte spans of the defects listed in a rendered
+/// prompt (see [`super::Prompt::render`]: `N. category at bytes S..E ...`).
+fn defect_spans(prompt: &str) -> Vec<(usize, usize)> {
+    const HEADER: &str = "\nDefects:\n";
+    let Some(start) = prompt.find(HEADER).map(|i| i + HEADER.len()) else {
+        return Vec::new();
+    };
+    let section = &prompt[start..];
+    let section = &section[..section.find("\nSource:\n```\n").unwrap_or(section.len())];
+    section
+        .lines()
+        .filter_map(|line| {
+            const AT: &str = " at bytes ";
+            let rest = &line[line.find(AT)? + AT.len()..];
+            let (s, rest) = rest.split_once("..")?;
+            let e: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            Some((s.parse().ok()?, e.parse().ok()?))
+        })
+        .collect()
+}
+
+/// The 1-based, inclusive `(first, last)` lines of `source` that the byte
+/// span `[start, end)` covers.
+fn line_range(source: &str, start: usize, end: usize) -> (usize, usize) {
+    let bytes = source.as_bytes();
+    let line_of = |b: usize| {
+        bytes[..b.min(bytes.len())]
+            .iter()
+            .filter(|&&c| c == b'\n')
+            .count()
+            + 1
+    };
+    let first = line_of(start);
+    let last = line_of(end.saturating_sub(1).max(start));
+    (first, last.max(first))
 }
 
 #[cfg(test)]
@@ -661,6 +725,8 @@ mod tests {
         assert_eq!(report.evaluated, 1);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].applied);
+        // The defect span is the whole file, so the gold patch stays inside it.
+        assert!(rows[0].test_preserved);
         // We don't assert on lint/test here because the small test
         // corpus and the harness's coarse structural proxy don't
         // always agree with a perfect patch; the metric contract is
@@ -742,6 +808,45 @@ mod tests {
         assert_eq!(Metric::ApplyPatchSuccess.name(), "apply_patch_success");
         assert_eq!(Metric::LintCleanRate.name(), "lint_clean_rate");
         assert_eq!(Metric::TestPreserved.name(), "test_preserved");
+    }
+
+    #[test]
+    fn test_touches_lines_outside_defect_checks_the_defect_span() {
+        // Four lines; the defect covers only line 2 ("b\n" is bytes 2..4).
+        let source = "a\nb\nc\nd\n";
+        let mut task = sample_task(source);
+        task.defects[0].span = (2, 4);
+        let prompt = task.prompt();
+        let patch = |diff: &str| Patch {
+            diff: diff.into(),
+            refusal_reason: None,
+        };
+        assert_eq!(defect_spans(&prompt.text), vec![(2, 4)]);
+
+        let inside = patch("@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n");
+        assert!(apply_unified_diff(&prompt.text, &inside).is_some());
+        assert!(!touches_lines_outside_defect(&inside, &prompt.text));
+
+        // Applies cleanly, but deletes line 4, which no defect covers. The
+        // old proxy (hunk start past twice the file length) passed this.
+        let outside = patch("@@ -3,2 +3,1 @@\n c\n-d\n");
+        assert_eq!(
+            apply_unified_diff(&prompt.text, &outside).as_deref(),
+            Some("a\nb\nc\n")
+        );
+        assert!(touches_lines_outside_defect(&outside, &prompt.text));
+
+        // A whole-file rewrite touches every line, so it is outside a
+        // one-line span...
+        let rewrite = patch("# quality-coder: whole-file-rewrite\n");
+        assert!(touches_lines_outside_defect(&rewrite, &prompt.text));
+        // ...but inside a span that covers the whole file.
+        let whole = sample_task(source).prompt();
+        assert!(!touches_lines_outside_defect(&rewrite, &whole.text));
+
+        // With no defects reported, any change is outside.
+        let none = Task::identity(Language::Python, "src/foo.py", source).prompt();
+        assert!(touches_lines_outside_defect(&inside, &none.text));
     }
 
     #[test]

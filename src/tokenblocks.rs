@@ -165,6 +165,12 @@ impl TbConfig {
     /// Every constraint later code relies on, checked once, naming the field
     /// at fault.
     pub fn validate(&self) -> Result<()> {
+        // `num_heads` first: the multiple check below divides by it.
+        anyhow::ensure!(
+            self.num_heads > 0,
+            "num_heads ({}) must be positive",
+            self.num_heads
+        );
         anyhow::ensure!(
             self.hidden_size > 0 && self.hidden_size % self.num_heads == 0,
             "hidden_size ({}) must be a positive multiple of num_heads ({})",
@@ -497,9 +503,16 @@ pub fn entropy_of_row(probs: &[f32]) -> f64 {
 /// weighted `EDGE_WEIGHT`, the backward pass accumulates with the trailing
 /// edge weighted `EDGE_WEIGHT`, and the two normalized sums are averaged.
 /// This is the signal both adaptive sizing and halo gating read.
+///
+/// Each pass is a weighted *mean*: it divides by its own weight total,
+/// `(len - 1) + EDGE_WEIGHT` (one edge up-weighted, not two), so a window of
+/// constant entropy `v` scores exactly `v` at every length. The previous
+/// normalizer counted both edges in each pass and scored that window
+/// `v * (len + 1) / (len + 2)` (`v / 2` for one token), so "normalized to
+/// [0, 1]" difficulty could never reach 1.
 pub fn bidirectional_cumulative_entropy(h: &[f64], start: usize, len: usize) -> f64 {
-    let end = (start + len).min(h.len());
-    let len = end - start;
+    let end = start.saturating_add(len).min(h.len());
+    let len = end.saturating_sub(start);
     if len == 0 {
         return 0.0;
     }
@@ -516,7 +529,7 @@ pub fn bidirectional_cumulative_entropy(h: &[f64], start: usize, len: usize) -> 
         forward += w_f * value;
         backward += w_b * value;
     }
-    let normalizer = (len as f64 - 2.0).max(0.0) + 2.0 * EDGE_WEIGHT;
+    let normalizer = (len as f64 - 1.0) + EDGE_WEIGHT;
     (forward / normalizer + backward / normalizer) / 2.0
 }
 
@@ -614,20 +627,25 @@ impl DecodeStats {
 
 /// Per-row summaries pulled off the device: `(token id, max probability,
 /// entropy in nats)`.
+///
+/// The argmax ranges over real tokens only, never [`MASK_ID`]: revealing the
+/// absorbing state would "commit" a position that is still masked, and the
+/// block would not be complete. The entropy stays over the full row.
 fn summarize_rows<B: Backend<FloatElem = f32>>(logits: &Tensor<B, 3>) -> Vec<(u16, f64, f64)> {
     let [_, n, _] = logits.dims();
     let logp = log_softmax(logits.clone(), 2);
     let flat: Vec<f32> = logp.into_data().convert::<f32>().iter().collect();
     (0..n)
         .map(|i| {
-            let row = &flat[i * TB_VOCAB..(i + 1) * TB_VOCAB];
+            let full = &flat[i * TB_VOCAB..(i + 1) * TB_VOCAB];
+            let row = &full[..usize::from(MASK_ID)];
             let max = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
             let arg = row
                 .iter()
                 .position(|v| *v == max)
                 .map(|p| p as u16)
                 .unwrap_or(0);
-            let probs: Vec<f32> = row.iter().map(|v| v.exp()).collect();
+            let probs: Vec<f32> = full.iter().map(|v| v.exp()).collect();
             (arg, f64::from(max.exp()), entropy_of_row(&probs))
         })
         .collect()
@@ -786,6 +804,10 @@ pub fn generate<B: Backend<FloatElem = f32>>(
         prompt.len(),
         cfg.context
     );
+    // A zero-size block never advances `pos`: the loop below would spin.
+    if let Sizing::Fixed(len) = plan.sizing {
+        anyhow::ensure!(len >= 1, "fixed block size must be at least 1, got {len}");
+    }
     let mut committed: Vec<u16> = prompt.to_vec();
     let mut cache = TbKvCache::<B>::new(cfg.num_layers);
     let mut stats = DecodeStats::default();
@@ -803,9 +825,13 @@ pub fn generate<B: Backend<FloatElem = f32>>(
     let mut pos = committed.len();
     while pos < total_len {
         // -- size the block ------------------------------------------------
+        // Blocks are clamped to `total_len`, not the context: "up to
+        // `total_len`" is a promise, and overshooting it handed larger-block
+        // plans longer continuations, so plan comparisons scored different
+        // lengths.
         let (size, difficulty, halo_len) = match plan.sizing {
             Sizing::Fixed(len) => {
-                let len = len.min(cfg.context - pos);
+                let len = len.min(total_len - pos);
                 (len, 0.0, 0)
             }
             Sizing::Entropy => {
@@ -825,13 +851,15 @@ pub fn generate<B: Backend<FloatElem = f32>>(
                     / (TB_VOCAB as f64).ln();
                 let mut halo_len = 0usize;
                 if plan.halo && difficulty >= cfg.halo_threshold {
+                    // The halo re-opens *generated* tail tokens only: the
+                    // prompt is the caller's input, never a revision target.
                     halo_len = ((difficulty * cfg.halo_max as f64).ceil() as usize)
                         .min(cfg.halo_max)
-                        .min(pos);
+                        .min(pos - prompt.len());
                 }
                 (
                     size_from_difficulty(difficulty, cfg.min_block, cfg.max_block)
-                        .min(cfg.context - pos),
+                        .min(total_len - pos),
                     difficulty,
                     halo_len,
                 )
@@ -870,32 +898,33 @@ pub fn generate<B: Backend<FloatElem = f32>>(
         // and values are fixed, so nothing in the cache is ever computed from
         // a token that no longer exists.
         let last_block = &mut stats.blocks;
-        if !outcome.halo_edits.is_empty() {
-            let first_edit = outcome
-                .halo_edits
-                .iter()
-                .map(|(p, _)| *p)
-                .min()
-                .unwrap_or(pos);
-            let mut edits = 0usize;
-            for (abs, tok) in &outcome.halo_edits {
-                if committed[*abs] != *tok && stats.flips.get(abs).copied().unwrap_or(0) < 1 {
-                    committed[*abs] = *tok;
-                    if let Some(block_stat) = last_block.last_mut() {
-                        block_stat.halo_edits += 1;
-                    }
-                    stats.flips.entry(*abs).and_modify(|c| *c += 1).or_insert(1);
-                    edits += 1;
+        for (abs, tok) in &outcome.halo_edits {
+            if committed[*abs] != *tok && stats.flips.get(abs).copied().unwrap_or(0) < 1 {
+                committed[*abs] = *tok;
+                if let Some(block_stat) = last_block.last_mut() {
+                    block_stat.halo_edits += 1;
                 }
+                stats.flips.entry(*abs).and_modify(|c| *c += 1).or_insert(1);
             }
-            if edits > 0 {
-                cache.truncate(first_edit);
-                let ids = ids_i64(&committed[first_edit..pos]);
-                let tokens = Tensor::<B, 1, Int>::from_ints(ids.as_slice(), device)
-                    .reshape([1, pos - first_edit]);
-                model.forward_cached(tokens, &mut cache);
-                stats.forwards += 1;
-            }
+        }
+        if halo_len > 0 {
+            // The halo tail's keys and values were last computed by the
+            // window forward, attending to the masked block and the peek —
+            // positions a committed block never sees under block-causal
+            // attention — and an edit also invalidates the earlier positions
+            // of its block, which attended to the old token (re-forwarding
+            // from the first edit alone left those stale). Rebuild every
+            // block the halo touched, one block per chunk, exactly as
+            // block-by-block decoding computed them.
+            let rebuilt = rebuild_blocks(
+                model,
+                device,
+                &committed,
+                &mut cache,
+                &stats.blocks,
+                pos - halo_len,
+            );
+            stats.forwards += rebuilt;
         }
         cache.truncate(pos);
         let ids = ids_i64(&outcome.block_tokens);
@@ -952,7 +981,22 @@ fn revision_pass<B: Backend<FloatElem = f32>>(
     stats: &mut DecodeStats,
     blocks: usize,
 ) -> Result<usize> {
-    let window_len = (blocks * cfg.max_block).min(committed.len());
+    // The window is the last `blocks` *generated* blocks, by their actual
+    // sizes. `blocks * max_block` over-reached whenever blocks were smaller
+    // than the ceiling -- into earlier blocks and, early on, into the prompt,
+    // which the pass then "revised" (the returned sequence no longer began
+    // with the caller's prompt). Still bounded by `blocks * max_block`.
+    let window_len = stats
+        .blocks
+        .iter()
+        .rev()
+        .take(blocks)
+        .map(|b| b.size)
+        .sum::<usize>()
+        .min(committed.len());
+    if window_len == 0 {
+        return Ok(0);
+    }
     let start = committed.len() - window_len;
     cache.truncate(start);
     let ids = ids_i64(&committed[start..]);
@@ -976,18 +1020,49 @@ fn revision_pass<B: Backend<FloatElem = f32>>(
             edits += 1;
         }
     }
-    if edits > 0 {
+    let window_blocks = stats.blocks.iter().rev().take(blocks).count();
+    if edits > 0 || window_blocks > 1 {
         // The cache now holds keys and values for tokens that no longer
-        // exist. Rebuild the window honestly rather than leaving stale state.
-        cache.truncate(start);
-        let ids = ids_i64(&committed[start..]);
-        let tokens =
-            Tensor::<B, 1, Int>::from_ints(ids.as_slice(), device).reshape([1, window_len]);
-        model.forward_cached(tokens, cache);
-        stats.forwards += 1;
-        stats.revision_forwards += 1;
+        // exist, and — for a window of several blocks — keys and values
+        // that attended across block boundaries in the bidirectional pass.
+        // Rebuild block by block, as decoding computed them. (A one-block
+        // window with no edits already holds exactly the commit forward.)
+        let rebuilt = rebuild_blocks(model, device, committed, cache, &stats.blocks, start);
+        stats.forwards += rebuilt;
+        stats.revision_forwards += rebuilt;
     }
     Ok(edits)
+}
+
+/// Re-forward every committed block that ends after position `from`, one
+/// block per chunk, so the cache holds exactly what block-by-block decoding
+/// computes (bidirectional inside a block, causal across blocks). Blocks are
+/// the generated ones in `blocks`; only those wholly inside `committed`
+/// count. Returns the forwards spent.
+fn rebuild_blocks<B: Backend<FloatElem = f32>>(
+    model: &TokenBlockModel<B>,
+    device: &B::Device,
+    committed: &[u16],
+    cache: &mut TbKvCache<B>,
+    blocks: &[BlockStat],
+    from: usize,
+) -> usize {
+    let spans: Vec<(usize, usize)> = blocks
+        .iter()
+        .map(|b| (b.start, b.start + b.size))
+        .filter(|(_, end)| *end > from && *end <= committed.len())
+        .collect();
+    let Some(&(first_start, _)) = spans.first() else {
+        return 0;
+    };
+    cache.truncate(first_start);
+    for &(start, end) in &spans {
+        let ids = ids_i64(&committed[start..end]);
+        let tokens =
+            Tensor::<B, 1, Int>::from_ints(ids.as_slice(), device).reshape([1, end - start]);
+        model.forward_cached(tokens, cache);
+    }
+    spans.len()
 }
 
 // -- training --------------------------------------------------------------
@@ -1043,6 +1118,10 @@ pub fn denoising_loss<B: AutodiffBackend<FloatElem = f32>>(
 /// Non-overlapping `context`-length windows; the remainder is dropped rather
 /// than padded — a padded position is a trained-on lie.
 pub fn build_windows(stream: &[u16], context: usize) -> Vec<Vec<u16>> {
+    if context == 0 {
+        // `chunks(0)` panics; a zero-length window holds nothing to train on.
+        return Vec::new();
+    }
     stream
         .chunks(context)
         .filter(|w| w.len() == context)
@@ -1098,9 +1177,31 @@ pub fn train_model<B: AutodiffBackend<FloatElem = f32>>(
         batch_size >= 1,
         "batch_size ({batch_size}) must be at least 1"
     );
+    // Every window is reshaped to `[_, context]` and embedded: a wrong length
+    // or an id past the real vocabulary (the mask id included) would panic
+    // deep inside the backend or train on a lie, so both are named here.
+    for (split, windows) in [("train", train_windows), ("validation", val_windows)] {
+        for (i, window) in windows.iter().enumerate() {
+            anyhow::ensure!(
+                window.len() == config.context,
+                "{split} window {i} has {} tokens, not context {}",
+                window.len(),
+                config.context
+            );
+            anyhow::ensure!(
+                window.iter().all(|t| usize::from(*t) < VOCAB_SIZE),
+                "{split} window {i} holds an id outside the {VOCAB_SIZE}-token vocabulary"
+            );
+        }
+    }
     let mut model = TokenBlockModel::<B>::new(config, device)?;
     let mut optim = AdamWConfig::new().init();
     let mut rng = StdRng::seed_from_u64(seed);
+    // Validation corruption comes from its own stream, re-seeded for every
+    // evaluation: each point on the curve scores the *same* corrupted
+    // windows (so points are comparable), and evaluating never advances the
+    // training stream (so `eval_every` cannot change which batches train).
+    let eval_seed = seed ^ 0x5eed_0f_e7a1_u64;
     let mut report = TbTrainReport::default();
     let started = Instant::now();
     let n = config.context;
@@ -1125,13 +1226,25 @@ pub fn train_model<B: AutodiffBackend<FloatElem = f32>>(
         let grads = GradientsParams::from_grads(loss.backward(), &model);
         model = optim.step(lr, model, grads);
         if step % eval_every == 0 || step + 1 == steps {
-            let val_loss = evaluate_loss(config, &model, device, val_windows, &mut rng);
+            let val_loss = evaluate_loss(
+                config,
+                &model,
+                device,
+                val_windows,
+                &mut StdRng::seed_from_u64(eval_seed),
+            );
             report.train_curve.push((step, train_loss));
             report.val_curve.push((step, val_loss));
         }
     }
     report.steps_run = steps;
-    let final_val = evaluate_loss(config, &model, device, val_windows, &mut rng);
+    let final_val = evaluate_loss(
+        config,
+        &model,
+        device,
+        val_windows,
+        &mut StdRng::seed_from_u64(eval_seed),
+    );
     report.final_val_loss = final_val;
     report.final_val_bpb = final_val / 2f64.ln();
     report.seconds = started.elapsed().as_secs_f64();
@@ -1205,9 +1318,15 @@ pub fn certificates() -> Vec<crate::verify::Certificate> {
 
     // 3. Bidirectional cumulative entropy matches a hand computation:
     //    forward: 2*0.5 + 1.0 + 0.0 = 2.0; backward: 0.5 + 1.0 + 2*0.0 = 1.5;
-    //    normalizer: (3-2) + 2*2 = 5; mean: (2/5 + 1.5/5)/2 = 0.35.
+    //    each pass's weight total: (3-1) + 2 = 4; mean: (2/4 + 1.5/4)/2 =
+    //    0.4375. And the property the hand number alone cannot pin (the old
+    //    normalizer passed a hand computation written with the same mistake):
+    //    a constant-entropy window scores that constant at every length.
     let got = bidirectional_cumulative_entropy(&[0.5, 1.0, 0.0, 2.0], 0, 3);
-    let entropy_residual = (got - 0.35).abs();
+    let constant_residual = (1..=8)
+        .map(|len| (bidirectional_cumulative_entropy(&vec![0.7; len], 0, len) - 0.7).abs())
+        .fold(0.0f64, f64::max);
+    let entropy_residual = (got - 0.4375).abs().max(constant_residual);
 
     // 4. Prefix invariance: logits on blocks 0..k are unchanged when a later
     //    block's tokens change. Block-causal attention cannot see them.
@@ -1326,7 +1445,8 @@ pub fn certificates() -> Vec<crate::verify::Certificate> {
             group: "tokenblocks",
             name: "bidirectional_entropy_matches_hand_computation",
             theorem: "The bidirectional cumulative entropy of [0.5, 1.0, 0.0] with \
-                      edge weight 2 is 0.35 exactly.",
+                      edge weight 2 is 0.4375 exactly, and a window of constant \
+                      entropy v scores v at every length (each pass is a weighted mean).",
             residual: entropy_residual,
             tolerance: 1e-9,
         },
@@ -1373,12 +1493,25 @@ pub fn load_stream(
 ) -> Result<StreamWindows> {
     use crate::tokenizer::ByteTokenizer;
     use std::io::Read as _;
+    anyhow::ensure!(context > 0, "context must be positive");
     let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut raw = Vec::with_capacity(max_bytes);
+    let limit = u64::try_from(max_bytes).unwrap_or(u64::MAX);
+    let mut raw = Vec::new();
+    // One byte past the cap tells a cut file from one that ended on its own.
     (&mut file)
-        .take(max_bytes as u64)
+        .take(limit.saturating_add(1))
         .read_to_end(&mut raw)
         .with_context(|| format!("read {}", path.display()))?;
+    if raw.len() > max_bytes {
+        // The cap almost always lands inside a document (and can split a
+        // UTF-8 character, which lossy decoding would turn into U+FFFD bytes
+        // nobody wrote). Keep whole lines only: the partial one would
+        // otherwise be the test split's last document.
+        raw.truncate(max_bytes);
+        if let Some(last_newline) = raw.iter().rposition(|b| *b == b'\n') {
+            raw.truncate(last_newline + 1);
+        }
+    }
     let text = String::from_utf8_lossy(&raw);
     let docs: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     anyhow::ensure!(
@@ -1413,9 +1546,17 @@ pub fn load_stream(
     Ok(StreamWindows { train, val, test })
 }
 
-/// Teacher-forced NLL of a generated continuation: one forward over the
-/// revealed sequence, log-probabilities read at the continuation positions.
-/// The same protocol for every decode plan, so plan scores are comparable.
+/// Teacher-forced NLL of a generated continuation, block by block: for each
+/// fixed block holding continuation positions, one forward with every
+/// earlier position clean and that block's continuation positions absorbed
+/// to [`MASK_ID`], log-probabilities read at those positions. The same
+/// protocol for every decode plan, so plan scores are comparable.
+///
+/// The scored positions must be masked. Block-causal attention lets a
+/// position see its own block, itself included, so scoring a *visible* token
+/// (what this did before) measured how well the tied head copies its input —
+/// near-zero NLL for any continuation, garbage included — not prediction.
+/// Masked, it is the quantity the model was trained on.
 pub fn score_continuation<B: Backend<FloatElem = f32>>(
     model: &TokenBlockModel<B>,
     cfg: &TbConfig,
@@ -1429,19 +1570,37 @@ pub fn score_continuation<B: Backend<FloatElem = f32>>(
         tokens.len() <= cfg.context,
         "prompt + continuation exceeds context"
     );
-    let ids = ids_i64(&tokens);
-    let n = tokens.len();
-    let input = Tensor::<B, 1, Int>::from_ints(ids.as_slice(), device).reshape([1, n]);
-    let bias = block_causal_bias::<B>(n, cfg.block_len, device);
-    let logits = model.forward(input, &bias);
-    let logp = log_softmax(logits, 2);
-    let flat: Vec<f32> = logp.into_data().convert::<f32>().iter().collect();
-    let mut total = 0.0f64;
-    for (k, t) in continuation.iter().enumerate() {
-        let pos = prompt.len() + k;
-        total -= f64::from(flat[pos * TB_VOCAB + usize::from(*t)]);
+    anyhow::ensure!(
+        tokens.iter().all(|t| usize::from(*t) < TB_VOCAB),
+        "prompt + continuation hold an id outside the {TB_VOCAB}-token vocabulary"
+    );
+    if continuation.is_empty() {
+        return Ok(0.0);
     }
-    Ok(total / continuation.len().max(1) as f64)
+    let n = tokens.len();
+    let block_len = cfg.block_len.max(1);
+    let bias = block_causal_bias::<B>(n, block_len, device);
+    let mut total = 0.0f64;
+    // First block that holds a continuation position (it may also hold the
+    // prompt's tail, which stays clean).
+    let mut block_start = TbConfig::block_of(prompt.len(), block_len) * block_len;
+    while block_start < n {
+        let block_end = (block_start + block_len).min(n);
+        let scored_from = block_start.max(prompt.len());
+        // Everything from the scored positions on is absorbed; later blocks
+        // are invisible to this one under the block-causal bias anyway.
+        let mut input = tokens.clone();
+        input[scored_from..].fill(MASK_ID);
+        let ids = ids_i64(&input);
+        let input = Tensor::<B, 1, Int>::from_ints(ids.as_slice(), device).reshape([1, n]);
+        let logp = log_softmax(model.forward(input, &bias), 2);
+        let flat: Vec<f32> = logp.into_data().convert::<f32>().iter().collect();
+        for (pos, t) in tokens.iter().enumerate().take(block_end).skip(scored_from) {
+            total -= f64::from(flat[pos * TB_VOCAB + usize::from(*t)]);
+        }
+        block_start = block_end;
+    }
+    Ok(total / continuation.len() as f64)
 }
 
 /// One decode plan's numbers over a set of prompts.
@@ -1752,7 +1911,7 @@ mod tests {
             halo: true,
             revision_blocks: 1,
         };
-        let (_, stats) = generate::<Nd>(
+        let (out, stats) = generate::<Nd>(
             &model,
             &config,
             &device,
@@ -1761,6 +1920,14 @@ mod tests {
             &plan,
         )
         .unwrap();
+        assert_eq!(out.len(), config.context);
+        // Halo and revision re-open generated tokens only: the caller's
+        // prompt comes back exactly as given.
+        assert_eq!(&out[..8], &window[..8], "the prompt was rewritten");
+        assert!(
+            out.iter().all(|t| *t != MASK_ID),
+            "a committed block still holds the mask token"
+        );
         for block in &stats.blocks {
             assert!(
                 (config.min_block..=config.max_block).contains(&block.size),
@@ -1769,6 +1936,156 @@ mod tests {
             );
             assert!(block.halo_len <= config.halo_max);
         }
-        assert!(stats.thrashed_positions() <= stats.total_edits());
+        // The thrash guard admits at most one flip per position, so no
+        // position may ever count as thrashed. (`thrashed <= total_edits`,
+        // the old check, holds for any flip map whatsoever.)
+        assert_eq!(stats.thrashed_positions(), 0);
+        assert!(
+            stats.flips.keys().all(|p| *p >= 8),
+            "a prompt position flipped"
+        );
+    }
+
+    #[test]
+    fn generation_stops_at_total_len_and_rejects_empty_blocks() {
+        let device = device();
+        let config = TbConfig::tiny();
+        let model = TokenBlockModel::<Nd>::new(&config, &device).unwrap();
+        let prompt = &pattern(&config)[..8];
+        // 5 tokens asked for with blocks of 8: exactly 5 come back.
+        let (out, stats) = generate::<Nd>(
+            &model,
+            &config,
+            &device,
+            prompt,
+            13,
+            &DecodePlan::baseline(config.block_len),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 13, "generation overshot total_len");
+        assert_eq!(stats.blocks.iter().map(|b| b.size).sum::<usize>(), 5);
+        // A zero-size fixed block can never advance: an error, not a hang.
+        assert!(generate::<Nd>(
+            &model,
+            &config,
+            &device,
+            prompt,
+            13,
+            &DecodePlan::baseline(0)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn continuation_scores_are_predictions_not_copies() {
+        // Every one-token continuation is scored from the same masked
+        // distribution, so the implied probabilities over the whole
+        // vocabulary sum to one. Scoring the visible token (the old leak)
+        // let each candidate see itself and broke this badly.
+        let device = device();
+        let config = TbConfig::tiny();
+        let model = TokenBlockModel::<Nd>::new(&config, &device).unwrap();
+        let prompt = &pattern(&config)[..8];
+        let total: f64 = (0..TB_VOCAB as u16)
+            .map(|t| {
+                let nll = score_continuation(&model, &config, &device, prompt, &[t]).unwrap();
+                (-nll).exp()
+            })
+            .sum();
+        assert!((total - 1.0).abs() < 1e-3, "probabilities sum to {total}");
+    }
+
+    #[test]
+    fn entropy_signal_is_a_weighted_mean() {
+        for len in 1..=6 {
+            let h = vec![0.3; len];
+            let got = bidirectional_cumulative_entropy(&h, 0, len);
+            assert!((got - 0.3).abs() < 1e-12, "len {len}: {got}");
+        }
+        // Out-of-range windows are empty, not a panic.
+        assert_eq!(bidirectional_cumulative_entropy(&[1.0, 2.0], 5, 3), 0.0);
+        assert_eq!(bidirectional_cumulative_entropy(&[1.0], 0, usize::MAX), 1.0);
+    }
+
+    #[test]
+    fn rebuild_restores_the_block_causal_cache_after_a_halo_window() {
+        let device = device();
+        let config = TbConfig::tiny();
+        let model = TokenBlockModel::<Nd>::new(&config, &device).unwrap();
+        let bl = config.block_len;
+        let n = 4 * bl;
+        let seq: Vec<u16> = pattern(&config)[..n].to_vec();
+        let to_tensor = |ids: &[u16]| {
+            Tensor::<Nd, 1, Int>::from_ints(ids_i64(ids).as_slice(), &device)
+                .reshape([1, ids.len()])
+        };
+        let flat =
+            |t: Tensor<Nd, 3>| -> Vec<f32> { t.into_data().convert::<f32>().iter().collect() };
+        let max_diff = |a: &[f32], b: &[f32]| {
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| f64::from((x - y).abs()))
+                .fold(0.0f64, f64::max)
+        };
+        let bias = block_causal_bias::<Nd>(n, bl, &device);
+        let expected = flat(model.forward(to_tensor(&seq), &bias).narrow(1, 3 * bl, bl));
+
+        // Block 0 is the prompt; blocks 1 and 2 were generated.
+        let blocks: Vec<BlockStat> = [bl, 2 * bl]
+            .iter()
+            .map(|&start| BlockStat {
+                start,
+                size: bl,
+                ..BlockStat::default()
+            })
+            .collect();
+        let decode_prefix = |cache: &mut TbKvCache<Nd>| {
+            for start in [0, bl, 2 * bl] {
+                model.forward_cached(to_tensor(&seq[start..start + bl]), cache);
+            }
+        };
+        // What a two-token halo's window forward leaves behind: block 2's
+        // tail recomputed while attending to the masked next block.
+        let pollute = |cache: &mut TbKvCache<Nd>| {
+            cache.truncate(3 * bl - 2);
+            let mut window = seq[3 * bl - 2..3 * bl].to_vec();
+            window.extend(std::iter::repeat_n(MASK_ID, bl));
+            model.forward_cached(to_tensor(&window), cache);
+            cache.truncate(3 * bl);
+        };
+
+        let mut stale = TbKvCache::<Nd>::new(config.num_layers);
+        decode_prefix(&mut stale);
+        pollute(&mut stale);
+        let stale_logits = flat(model.forward_cached(to_tensor(&seq[3 * bl..]), &mut stale));
+        assert!(
+            max_diff(&stale_logits, &expected) > 1e-6,
+            "the halo window must actually disturb the cache for this test to mean anything"
+        );
+
+        let mut rebuilt = TbKvCache::<Nd>::new(config.num_layers);
+        decode_prefix(&mut rebuilt);
+        pollute(&mut rebuilt);
+        let spent = rebuild_blocks(
+            &model,
+            &device,
+            &seq[..3 * bl],
+            &mut rebuilt,
+            &blocks,
+            3 * bl - 2,
+        );
+        assert_eq!(spent, 1, "only the touched block is re-forwarded");
+        assert_eq!(rebuilt.len, 3 * bl);
+        let got = flat(model.forward_cached(to_tensor(&seq[3 * bl..]), &mut rebuilt));
+        assert!(max_diff(&got, &expected) < 1e-4);
+    }
+
+    #[test]
+    fn config_with_zero_heads_is_an_error_not_a_panic() {
+        let config = TbConfig {
+            num_heads: 0,
+            ..TbConfig::tiny()
+        };
+        assert!(config.validate().is_err());
     }
 }

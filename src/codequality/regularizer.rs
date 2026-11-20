@@ -1,27 +1,31 @@
 //! Quality regularizer (roadmap Phase 25).
 //!
 //! Where [`super::filter`] decides which windows to train on at all, the
-//! regularizer adds a continuous pull toward a target quality: the loss
-//! includes `weight * mean((target - score(x))^2)`, which is positive
-//! whenever the batch's mean quality is below the target and zero when
-//! the batch already meets it.
+//! regularizer computes `weight * (target - mean(score))^2` over a batch's
+//! per-window quality scores: positive whenever the batch's mean quality
+//! differs from the target (in either direction), zero when it meets it.
 //!
-//! # Why this is *not* `-log(1 - p)`
+//! # What this term can and cannot do
 //!
-//! The unlikelihood term in [`crate::lm`] charges per flagged token; the
-//! regularizer pulls the *batch* toward a target. They are complementary
-//! signals: the per-token term rewards the model for not generating a
-//! specific bad pattern; the regularizer rewards it for generating
-//! higher-quality code on average, however "quality" is measured.
+//! **It carries no gradient.** The scores are [`QualityScore`]s — plain
+//! `f32`s computed on the CPU from source text by lexical and structural
+//! heuristics — and [`QualityRegularizer::loss`] wraps the result with
+//! `Tensor::from_floats`, a leaf with no path back to any model parameter.
+//! Added to a training loss it shifts the reported value and leaves every
+//! parameter gradient exactly as it was, at *any* weight. It therefore
+//! cannot pull the model toward higher-quality code; it is a monitoring
+//! number for a batch, not an objective. Turning it into a real pull needs a
+//! differentiable quality proxy (for example, scoring the model's own
+//! token distribution against the anti-pattern labels, which is what the
+//! unlikelihood term in [`crate::lm`] already does per token), which this
+//! module does not have. No training path in the crate calls it.
 //!
 //! # Identity at strength zero
 //!
-//! At `weight = 0.0` the regularizer contributes nothing to the loss,
-//! and the gradient with respect to the model is unchanged. That
-//! containment is the certificate `codequality/identity_at_strength_zero`
-//! checks: enabling the regularizer with a zero weight is bit-exact no-op
-//! on the loss, so a CLI flag that defaults to zero cannot make the first
-//! step worse than not enabling it.
+//! At `weight = 0.0` the value is an exact zero tensor. The certificate
+//! `codequality/identity_at_strength_zero` checks that bit-exactly. (Because
+//! of the section above, the *gradient* is unchanged at every weight, not
+//! only at zero.)
 
 use burn::tensor::{backend::Backend, Tensor};
 
@@ -64,13 +68,12 @@ impl QualityRegularizer {
         self.weight == 0.0
     }
 
-    /// Build the loss term for a batch of per-window scores.
+    /// The term's value for a batch of per-window scores.
     ///
     /// Returns a `[1]` tensor (so it broadcasts cleanly with a per-token
-    /// loss) and the pre-tensor scalar the regularizer expects. The mean
-    /// is taken over the batch dimension because the unlikelihood term is
-    /// also a mean, so the two live on the same scale and their weights
-    /// can be compared directly.
+    /// loss) and the same value as a scalar. The tensor is a constant leaf:
+    /// it has no gradient with respect to any model parameter (see the module
+    /// docs), so adding it to a loss changes the logged value only.
     pub fn loss<B: Backend<FloatElem = f32>>(
         &self,
         scores: &[QualityScore],

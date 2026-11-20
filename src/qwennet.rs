@@ -18,7 +18,9 @@
 //! 1. Four bias-free projections: `qkv = in_proj_qkv(x) [b,n,C]`,
 //!    `z = in_proj_z(x) [b,n,6144]`, `b_ = in_proj_b(x) [b,n,48]`,
 //!    `a = in_proj_a(x) [b,n,48]`.
-//! 2. Causal depthwise conv on qkv (weight `[C, K]`, no bias), then SiLU.
+//! 2. Causal depthwise conv on qkv (weight `[C, K]` indexed by lag, i.e. the
+//!    checkpoint's PyTorch taps reversed -- see `conv_param`; no bias), then
+//!    SiLU.
 //! 3. Split into q `[b,n,2048]`, k `[b,n,2048]`, v `[b,n,6144]` (in that
 //!    order); reshape q,k to `[b,n,16,128]`, v to `[b,n,48,128]`.
 //! 4. `beta = sigmoid(b_)`; `g = -exp(A_log) * softplus(a + dt_bias)`;
@@ -365,12 +367,14 @@ impl<B: Backend> QwenLinear<B> {
         }
     }
 
-    /// Quantize an f32 weight into NF4 residency, preserving its `ParamId`.
+    /// Quantize an f32 weight into NF4 residency.
     ///
-    /// The id is reused on purpose: a converted trunk must compare equal to the
-    /// one it came from under `checkpoint::canonical_hash_hex`, or converting a
-    /// trunk would silently invalidate every checkpoint taken before it.
-    /// Attached adapters are an error — convert first, then attach.
+    /// The weight stops being a `Param` at all: the packed form is
+    /// `#[module(skip)]`, so it leaves the module record and
+    /// `checkpoint::canonical_hash_hex` of a converted trunk DIFFERS from the
+    /// f32 trunk it came from (the hash covers parameter values, and this
+    /// parameter is gone). A bias, if present, keeps its `ParamId`. Attached
+    /// adapters are an error — convert first, then attach.
     pub fn to_nf4(self) -> Result<Self> {
         match self {
             Self::F32(linear) => {
@@ -397,7 +401,7 @@ impl<B: Backend> QwenLinear<B> {
                 let bias = linear.bias;
                 let mut nf4 = Nf4Linear::from_values(&values, d_in, d_out);
                 if let Some(b) = bias {
-                    nf4.bias = Some(Param::from_tensor(b.val()));
+                    nf4.bias = Some(Param::initialized(b.id, b.val()));
                 }
                 Ok(Self::Nf4(nf4))
             }
@@ -413,6 +417,10 @@ impl<B: Backend> QwenLinear<B> {
     /// dropping or duplicating an adapter would corrupt a run's resume
     /// story.
     pub fn with_lora(self, config: &QwenLoraConfig, device: &B::Device) -> Result<Self> {
+        // `LoraConfig::new` clamps a zero rank to 1 and takes any alpha, so an
+        // unvalidated rank-0 or NaN-alpha config would attach a different
+        // adapter than the one asked for, silently.
+        config.validate()?;
         match self {
             Self::Nf4(base) => {
                 let lcfg = LoraConfig::new(base.d_input(), base.d_output(), config.rank)
@@ -817,8 +825,10 @@ impl<B: Backend> QwenMlp<B> {
 struct Projections<B: Backend> {
     /// `[b, q_heads, n, dim]`, normed, not yet rotated.
     q: Tensor<B, 4>,
-    /// `[b, n, q_heads*dim]`, the sigmoid output gate.
-    gate: Tensor<B, 3>,
+    /// `[b, n, q_heads*dim]`, the sigmoid output gate; `None` when the
+    /// architecture has no output gate (`attn_output_gate = false`, so
+    /// `q_proj` is `heads*dim` wide rather than twice that).
+    gate: Option<Tensor<B, 3>>,
     /// `[b, kv_heads, n, dim]`, normed, not yet rotated.
     k: Tensor<B, 4>,
     /// `[b, kv_heads, n, dim]`.
@@ -828,9 +838,11 @@ struct Projections<B: Backend> {
 /// Qwen3.8 full-attention layer (every 4th decoder layer), bias-free
 /// everywhere, exactly the HF `modeling_qwen3_5.py` math:
 ///
-/// - `q_proj` widens to `2 * heads * dim`: the first half per head is the
-///   query, the second half reshapes to the `[b, n, heads*dim]` sigmoid
-///   output gate.
+/// - `q_proj` widens to `2 * heads * dim` (when `attn_output_gate`, as on
+///   Qwen3.8): the first half per head is the query, the second half
+///   reshapes to the `[b, n, heads*dim]` sigmoid output gate. Without the
+///   gate `q_proj` is `heads * dim` wide and the context goes straight to
+///   `o_proj`.
 /// - `q_norm`/`k_norm` are zero-centered [`QwenRmsNorm`]s over the head
 ///   dim, applied per head BEFORE rotary.
 /// - Partial RoPE (base `rope_base` = 1e7, NOT the repo default 1e4) over
@@ -915,12 +927,22 @@ impl<B: Backend> QwenFullAttention<B> {
     fn project(&self, x: Tensor<B, 3>) -> Projections<B> {
         let [b, n, _h] = x.dims();
         let (heads, kv, dim) = (self.num_heads, self.num_kv_heads, self.head_dim);
-        let qh = self
-            .q_proj
-            .forward(x.clone())
-            .reshape([b, n, heads, 2 * dim]);
-        let q = self.q_norm.forward_4d(qh.clone().narrow(3, 0, dim));
-        let gate = qh.narrow(3, dim, dim).reshape([b, n, heads * dim]);
+        let q_out = self.q_proj.forward(x.clone());
+        // `new` sizes `q_proj` from `attn_output_gate`: twice `heads*dim` with
+        // the gate interleaved per head (HF `view(.., heads, 2*dim).chunk(2)`),
+        // exactly `heads*dim` without it. Reading the width keeps the layer
+        // honest for both instead of reshaping a gate-less projection into a
+        // shape it cannot have.
+        let (q, gate) = if q_out.dims()[2] == 2 * heads * dim {
+            let qh = q_out.reshape([b, n, heads, 2 * dim]);
+            let q = self.q_norm.forward_4d(qh.clone().narrow(3, 0, dim));
+            (q, Some(qh.narrow(3, dim, dim).reshape([b, n, heads * dim])))
+        } else {
+            (
+                self.q_norm.forward_4d(q_out.reshape([b, n, heads, dim])),
+                None,
+            )
+        };
         let k = self
             .k_norm
             .forward_4d(self.k_proj.forward(x.clone()).reshape([b, n, kv, dim]));
@@ -961,7 +983,11 @@ impl<B: Backend> QwenFullAttention<B> {
         let q = apply_rotary_partial(p.q, 0, self.rope_base, self.rotary_dim);
         let k = apply_rotary_partial(p.k, 0, self.rope_base, self.rotary_dim);
         let ctx = self.attend(q, k, p.v, causal_mask::<B>(n, &device));
-        self.o_proj.forward(ctx.mul(sigmoid(p.gate)))
+        let ctx = match p.gate {
+            Some(gate) => ctx.mul(sigmoid(gate)),
+            None => ctx,
+        };
+        self.o_proj.forward(ctx)
     }
 
     /// One decode step against the KV cache in `state`: the new token's
@@ -986,12 +1012,14 @@ impl<B: Backend> QwenFullAttention<B> {
             None,
             &device,
         );
-        let ctx = self.attend(q, k, v, mask);
-        let gate = p.gate.reshape([b, self.num_heads * self.head_dim]);
-        self.o_proj.forward(
-            ctx.reshape([b, self.num_heads * self.head_dim])
-                .mul(sigmoid(gate)),
-        )
+        let ctx = self
+            .attend(q, k, v, mask)
+            .reshape([b, self.num_heads * self.head_dim]);
+        let ctx = match p.gate {
+            Some(gate) => ctx.mul(sigmoid(gate.reshape([b, self.num_heads * self.head_dim]))),
+            None => ctx,
+        };
+        self.o_proj.forward(ctx)
     }
 
     /// Scores-only max-logit probe (training-stability monitor, mirrors
@@ -1142,11 +1170,17 @@ fn placeholder_linear<B: Backend>(device: &B::Device) -> QwenLinear<B> {
 }
 
 impl<B: Backend> QwenTrunk<B> {
-    /// Logits from a hidden state: final norm + untied lm_head. Mirrors
-    /// `LanguageModel::logits_from_hidden` so vecread can decode fused states.
+    /// Logits from a hidden state as [`Self::forward_hidden`] returns it --
+    /// i.e. ALREADY through the final norm -- so this is the untied `lm_head`
+    /// alone, and `logits_from_hidden(forward_hidden(t)) == forward(t)`.
+    ///
+    /// Unlike `LanguageModel::logits_from_hidden` (whose hidden state is
+    /// pre-norm), applying `final_norm` here again would normalize twice: the
+    /// fused path (`FusedQwen`) computes its logits as `lm_head(fused)`, so a
+    /// lens decoding the same state through a second norm would report logits
+    /// the model never produced.
     pub fn logits_from_hidden(&self, hidden: Tensor<B, 3>) -> Tensor<B, 3> {
-        let normed = self.final_norm.forward(hidden);
-        self.lm_head.forward(normed)
+        self.lm_head.forward(hidden)
     }
     /// Quantize every projection in the trunk to NF4 residency.
     ///
@@ -1384,7 +1418,16 @@ fn linear_param<B: Backend>(
     )))
 }
 
-/// Checkpoint depthwise conv `[C, 1, K]` -> Burn `Param` `[C, K]`.
+/// Checkpoint depthwise conv `[C, 1, K]` -> Burn `Param` `[C, K]`, with the
+/// taps REVERSED.
+///
+/// PyTorch's `nn.Conv1d(padding=K-1)[..., :n]` (and `causal_conv1d_fn`) is a
+/// cross-correlation over the left-padded input: `out[t] = sum_j w[j] *
+/// x[t - (K-1) + j]`, so tap `K-1` multiplies the CURRENT row.
+/// [`causal_depthwise_conv`] indexes taps by lag instead (`out[t] = sum_l
+/// w[l] * x[t - l]`, tap `0` on the current row), so lag `l` is checkpoint tap
+/// `K-1-l`. Copying the taps straight across runs every real linear layer's
+/// short convolution backwards in time.
 fn conv_param<B: Backend>(
     tensor: &DecodedTensor,
     device: &B::Device,
@@ -1400,14 +1443,20 @@ fn conv_param<B: Backend>(
     ensure!(
         tensor.shape.len() == 3
             && tensor.shape.get(1) == Some(&1)
+            && kernel > 0
             && channels * kernel == tensor.data.len(),
         "tensor {:?} shape {:?} is not a depthwise [C, 1, K] conv weight",
         tensor.name,
         tensor.shape
     );
-    Ok(Param::from_tensor(
-        Tensor::<B, 1>::from_floats(tensor.data.as_slice(), device).reshape([channels, kernel]),
-    ))
+    let mut by_lag: Vec<f32> = Vec::with_capacity(tensor.data.len());
+    for taps in tensor.data.chunks_exact(kernel) {
+        by_lag.extend(taps.iter().rev());
+    }
+    Ok(Param::from_tensor(Tensor::<B, 2>::from_data(
+        TensorData::new(by_lag, [channels, kernel]),
+        device,
+    )))
 }
 
 /// Checkpoint rank-1 vector -> Burn `Param`.
@@ -1724,6 +1773,15 @@ fn fill_gated_delta_head<B: Backend>(
     )?;
     head.out_proj = w;
     report.record(class, bytes, store);
+    // The audit accepts `conv1d.bias` as a known name, but this head has no
+    // bias slot (the model generation is bias-free): a checkpoint that does
+    // carry one must fail here, not have it dropped on the floor.
+    let conv_bias = p("conv1d.bias");
+    ensure!(
+        !map.location.contains_key(&conv_bias),
+        "checkpoint carries {conv_bias:?}, but GatedDeltaHead's conv is bias-free; \
+         loading would silently drop it"
+    );
     // Rank-1 tensors and the conv weight stay f32 in BOTH modes (policy).
     let conv = map.read_part(&p("conv1d.weight"), QwenPart::LinearConv, dims)?;
     report.record_f32(class, 4 * conv.data.len());
@@ -1839,8 +1897,8 @@ fn ensure_linear_layer(layer_idx: usize, dims: &QwenArchDims) -> Result<()> {
         "layer {layer_idx} is a full-attention layer; it has no linear_attn tensors"
     );
     ensure!(
-        dims.linear_v_heads % dims.linear_k_groups == 0,
-        "value heads {} not a multiple of key groups {}",
+        dims.linear_k_groups > 0 && dims.linear_v_heads % dims.linear_k_groups == 0,
+        "value heads {} not a positive multiple of key groups {}",
         dims.linear_v_heads,
         dims.linear_k_groups
     );
@@ -1859,14 +1917,14 @@ fn open_audited_shards(dir: &Path, config: &QwenTrunkConfig) -> Result<ShardMap>
         dims.num_layers
     );
     ensure!(
-        dims.linear_v_heads % dims.linear_k_groups == 0,
-        "value heads {} not a multiple of key groups {}",
+        dims.linear_k_groups > 0 && dims.linear_v_heads % dims.linear_k_groups == 0,
+        "value heads {} not a positive multiple of key groups {}",
         dims.linear_v_heads,
         dims.linear_k_groups
     );
     ensure!(
-        dims.num_q_heads % dims.num_kv_heads == 0,
-        "query heads {} not a multiple of kv heads {}",
+        dims.num_kv_heads > 0 && dims.num_q_heads % dims.num_kv_heads == 0,
+        "query heads {} not a positive multiple of kv heads {}",
         dims.num_q_heads,
         dims.num_kv_heads
     );
@@ -2520,7 +2578,15 @@ mod tests {
     /// Write a synthetic one-shard safetensors dir holding every tensor a
     /// trunk of `dims` needs (F32 dtype, import.rs fixture pattern).
     fn write_tiny_fixture(dims: &QwenArchDims) -> std::path::PathBuf {
-        let mut specs: Vec<(String, Vec<usize>)> = Vec::new();
+        write_tiny_fixture_with(dims, &[])
+    }
+
+    /// [`write_tiny_fixture`] plus `extra` tensors appended to the shard.
+    fn write_tiny_fixture_with(
+        dims: &QwenArchDims,
+        extra: &[(String, Vec<usize>)],
+    ) -> std::path::PathBuf {
+        let mut specs: Vec<(String, Vec<usize>)> = extra.to_vec();
         let h = dims.hidden_size;
         let inter = dims.intermediate_size;
         let conv_c = 2 * dims.key_dim() + dims.value_dim();
@@ -2759,6 +2825,66 @@ mod tests {
             report.packed_bytes > 0 && report.f32_kept_bytes > 0,
             "report accounts both storages"
         );
+
+        // The bound above compounds ~40 per-tensor errors and is loose enough
+        // to pass almost anything. The exact property: an f32 trunk holding
+        // the NF4 trunk's DEQUANTIZED weights computes bit-identical logits
+        // (same values, same ops) -- which pins every packed weight to its
+        // slot and orientation, something no error bound can do.
+        let deq = |l: &mut QwenLinear<B>| {
+            let old = std::mem::replace(l, placeholder_linear(&device));
+            *l = match old {
+                QwenLinear::Nf4(n) => QwenLinear::F32(Linear {
+                    weight: Param::from_tensor(n.dequantized_weight(&device)),
+                    bias: None,
+                }),
+                other => panic!("expected an NF4-resident weight, got {other:?}"),
+            };
+        };
+        let (mut twin, _) = load_qwen_trunk_nf4::<B>(&dir, &config, &device)
+            .unwrap_or_else(|e| panic!("nf4 reload: {e:#}"));
+        twin.embed_tokens = match std::mem::replace(
+            &mut twin.embed_tokens,
+            QwenEmbed::F32(EmbeddingConfig::new(1, 1).init(&device)),
+        ) {
+            QwenEmbed::Nf4(e) => QwenEmbed::F32(Embedding {
+                weight: Param::from_tensor(e.dequantized_weight::<B>(&device)),
+            }),
+            QwenEmbed::F32(_) => panic!("expected an NF4-resident embedding"),
+        };
+        deq(&mut twin.lm_head);
+        for layer in &mut twin.layers {
+            match &mut layer.mixer {
+                QwenMixer::Linear(h) => {
+                    for l in [
+                        &mut h.in_proj_qkv,
+                        &mut h.in_proj_z,
+                        &mut h.in_proj_b,
+                        &mut h.in_proj_a,
+                        &mut h.out_proj,
+                    ] {
+                        deq(l);
+                    }
+                }
+                QwenMixer::Full(a) => {
+                    for l in [&mut a.q_proj, &mut a.k_proj, &mut a.v_proj, &mut a.o_proj] {
+                        deq(l);
+                    }
+                }
+            }
+            for l in [
+                &mut layer.mlp.gate_proj,
+                &mut layer.mlp.up_proj,
+                &mut layer.mlp.down_proj,
+            ] {
+                deq(l);
+            }
+        }
+        let logits_twin = flat3(twin.forward(tiny_tokens()));
+        assert!(
+            close(&logits_twin, &logits_nf4, 0.0),
+            "NF4 trunk != f32 trunk of its dequantized weights"
+        );
         std::fs::remove_dir_all(&dir).unwrap_or_else(|e| panic!("clean {}: {e}", dir.display()));
     }
 
@@ -2920,5 +3046,99 @@ mod tests {
         );
         assert_eq!(q1.dequantize(), q2.dequantize());
         assert_eq!(q1.len(), 48 * 5120);
+    }
+
+    #[test]
+    fn conv_param_follows_pytorch_tap_order() {
+        // PyTorch `Conv1d(padding=K-1)[..., :n]` with checkpoint taps
+        // [1, 2, 3] on an impulse at t=2 reads w[K-1]=3 at t=2, then 2, then
+        // 1 (cross-correlation over the left-padded input). The loaded
+        // weight must reproduce THAT, not the taps in file order.
+        let device = Default::default();
+        let tensor = DecodedTensor {
+            name: "conv".to_string(),
+            shape: vec![2, 1, 3],
+            data: vec![1.0, 2.0, 3.0, 10.0, 20.0, 30.0],
+        };
+        let weight = conv_param::<B>(&tensor, &device).unwrap().val();
+        let mut x = vec![0.0f32; 12];
+        x[2 * 2] = 1.0; // channel 0, t = 2
+        x[2 * 2 + 1] = 1.0; // channel 1, t = 2
+        let input = Tensor::<B, 1>::from_floats(x.as_slice(), &device).reshape([1, 6, 2]);
+        let out = flat3(causal_depthwise_conv(input, weight));
+        let want = [
+            0.0, 0.0, 0.0, 0.0, 3.0, 30.0, 2.0, 20.0, 1.0, 10.0, 0.0, 0.0,
+        ];
+        assert!(close(&out, &want, 0.0), "got {out:?}");
+    }
+
+    #[test]
+    fn logits_from_hidden_inverts_forward_hidden() {
+        // `forward_hidden` already applies the final norm; decoding its
+        // output must give exactly `forward`, including with a nonzero
+        // (zero-centered) final-norm weight, where a second norm changes
+        // the result.
+        let device = Default::default();
+        let mut trunk = QwenTrunk::<B>::new(tiny_config(), &device);
+        trunk.final_norm.weight = Param::from_tensor(Tensor::<B, 1>::random(
+            [tiny_dims().hidden_size],
+            Distribution::Uniform(0.5, 1.5),
+            &device,
+        ));
+        force_initialization(&trunk);
+        let tokens = tiny_tokens();
+        let want = flat3(trunk.forward(tokens.clone()));
+        let got = flat3(trunk.logits_from_hidden(trunk.forward_hidden(tokens)));
+        assert!(close(&got, &want, 0.0), "logits_from_hidden re-normalized");
+    }
+
+    #[test]
+    fn ungated_full_attention_runs_and_decodes() {
+        // `attn_output_gate = false` sizes q_proj at heads*dim; prefill and
+        // decode must both run on it (they used to reshape it to 2*dim and
+        // panic) and agree exactly.
+        let device = Default::default();
+        let dims = QwenArchDims {
+            attn_output_gate: false,
+            ..tiny_dims()
+        };
+        let attn = QwenFullAttention::<B>::new(&dims, 10_000_000.0, 1e-6, &device);
+        force_initialization(&attn);
+        let n = 4;
+        let x = Tensor::<B, 3>::random(
+            [1, n, dims.hidden_size],
+            Distribution::Normal(0.0, 0.02),
+            &device,
+        );
+        let prefill = attn.forward(x.clone());
+        let mut state = LayerState::<B>::new();
+        for t in 0..n {
+            let xt = x.clone().narrow(1, t, 1).reshape([1, dims.hidden_size]);
+            let got = flat3(attn.step(xt, &mut state).reshape([1, 1, dims.hidden_size]));
+            let want = flat3(prefill.clone().narrow(1, t, 1));
+            assert!(close(&got, &want, 0.0), "step {t} diverged from prefill");
+        }
+    }
+
+    #[test]
+    fn loader_refuses_a_conv_bias_it_cannot_hold() {
+        // The audit knows `conv1d.bias` by name, but the head has no bias
+        // slot: a checkpoint carrying one must fail the load, not lose it.
+        let device = Default::default();
+        let dims = tiny_dims();
+        let conv_c = 2 * dims.key_dim() + dims.value_dim();
+        let dir = write_tiny_fixture_with(
+            &dims,
+            &[(
+                "model.language_model.layers.0.linear_attn.conv1d.bias".to_string(),
+                vec![conv_c],
+            )],
+        );
+        let err = match load_qwen_trunk::<B>(&dir, &tiny_config(), &device) {
+            Ok(_) => panic!("a conv bias was silently dropped"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("conv1d.bias"), "unexpected error: {err}");
+        std::fs::remove_dir_all(&dir).unwrap_or_else(|e| panic!("clean {}: {e}", dir.display()));
     }
 }

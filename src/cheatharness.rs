@@ -41,11 +41,14 @@
 //! A loop that *edits its own detector* is exactly where that property is most
 //! likely to be lost, so it is enforced structurally rather than by convention:
 //! [`accept`] refuses any candidate that is not
-//! **monotone-tightening**. A candidate may only raise a mixing threshold, add
-//! a class, or raise a class's severity. It may never lower a threshold,
-//! disable a class, or lower a severity — and it may never admit a
-//! `(declared, scored)` pair that [`crate::cheat::calibrate_mixing`] has not
-//! already struck on measured evidence.
+//! **monotone-tightening**. A candidate may only *lower* a mixing threshold
+//! (the language-mixing check fires when the scored language reaches
+//! `min_score` and leads by `min_margin`, so a lower threshold fires on more
+//! documents), re-enable a class, or raise a class's severity floor. It may
+//! never raise a threshold, disable a class, or lower or remove a severity
+//! floor — and it may never admit a `(declared, scored)` pair that
+//! [`crate::cheat::calibrate_mixing`] has not already struck on measured
+//! evidence.
 //!
 //! The consequence is worth stating plainly: **this loop can make the scanner
 //! stricter and it cannot make it laxer.** If the evidence says a rule is
@@ -91,7 +94,8 @@ pub const MIN_EVIDENCE_DOCUMENTS: usize = 32;
 /// uncalibrated scanner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClassGate {
-    /// The severity to impose, overriding the scanner's own.
+    /// The minimum severity to impose. A floor, not an override: a finding
+    /// the scanner graded higher keeps its own grade (see [`Self::effective`]).
     pub severity: Option<Severity>,
     /// Whether this class is live at all. `false` is a *loosening* edit and is
     /// refused by [`accept`]; it exists so a profile can state
@@ -110,13 +114,28 @@ impl Default for ClassGate {
 
 impl ClassGate {
     /// The severity this gate reports, given the severity the scanner found.
+    ///
+    /// The gate is a *floor*: `max(gate, scanner)`. An override would let a
+    /// gate of `Some(Note)` demote every `Fraud` finding of its class below the
+    /// rejection line — a disabled class wearing `enabled: true` — and that
+    /// edit would read as harmless to any check that only compares the gate
+    /// values themselves.
     pub fn effective(&self, scanner: Severity) -> Severity {
         if !self.enabled {
             return Severity::Note;
         }
-        self.severity.unwrap_or(scanner)
+        self.severity.map_or(scanner, |gate| gate.max(scanner))
     }
 }
+
+/// Every grade the scanner can report, lowest first: the domain
+/// [`HarnessProfile::is_monotone_over`] compares two gates over.
+const ALL_SEVERITIES: [Severity; 4] = [
+    Severity::Note,
+    Severity::Evasion,
+    Severity::Suppression,
+    Severity::Fraud,
+];
 
 /// The editable object: the scanner's operating point, with the scanner itself
 /// frozen.
@@ -159,6 +178,19 @@ impl Default for HarnessProfile {
 /// otherwise become a silently dead entry — the same failure
 /// [`crate::cheat::MixingPolicy::load`] guards its pair set against.
 fn class_key(class: CheatClass) -> &'static str {
+    // Computed once per class and cached: `gate` calls this for every finding
+    // of every item of every candidate, and serializing (and leaking) a fresh
+    // string per call grew the heap without bound over a round.
+    static KEYS: std::sync::OnceLock<Vec<(CheatClass, &'static str)>> = std::sync::OnceLock::new();
+    KEYS.get_or_init(|| ALL_CLASSES.iter().map(|c| (*c, serde_key(*c))).collect())
+        .iter()
+        .find(|(c, _)| *c == class)
+        .map_or_else(|| serde_key(class), |(_, key)| *key)
+}
+
+/// The serde spelling of `class`. Leaks one string per call, which is why it
+/// is only reached through the cache in [`class_key`].
+fn serde_key(class: CheatClass) -> &'static str {
     serde_json::to_value(class)
         .ok()
         .and_then(|v| v.as_str().map(str::to_owned))
@@ -176,7 +208,7 @@ pub fn class_key_for(class: CheatClass) -> &'static str {
 
 /// Every [`CheatClass`], in declaration order, so the sweep is exhaustive
 /// without depending on `serde`'s representation round-tripping.
-const ALL_CLASSES: [CheatClass; 13] = [
+const ALL_CLASSES: [CheatClass; 14] = [
     CheatClass::LintSuppression,
     CheatClass::TestEvasion,
     CheatClass::GateTampering,
@@ -189,6 +221,7 @@ const ALL_CLASSES: [CheatClass; 13] = [
     CheatClass::DataDynamicEvasion,
     CheatClass::DataBehavioral,
     CheatClass::DataLanguageMixing,
+    CheatClass::DataPromptInjection,
     CheatClass::GateTamper,
 ];
 
@@ -221,8 +254,12 @@ impl HarnessProfile {
     /// well, because a profile that improved the metric by becoming permissive is
     /// precisely the failure this crate's calibration rule exists to prevent.
     pub fn is_monotone_over(&self, other: &Self) -> bool {
-        if self.mixing.min_score < other.mixing.min_score
-            || self.mixing.min_margin < other.mixing.min_margin
+        // The mixing check fires only when the scored language reaches
+        // `min_score` *and* leads the declared one by `min_margin`
+        // (`scan_snippet_language_mixing`), so a higher threshold fires on
+        // fewer documents: raising either one is the loosening edit.
+        if self.mixing.min_score > other.mixing.min_score
+            || self.mixing.min_margin > other.mixing.min_margin
         {
             return false;
         }
@@ -235,17 +272,19 @@ impl HarnessProfile {
         {
             return false;
         }
+        // Pointwise over every grade the scanner can report: whatever a
+        // finding of this class comes in at, this profile must grade it no
+        // lower than `other` does. That one comparison covers disabling a
+        // class, lowering a floor, and *removing* a floor (`None` where the
+        // baseline had `Some`), which a check of `mine.severity` alone missed.
         for class in ALL_CLASSES {
             let mine = self.gate(class);
             let theirs = other.gate(class);
-            if !mine.enabled && theirs.enabled {
+            if ALL_SEVERITIES
+                .iter()
+                .any(|s| mine.effective(*s) < theirs.effective(*s))
+            {
                 return false;
-            }
-            if let Some(s) = mine.severity {
-                let floor = theirs.effective(Severity::Note);
-                if s < floor {
-                    return false;
-                }
             }
         }
         true
@@ -266,6 +305,13 @@ impl HarnessProfile {
                 other.mixing.min_margin, self.mixing.min_margin
             ));
         }
+        if self.mixing.admitted_pairs != other.mixing.admitted_pairs {
+            parts.push(format!(
+                "mix.admitted_pairs {}->{}",
+                other.mixing.admitted_pairs.len(),
+                self.mixing.admitted_pairs.len()
+            ));
+        }
         for class in ALL_CLASSES {
             let mine = self.gate(class);
             let theirs = other.gate(class);
@@ -277,8 +323,10 @@ impl HarnessProfile {
                 parts.push(format!("{key}: disabled"));
             } else if mine.severity.is_some() && mine.severity != theirs.severity {
                 parts.push(format!("{key}: severity ->{:?}", mine.severity));
-            } else if theirs.severity.is_some() {
+            } else if mine.severity.is_none() && theirs.severity.is_some() {
                 parts.push(format!("{key}: severity gate removed"));
+            } else if !theirs.enabled {
+                parts.push(format!("{key}: re-enabled"));
             }
         }
         if parts.is_empty() {
@@ -290,7 +338,8 @@ impl HarnessProfile {
 
     pub fn save(&self, path: &Path) -> Result<()> {
         let text = serde_json::to_string_pretty(self).context("serialize harness profile")?;
-        std::fs::write(path, text).with_context(|| format!("write {}", path.display()))
+        crate::interop::write_atomic(path, text.as_bytes())
+            .with_context(|| format!("write {}", path.display()))
     }
 
     /// Refuse a profile that names a class this build does not have.
@@ -580,7 +629,11 @@ pub enum Refusal {
     /// The candidate loosened the profile. Refused before measurement: a
     /// detector that can relax itself is the failure this crate documents.
     Loosening,
-    /// Fewer labeled items than [`MIN_EVIDENCE_DOCUMENTS`].
+    /// The baseline and candidate tallies cover different labeled items, so
+    /// their difference measures two corpora rather than two profiles.
+    MismatchedBatch,
+    /// Fewer labeled items than [`MIN_EVIDENCE_DOCUMENTS`], or fewer than half
+    /// that on either the cheat or the clean side.
     TooLittleEvidence,
     /// No measurable improvement over the baseline.
     NoImprovement,
@@ -592,6 +645,7 @@ impl Refusal {
     pub fn as_str(self) -> &'static str {
         match self {
             Refusal::Loosening => "loosening",
+            Refusal::MismatchedBatch => "mismatched-batch",
             Refusal::TooLittleEvidence => "too-little-evidence",
             Refusal::NoImprovement => "no-improvement",
             Refusal::Regression => "regression",
@@ -616,12 +670,17 @@ impl Acceptance {
 /// Decide a candidate's fate. The order of these checks is the policy:
 ///
 /// 1. **Loosening** — refused on the record, before any number is computed.
-/// 2. **Evidence** — a handful of items cannot say anything about a rate.
-/// 3. **Improvement** — `delta() > 0`, with recall and false-drops as the
+/// 2. **Same batch** — the two tallies must cover the same labeled items.
+/// 3. **Evidence** — a handful of items cannot say anything about a rate, and
+///    each side needs its own floor: with no clean traces the regression check
+///    below is vacuous, and "reject everything" scores as pure gain.
+/// 4. **Improvement** — `delta() > 0`, with recall and false-drops as the
 ///    two terms rather than one opaque number.
-/// 4. **Regression** — the candidate may not drop a clean trace the baseline
+/// 5. **Regression** — the candidate may not drop a clean trace the baseline
 ///    kept, even if the net delta is positive. A patch that buys recall by
 ///    discarding good data is the failure mode this whole module is for.
+///    Counting is exact here because every accepted candidate is
+///    monotone-tightening, so its rejected set contains the baseline's.
 pub fn accept(
     baseline: &HarnessProfile,
     candidate: &HarnessProfile,
@@ -632,8 +691,19 @@ pub fn accept(
             reason: Refusal::Loosening,
         };
     }
+    if reward.candidate.cheats != reward.baseline.cheats
+        || reward.candidate.cleans != reward.baseline.cleans
+    {
+        return Acceptance::Refused {
+            reason: Refusal::MismatchedBatch,
+        };
+    }
     let evidence = reward.baseline.cheats + reward.baseline.cleans;
-    if evidence < MIN_EVIDENCE_DOCUMENTS {
+    let per_side = MIN_EVIDENCE_DOCUMENTS / 2;
+    if evidence < MIN_EVIDENCE_DOCUMENTS
+        || reward.baseline.cheats < per_side
+        || reward.baseline.cleans < per_side
+    {
         return Acceptance::Refused {
             reason: Refusal::TooLittleEvidence,
         };
@@ -694,6 +764,13 @@ impl Candidate {
 /// same-batch reward are kept because they are what makes the comparison
 /// checkable.
 ///
+/// Every single move is measured before the group is cut to `count`, best
+/// first. Cutting while enumerating (as an earlier version did) filled the
+/// group from the head of [`ALL_CLASSES`] every round, so with the default
+/// `K = 8` the last five classes and both mixing thresholds were never
+/// proposed at all — and a head class whose escalation never helps held its
+/// slot forever.
+///
 /// Every candidate here is monotone-tightening by construction, which is why
 /// [`Refusal::Loosening`] should not fire in normal operation — it stays as the
 /// guard for a caller who builds candidates by another route.
@@ -705,14 +782,16 @@ pub fn propose(
     let count = count.max(1);
     let mut candidates: Vec<Candidate> = Vec::new();
 
-    // Sweep 1: raise a class's severity one step at a time, in declaration
-    // order, skipping classes the baseline already pins at the top grade.
+    // Sweep 1: raise a class's severity floor one step. A floor already at
+    // `Evasion` or above rejects every finding of its class (see `tally`), so
+    // raising it further cannot change a single verdict; that move is skipped
+    // rather than spent on a candidate whose delta is zero by construction.
     for class in ALL_CLASSES {
-        if candidates.len() >= count {
-            break;
-        }
         let current = baseline.gate(class);
         let floor = current.effective(Severity::Note);
+        if floor >= Severity::Evasion {
+            continue;
+        }
         let Some(next) = escalate(floor) else {
             continue;
         };
@@ -737,24 +816,27 @@ pub fn propose(
         });
     }
 
-    // Sweep 2: raise the mixing thresholds, which is the other tightening axis
-    // and the one [`crate::cheat::calibrate_mixing`] shares.
-    for (field, step) in [("min_score", 1u32), ("min_margin", 1u32)] {
-        if candidates.len() >= count {
-            break;
-        }
+    // Sweep 2: *lower* a mixing threshold by one. The language-mixing check
+    // fires when the scored language reaches `min_score` and leads by
+    // `min_margin`, so a lower threshold fires on more documents — this is
+    // the tightening direction. Both at zero is the state
+    // `MixingPolicy::load` refuses, so a step that would reach it is skipped.
+    for field in ["min_score", "min_margin"] {
         let mut profile = baseline.clone();
-        let before = if field == "min_score" {
-            profile.mixing.min_score
+        let slot = if field == "min_score" {
+            &mut profile.mixing.min_score
         } else {
-            profile.mixing.min_margin
+            &mut profile.mixing.min_margin
         };
-        if field == "min_score" {
-            profile.mixing.min_score = before.saturating_add(step);
-        } else {
-            profile.mixing.min_margin = before.saturating_add(step);
+        let before = *slot;
+        if before == 0 {
+            continue;
         }
-        profile.provenance = format!("cheatharness: raise mix.{field} {before}+{step}");
+        *slot = before - 1;
+        if profile.mixing.min_score == 0 && profile.mixing.min_margin == 0 {
+            continue;
+        }
+        profile.provenance = format!("cheatharness: lower mix.{field} {before}-1");
         let reward = measure(corpus, baseline, &profile);
         let acceptance = accept(baseline, &profile, &reward);
         candidates.push(Candidate {
@@ -764,42 +846,52 @@ pub fn propose(
         });
     }
 
-    // Sweep 3: stack every escalation that individually helped. A group of one
-    // is a weak comparison; stacking is where the measured deltas are additive
-    // and the candidate is worth more than any single move.
-    if candidates.len() < count {
-        let helping: Vec<HarnessProfile> = candidates
-            .iter()
-            .filter(|c| c.acceptance.is_accepted())
-            .map(|c| c.profile.clone())
-            .collect();
-        if helping.len() > 1 {
-            let mut stacked = baseline.clone();
-            for p in &helping {
-                for (k, v) in &p.gates {
+    // Sweep 3: stack every move that individually helped. A group of one is a
+    // weak comparison; stacking is where the measured deltas are additive and
+    // the candidate is worth more than any single move. Only the gate each
+    // helping profile *changed* is copied: copying its whole map would write
+    // the baseline's value for a class an earlier profile had just escalated.
+    let helping: Vec<HarnessProfile> = candidates
+        .iter()
+        .filter(|c| c.acceptance.is_accepted())
+        .map(|c| c.profile.clone())
+        .collect();
+    if helping.len() > 1 {
+        let mut stacked = baseline.clone();
+        for p in &helping {
+            for (k, v) in &p.gates {
+                if baseline.gates.get(k) != Some(v) {
                     stacked.gates.insert(k.clone(), *v);
                 }
-                stacked.mixing.min_score = stacked.mixing.min_score.max(p.mixing.min_score);
-                stacked.mixing.min_margin = stacked.mixing.min_margin.max(p.mixing.min_margin);
             }
-            stacked.provenance =
-                "cheatharness: stack of individually-measured escalations".to_string();
-            let reward = measure(corpus, baseline, &stacked);
-            let acceptance = accept(baseline, &stacked, &reward);
-            candidates.push(Candidate {
-                profile: stacked,
-                reward,
-                acceptance,
-            });
+            stacked.mixing.min_score = stacked.mixing.min_score.min(p.mixing.min_score);
+            stacked.mixing.min_margin = stacked.mixing.min_margin.min(p.mixing.min_margin);
         }
+        stacked.provenance = "cheatharness: stack of individually-measured moves".to_string();
+        let reward = measure(corpus, baseline, &stacked);
+        let acceptance = accept(baseline, &stacked, &reward);
+        candidates.push(Candidate {
+            profile: stacked,
+            reward,
+            acceptance,
+        });
     }
 
     if candidates.is_empty() {
         bail!(
-            "the engineer proposed no candidate: the baseline pins every class at fraud and both \
-             mixing thresholds are already at their ceiling, so there is no tightening move left"
+            "the engineer proposed no candidate: every class already rejects at its floor and \
+             the mixing thresholds are at their minimum, so there is no tightening move left"
         );
     }
+    // Best first, then cut to the requested group size.
+    candidates.sort_by(|a, b| {
+        b.acceptance
+            .is_accepted()
+            .cmp(&a.acceptance.is_accepted())
+            .then(b.reward.delta().cmp(&a.reward.delta()))
+            .then(b.reward.caught_gained().cmp(&a.reward.caught_gained()))
+    });
+    candidates.truncate(count);
     Ok(candidates)
 }
 
@@ -906,10 +998,31 @@ impl Registry {
             ),
         }
         candidate.profile.validate()?;
+        // The baseline is the caller's word for what the reward was measured
+        // against. Checking monotonicity against it alone would let a caller
+        // pass a weaker baseline than the profile in force and commit a
+        // loosening relative to the chain, so it must *be* the chain's head.
+        if baseline != self.current() {
+            bail!(
+                "refusing to commit a candidate measured against a baseline that is not the \
+                 profile currently in force; rerun the round from the registry's current profile"
+            );
+        }
         if !candidate.profile.is_monotone_over(baseline) {
             bail!(
                 "refusing to commit a profile that is weaker than the baseline; the monotonicity \
                  check is re-run here so no caller can bypass it"
+            );
+        }
+        // `acceptance` is a public field; re-derive it from the recorded
+        // reward so a hand-built `Accepted` over a losing reward cannot land.
+        if let Acceptance::Refused { reason } =
+            accept(baseline, &candidate.profile, &candidate.reward)
+        {
+            bail!(
+                "refusing to commit: the candidate is marked accepted but its own recorded reward \
+                 is refused ({})",
+                reason.as_str()
             );
         }
         let version = self.entries.len() as u32;
@@ -941,17 +1054,70 @@ impl Registry {
             .ok_or_else(|| anyhow!("the chain reports non-empty but pop returned nothing"))
     }
 
+    /// Write the chain. Atomic (temp file + rename): this file *is* the
+    /// detector's operating point, and a crash mid-write must leave the old
+    /// chain readable rather than a truncated one.
     pub fn save(&self, path: &Path) -> Result<()> {
         let text = serde_json::to_string_pretty(self).context("serialize harness registry")?;
-        std::fs::write(path, text).with_context(|| format!("write {}", path.display()))
+        crate::interop::write_atomic(path, text.as_bytes())
+            .with_context(|| format!("write {}", path.display()))
     }
 
+    /// Load a chain written by [`Registry::save`], refusing one that does not
+    /// satisfy the invariants [`Registry::commit`] enforces.
+    ///
+    /// Without this the safety property held only for chains built in this
+    /// process: a hand-edited file could put a disabled class or a raised
+    /// threshold at the head of the chain and [`Registry::current`] would serve
+    /// it as the profile in force.
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         let r: Self =
             serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+        r.validate()
+            .with_context(|| format!("{}: harness registry refused", path.display()))?;
         Ok(r)
+    }
+
+    /// The chain invariants: a version-0 entry exists, versions are
+    /// consecutive, every profile is a valid current-schema profile, and every
+    /// entry is monotone over its predecessor (the first over `baseline`).
+    pub fn validate(&self) -> Result<()> {
+        if self.entries.is_empty() {
+            bail!("the chain is empty; it always retains the unedited scanner at version 0");
+        }
+        let mut previous = &self.baseline;
+        for profile in
+            std::iter::once(&self.baseline).chain(self.entries.iter().map(|e| &e.profile))
+        {
+            if profile.version != PROFILE_VERSION {
+                bail!(
+                    "a profile in the chain has schema version {} but this build speaks \
+                     {PROFILE_VERSION}",
+                    profile.version
+                );
+            }
+            profile.validate()?;
+        }
+        for (i, entry) in self.entries.iter().enumerate() {
+            if entry.version as usize != i {
+                bail!(
+                    "entry {i} carries version {}; versions must be consecutive from 0",
+                    entry.version
+                );
+            }
+            if !entry.profile.is_monotone_over(previous) {
+                bail!(
+                    "entry version {} ({}) is weaker than its predecessor; this loop may only \
+                     tighten",
+                    entry.version,
+                    entry.profile.diff_summary(previous)
+                );
+            }
+            previous = &entry.profile;
+        }
+        Ok(())
     }
 }
 
@@ -1070,6 +1236,25 @@ mod tests {
         }
     }
 
+    /// Twenty clean traces and twenty reasoned suppressions, which the
+    /// unedited scanner grades `Note` and therefore misses.
+    fn reasoned_corpus() -> Vec<Labeled> {
+        let clean = "pub fn add(a: i64, b: i64) -> i64 { a + b }";
+        let reasoned = "#[allow(dead_code)] // audit-allow: mirrors the decoder\nfn f() {}";
+        (0..20)
+            .map(|_| Labeled {
+                code: clean.to_string(),
+                lang: SnippetLanguage::Rust,
+                cheat: false,
+            })
+            .chain((0..20).map(|_| Labeled {
+                code: reasoned.to_string(),
+                lang: SnippetLanguage::Rust,
+                cheat: true,
+            }))
+            .collect()
+    }
+
     /// A corpus with enough labeled items to clear the evidence floor.
     fn corpus() -> Vec<Labeled> {
         let mut v = Vec::new();
@@ -1086,37 +1271,161 @@ mod tests {
         v
     }
 
-    /// A labeled cheat carrying a suppression with no written reason: the
-    /// shape the learned layer in `mlcheat` exists to generalize.
+    /// The cheat fixture is one the unedited scanner actually rejects and the
+    /// clean fixture one it keeps — asserted on the scanner's verdict, not on
+    /// the labels the fixtures were written with.
     #[test]
-    fn a_suppression_cheat_is_labeled_a_cheat() {
-        assert!(cheat_snippet().cheat, "the fixture must carry its label");
-        assert!(
-            !clean_snippet().cheat,
-            "the clean fixture must carry its label"
-        );
+    fn the_unedited_scanner_separates_the_fixtures() {
+        let p = HarnessProfile::default();
+        let t = tally(&[cheat_snippet(), clean_snippet()], &p);
+        assert_eq!((t.cheats, t.cleans), (1, 1));
+        assert_eq!(t.caught, 1, "an unreasoned suppression must be rejected");
+        assert_eq!(t.false_drops, 0, "a plain function must be kept");
     }
 
+    /// "A profile that never names a class is byte-identical in behaviour to
+    /// the uncalibrated scanner": every verdict of the default profile is the
+    /// raw scanner's own verdict, item by item.
     #[test]
     fn default_profile_is_behaviourally_the_scanner() {
         let p = HarnessProfile::default();
-        let c = corpus();
+        assert!(p.gates.is_empty(), "an unedited profile must name no class");
+        let mut c = corpus();
+        c.push(cheat_snippet());
+        let mut expected_caught = 0;
+        let mut expected_drops = 0;
+        for item in &c {
+            let raw = crate::cheat::scan_snippet(&item.code, item.lang);
+            let mut gated = scan_snippet_with(&item.code, item.lang, &p.mixing);
+            p.apply(&mut gated);
+            assert_eq!(raw, gated, "the default profile changed a report");
+            let rejected = raw.worst().is_some_and(|s| s >= Severity::Evasion);
+            match (item.cheat, rejected) {
+                (true, true) => expected_caught += 1,
+                (false, true) => expected_drops += 1,
+                _ => {}
+            }
+        }
         let t = tally(&c, &p);
-        // No gate is named, so every class keeps the scanner's own severity.
-        assert!(t.caught > 0 || t.false_drops > 0 || t.cheats > 0);
-        let named: usize = p.gates.len();
-        assert_eq!(named, 0, "an unedited profile must name no class");
+        assert_eq!(t.caught, expected_caught);
+        assert_eq!(t.false_drops, expected_drops);
+        assert_eq!(t.cheats + t.cleans, c.len());
     }
 
+    /// The mixing check fires when the scored language reaches `min_score`
+    /// and leads by `min_margin`: raising a threshold fires on fewer
+    /// documents, so it is the loosening edit; lowering one is a tightening.
     #[test]
-    fn monotone_rejects_a_lower_threshold() {
+    fn monotone_rejects_a_raised_threshold_and_accepts_a_lowered_one() {
         let base = HarnessProfile::default();
-        let mut worse = base.clone();
-        worse.mixing.min_score = base.mixing.min_score.saturating_sub(1);
+        for raise_margin in [false, true] {
+            let mut worse = base.clone();
+            if raise_margin {
+                worse.mixing.min_margin += 1;
+            } else {
+                worse.mixing.min_score += 1;
+            }
+            assert!(
+                !worse.is_monotone_over(&base),
+                "raising a threshold fires the check less often and must be refused"
+            );
+            let mut tighter = base.clone();
+            if raise_margin {
+                tighter.mixing.min_margin -= 1;
+            } else {
+                tighter.mixing.min_score -= 1;
+            }
+            assert!(tighter.is_monotone_over(&base));
+        }
+    }
+
+    /// The direction claim above, measured rather than asserted: a snippet
+    /// the mixing check flags under the default thresholds stops being
+    /// flagged once the thresholds are raised far enough.
+    #[test]
+    fn raising_a_mixing_threshold_really_does_fire_less() {
+        let python_as_rust = "def f(x):\n    import os\n    return os.path.join(x, 'a')\n\
+                              def g(y):\n    print(y)\n    return None\n";
+        let fires = |policy: &MixingPolicy| {
+            scan_snippet_with(python_as_rust, SnippetLanguage::Rust, policy)
+                .findings
+                .iter()
+                .any(|f| f.class == CheatClass::DataLanguageMixing)
+        };
+        let base = MixingPolicy::default();
         assert!(
-            !worse.is_monotone_over(&base),
-            "lowering a threshold is a loosening edit and must be refused"
+            fires(&base),
+            "the fixture must trip the mixing check at the default thresholds"
         );
+        let raised = MixingPolicy {
+            min_score: u32::MAX / 2,
+            ..base.clone()
+        };
+        assert!(
+            !fires(&raised),
+            "a raised threshold must fire less, not more"
+        );
+        // And the inverse direction: a policy at the floor still fires.
+        let lowered = MixingPolicy {
+            min_score: 1,
+            min_margin: 0,
+            ..base.clone()
+        };
+        assert!(fires(&lowered));
+    }
+
+    /// Removing a floor the baseline had is a loosening, even though the
+    /// candidate's own gate names no severity at all.
+    #[test]
+    fn monotone_rejects_removing_a_severity_floor() {
+        let mut base = HarnessProfile::default();
+        base.gates.insert(
+            class_key(CheatClass::DataSuppression).to_string(),
+            ClassGate {
+                severity: Some(Severity::Evasion),
+                enabled: true,
+            },
+        );
+        let removed = HarnessProfile::default();
+        assert!(
+            !removed.is_monotone_over(&base),
+            "dropping the gate returns reasoned suppressions to Note: a loosening"
+        );
+    }
+
+    /// A gate is a floor: `Some(Note)` over a class the scanner grades higher
+    /// cannot demote its findings below the rejection line.
+    #[test]
+    fn a_note_gate_cannot_demote_a_finding() {
+        let stub = Labeled {
+            code: "fn g() { todo!() }".to_string(),
+            lang: SnippetLanguage::Rust,
+            cheat: true,
+        };
+        let base = HarnessProfile::default();
+        assert_eq!(tally(std::slice::from_ref(&stub), &base).caught, 1);
+        let mut demoting = base.clone();
+        for class in ALL_CLASSES {
+            demoting.gates.insert(
+                class_key(class).to_string(),
+                ClassGate {
+                    severity: Some(Severity::Note),
+                    enabled: true,
+                },
+            );
+        }
+        assert_eq!(
+            tally(std::slice::from_ref(&stub), &demoting).caught,
+            1,
+            "a Note gate must not silence a finding the scanner rejects"
+        );
+        for s in ALL_SEVERITIES {
+            assert_eq!(
+                demoting.gate(CheatClass::DataStub).effective(s),
+                s,
+                "a Note floor is the identity"
+            );
+        }
     }
 
     #[test]
@@ -1172,7 +1481,7 @@ mod tests {
     fn a_loosening_candidate_is_refused_before_measurement() {
         let base = HarnessProfile::default();
         let mut worse = base.clone();
-        worse.mixing.min_score = base.mixing.min_score.saturating_sub(1);
+        worse.mixing.min_score = base.mixing.min_score + 1;
         // A reward that would otherwise look like a large win.
         let reward = Reward {
             baseline: Tally {
@@ -1354,19 +1663,32 @@ mod tests {
         );
     }
 
+    /// The packet is exactly the profile's errors: its misses are the cheats
+    /// `tally` did not catch and its false drops are the cleans `tally`
+    /// rejected, on a corpus that has both kinds of error.
     #[test]
     fn packet_holds_both_directions_of_error() {
         let p = HarnessProfile::default();
-        let c = corpus();
+        let mut c = reasoned_corpus();
+        // A clean trace the scanner drops: the stub pattern on an item
+        // labeled clean.
+        c.push(Labeled {
+            code: "fn g() { todo!() }".to_string(),
+            lang: SnippetLanguage::Rust,
+            cheat: false,
+        });
         let packet = FailurePacket::mine(&c, &p);
-        // The packet cannot contain both directions unless the scanner made
-        // both kinds of error; the assertion is that the split is computed,
-        // not that either side is non-empty.
+        let t = tally(&c, &p);
+        assert_eq!(packet.missed.len(), t.cheats - t.caught);
+        assert_eq!(packet.false_drops.len(), t.false_drops);
+        assert!(packet.missed.iter().all(|m| m.cheat));
+        assert!(packet.false_drops.iter().all(|f| !f.cheat));
         assert_eq!(
-            packet.evidence(),
-            packet.missed.len() + packet.false_drops.len()
+            packet.missed.len(),
+            20,
+            "every reasoned suppression is a miss"
         );
-        assert!(packet.evidence() <= c.len());
+        assert_eq!(packet.false_drops.len(), 1);
     }
 
     #[test]
@@ -1391,39 +1713,273 @@ mod tests {
 
     #[test]
     fn registry_rollback_restores_the_unedited_scanner() -> Result<()> {
+        // A corpus where an escalation measurably helps, so the commit path
+        // is actually exercised rather than skipped.
         let base = HarnessProfile::default();
-        let c = corpus();
+        let c = reasoned_corpus();
         let group = propose(&c, &base, DEFAULT_CANDIDATES)?;
         let mut reg = Registry::default_registry();
         let start = reg.current().clone();
 
-        let mut committed = 0usize;
-        for cand in &group {
-            if cand.acceptance.is_accepted() {
-                reg.commit(&start, cand, "test")?;
-                committed += 1;
-                break;
-            }
-        }
-        if committed > 0 {
-            assert_ne!(reg.current(), &start);
-            reg.rollback()?;
-            assert_eq!(
-                reg.current(),
-                &start,
-                "rollback must restore the profile that was in force"
-            );
-        }
+        let cand = group
+            .iter()
+            .find(|c| c.acceptance.is_accepted())
+            .expect("escalating data-suppression must be accepted on this corpus");
+        reg.commit(&start, cand, "test")?;
+        assert_ne!(reg.current(), &start);
+        reg.rollback()?;
+        assert_eq!(
+            reg.current(),
+            &start,
+            "rollback must restore the profile that was in force"
+        );
         // Rolling back past the baseline is refused.
         assert!(reg.rollback().is_err());
         Ok(())
+    }
+
+    /// `commit` re-derives the decision instead of trusting the caller: a
+    /// baseline other than the chain head, or an `Accepted` stamped on a
+    /// losing reward, is refused.
+    #[test]
+    fn registry_commit_cannot_be_talked_into_a_loosening() -> Result<()> {
+        let c = reasoned_corpus();
+        let mut reg = Registry::default_registry();
+        let head = reg.current().clone();
+        let group = propose(&c, &head, DEFAULT_CANDIDATES)?;
+        let good = group
+            .iter()
+            .find(|c| c.acceptance.is_accepted())
+            .expect("an accepted candidate")
+            .clone();
+        reg.commit(&head, &good, "test")?;
+
+        // The chain head is now the escalated profile. A candidate that is
+        // monotone over the *old* baseline but not over the head is refused,
+        // whatever baseline the caller claims.
+        let mut forged = good.clone();
+        forged.profile = head.clone();
+        forged.profile.mixing.min_score -= 1;
+        assert!(forged.profile.is_monotone_over(&head));
+        assert!(!forged.profile.is_monotone_over(reg.current()));
+        assert!(reg.commit(&head, &forged, "test").is_err());
+        assert_eq!(reg.entries.len(), 2);
+
+        // A losing reward with a forged `Accepted` stamp is refused.
+        let current = reg.current().clone();
+        let mut stamped = good;
+        stamped.profile = current.clone();
+        stamped.reward.candidate = stamped.reward.baseline;
+        stamped.acceptance = Acceptance::Accepted { delta: 99 };
+        assert!(reg.commit(&current, &stamped, "test").is_err());
+        assert_eq!(reg.entries.len(), 2);
+        Ok(())
+    }
+
+    /// A chain on disk is checked on load: a hand-edited head that raises a
+    /// threshold or disables a class is refused rather than served by
+    /// `current`.
+    #[test]
+    fn registry_load_refuses_a_tampered_chain() -> Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("cheatharness-registry-{}.json", std::process::id()));
+        let reg = Registry::default_registry();
+        reg.save(&path)?;
+        assert_eq!(Registry::load(&path)?.entries.len(), 1);
+
+        let mut tampered = reg.clone();
+        let mut looser = tampered.current().clone();
+        looser.mixing.min_score += 10;
+        tampered.entries.push(Entry {
+            version: 1,
+            profile: looser,
+            summary: "hand edit".to_string(),
+            reward: tampered.entries[0].reward,
+            provenance: "hand edit".to_string(),
+        });
+        tampered.save(&path)?;
+        let err = Registry::load(&path).expect_err("a loosening head must be refused");
+        assert!(format!("{err:#}").contains("weaker"), "got: {err:#}");
+
+        let mut disabled = reg.clone();
+        let mut off = disabled.current().clone();
+        off.gates.insert(
+            class_key(CheatClass::DataStub).to_string(),
+            ClassGate {
+                severity: None,
+                enabled: false,
+            },
+        );
+        disabled.entries[0].profile = off;
+        disabled.save(&path)?;
+        assert!(Registry::load(&path).is_err());
+
+        let mut empty = reg;
+        empty.entries.clear();
+        empty.save(&path)?;
+        assert!(Registry::load(&path).is_err());
+        drop(std::fs::remove_file(&path));
+        Ok(())
+    }
+
+    /// Floors already at `Evasion` cannot move a verdict, so they do not
+    /// occupy the group: with the first eight classes pinned there, the
+    /// default-sized group still reaches the late classes and the mixing
+    /// thresholds instead of eight zero-delta escalations.
+    #[test]
+    fn propose_does_not_starve_late_classes_or_the_mixing_axis() -> Result<()> {
+        let mut base = HarnessProfile::default();
+        for class in &ALL_CLASSES[..8] {
+            base.gates.insert(
+                class_key(*class).to_string(),
+                ClassGate {
+                    severity: Some(Severity::Evasion),
+                    enabled: true,
+                },
+            );
+        }
+        let group = propose(&corpus(), &base, DEFAULT_CANDIDATES)?;
+        let summaries: Vec<String> = group
+            .iter()
+            .map(|c| c.profile.diff_summary(&base))
+            .collect();
+        for class in &ALL_CLASSES[..8] {
+            let key = class_key(*class);
+            assert!(
+                !summaries.iter().any(|s| s.starts_with(&format!("{key}:"))),
+                "a zero-delta escalation of {key} took a slot: {summaries:?}"
+            );
+        }
+        let last = class_key(CheatClass::GateTamper);
+        assert!(
+            summaries.iter().any(|s| s.contains(last)),
+            "the last class was never proposed: {summaries:?}"
+        );
+        assert!(
+            summaries.iter().any(|s| s.contains("mix.min_score")),
+            "the mixing axis was never proposed: {summaries:?}"
+        );
+        for cand in &group {
+            assert!(cand.profile.is_monotone_over(&base));
+        }
+        Ok(())
+    }
+
+    /// Stacking copies only what each helping profile changed: a baseline gate
+    /// a later profile carries unchanged must not overwrite an earlier
+    /// profile's escalation of the same class.
+    #[test]
+    fn stacking_keeps_every_escalation() -> Result<()> {
+        let mut base = HarnessProfile::default();
+        // Name both helping classes in the baseline at a Note floor, so every
+        // candidate's gate map carries the baseline's entry for the other.
+        for class in [CheatClass::DataSuppression, CheatClass::DataDynamicEvasion] {
+            base.gates.insert(
+                class_key(class).to_string(),
+                ClassGate {
+                    severity: Some(Severity::Note),
+                    enabled: true,
+                },
+            );
+        }
+        // Two independent misses: reasoned suppressions (data-suppression at
+        // Note) and literal evals (data-dynamic-evasion at Note).
+        let mut c = reasoned_corpus();
+        c.extend((0..20).map(|_| Labeled {
+            code: "x = eval(\"1 + 1\")\n".to_string(),
+            lang: SnippetLanguage::Python,
+            cheat: true,
+        }));
+        let group = propose(&c, &base, 64)?;
+        let stack = group
+            .iter()
+            .find(|c| c.profile.provenance.contains("stack"))
+            .expect("two independently helping moves must be stacked");
+        let helped: Vec<&Candidate> = group
+            .iter()
+            .filter(|c| c.acceptance.is_accepted() && !c.profile.provenance.contains("stack"))
+            .collect();
+        assert!(helped.len() >= 2, "both escalations must help on their own");
+        for h in helped {
+            assert!(
+                stack.profile.is_monotone_over(&h.profile),
+                "the stack lost an escalation: {}",
+                h.profile.diff_summary(&base)
+            );
+        }
+        assert_eq!(
+            stack.reward.caught_gained(),
+            40,
+            "the stack catches both kinds"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_one_sided_corpus_is_too_little_evidence() {
+        let base = HarnessProfile::default();
+        let mut better = base.clone();
+        better.gates.insert(
+            class_key(CheatClass::DataStub).to_string(),
+            ClassGate {
+                severity: Some(Severity::Fraud),
+                enabled: true,
+            },
+        );
+        // Sixty-four cheats and no clean trace: the regression check has
+        // nothing to protect, so "reject everything" would score as a win.
+        let reward = Reward {
+            baseline: Tally {
+                caught: 0,
+                false_drops: 0,
+                cheats: 64,
+                cleans: 0,
+            },
+            candidate: Tally {
+                caught: 64,
+                false_drops: 0,
+                cheats: 64,
+                cleans: 0,
+            },
+        };
+        assert_eq!(
+            accept(&base, &better, &reward),
+            Acceptance::Refused {
+                reason: Refusal::TooLittleEvidence
+            }
+        );
+    }
+
+    #[test]
+    fn a_reward_over_two_different_batches_is_refused() {
+        let base = HarnessProfile::default();
+        let reward = Reward {
+            baseline: Tally {
+                caught: 0,
+                false_drops: 0,
+                cheats: 40,
+                cleans: 40,
+            },
+            candidate: Tally {
+                caught: 30,
+                false_drops: 0,
+                cheats: 30,
+                cleans: 10,
+            },
+        };
+        assert_eq!(
+            accept(&base, &base, &reward),
+            Acceptance::Refused {
+                reason: Refusal::MismatchedBatch
+            }
+        );
     }
 
     #[test]
     fn registry_refuses_to_commit_a_refused_candidate() {
         let base = HarnessProfile::default();
         let mut worse = base.clone();
-        worse.mixing.min_score = base.mixing.min_score.saturating_sub(1);
+        worse.mixing.min_score = base.mixing.min_score + 1;
         let cand = Candidate {
             profile: worse,
             reward: Reward {

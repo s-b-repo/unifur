@@ -21,21 +21,32 @@
 //!   literal-String Replace, NFC/NFD/NFKC/NFKD (standard tables), and
 //!   Sequences of those. Regex Replace stays a loud error: a pattern
 //!   misread as a literal corrupts ids silently.
-//! - Byte fallback (`<0xHH>` tokens) is supported on decode; characters with
-//!   no merge path fall back to the file's `unk_token` when one exists, else
-//!   error naming the character (never silent substitution).
+//! - Byte fallback (`<0xHH>` tokens) is supported on decode, and on encode
+//!   when the model declares `byte_fallback: true`; otherwise characters
+//!   with no merge path fall back to a top-level `unk_token` when one exists
+//!   (the `model.unk_token` field is NOT read), else error naming the
+//!   character (never silent substitution).
+//! - Non-ByteLevel decoders (`Replace`, `ByteFallback`, `Fuse`, `Strip`,
+//!   Metaspace) are not applied: such files decode to raw token strings.
+//! - `Whitespace` / `WhitespaceSplit` / absent pre-tokenizers are all mapped
+//!   to [`Pretokenizer::Whitespace`] (whitespace kept, attached to the next
+//!   word), which is NOT what HF does for any of the three.
 //! - Merge entries accept `"a b"` strings and `["a", "b"]` arrays (both
 //!   shipped in real files); `#version` headers are skipped, not parsed.
 //! - Added-token ids may sit past the base vocabulary; the table spans both.
 //! - Merge-rank order is load-bearing (late-ranked merges starve); the engine
 //!   follows ranks faithfully, which the mini-pipeline test pins.
 //!
-//! Validated against real on-disk `tokenizer.json` files (154K vocab,
+//! Exercised against real on-disk `tokenizer.json` files (154K vocab,
 //! 321K merges, 36 added tokens): `test_real_world_file_loads_and_roundtrips`
 //! loads, checks the declared pipeline, round-trips diverse text, confirms
-//! merges fire and added tokens bypass. The Qwen-file parity gate lives in
-//! `qwen_tokenizer_parity_against_reference`, `#[ignore]`d until
-//! `QWEN_TOKENIZER_JSON` points at a downloaded file.
+//! merges fire and added tokens bypass. Round-trip is NOT id parity: a
+//! byte-level pipeline round-trips under any split, so HF id parity is
+//! unverified until reference id vectors are recorded. Both real-file tests
+//! (and `qwen_tokenizer_parity_against_reference`, which despite its name
+//! also checks only round-trip) pass vacuously when no file is present
+//! (`GLM_TOKENIZER_JSON` / `QWEN_TOKENIZER_JSON`). The splitter's regex
+//! semantics are pinned by hand-derived cases in the unit tests.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -295,6 +306,15 @@ fn split_gpt2(text: &str, dialect: Gpt2Dialect) -> Result<Vec<String>> {
             // so a stray mark attaches forward as prefix punctuation.
             j += 1;
         }
+        // The prefix is optional (`?`): when prefix + run fails, the regex
+        // backtracks to the empty prefix. That matters where the prefix
+        // character can itself start a run -- a Qwen mark not followed by a
+        // letter (`"1\u{301}"`) is a `[\p{L}\p{M}]+` run of its own, and
+        // without this retry no later alternative matches it and the
+        // splitter stalls with an error on valid text.
+        if j > i && !(j < chars.len() && is_ll(chars[j])) {
+            j = i;
+        }
         if j < chars.len() && is_ll(chars[j]) {
             while j < chars.len() && is_ll(chars[j]) {
                 j += 1;
@@ -341,21 +361,32 @@ fn split_gpt2(text: &str, dialect: Gpt2Dialect) -> Result<Vec<String>> {
             out.push(chars[start..i].iter().collect());
             continue;
         }
-        // 5. Newline-aware dialects only: whitespace run containing a newline.
+        // 5. Newline-aware dialects only: `\s*[\r\n]+`. The greedy `\s*`
+        // backtracks until a newline follows, so the match ends right after
+        // the LAST newline inside the whitespace run: `"\n  x"` matches
+        // `"\n"` and leaves `"  x"` to alternatives 6/2, exactly as the
+        // regex does (taking the whole run would swallow the indentation
+        // that belongs to the next line's tokens).
         if newline_aware {
             j = i;
-            let mut seen_newline = false;
+            let mut end_after_newline = None;
             while j < chars.len() && is_space(chars[j]) {
-                seen_newline = seen_newline || is_newline(chars[j]);
+                if is_newline(chars[j]) {
+                    end_after_newline = Some(j + 1);
+                }
                 j += 1;
             }
-            if seen_newline {
-                i = j;
+            if let Some(end) = end_after_newline {
+                i = end;
                 out.push(chars[start..i].iter().collect());
                 continue;
             }
         }
-        // 6. Trailing whitespace (not followed by a non-space).
+        // 6. `\s+(?!\S)`: a whitespace run at the end of input matches whole;
+        // a run followed by a non-space backtracks one character, so its
+        // last character is left to prefix the next word
+        // (`"a   b"` -> `"a"`, `"  "`, `" b"`). A single whitespace
+        // character before a non-space fails here and falls to 7.
         j = i;
         while j < chars.len() && is_space(chars[j]) {
             j += 1;
@@ -365,7 +396,12 @@ fn split_gpt2(text: &str, dialect: Gpt2Dialect) -> Result<Vec<String>> {
             out.push(chars[start..i].iter().collect());
             continue;
         }
-        // 7. Plain whitespace run.
+        if j >= i + 2 {
+            i = j - 1;
+            out.push(chars[start..i].iter().collect());
+            continue;
+        }
+        // 7. `\s+`: the single whitespace character left before a non-space.
         if j > i {
             i = j;
             out.push(chars[start..i].iter().collect());
@@ -402,6 +438,11 @@ struct BpeModelRaw {
     vocab: HashMap<String, u32>,
     #[serde(default)]
     merges: Vec<MergeEntry>,
+    /// HF `byte_fallback`: a symbol missing from the vocabulary encodes as
+    /// its UTF-8 bytes spelled `<0xHH>` (when every one of them is in the
+    /// vocabulary) instead of as `unk`.
+    #[serde(default)]
+    byte_fallback: bool,
 }
 
 /// Minimal top-level shape of a HuggingFace `tokenizer.json`.
@@ -567,6 +608,8 @@ pub struct BpeTokenizer {
     eos: Option<u32>,
     pad: Option<u32>,
     unk: Option<u32>,
+    /// The model's `byte_fallback` flag (see [`BpeModelRaw`]).
+    byte_fallback: bool,
     /// Pre-tokenization declared by the file; [`Pretokenizer::Whitespace`]
     /// when the file declares none (the legacy behavior).
     default_strategy: Pretokenizer,
@@ -765,6 +808,14 @@ impl BpeTokenizer {
 
         let mut added: Vec<(String, u32)> = Vec::with_capacity(file.added_tokens.len());
         for tok in &file.added_tokens {
+            // An empty content matches at every offset without consuming
+            // anything: `split_added` would loop forever on the first
+            // character that no other added token starts with.
+            ensure!(
+                !tok.content.is_empty(),
+                "added token {} has empty content",
+                tok.id
+            );
             vocab.insert(tok.content.clone(), tok.id);
             if let Some(slot) = decode_table.get_mut(tok.id as usize) {
                 *slot = Some(tok.content.clone());
@@ -802,6 +853,7 @@ impl BpeTokenizer {
             eos,
             pad,
             unk,
+            byte_fallback: model.byte_fallback,
             default_strategy,
             dialect,
             byte_level,
@@ -900,8 +952,10 @@ impl BpeTokenizer {
     }
 
     /// BPE merge loop over one pre-tokenized chunk. Starts from Unicode
-    /// scalar values; unknown single characters fall back to the file's
-    /// `unk_token` when one exists, else error naming the character.
+    /// scalar values; a symbol missing from the vocabulary becomes its
+    /// `<0xHH>` byte tokens when the model declares `byte_fallback` (HF
+    /// semantics), else the file's `unk_token` when one exists, else an
+    /// error naming the symbol.
     fn encode_chunk(&self, chunk: &str) -> Result<Vec<u32>> {
         let mut symbols: Vec<String> = chunk.chars().map(|c| c.to_string()).collect();
         if symbols.is_empty() {
@@ -927,27 +981,32 @@ impl BpeTokenizer {
                 }
             }
         }
-        symbols
-            .iter()
-            .map(|s| {
-                self.vocab
-                    .get(s)
-                    .copied()
-                    .or_else(|| {
-                        // Byte fallback `<0xHH>`: decode-time convention shared
-                        // with HF files that set byte_fallback.
-                        byte_fallback_id(s).and_then(|id| {
-                            if (id as usize) < self.decode_table.len() {
-                                Some(id)
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .or(self.unk)
-                    .with_context(|| format!("no token for {s:?} and no unk_token"))
-            })
-            .collect()
+        let mut ids = Vec::with_capacity(symbols.len());
+        for s in &symbols {
+            if let Some(id) = self.vocab.get(s) {
+                ids.push(*id);
+                continue;
+            }
+            // Byte fallback, as HF does it: the symbol's UTF-8 bytes looked
+            // up as `<0xHH>` vocabulary entries (uppercase hex), all or
+            // nothing. (The id of a byte token is whatever the vocabulary
+            // says -- never the byte value itself.)
+            if self.byte_fallback {
+                let bytes: Option<Vec<u32>> = s
+                    .bytes()
+                    .map(|b| self.vocab.get(&format!("<0x{b:02X}>")).copied())
+                    .collect();
+                if let Some(bytes) = bytes {
+                    ids.extend(bytes);
+                    continue;
+                }
+            }
+            let unk = self
+                .unk
+                .with_context(|| format!("no token for {s:?} and no unk_token"))?;
+            ids.push(unk);
+        }
+        Ok(ids)
     }
 
     /// Encode with an explicit pre-tokenization strategy, overriding the
@@ -1072,11 +1131,6 @@ fn parse_byte_fallback(token: &str) -> Option<u8> {
     } else {
         None
     }
-}
-
-/// Mirror of [`parse_byte_fallback`] for the encode side.
-fn byte_fallback_id(symbol: &str) -> Option<u32> {
-    parse_byte_fallback(symbol).map(u32::from)
 }
 
 #[cfg(test)]
@@ -1220,6 +1274,11 @@ mod tests {
             BpeTokenizer::from_json(r#"{"model": {"vocab": {"a": 0}, "merges": ["lonely"]}}"#)
                 .is_err()
         );
+        // An empty added token would hang `split_added`; refused at load.
+        assert!(BpeTokenizer::from_json(
+            r#"{"model": {"vocab": {"a": 0}, "merges": []}, "added_tokens": [{"id": 0, "content": ""}]}"#
+        )
+        .is_err());
     }
 
     /// Real-file parity gate over a Qwen `tokenizer.json`: scale, declared
@@ -1404,6 +1463,79 @@ mod tests {
                 "splitter dropped text ({dialect:?})"
             );
         }
+    }
+
+    #[test]
+    fn test_splitter_whitespace_backtracking_matches_the_regex() {
+        // `\s+(?!\S)` backtracks one character before a non-space, so the
+        // last space of a run prefixes the next word; hand-derived from the
+        // regex semantics (the regex engine HF uses backtracks this way).
+        assert_eq!(
+            split_gpt2("hello   world", Gpt2Dialect::Original).unwrap(),
+            vec!["hello", "  ", " world"]
+        );
+        assert_eq!(
+            split_gpt2("  spaced   out  ", Gpt2Dialect::GlmFamily).unwrap(),
+            vec![" ", " spaced", "  ", " out", "  "]
+        );
+        // `\s*[\r\n]+` ends after the last newline of the run; the
+        // indentation that follows belongs to the next line's tokens.
+        assert_eq!(
+            split_gpt2("a\n  b", Gpt2Dialect::GlmFamily).unwrap(),
+            vec!["a", "\n", " ", " b"]
+        );
+        assert_eq!(
+            split_gpt2("def f():\n    return x", Gpt2Dialect::Qwen).unwrap(),
+            vec!["def", " f", "():\n", "   ", " return", " x"]
+        );
+        assert_eq!(
+            split_gpt2("a\n \n b", Gpt2Dialect::GlmFamily).unwrap(),
+            vec!["a", "\n \n", " b"]
+        );
+        // A single whitespace character before a non-space is `\s+` alone.
+        assert_eq!(
+            split_gpt2("a \tb", Gpt2Dialect::Original).unwrap(),
+            vec!["a", " ", "\t", "b"]
+        );
+    }
+
+    #[test]
+    fn test_qwen_stray_mark_is_a_run_not_a_stall() {
+        // A mark after a digit: the optional prefix backtracks to empty and
+        // `[\p{L}\p{M}]+` matches the mark itself. Before the backtrack the
+        // splitter errored ("stalled") on this valid input.
+        let mark = char::from_u32(0x301).expect("U+0301 exists");
+        let text = format!("1{mark}");
+        assert_eq!(
+            split_gpt2(&text, Gpt2Dialect::Qwen).unwrap(),
+            vec!["1".to_string(), mark.to_string()]
+        );
+        // GLM has no marks class: the mark is punctuation there.
+        assert_eq!(
+            split_gpt2(&text, Gpt2Dialect::GlmFamily).unwrap(),
+            vec!["1".to_string(), mark.to_string()]
+        );
+    }
+
+    #[test]
+    fn test_byte_fallback_encodes_through_byte_tokens_only_when_declared() {
+        let with_fallback = FIXTURE.replace(
+            "\"unk_token\": null,\n            \"vocab\"",
+            "\"unk_token\": null, \"byte_fallback\": true,\n            \"vocab\"",
+        );
+        assert_ne!(with_fallback, FIXTURE, "fixture edit must apply");
+        let tok = BpeTokenizer::from_json(&with_fallback).unwrap();
+        // "A" is not in the vocab; its byte token `<0x41>` is id 9 (not 65,
+        // the byte value the old encode path returned).
+        assert_eq!(
+            tok.encode_with("hA", Pretokenizer::Raw).unwrap(),
+            vec![0, 9]
+        );
+        assert_eq!(tok.decode(&[0, 9]).unwrap(), "hA");
+        // A byte with no `<0xHH>` entry: no partial fallback, and no unk.
+        assert!(tok.encode_with("z", Pretokenizer::Raw).is_err());
+        // Without the flag, an out-of-vocab character is an error.
+        assert!(fixture().encode_with("hA", Pretokenizer::Raw).is_err());
     }
 
     /// Byte-level fixture the way GPT-2-family files look. U+0120 is built

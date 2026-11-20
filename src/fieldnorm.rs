@@ -657,8 +657,8 @@ fn unescape_literals(text: &str) -> String {
 /// Fenrir/Trendyol `{system, user, assistant}` -> instruction text. The
 /// boilerplate system block is dropped (and counted), not rendered: it is the
 /// same persona paragraph across the whole source. An `escaped_jsonl`
-/// source's second escape layer is removed first (and counted when it
-/// changed anything).
+/// source's second escape layer is removed first (not counted: the layer is
+/// uniform across the source, see [`SourceSpec::escaped_jsonl`]).
 fn render_chat(value: &Value, escaped: bool) -> RowOutcome {
     let (Some(user), Some(assistant)) = (get_str(value, "user"), get_str(value, "assistant"))
     else {
@@ -871,15 +871,28 @@ fn nvd_references(cve: &Value) -> Vec<(String, bool)> {
     out
 }
 
-/// NVD's own severity line, when a CVSS v3.x metric exists: the primary (or
-/// first) metric's `baseSeverity` and `baseScore`.
+/// NVD's own severity line, from the newest CVSS version scored (v3.1, v3.0,
+/// then v2): the `Primary` (NVD's own) metric's `baseSeverity` and
+/// `baseScore`, else the first `Secondary` (CNA) metric that has one.
+///
+/// The NVD 2.0 schema keeps `baseSeverity` in different places per version:
+/// inside `cvssData` for CVSS v3.x, beside `cvssData` on the metric for v2.
+/// Both are read; reading only the metric level silently dropped the severity
+/// of every v3.x-only CVE (nearly all of 2023-2025).
 fn nvd_severity(cve: &Value) -> Option<String> {
     let metrics = cve.get("metrics")?;
     for key in ["cvssMetricV31", "cvssMetricV30", "cvssMetricV2"] {
         if let Some(list) = metrics.get(key).and_then(Value::as_array) {
-            for metric in list {
+            let is_primary = |m: &&Value| get_str(m, "type") == Some("Primary");
+            let primary_first = list
+                .iter()
+                .filter(is_primary)
+                .chain(list.iter().filter(|m| !is_primary(m)));
+            for metric in primary_first {
                 let data = metric.get("cvssData");
-                let severity = get_str(metric, "baseSeverity");
+                let severity = data
+                    .and_then(|d| get_str(d, "baseSeverity"))
+                    .or_else(|| get_str(metric, "baseSeverity"));
                 let score = data.and_then(|d| d.get("baseScore")).and_then(|s| {
                     s.as_f64()
                         .or_else(|| s.as_str().and_then(|t| t.parse().ok()))
@@ -1224,6 +1237,19 @@ pub fn hugo_markdown_to_text(input: &str, stats_out: &mut MarkdownStrip) -> Stri
             }
             continue;
         }
+        // Fences are decided before comments: inside a fence `<!--` is code
+        // (an HTML/XML example), and treating it as a comment opener stripped
+        // the line through the inline pass -- or, unterminated, swallowed the
+        // rest of the block, closing fence included.
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            out.push_str(raw_line);
+            out.push('\n');
+            continue;
+        }
         if let Some(start) = raw_line.find("<!--") {
             stats_out.html_comments += 1;
             if !raw_line[start..].contains("-->") {
@@ -1239,15 +1265,6 @@ pub fn hugo_markdown_to_text(input: &str, stats_out: &mut MarkdownStrip) -> Stri
                 out.push_str(&strip_md_inline(&combined, stats_out));
                 out.push('\n');
             }
-            continue;
-        }
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence {
-            out.push_str(raw_line);
-            out.push('\n');
             continue;
         }
         // Link reference definitions carry no prose.
@@ -2683,6 +2700,14 @@ pub fn build_field_corpus(
                 .with_context(|| format!("read {}", marker.display()))?;
             let stats: SourceStats = serde_json::from_str(&text)
                 .with_context(|| format!("{} is not a source marker", marker.display()))?;
+            // A resumed identity source is still mixed into all.jsonl, so the
+            // manifest must still say so (it used to come back `None`).
+            if source.name == IDENTITY_SOURCE {
+                manifest.identity = Some(IdentityNote {
+                    path: config.identity_path.clone(),
+                    documents: stats.documents,
+                });
+            }
             manifest.resumed_sources.push(source.name.clone());
             manifest.sources.insert(source.name.clone(), stats);
             continue;
@@ -3342,6 +3367,25 @@ mod tests {
     }
 
     #[test]
+    fn hugo_markdown_keeps_html_comments_inside_fences_verbatim() {
+        // An HTML example in a fence is code: its `<!--` is not a comment
+        // opener. Before fences were decided first, the one-line comment was
+        // stripped along with the tags, and the unterminated one swallowed
+        // the closing fence and the prose after it.
+        let mut stats = MarkdownStrip::default();
+        let input = "Intro.\n\n```html\n<!-- header --> <div class=\"a\">x</div>\n<!-- open\n```\n\nAfter the fence.\n\n<!-- a real comment -->\nTail.\n";
+        let text = hugo_markdown_to_text(input, &mut stats);
+        assert!(
+            text.contains("<!-- header --> <div class=\"a\">x</div>\n<!-- open"),
+            "fenced HTML stays verbatim: {text}"
+        );
+        assert!(text.contains("After the fence."), "{text}");
+        assert!(text.contains("Tail."), "{text}");
+        assert!(!text.contains("a real comment"), "{text}");
+        assert_eq!(stats.html_comments, 1, "only the comment outside the fence");
+    }
+
+    #[test]
     fn sgml_strips_elements_decodes_entities_and_counts_unhandled() {
         let mut stats = SgmlStrip::default();
         let input = "<!-- doc header -->\n<chapter id=\"x\">\n <title>Configuration &amp; Tuning</title>\n <para>\n  See &sect; 4 &mdash; the &weirdentity; setting.\n </para>\n <programlisting><![CDATA[if (a < b) { f(); }]]></programlisting>\n</chapter>\n";
@@ -3512,6 +3556,13 @@ mod tests {
         assert_eq!(manifest.sources["identity"].documents, 1);
         let all = std::fs::read_to_string(corpus_dir.join("dataset/all.jsonl")).unwrap();
         assert!(all.contains("identity-000001"), "{all}");
+        // A resumed build still mixes the identity source in, and its
+        // manifest still records it.
+        let rerun = build_field_corpus(&spec, &datasets, &corpus_dir, &config, false).unwrap();
+        assert!(rerun.resumed_sources.iter().any(|s| s == IDENTITY_SOURCE));
+        let note = rerun.identity.as_ref().expect("identity survives a resume");
+        assert_eq!(note.documents, 1);
+        assert_eq!(note.path, identity);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -3568,11 +3619,16 @@ mod tests {
                     {"description": [{"lang": "en", "value": "CWE-787"}]},
                     {"description": [{"lang": "en", "value": "CWE-787"}]}
                 ],
+                // The real NVD 2.0 shape: v3.x keeps `baseSeverity` inside
+                // `cvssData`. (This fixture used to put it on the metric,
+                // which is the v2 shape -- and the only one the code read.)
                 "metrics": {
                     "cvssMetricV31": [{
+                        "source": "nvd@nist.gov",
                         "type": "Primary",
-                        "cvssData": {"baseScore": 9.8},
-                        "baseSeverity": "CRITICAL"
+                        "cvssData": {"version": "3.1", "baseScore": 9.8, "baseSeverity": "CRITICAL"},
+                        "exploitabilityScore": 3.9,
+                        "impactScore": 5.9
                     }]
                 },
                 "references": [
@@ -3604,6 +3660,44 @@ mod tests {
         );
         // Duplicate weakness ids are listed once.
         assert_eq!(text.matches("CWE-787").count(), 1, "{text}");
+    }
+
+    #[test]
+    fn nvd_severity_reads_each_versions_schema_and_prefers_primary() {
+        // A CNA's Secondary score listed first must not shadow NVD's Primary.
+        let cve = serde_json::json!({
+            "metrics": {
+                "cvssMetricV31": [
+                    {"type": "Secondary", "cvssData": {"baseScore": 5.3, "baseSeverity": "MEDIUM"}},
+                    {"type": "Primary", "cvssData": {"baseScore": 7.5, "baseSeverity": "HIGH"}}
+                ]
+            }
+        });
+        assert_eq!(
+            nvd_severity(&cve).as_deref(),
+            Some("HIGH (base score 7.5)")
+        );
+        // Secondary only: it is the fallback.
+        let cve = serde_json::json!({
+            "metrics": {"cvssMetricV30": [
+                {"type": "Secondary", "cvssData": {"baseScore": 6.1, "baseSeverity": "MEDIUM"}}
+            ]}
+        });
+        assert_eq!(
+            nvd_severity(&cve).as_deref(),
+            Some("MEDIUM (base score 6.1)")
+        );
+        // CVSS v2 keeps the severity beside `cvssData`.
+        let cve = serde_json::json!({
+            "metrics": {"cvssMetricV2": [
+                {"type": "Primary", "cvssData": {"version": "2.0", "baseScore": 4.3}, "baseSeverity": "MEDIUM"}
+            ]}
+        });
+        assert_eq!(
+            nvd_severity(&cve).as_deref(),
+            Some("MEDIUM (base score 4.3)")
+        );
+        assert_eq!(nvd_severity(&serde_json::json!({"metrics": {}})), None);
     }
 
     #[test]

@@ -68,6 +68,11 @@ const THINK_DEPTHS: [usize; 4] = [1, 2, 4, 8];
 /// Everything a request handler needs, shared across connection threads.
 struct GuiState {
     root: PathBuf,
+    /// Serializes chat-log appends. Each connection runs on its own thread,
+    /// and `ChainedLog::append` is open-head-then-append: two concurrent turns
+    /// would both chain onto the same head with the same `seq`, forking the
+    /// log so it never verifies again.
+    chat_lock: std::sync::Mutex<()>,
 }
 
 impl GuiState {
@@ -103,7 +108,10 @@ impl GuiServer {
             .with_context(|| format!("bind the nina dashboard on 127.0.0.1:{port}"))?;
         Ok(Self {
             listener,
-            state: Arc::new(GuiState { root }),
+            state: Arc::new(GuiState {
+                root,
+                chat_lock: std::sync::Mutex::new(()),
+            }),
         })
     }
 
@@ -441,8 +449,11 @@ fn chain_badge(path: &Path) -> String {
                 esc(&path.display().to_string())
             )
         }
+        // Escaped: the verifier's message quotes `prev` / `hash` values read
+        // straight out of the (by definition untrusted) tampered file.
         Err(err) => format!(
-            "<span class=\"chain-bad\">TAMPERED: {err}</span> <code>{}</code>",
+            "<span class=\"chain-bad\">TAMPERED: {}</span> <code>{}</code>",
+            esc(&format!("{err}")),
             esc(&path.display().to_string())
         ),
     }
@@ -451,18 +462,32 @@ fn chain_badge(path: &Path) -> String {
 /// The last `n` lines of a file, reading at most [`TAIL_READ_CAP`] bytes of
 /// its tail so a big log cannot make the dashboard slow.
 fn tail_lines(path: &Path, n: usize) -> Result<Vec<String>> {
-    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let len = bytes.len() as u64; // audit-allow: a file length always fits u64
-    let start = if len > TAIL_READ_CAP {
-        let from = usize::try_from(len - TAIL_READ_CAP).unwrap_or(0);
-        // Start after the next newline so the first shown line is whole.
-        bytes
-            .iter()
-            .skip(from)
-            .position(|b| *b == b'\n')
-            .map_or(from, |p| from + p + 1)
-    } else {
+    use std::io::{Seek, SeekFrom};
+    // Seek, don't slurp: reading the whole file and skipping its head (what
+    // this used to do) cost the full log size per request, which is exactly
+    // what the cap promises not to.
+    let mut file = std::fs::File::open(path).with_context(|| format!("read {}", path.display()))?;
+    let len = file
+        .metadata()
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    let cut = len.saturating_sub(TAIL_READ_CAP);
+    // One byte before the cut is read too, to tell whether the cut already
+    // falls on a line start (then no line is dropped).
+    let read_from = cut.saturating_sub(1);
+    file.seek(SeekFrom::Start(read_from))
+        .with_context(|| format!("seek {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(len - read_from)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("read {}", path.display()))?;
+    let start = if cut == 0 {
         0
+    } else if bytes.first() == Some(&b'\n') {
+        1
+    } else {
+        // Start after the next newline so the first shown line is whole.
+        bytes.iter().position(|b| *b == b'\n').map_or(1, |p| p + 1)
     };
     let text = String::from_utf8_lossy(bytes.get(start..).unwrap_or(&[]));
     let lines: Vec<&str> = text.lines().collect();
@@ -543,8 +568,9 @@ fn page_overview(state: &GuiState) -> String {
                 body.push_str("</table>");
             }
             Err(err) => body.push_str(&format!(
-                "<div class=\"error\">the registry at <code>{}</code> is unreadable: {err}</div>",
-                esc(&registry_path.display().to_string())
+                "<div class=\"error\">the registry at <code>{}</code> is unreadable: {}</div>",
+                esc(&registry_path.display().to_string()),
+                esc(&format!("{err:#}"))
             )),
         }
     }
@@ -579,8 +605,9 @@ fn logs_section(state: &GuiState) -> String {
         }
         Err(err) => {
             return format!(
-                "<div class=\"error\">cannot list <code>{}</code>: {err}</div>",
-                esc(&dir.display().to_string())
+                "<div class=\"error\">cannot list <code>{}</code>: {}</div>",
+                esc(&dir.display().to_string()),
+                esc(&err.to_string())
             )
         }
     }
@@ -609,13 +636,22 @@ fn page_live(state: &GuiState, params: &[(String, String)]) -> String {
     let mut body = format!("<h2>live tails (last {n} records per log, refreshes every 5s)</h2>");
     let mut names: Vec<PathBuf> = Vec::new();
     if dir.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().is_some_and(|e| e == "jsonl") {
-                    names.push(path);
+        match std::fs::read_dir(&dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|e| e == "jsonl") {
+                        names.push(path);
+                    }
                 }
             }
+            // An unreadable logs dir is not an empty one: say so, ahead of
+            // the empty state below.
+            Err(err) => body.push_str(&format!(
+                "<div class=\"error\">cannot list <code>{}</code>: {}</div>",
+                esc(&dir.display().to_string()),
+                esc(&err.to_string())
+            )),
         }
         names.sort();
     }
@@ -644,7 +680,10 @@ fn page_live(state: &GuiState, params: &[(String, String)]) -> String {
                 }
                 body.push_str("</pre>");
             }
-            Err(err) => body.push_str(&format!("<div class=\"error\">{err}</div>")),
+            Err(err) => body.push_str(&format!(
+                "<div class=\"error\">{}</div>",
+                esc(&format!("{err:#}"))
+            )),
         }
     }
     page(
@@ -670,22 +709,15 @@ struct LoadedStudent {
 /// there is none — the skip-if-absent discipline: pages that need a model
 /// say so loudly instead of inventing one.
 fn load_student(paths: &NinaPaths) -> Result<Option<LoadedStudent>> {
-    use crate::student::{GeometricStudent, StudentConfig};
+    use crate::student::GeometricStudent;
     let Some(path) = crate::checkpoint::latest_in_dir(&paths.student_dir(), "student")? else {
         return Ok(None);
     };
-    let config = match crate::checkpoint::TrainState::for_model(&path)? {
-        Some(state) => match state.config.get("student_config") {
-            Some(value) => serde_json::from_value(value.clone()).with_context(|| {
-                format!(
-                    "parse the student config recorded beside {}",
-                    path.display()
-                )
-            })?,
-            None => StudentConfig::default(),
-        },
-        None => StudentConfig::default(),
-    };
+    // The same resolution `nina::route_prompt` uses for this checkpoint
+    // (training state, then the `config.json` deployment manifest, then the
+    // default), so the router and the generator on one page can never build
+    // the student at two different shapes.
+    let config = crate::nina::student_config_for_checkpoint(&path)?;
     let context = config.context;
     let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
     <Eval as burn::tensor::backend::Backend>::seed(&device, 0);
@@ -712,6 +744,16 @@ fn encode_window(loaded: &LoadedStudent, prompt: &str) -> (Vec<u16>, bool) {
     (ids, truncated)
 }
 
+/// `encode_document` closes the text with `<eos>`. A generation prompt must
+/// not: conditioned on "the document ended", the student's next token is not
+/// a continuation (the CLI's serve-time `encode_prompt` omits it for the same
+/// reason).
+fn strip_closing_eos(ids: &mut Vec<u16>) {
+    if ids.last() == Some(&Special::Eos.id()) {
+        ids.pop();
+    }
+}
+
 fn token_tensor(ids: &[u16]) -> Result<burn::tensor::Tensor<Eval, 2, burn::tensor::Int>> {
     use burn::tensor::{Int, Tensor};
     let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
@@ -725,6 +767,7 @@ fn token_tensor(ids: &[u16]) -> Result<burn::tensor::Tensor<Eval, 2, burn::tenso
 /// sampler, no temperature, and the page labels it as exactly that.
 fn generate_greedy(loaded: &LoadedStudent, prompt: &str) -> Result<String> {
     let (mut ids, _) = encode_window(loaded, prompt);
+    strip_closing_eos(&mut ids);
     let prompt_len = ids.len();
     for _ in 0..GENERATE_MAX_NEW {
         let window_start = ids.len().saturating_sub(loaded.context);
@@ -774,7 +817,8 @@ fn page_thinking(state: &GuiState, params: &[(String, String)]) -> String {
         match think_inner(state, prompt) {
             Ok(html) => body.push_str(&html),
             Err(err) => body.push_str(&format!(
-                "<div class=\"error\">the thought trace failed: {err}</div>"
+                "<div class=\"error\">the thought trace failed: {}</div>",
+                esc(&format!("{err:#}"))
             )),
         }
     }
@@ -837,7 +881,8 @@ fn chat_turn(state: &GuiState, prompt: &str) -> String {
         Ok(html) => html,
         Err(err) => format!(
             "<div class=\"turn\"><div class=\"error\">the chat turn failed before it could be \
-             logged: {err}</div></div>"
+             logged: {}</div></div>",
+            esc(&format!("{err:#}"))
         ),
     }
 }
@@ -883,16 +928,24 @@ fn chat_turn_inner(state: &GuiState, prompt: &str) -> Result<String> {
 
     // The turn is history: append it to the chained chat log *before*
     // rendering, so what the page shows and what the chain holds cannot drift.
-    let mut log = ChainedLog::open(state.chat_log())?;
-    let record = log.append(&json!({
-        "event": "chat",
-        "prompt": prompt,
-        "router": routed.get("router").cloned().unwrap_or(Value::Null),
-        "top": routed.get("top").cloned().unwrap_or(Value::Null),
-        "answer": answer,
-        "generation": generation_note,
-        "registry_note": registry_note,
-    }))?;
+    // Open + append happen under the lock so concurrent turns chain in order.
+    let (log, record) = {
+        let _guard = state
+            .chat_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("the chat-log lock is poisoned by a failed turn"))?;
+        let mut log = ChainedLog::open(state.chat_log())?;
+        let record = log.append(&json!({
+            "event": "chat",
+            "prompt": prompt,
+            "router": routed.get("router").cloned().unwrap_or(Value::Null),
+            "top": routed.get("top").cloned().unwrap_or(Value::Null),
+            "answer": answer,
+            "generation": generation_note,
+            "registry_note": registry_note,
+        }))?;
+        (log, record)
+    };
 
     let mut out = String::from("<div class=\"turn\">");
     out.push_str(&format!("<p><b>you:</b> {}</p>", esc(prompt)));
@@ -955,21 +1008,25 @@ fn render_route(routed: &Value) -> String {
         esc(top)
     ));
     if let Some(traffic) = routed.get("traffic").and_then(Value::as_array) {
+        // `route_prompt` emits `box_id`, `traffic` and `top1_tokens` per row;
+        // `top` is a box id. (This used to read a `language` key that is never
+        // emitted, so every row showed "?" and the top box was never marked.)
         out.push_str(
-            "<table><tr><th>box</th><th>language</th><th>traffic</th>\
+            "<table><tr><th>box</th><th>traffic</th>\
                       <th>top-1 tokens</th></tr>",
         );
         for row in traffic {
-            let language = row.get("language").and_then(Value::as_str).unwrap_or("?");
             let box_id = row.get("box_id").and_then(Value::as_str).unwrap_or("?");
             let gate = row.get("traffic").and_then(Value::as_f64).unwrap_or(0.0);
             let top1 = row.get("top1_tokens").and_then(Value::as_u64).unwrap_or(0);
-            let bold = language == top;
-            let (open, close) = if bold { ("<b>", "</b>") } else { ("", "") };
+            let (open, close) = if box_id == top {
+                ("<b>", "</b>")
+            } else {
+                ("", "")
+            };
             out.push_str(&format!(
-                "<tr>{open}<td>{}</td><td>{}</td><td>{gate:.4}</td><td>{top1}</td>{close}</tr>",
+                "<tr><td>{open}{}{close}</td><td>{gate:.4}</td><td>{top1}</td></tr>",
                 esc(box_id),
-                esc(language),
             ));
         }
         out.push_str("</table>");
@@ -992,7 +1049,8 @@ fn chat_history(chat_log: &Path, n: usize) -> String {
         Ok(lines) => lines,
         Err(err) => {
             out.push_str(&format!(
-                "<div class=\"error\">cannot read the chat log: {err}</div>"
+                "<div class=\"error\">cannot read the chat log: {}</div>",
+                esc(&format!("{err:#}"))
             ));
             return out;
         }
@@ -1042,14 +1100,21 @@ fn page_data(state: &GuiState) -> String {
     let mut body = String::from("<h2>corpora</h2>");
     let mut manifests: Vec<(String, PathBuf)> = Vec::new();
     if state.root.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&state.root) {
-            for entry in entries.flatten() {
-                let manifest = entry.path().join("dataset").join("manifest.json");
-                if manifest.is_file() {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    manifests.push((name, manifest));
+        match std::fs::read_dir(&state.root) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let manifest = entry.path().join("dataset").join("manifest.json");
+                    if manifest.is_file() {
+                        let name = entry.file_name().to_string_lossy().into_owned();
+                        manifests.push((name, manifest));
+                    }
                 }
             }
+            Err(err) => body.push_str(&format!(
+                "<div class=\"error\">cannot list <code>{}</code>: {}</div>",
+                esc(&state.root.display().to_string()),
+                esc(&err.to_string())
+            )),
         }
         manifests.sort();
     }
@@ -1070,7 +1135,10 @@ fn page_data(state: &GuiState) -> String {
                     .with_context(|| format!("parse {}", manifest.display()))
             }) {
             Ok(value) => body.push_str(&render_manifest(&value)),
-            Err(err) => body.push_str(&format!("<div class=\"error\">{err}</div>")),
+            Err(err) => body.push_str(&format!(
+                "<div class=\"error\">{}</div>",
+                esc(&format!("{err:#}"))
+            )),
         }
     }
     page("data", badge, "", &body)
@@ -1392,6 +1460,97 @@ mod tests {
         assert!(parse_request_line("GET / HTTP/2").is_err());
         assert!(parse_request_line("GET http://x/ HTTP/1.1").is_err());
         assert!(parse_request_line("GET /").is_err());
+    }
+
+    #[test]
+    fn concurrent_chat_turns_keep_the_chain_verifiable() {
+        // One thread per connection: unserialized open+append let two turns
+        // chain onto the same head, and the log never verified again.
+        let dir = scratch("chat-race");
+        let addr = start(&dir);
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                scope.spawn(move || {
+                    let (status, body) = http_get(addr, &format!("/chat?prompt=turn{i}"));
+                    assert_eq!(status, 200, "{body}");
+                });
+            }
+        });
+        let report = ChainedLog::verify(&dir.join("logs/chat.jsonl")).unwrap();
+        assert_eq!(report.lines, 8);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_tampered_badge_escapes_what_it_quotes_from_the_log() {
+        let dir = scratch("badge-xss");
+        let path = dir.join("evil.jsonl");
+        std::fs::write(
+            &path,
+            "{\"seq\":0,\"ts\":1,\"prev\":\"<script>alert(1)</script>\",\"hash\":\"h\",\"payload\":{}}\n",
+        )
+        .unwrap();
+        let badge = chain_badge(&path);
+        assert!(badge.contains("TAMPERED"), "{badge}");
+        assert!(!badge.contains("<script>"), "{badge}");
+        assert!(badge.contains("&lt;script&gt;"), "{badge}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_route_table_marks_the_top_box() {
+        let routed = json!({
+            "router": "probe",
+            "top": "coding:rust",
+            "traffic": [
+                {"box_id": "coding:python", "traffic": 0.25, "top1_tokens": 1},
+                {"box_id": "coding:rust", "traffic": 0.75, "top1_tokens": 3},
+            ],
+        });
+        let html = render_route(&routed);
+        assert!(html.contains("<b>coding:rust</b>"), "{html}");
+        assert!(!html.contains("<b>coding:python</b>"), "{html}");
+        assert!(
+            !html.contains(">?<"),
+            "a column reads a key route_prompt never emits: {html}"
+        );
+        assert!(html.contains("0.7500"), "{html}");
+    }
+
+    #[test]
+    fn a_generation_prompt_does_not_end_the_document() {
+        let mut ids = ByteTokenizer::new().encode_document("fn main");
+        assert_eq!(ids.last(), Some(&Special::Eos.id()));
+        strip_closing_eos(&mut ids);
+        assert_eq!(ids.first(), Some(&Special::Bos.id()));
+        assert_eq!(ids.last(), Some(&u16::from(b'n')));
+        assert_eq!(ids.len(), "fn main".len() + 1);
+        // Idempotent on an already-open prompt.
+        strip_closing_eos(&mut ids);
+        assert_eq!(ids.len(), "fn main".len() + 1);
+    }
+
+    #[test]
+    fn tail_lines_keeps_a_line_that_starts_exactly_at_the_cap() {
+        // 16-byte lines; the cap cut lands exactly on the start of line 10,
+        // which must be shown whole rather than skipped.
+        let dir = scratch("tail-boundary");
+        let path = dir.join("big.jsonl");
+        let width = 16u64;
+        let count = TAIL_READ_CAP / width + 10;
+        let text: String = (0..count).map(|i| format!("{i:015}\n")).collect();
+        std::fs::write(&path, text).unwrap();
+        let lines = tail_lines(&path, usize::MAX).unwrap();
+        assert_eq!(
+            lines.first().map(String::as_str),
+            Some(format!("{:015}", 10).as_str())
+        );
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(format!("{:015}", count - 1).as_str())
+        );
+        assert_eq!(u64::try_from(lines.len()).unwrap(), TAIL_READ_CAP / width);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

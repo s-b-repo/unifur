@@ -36,12 +36,17 @@
 //! | `.` | any byte except newline |
 //! | `\s` `\w` `\d` | whitespace, `[A-Za-z0-9_]`, `[0-9]`; upper case negates |
 //! | `[abc]`, `[a-z]`, `[^)]` | a class, a range, a negated class |
-//! | `\b`, `$` | a word boundary, the end of a line or of the text |
+//! | `\b`, `$` | a word boundary, the end of a line or of the text (a special token ends the text) |
 //! | `*`, `+`, `?`, `{n}`, `{n,m}` | greedy quantifiers on the preceding atom |
 //!
 //! Alternation and groups are **not** supported; an unescaped `(`, `)` or `|`
-//! is a parse error rather than a silent literal. Two rules are cheaper than
-//! one wrong one.
+//! is a parse error rather than a silent literal, and so is an unescaped `^`
+//! outside a class (there is no start anchor). Two rules are cheaper than one
+//! wrong one.
+//!
+//! Backtracking is memoized on `(atom, position)` failures, so adjacent
+//! overlapping quantifiers (`\s*\(?\s*\w*\s*`) cost polynomial time in the
+//! run they backtrack over instead of growing with its power.
 //!
 //! # Tokens, not characters
 //!
@@ -222,7 +227,8 @@ enum Atom {
     },
     /// Zero width: `is_word` differs on the two sides.
     WordBoundary,
-    /// Zero width: end of text or just before a newline.
+    /// Zero width: end of text, just before a newline, or just before a
+    /// special token (a document boundary is the end of that document's text).
     LineEnd,
     /// Zero width: records where the body starts.
     Mark,
@@ -377,6 +383,13 @@ impl Pattern {
                     char::from(c),
                     i - 1
                 ),
+                // Read as a literal, `^pass` would silently match the text
+                // "^pass" instead of anchoring; refuse it like the other
+                // metacharacters this engine does not implement.
+                b'^' => bail!(
+                    "'^' at byte {}: there is no start anchor; escape it as '\\^' for a literal caret",
+                    i - 1
+                ),
                 b'*' | b'+' | b'?' | b'{' => {
                     bail!("quantifier '{}' at byte {} has nothing to repeat", char::from(c), i - 1)
                 }
@@ -439,7 +452,13 @@ impl Pattern {
     /// Anchored match at `at`. Returns the end of the match and, if a
     /// [`Atom::Mark`] was crossed, its position.
     fn match_at(&self, text: &[u16], at: usize) -> Option<(usize, Option<usize>)> {
-        self.go(text, 0, at, None)
+        // States `(atom index, position)` already shown not to complete the
+        // match. Whether the rest of the pattern matches from a state does not
+        // depend on the mark carried into it, so a failure is a failure on
+        // every path. Without this, `k` adjacent quantifiers over one run of
+        // `n` tokens tried every one of the ~n^k ways to split it.
+        let mut failed = std::collections::HashSet::new();
+        self.go(text, 0, at, None, &mut failed)
     }
 
     fn go(
@@ -448,22 +467,27 @@ impl Pattern {
         idx: usize,
         pos: usize,
         mark: Option<usize>,
+        failed: &mut std::collections::HashSet<(usize, usize)>,
     ) -> Option<(usize, Option<usize>)> {
         let Some((atom, quant)) = self.atoms.get(idx) else {
             return Some((pos, mark));
         };
         match atom {
-            Atom::Mark => self.go(text, idx + 1, pos, Some(pos)),
+            Atom::Mark => self.go(text, idx + 1, pos, Some(pos), failed),
             Atom::WordBoundary => {
                 let before = pos > 0 && is_word_token(text[pos - 1]);
                 let after = pos < text.len() && is_word_token(text[pos]);
                 (before != after)
-                    .then(|| self.go(text, idx + 1, pos, mark))
+                    .then(|| self.go(text, idx + 1, pos, mark, failed))
                     .flatten()
             }
             Atom::LineEnd => {
-                let at_end = pos >= text.len() || text[pos] == u16::from(b'\n');
-                at_end.then(|| self.go(text, idx + 1, pos, mark)).flatten()
+                let at_end = text
+                    .get(pos)
+                    .is_none_or(|t| *t == u16::from(b'\n') || *t >= 256);
+                at_end
+                    .then(|| self.go(text, idx + 1, pos, mark, failed))
+                    .flatten()
             }
             _ => {
                 // Greedy: take as many as possible, then give back one at a
@@ -475,9 +499,17 @@ impl Pattern {
                 if n < quant.min {
                     return None;
                 }
-                (quant.min..=n)
-                    .rev()
-                    .find_map(|k| self.go(text, idx + 1, pos + k, mark))
+                (quant.min..=n).rev().find_map(|k| {
+                    let state = (idx + 1, pos + k);
+                    if failed.contains(&state) {
+                        return None;
+                    }
+                    let hit = self.go(text, idx + 1, pos + k, mark, failed);
+                    if hit.is_none() {
+                        failed.insert(state);
+                    }
+                    hit
+                })
             }
         }
     }
@@ -912,6 +944,20 @@ impl LabelManifest {
             path.display(),
             manifest.categories.len()
         );
+        // These weights go straight into the penalized loss through
+        // `weight_table`. `RuleSet::validate` refuses a negative or non-finite
+        // weight; a manifest is read without its rule set, so it has to refuse
+        // them itself — a negative weight flips the unlikelihood charge into a
+        // reward for the flagged tokens, and a NaN poisons every batch.
+        for c in &manifest.categories {
+            anyhow::ensure!(
+                c.weight.is_finite() && c.weight >= 0.0,
+                "{}: category '{}' has weight {}, which must be finite and >= 0",
+                path.display(),
+                c.name,
+                c.weight
+            );
+        }
         Ok(manifest)
     }
 
@@ -963,6 +1009,200 @@ impl LabelManifest {
         }
         out
     }
+}
+
+// ------------------------------------------------------- detector labels --
+
+/// One detector finding located on a line of a training document, to be
+/// turned into labels by [`label_detector_lines`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineFinding {
+    /// 1-based line in the document's text.
+    pub line: usize,
+    /// Must name an entry in the `categories` passed alongside.
+    pub category: String,
+    /// What fired (`"cheat:data-suppression"`), counted in the manifest.
+    pub rule: String,
+}
+
+/// The categories detector-derived labels use, one per detector, each at full
+/// weight. Label byte `k + 1` means `detector_categories()[k]`.
+pub fn detector_categories() -> Vec<Category> {
+    [
+        (
+            "detector-smuggle",
+            "hidden, invisible or encoded content (crate::smuggle)",
+        ),
+        (
+            "detector-cheat",
+            "suppression, stubs, gaming and evasion (crate::cheat)",
+        ),
+        (
+            "detector-polyglot",
+            "suppression, skipped tests and stubs in the long tail of languages (crate::polyglot)",
+        ),
+        ("detector-rogue", "evaluation gaming (crate::rogue)"),
+        (
+            "detector-lint",
+            "external linter diagnostics (crate::lintrunner)",
+        ),
+        (
+            "detector-character",
+            "the character rubric's integrity signal (crate::character)",
+        ),
+    ]
+    .iter()
+    .map(|(name, description)| Category {
+        name: (*name).to_string(),
+        weight: 1.0,
+        description: (*description).to_string(),
+    })
+    .collect()
+}
+
+/// Per-token labels for a document from detector findings, in the format the
+/// penalized loss reads: one byte per token (the byte-level tokenizer's tokens
+/// are the text's bytes), [`CLEAN`] or `1 + ` the category's index, plus the
+/// [`LabelManifest`] that says what each label byte means and weighs.
+///
+/// Each finding labels its line from the first non-whitespace byte to the
+/// last non-whitespace byte: the offending text, not the indentation the
+/// next line also needs and not the newline that ends it. Where two findings
+/// label the same line the first one in `findings` order wins, as overlapping
+/// spans do in [`Labeler::label`]. A finding whose line is past the end of the
+/// text labels nothing.
+///
+/// # Kept documents only
+///
+/// This is negative supervision on *training data*: call it for documents the
+/// integrity pipeline kept (see [`crate::integrity::training_labels`], which
+/// refuses anything else), never for the model's own outputs. A detector
+/// wired into a loss over generations is a reward term by another name, and
+/// [`crate::cheat`] explains why that teaches evasion instead of honesty.
+pub fn label_detector_lines(
+    text: &str,
+    findings: &[LineFinding],
+    categories: &[Category],
+) -> Result<(Vec<u8>, LabelManifest)> {
+    anyhow::ensure!(
+        categories.len() <= MAX_CATEGORIES,
+        "{} categories do not fit a label byte (max {MAX_CATEGORIES})",
+        categories.len()
+    );
+    let bytes = text.as_bytes();
+    // Byte range of each line, without its newline.
+    let mut lines: Vec<(usize, usize)> = Vec::new();
+    let mut start = 0usize;
+    for (at, b) in bytes.iter().enumerate() {
+        if *b == b'\n' {
+            lines.push((start, at));
+            start = at + 1;
+        }
+    }
+    lines.push((start, bytes.len()));
+
+    let mut labels = vec![CLEAN; bytes.len()];
+    let mut rule_names: Vec<String> = Vec::new();
+    let mut spans: Vec<Span> = Vec::new();
+    for finding in findings {
+        let index = categories
+            .iter()
+            .position(|c| c.name == finding.category)
+            .with_context(|| {
+                format!(
+                    "finding on line {} names unknown category {:?}",
+                    finding.line, finding.category
+                )
+            })?;
+        let label = u8::try_from(index + 1)
+            .with_context(|| format!("category index {index} does not fit a label byte"))?;
+        let Some(&(line_start, line_end)) = finding.line.checked_sub(1).and_then(|k| lines.get(k))
+        else {
+            continue;
+        };
+        let line = bytes.get(line_start..line_end).unwrap_or(&[]);
+        let Some(first) = line.iter().position(|b| !b.is_ascii_whitespace()) else {
+            continue;
+        };
+        let last = line
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace())
+            .unwrap_or(first);
+        let (span_start, span_end) = (line_start + first, line_start + last + 1);
+        for slot in labels.iter_mut().take(span_end).skip(span_start) {
+            if *slot == CLEAN {
+                *slot = label;
+            }
+        }
+        let rule = match rule_names.iter().position(|r| *r == finding.rule) {
+            Some(k) => k,
+            None => {
+                rule_names.push(finding.rule.clone());
+                rule_names.len() - 1
+            }
+        };
+        spans.push(Span {
+            start: span_start,
+            end: span_end,
+            rule,
+            label,
+        });
+    }
+
+    let mut category_counts: Vec<CategoryCount> = categories
+        .iter()
+        .map(|c| CategoryCount {
+            name: c.name.clone(),
+            weight: c.weight,
+            description: c.description.clone(),
+            tokens: 0,
+            spans: 0,
+        })
+        .collect();
+    for label in &labels {
+        if let Some(c) = usize::from(*label)
+            .checked_sub(1)
+            .and_then(|k| category_counts.get_mut(k))
+        {
+            c.tokens += 1;
+        }
+    }
+    let mut rules: Vec<RuleCount> = rule_names
+        .iter()
+        .map(|name| RuleCount {
+            name: name.clone(),
+            category: String::new(),
+            language: String::new(),
+            spans: 0,
+        })
+        .collect();
+    for span in &spans {
+        if let Some(r) = rules.get_mut(span.rule) {
+            r.spans += 1;
+            if r.category.is_empty() {
+                if let Some(c) = usize::from(span.label)
+                    .checked_sub(1)
+                    .and_then(|k| categories.get(k))
+                {
+                    r.category = c.name.clone();
+                }
+            }
+        }
+        if let Some(c) = usize::from(span.label)
+            .checked_sub(1)
+            .and_then(|k| category_counts.get_mut(k))
+        {
+            c.spans += 1;
+        }
+    }
+    let manifest = LabelManifest {
+        format_version: MANIFEST_VERSION,
+        tokens: labels.len(),
+        labeled_tokens: labels.iter().filter(|l| **l != CLEAN).count(),
+        categories: category_counts,
+        rules,
+    };
+    Ok((labels, manifest))
 }
 
 // ---------------------------------------------------------------- builtin --
@@ -1222,10 +1462,18 @@ fn builtin_rules() -> RuleSet {
             "allow-unused-must-use",
             suppress,
             "rust",
-            r"#\s*!?\s*\[\s*allow\s*\(\s*",
-            r"unused_must_use\b",
-            &["#[allow(unused_must_use)]\nfn f() {}", "#![allow(unused_must_use)]"],
-            &["#[allow(dead_code)]", "#[deny(unused_must_use)]"],
+            r"#\s*!?\s*\[\s*allow\s*\([^)\n]*",
+            r"\bunused_must_use\b",
+            &[
+                "#[allow(unused_must_use)]\nfn f() {}",
+                "#![allow(unused_must_use)]",
+                "#[allow(dead_code, unused_must_use)]",
+            ],
+            &[
+                "#[allow(dead_code)]",
+                "#[deny(unused_must_use)]",
+                "#[allow(not_unused_must_use_really)]",
+            ],
         ),
         // ---- hardcoded secrets -------------------------------------------
         rule(
@@ -1379,6 +1627,84 @@ mod tests {
         // ...and a special is not a word character either.
         let boundary = Pattern::parse(r"\bab").unwrap();
         assert!(boundary.match_at(&[256, 97, 98], 1).is_some());
+    }
+
+    #[test]
+    fn test_a_caret_outside_a_class_is_refused_not_a_literal() {
+        // There is no start anchor: `^pass` must not quietly become a rule
+        // for the text "^pass".
+        assert!(Pattern::parse("^pass").is_err());
+        assert_eq!(matches(r"\^x", "a^x"), Some((1, 3)));
+        assert!(Pattern::parse("[^x]").is_ok());
+    }
+
+    #[test]
+    fn test_line_end_matches_before_a_document_boundary() {
+        // In a token corpus documents are separated by special tokens, so the
+        // last line of a document ends at a special, not at a newline. `$`
+        // must see that as the end of the text, as `label_text` would.
+        let p = Pattern::parse(r"noqa[ \t]*$").unwrap();
+        let mut tokens = text_tokens("import os  # noqa");
+        tokens.push(257);
+        tokens.extend(text_tokens("x = 1"));
+        let start = "import os  # ".len();
+        let special = "import os  # noqa".len();
+        assert_eq!(tokens[special], 257);
+        assert_eq!(
+            p.match_at(&tokens, start).map(|(end, _)| end),
+            Some(special)
+        );
+        let labeler = Labeler::builtin().expect("built-in rules");
+        let labels = labeler.label(&tokens);
+        assert!(
+            labels[start..special].iter().all(|l| *l != CLEAN),
+            "a blanket noqa on a document's last line went unlabeled: {labels:?}"
+        );
+        assert_eq!(
+            labels[special], CLEAN,
+            "the special itself is never labeled"
+        );
+    }
+
+    #[test]
+    fn test_adjacent_quantifiers_do_not_backtrack_exponentially() {
+        // Eight overlapping `\s*` over a long run of spaces with no `x` after
+        // it: unmemoized, the matcher tries every way to split the run among
+        // eight quantifiers (~n^7/7! ≈ 3e11 paths at n = 150) at every start
+        // position; memoized it is ~8·n²/2 states per start.
+        let p = Pattern::parse(r"\s*\s*\s*\s*\s*\s*\s*\s*x").unwrap();
+        let text = " ".repeat(150);
+        let started = std::time::Instant::now();
+        assert_eq!(p.find(&text_tokens(&text)), None);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "matching took {:?}",
+            started.elapsed()
+        );
+        // The memo only prunes failures: a match that exists is still found.
+        let hit = format!("{text}x");
+        assert_eq!(p.find(&text_tokens(&hit)), Some((0, 151)));
+    }
+
+    #[test]
+    fn test_a_manifest_with_a_negative_weight_is_refused() {
+        let labeler = Labeler::builtin().expect("built-in rules");
+        let tokens = text_tokens("except:\n    pass\n");
+        let (labels, spans) = labeler.label_with_spans(&tokens);
+        let dir = std::env::temp_dir().join("dblocks-antipattern-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("bad-weight-{}.json", std::process::id()));
+        // A negative weight is valid JSON (NaN and infinity are not), and
+        // would turn the unlikelihood charge into a reward.
+        let mut manifest = labeler.manifest(&labels, &spans);
+        manifest.categories[0].weight = -1.0;
+        manifest.write(&path).unwrap();
+        let err = LabelManifest::read(&path).expect_err("a negative weight must be refused");
+        assert!(err.to_string().contains("weight"), "got: {err}");
+        let good = labeler.manifest(&labels, &spans);
+        good.write(&path).unwrap();
+        assert_eq!(LabelManifest::read(&path).unwrap(), good);
+        drop(std::fs::remove_file(&path));
     }
 
     #[test]
@@ -1547,7 +1873,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join("dblocks-antipattern-tests");
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("manifest.json");
+        let path = dir.join(format!("manifest-{}.json", std::process::id()));
         manifest.write(&path).unwrap();
         assert_eq!(LabelManifest::read(&path).unwrap(), manifest);
         assert!(manifest.render().contains("error-swallowing"));
@@ -1565,5 +1891,63 @@ mod tests {
             report.contains("line 4: [broad-catch] bare-except"),
             "{report}"
         );
+    }
+
+    #[test]
+    fn detector_labels_cover_exactly_the_offending_lines() {
+        let text = "def add(a, b):\n    x = f()  # noqa\n    return a + b\n";
+        let categories = detector_categories();
+        let findings = vec![LineFinding {
+            line: 2,
+            category: "detector-cheat".to_string(),
+            rule: "cheat:data-suppression".to_string(),
+        }];
+        let (labels, manifest) = label_detector_lines(text, &findings, &categories).unwrap();
+        assert_eq!(labels.len(), text.len());
+        let line2_start = text.find("x = f()").unwrap();
+        let line2_end = text.find("# noqa").unwrap() + "# noqa".len();
+        for (i, label) in labels.iter().enumerate() {
+            let inside = i >= line2_start && i < line2_end;
+            let expected = if inside { 2 } else { CLEAN };
+            assert_eq!(
+                *label,
+                expected,
+                "byte {i} ({:?})",
+                text.as_bytes()[i] as char
+            );
+        }
+        assert_eq!(manifest.labeled_tokens, line2_end - line2_start);
+        assert_eq!(manifest.categories[1].spans, 1);
+        assert_eq!(manifest.rules.len(), 1);
+        assert_eq!(manifest.rules[0].category, "detector-cheat");
+        // The table the loss reads charges label 2 at the category's weight.
+        assert_eq!(manifest.weight_table()[2], 1.0);
+        assert_eq!(manifest.weight_table()[0], 0.0);
+    }
+
+    #[test]
+    fn a_document_without_findings_gets_no_labels() {
+        let text = "fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n";
+        let (labels, manifest) = label_detector_lines(text, &[], &detector_categories()).unwrap();
+        assert!(labels.iter().all(|l| *l == CLEAN));
+        assert_eq!(manifest.labeled_tokens, 0);
+    }
+
+    #[test]
+    fn detector_labels_refuse_an_unknown_category_and_skip_a_line_past_the_end() {
+        let text = "one line\n";
+        let unknown = vec![LineFinding {
+            line: 1,
+            category: "nope".to_string(),
+            rule: "x".to_string(),
+        }];
+        assert!(label_detector_lines(text, &unknown, &detector_categories()).is_err());
+        let past = vec![LineFinding {
+            line: 9,
+            category: "detector-smuggle".to_string(),
+            rule: "x".to_string(),
+        }];
+        let (labels, _) = label_detector_lines(text, &past, &detector_categories()).unwrap();
+        assert!(labels.iter().all(|l| *l == CLEAN));
     }
 }

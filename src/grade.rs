@@ -36,9 +36,10 @@
 //!
 //! Minimizing `-(-ln p)` = maximizing `ln p` without bound is the failure mode
 //! [`crate::lm::Unlikelihood`] exists to prevent. A negative grade therefore
-//! scales the *bounded* unlikelihood charge — its gradient is
-//! `α · |g| · (1 − p)`, which vanishes as `p → 0` instead of exploding. The
-//! point value scales the charge's magnitude; it never changes its sign.
+//! scales the *bounded* unlikelihood charge — its gradient with respect to the
+//! target token's logit is `α · |g| · p` (since `∂(−ln(1 − p))/∂z = p` under a
+//! softmax), which vanishes as `p → 0` instead of exploding. The point value
+//! scales the charge's magnitude; it never changes its sign.
 //!
 //! # Sidecar format
 //!
@@ -122,7 +123,8 @@ impl Grade {
     }
 
     /// Snap a real-valued point total to the nearest of the five levels.
-    /// Anything outside `[-1.5, 1.5]` is a caller error and clamps.
+    /// Anything outside `[-1, 1]` is a caller error and clamps to the nearer
+    /// end; a NaN is Neutral.
     #[must_use]
     pub fn from_points(points: f64) -> Self {
         let scaled = (points * 2.0).round().clamp(-2.0, 2.0) as i8;
@@ -133,8 +135,16 @@ impl Grade {
     /// [`crate::codequality`] composite score, a test pass fraction, a judge's
     /// verdict — using [`SCORE_THRESHOLDS`]. Monotone by construction: a better
     /// score never earns fewer points.
+    ///
+    /// A NaN is no measurement, so it is Neutral — no opinion, no charge.
+    /// Every comparison against NaN is false, so without this check it fell
+    /// through every threshold to `Wrong` and charged the unlikelihood
+    /// penalty on tokens nothing had judged.
     #[must_use]
     pub fn from_score(score: f32) -> Self {
+        if score.is_nan() {
+            return Self::Neutral;
+        }
         for &(threshold, grade) in &SCORE_THRESHOLDS {
             if score >= threshold {
                 return grade;
@@ -147,7 +157,9 @@ impl Grade {
     /// `neutral`, `partial`, `correct`), a point value (`-1`, `-0.5`, `0`,
     /// `0.5`, `1`), or `auto` for "no opinion". Hyphens, spaces, casing and
     /// case-folded abbreviations are all accepted, because this string comes
-    /// from a terminal.
+    /// from a terminal. A number outside `[-1, 1]` (or `inf`, `nan`) is
+    /// refused rather than clamped: `5` on a one-to-five scale is not "+1",
+    /// and `inf` is not a grade anyone typed on purpose.
     #[must_use]
     pub fn parse(text: &str) -> Option<Self> {
         let trimmed = text.trim();
@@ -166,7 +178,13 @@ impl Grade {
         // The numeric fallback reads the *unreplaced* text: the `-` → `_`
         // normalization above is for names like "partially-wrong" and would
         // eat the sign of "-1".
-        named.or_else(|| trimmed.parse::<f64>().ok().map(Self::from_points))
+        named.or_else(|| {
+            trimmed
+                .parse::<f64>()
+                .ok()
+                .filter(|p| p.is_finite() && p.abs() <= 1.0)
+                .map(Self::from_points)
+        })
     }
 
     /// A short, stable name for reports, manifests and rule files.
@@ -293,11 +311,8 @@ impl GradePlane {
         self.values.is_empty()
     }
 
-    /// The grade of one token index.
-    ///
-    /// # Panics
-    ///
-    /// If `index` is out of range.
+    /// The grade of one token index; Neutral past the end of the plane (the
+    /// same as [`Self::get_or_neutral`] — it never panics).
     #[must_use]
     pub fn get(&self, index: usize) -> Grade {
         self.get_or_neutral(index)
@@ -650,7 +665,9 @@ mod tests {
     }
 
     fn sidecar_path(name: &str) -> PathBuf {
-        let path = scratch_dir().join(format!("{name}.grades"));
+        // The process id keeps two concurrent `cargo test` runs from writing
+        // over each other's fixtures in the shared temp dir.
+        let path = scratch_dir().join(format!("{name}-{}.grades", std::process::id()));
         let _ = std::fs::remove_file(&path);
         path
     }
@@ -701,6 +718,8 @@ mod tests {
         assert_eq!(Grade::from_score(0.20), Grade::PartiallyWrong);
         assert_eq!(Grade::from_score(0.199), Grade::Wrong);
         assert_eq!(Grade::from_score(0.0), Grade::Wrong);
+        // No measurement is no opinion, not the harshest grade.
+        assert_eq!(Grade::from_score(f32::NAN), Grade::Neutral);
     }
 
     #[test]
@@ -723,6 +742,10 @@ mod tests {
         }
         assert_eq!(Grade::parse("sometimes"), None);
         assert_eq!(Grade::parse(""), None);
+        // Out-of-range numbers are refused, not clamped into a grade.
+        for text in ["5", "-3", "inf", "nan", "1.5"] {
+            assert_eq!(Grade::parse(text), None, "{text} must not parse");
+        }
     }
 
     #[test]
@@ -901,7 +924,7 @@ mod tests {
         );
         assert_eq!(manifest.corpus_tokens, 4);
 
-        let path = scratch_dir().join("manifest.grades.json");
+        let path = scratch_dir().join(format!("manifest-{}.grades.json", std::process::id()));
         manifest.write(&path).expect("write manifest");
         let read = GradeManifest::read(&path).expect("read manifest");
         assert_eq!(read, manifest);

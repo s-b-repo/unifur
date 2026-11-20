@@ -104,13 +104,21 @@ pub struct Trial {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Summary {
     pub n: usize,
+    /// `mean`, `median`, `min` and `max` are NaN when a trial was (a
+    /// diverged loss, say); `serde_json` writes a NaN as `null`, so without
+    /// `nan_null` such a record could be appended but never read back, and
+    /// one bad cell made the whole log unreadable.
+    #[serde(with = "nan_null")]
     pub mean: f64,
+    #[serde(with = "nan_null")]
     pub median: f64,
     /// Sample standard deviation (`n - 1` in the denominator); NaN for `n < 2`
     /// (written as `null`).
     #[serde(with = "nan_null")]
     pub std: f64,
+    #[serde(with = "nan_null")]
     pub min: f64,
+    #[serde(with = "nan_null")]
     pub max: f64,
     /// `t_{0.975, n-1} * std / sqrt(n)`; NaN for `n < 2` (written as `null`).
     #[serde(with = "nan_null")]
@@ -185,10 +193,16 @@ pub fn median(values: &[f64]) -> f64 {
 
 /// Two-sided 95% quantile of Student's t with `df` degrees of freedom.
 ///
-/// Tabulated to four decimals for `df <= 30` and at a few larger values; the
-/// normal quantile `1.960` beyond `df = 120`. The table is what a benchmark of
-/// three to thirty repeats needs; a run with hundreds of repeats is within a
-/// per-mille of the normal interval anyway.
+/// Tabulated to four decimals for `df <= 30`; for `31..=120` the
+/// Cornish-Fisher expansion of the t quantile about the normal one
+/// (Abramowitz & Stegun 26.7.5), which agrees with the tables to four
+/// decimals there; the normal quantile `1.960` beyond `df = 120`.
+///
+/// The middle range used to be three flat brackets holding each bracket's
+/// *largest*-df value (e.g. `t(40)` for every `df` in `31..=40`), which is
+/// the smallest quantile in the bracket: every interval in that range was
+/// narrower than 95%. Beyond `df = 120` the normal value still understates
+/// `t` slightly -- by at most about one percent, at `df = 121`.
 pub fn t_quantile_975(df: usize) -> f64 {
     const TABLE: [f64; 30] = [
         12.7062, 4.3027, 3.1824, 2.7764, 2.5706, 2.4469, 2.3646, 2.3060, 2.2622, 2.2281, 2.2010,
@@ -198,9 +212,17 @@ pub fn t_quantile_975(df: usize) -> f64 {
     match df {
         0 => f64::INFINITY,
         1..=30 => TABLE[df - 1],
-        31..=40 => 2.0211,
-        41..=60 => 2.0003,
-        61..=120 => 1.9799,
+        31..=120 => {
+            let x = 1.959_963_984_540_054_f64;
+            let n = df as f64;
+            let (x3, x5, x7, x9) = (x.powi(3), x.powi(5), x.powi(7), x.powi(9));
+            let g1 = (x3 + x) / 4.0;
+            let g2 = (5.0 * x5 + 16.0 * x3 + 3.0 * x) / 96.0;
+            let g3 = (3.0 * x7 + 19.0 * x5 + 17.0 * x3 - 15.0 * x) / 384.0;
+            let g4 =
+                (79.0 * x9 + 776.0 * x7 + 1482.0 * x5 - 1920.0 * x3 - 945.0 * x) / 92160.0;
+            x + g1 / n + g2 / n.powi(2) + g3 / n.powi(3) + g4 / n.powi(4)
+        }
         _ => 1.9600,
     }
 }
@@ -285,8 +307,13 @@ impl RunLog {
             .open(path)
             .with_context(|| format!("open {} for append", path.display()))?;
         let line = serde_json::to_string(record).context("serialize record")?;
-        writeln!(file, "{line}").with_context(|| format!("append to {}", path.display()))?;
-        file.flush()?;
+        // One `write_all` of the whole line, newline included: `writeln!` may
+        // issue several writes, and two processes appending to the same log
+        // could then interleave fragments of their records.
+        file.write_all(format!("{line}\n").as_bytes())
+            .with_context(|| format!("append to {}", path.display()))?;
+        file.flush()
+            .with_context(|| format!("flush {}", path.display()))?;
         Ok(())
     }
 
@@ -408,6 +435,48 @@ mod tests {
         assert!(Summary::of(&[]).is_none());
         assert_eq!(median(&[4.0, 1.0, 3.0, 2.0]), 2.5);
         assert!(median(&[]).is_nan());
+    }
+
+    #[test]
+    fn test_a_record_with_a_nan_trial_reads_back() {
+        // A diverged run's loss is NaN; its record must not poison the log.
+        let mut r = Record::new("nan", "loss", serde_json::Value::Null, vec![1, 2]);
+        r.push(f64::NAN, false);
+        r.push(1.0, false);
+        let line = serde_json::to_string(&r).unwrap();
+        let back: Record = serde_json::from_str(&line).unwrap();
+        let s = back.summary.unwrap();
+        assert_eq!(s.n, 2);
+        assert!(s.mean.is_nan());
+        assert!(back.trials[0].value.is_nan() && back.trials[1].value == 1.0);
+    }
+
+    #[test]
+    fn test_t_quantile_matches_published_values_past_the_table() {
+        // Published t(0.975, df) to four decimals. The old brackets returned
+        // t(40) = 2.0211 for df = 31 (true 2.0395): an interval too narrow.
+        for (df, want) in [
+            (30usize, 2.0423),
+            (31, 2.0395),
+            (35, 2.0301),
+            (40, 2.0211),
+            (41, 2.0195),
+            (50, 2.0086),
+            (60, 2.0003),
+            (61, 1.9996),
+            (100, 1.9840),
+            (120, 1.9799),
+        ] {
+            let got = t_quantile_975(df);
+            assert!((got - want).abs() < 6e-5, "t(0.975, {df}) = {got}, want {want}");
+        }
+        // Non-increasing in df across the table/expansion/normal seams.
+        let mut last = f64::INFINITY;
+        for df in 1..=200 {
+            let t = t_quantile_975(df);
+            assert!(t <= last && t >= 1.96, "df {df}: {t}");
+            last = t;
+        }
     }
 
     #[test]

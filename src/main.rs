@@ -788,6 +788,164 @@ mod lm_cli_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// `--lexical`, `--structural` and `fused prove --sweep` default on and
+    /// used to be impossible to turn off: a `bool` with `default_value_t =
+    /// true` is a `SetTrue` flag, which can only ever set what is already set.
+    #[test]
+    fn default_on_switches_can_be_turned_off() {
+        let score = |flags: &[&str]| {
+            let base = ["dblocks", "lm", "score", "--input", "x.rs"];
+            let cli = Cli::try_parse_from(base.into_iter().chain(flags.iter().copied())).unwrap();
+            let Command::Lm {
+                action:
+                    LmAction::Score {
+                        lexical,
+                        structural,
+                        ..
+                    },
+            } = cli.command
+            else {
+                unreachable!()
+            };
+            (lexical, structural)
+        };
+        assert_eq!(score(&[]), (true, true));
+        assert_eq!(score(&["--lexical"]), (true, true));
+        assert_eq!(score(&["--lexical", "false"]), (false, true));
+        assert_eq!(
+            score(&["--structural", "false", "--lexical", "false"]),
+            (false, false)
+        );
+
+        let prove = |flags: &[&str]| {
+            let base = [
+                "dblocks",
+                "geom",
+                "fused",
+                "prove",
+                "--corpus",
+                "c",
+                "--meta",
+                "m",
+                "--weights",
+                "w",
+            ];
+            let cli = Cli::try_parse_from(base.into_iter().chain(flags.iter().copied())).unwrap();
+            let Command::Geom {
+                action: GeomAction::Fused { action },
+            } = cli.command
+            else {
+                unreachable!()
+            };
+            let FusedAction::Prove { sweep, .. } = *action else {
+                unreachable!()
+            };
+            sweep
+        };
+        assert!(prove(&[]));
+        assert!(!prove(&["--sweep", "false"]));
+    }
+
+    /// The fused trainer's CLI default holds scenes out, as the library's does:
+    /// with 0, `fused eval`/`prove` read their "held-out" tail from training
+    /// scenes.
+    #[test]
+    fn fused_train_holds_scenes_out_by_default() {
+        let cli = Cli::try_parse_from([
+            "dblocks",
+            "geom",
+            "fused",
+            "train",
+            "--corpus",
+            "c",
+            "--meta",
+            "m",
+            "--weights",
+            "w",
+        ])
+        .unwrap();
+        let Command::Geom {
+            action: GeomAction::Fused { action },
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        let FusedAction::Train { holdout, .. } = *action else {
+            unreachable!()
+        };
+        assert!(holdout > 0);
+        assert_eq!(
+            holdout,
+            diffusionblocks::geomfusion::FusedTrainConfig::default().holdout
+        );
+    }
+
+    /// `io` and `bench` carry their own help: the bench text used to be the
+    /// first line of `io`'s.
+    #[test]
+    fn io_and_bench_help_describe_themselves() {
+        use clap::CommandFactory;
+        let cli = Cli::command();
+        let about = |name: &str| {
+            cli.find_subcommand(name)
+                .and_then(|c| c.get_about())
+                .map(|a| a.to_string())
+                .unwrap_or_default()
+        };
+        assert!(about("io").contains("I/O engine"), "{}", about("io"));
+        assert!(
+            about("bench").contains("Sweep solvers"),
+            "{}",
+            about("bench")
+        );
+    }
+
+    /// `--data-dir` values go, in order, to the datasets that need one.
+    #[test]
+    fn data_dirs_go_to_the_datasets_that_need_them() {
+        let names = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let choices = dataset_choices(
+            &names(&["synthetic", "cifar100"]),
+            vec![PathBuf::from("/data/cifar")],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(choices[0], DatasetChoice::Synthetic));
+        assert!(
+            matches!(&choices[1], DatasetChoice::Cifar100 { dir, .. } if dir == Path::new("/data/cifar")),
+            "cifar100 must receive the one --data-dir given"
+        );
+        // A directory nothing needs is refused rather than ignored.
+        assert!(dataset_choices(&names(&["synthetic"]), vec![PathBuf::from("/x")], false).is_err());
+        // A real dataset without one is still refused.
+        assert!(dataset_choices(&names(&["cifar100"]), Vec::new(), false).is_err());
+    }
+
+    /// The external presets lint the source they are piped, not the working
+    /// directory, and clippy (no stdin mode) is refused rather than run.
+    #[test]
+    fn external_score_presets_read_stdin() {
+        let input = Path::new("src/x.py");
+        let ruff = external_score_command("ruff", input).unwrap();
+        assert_eq!(ruff.last().map(String::as_str), Some("-"));
+        assert!(ruff
+            .windows(2)
+            .any(|w| w[0] == "--stdin-filename" && w[1] == "src/x.py"));
+        let eslint = external_score_command("eslint", input).unwrap();
+        assert!(eslint.iter().any(|a| a == "--stdin"));
+        assert!(external_score_command("clippy", input).is_err());
+        assert_eq!(
+            external_score_command("mytool", input).unwrap(),
+            vec!["mytool".to_string()]
+        );
+    }
+
+    #[test]
+    fn heretic_baseline_needs_a_target() {
+        assert!(parse_train(&["--heretic-baseline", "b.txt"]).is_err());
+        assert!(parse_train(&["--heretic-baseline", "b.txt", "--heretic-target", "t.txt"]).is_ok());
+    }
+
     #[test]
     fn mosme_spec_and_placement() {
         let dir = std::env::temp_dir().join(format!("dblocks-lm-cli-{}", std::process::id()));
@@ -917,16 +1075,22 @@ enum LmAction {
         input: PathBuf,
         #[arg(long, default_value = "rust")]
         language: String,
-        /// Include the lexical (anti-pattern) dimension.
-        #[arg(long, default_value_t = true)]
+        /// Include the lexical (anti-pattern) dimension; `--lexical false`
+        /// leaves it out.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+              num_args = 0..=1, default_missing_value = "true")]
         lexical: bool,
-        /// Include the structural heuristics dimension.
-        #[arg(long, default_value_t = true)]
+        /// Include the structural heuristics dimension; `--structural false`
+        /// leaves it out.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+              num_args = 0..=1, default_missing_value = "true")]
         structural: bool,
         /// Include the external-analyzer dimension. Requires the
         /// `codequality-external` Cargo feature at build time and the named
         /// tool on `PATH` at run time; otherwise the dimension is silently
-        /// skipped.
+        /// skipped. `ruff` and `eslint` are run in stdin mode on the source;
+        /// `clippy` is refused (it cannot lint a single file from stdin); any
+        /// other name is run as given, with the source on its stdin.
         #[arg(long)]
         external: Option<String>,
         #[arg(long)]
@@ -991,7 +1155,7 @@ enum LmAction {
         #[arg(long, requires = "heretic_baseline")]
         heretic_target: Option<PathBuf>,
         /// Prompts whose behaviour Heretic must preserve, one per line.
-        #[arg(long)]
+        #[arg(long, requires = "heretic_target")]
         heretic_baseline: Option<PathBuf>,
         #[arg(long, default_value_t = 12)]
         heretic_trials: usize,
@@ -1246,6 +1410,9 @@ enum LmAction {
         #[arg(long, action = clap::ArgAction::Append)]
         grant: Vec<PathBuf>,
     },
+    /// Mean next-token cross-entropy and perplexity of a checkpoint over
+    /// windows sampled from `--corpus` (prompt tokens excluded when a mask
+    /// sidecar is present). Held out only if `--corpus` was not trained on.
     Evaluate {
         #[arg(long)]
         checkpoint: PathBuf,
@@ -1486,8 +1653,6 @@ enum Command {
         #[arg(long, default_value_t = 32)]
         plan_budget: usize,
     },
-    /// Sweep solvers and strategies, reporting cost and agreement
-    /// (roadmap 2.9 / 4.7 / 6.6 / 8.6 / 10.7 harness).
     /// Measure the parallel I/O engine and the block execution modes.
     ///
     /// The two halves of Phase 34 in one place, because the question they
@@ -1513,6 +1678,8 @@ enum Command {
         #[arg(long)]
         block_modes: bool,
     },
+    /// Sweep solvers and strategies, reporting cost and agreement
+    /// (roadmap 2.9 / 4.7 / 6.6 / 8.6 / 10.7 harness).
     Bench {
         #[command(flatten)]
         model: ModelArgs,
@@ -1626,6 +1793,16 @@ enum Command {
         #[command(subcommand)]
         action: LmAction,
     },
+    /// Next-Concept Modeling: train and evaluate the multiscale residual-VQ
+    /// tokenizer (stage 1) and the level-wise generator (stage 2).
+    ///
+    /// Boxed: the whole tree lives in the library
+    /// (`diffusionblocks::ncm::cli`), and boxing keeps its builder frames off
+    /// the stack of whatever parses the root `Cli`.
+    Ncm {
+        #[command(subcommand)]
+        action: Box<diffusionblocks::ncm::cli::NcmAction>,
+    },
     /// Token-block diffusion substrate (plan items 1-2): a BD3-LM-style
     /// semi-autoregressive byte LM with block-causal attention, per-block KV
     /// caching, entropy-adaptive block sizing, an entropy-gated halo, and a
@@ -1648,6 +1825,16 @@ enum Command {
     Experts {
         #[command(subcommand)]
         action: ExpertsAction,
+    },
+    /// Route a prompt through the three-layer hierarchical router: the
+    /// meta-router picks a weighted category combination, the category
+    /// routers pick specialists, and the plan reports which layer decided
+    /// what.
+    Route(Box<RouteArgs>),
+    /// The hierarchical router's meta-router: training and held-out eval.
+    Router {
+        #[command(subcommand)]
+        action: Box<RouterAction>,
     },
     /// The specialist coding student: per-language trace training with the
     /// router-which-knows auxiliary, its routing readout, and its shape
@@ -1677,6 +1864,130 @@ enum Command {
         #[command(subcommand)]
         action: CorpusAction,
     },
+    // No doc comment here on purpose: the help text lives on `TeacherCli`,
+    // so its builder temporaries stay out of this (debug-build, ~900 KiB)
+    // `augment_subcommands` frame that every CLI parse runs through.
+    Teacher(TeacherCli),
+    /// ALIEN-FINDER (TRISKELE plan §16): rank coherent-but-unproposed points
+    /// between specialist vectors, embed a specialist from a student
+    /// checkpoint, and fit the pilot-survival predictor. It ranks
+    /// candidates; it does not establish that any of them works.
+    Alien {
+        #[command(subcommand)]
+        action: Box<AlienAction>,
+    },
+}
+
+/// The ALIEN-FINDER subcommands. Each takes its own args struct, so clap
+/// builds each in its own frame rather than on the root `Cli`'s.
+#[derive(Subcommand)]
+enum AlienAction {
+    /// Rank between-space candidates in a vector file: coherence (affine
+    /// reconstruction from the knowns) x (1 - likelihood), with on-known and
+    /// null-space controls and the prototype's self-checks per scope.
+    Rank(AlienRankArgs),
+    /// Embed one specialist from a nina student checkpoint and a sample of
+    /// its field corpus (mean hidden state over evenly spaced windows), and
+    /// add it to a vector file.
+    Embed(AlienEmbedArgs),
+    /// The pilot-survival predictor.
+    Survival {
+        #[command(subcommand)]
+        action: AlienSurvivalAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum AlienSurvivalAction {
+    /// Fit the logistic survival predictor on recorded pilot outcomes. It
+    /// refuses to fit on too few outcomes and withholds the held-out
+    /// accuracy when too few are held out.
+    Train(AlienSurvivalTrainArgs),
+}
+
+#[derive(clap::Args)]
+struct AlienRankArgs {
+    /// Vector file: `{"vectors": [{"name", "vector", "category"?}, ...]}`
+    /// or a bare array of those.
+    #[arg(long)]
+    vectors: PathBuf,
+    /// One finder per category plus a top-level finder between the category
+    /// centroids (every vector needs a category).
+    #[arg(long, default_value_t = false)]
+    per_category: bool,
+    /// Proposals shown per scope.
+    #[arg(long, default_value_t = 20)]
+    top: usize,
+    #[arg(long, default_value_t = 7)]
+    seed: u64,
+    /// Dirichlet blends drawn into each scope's pool.
+    #[arg(long, default_value_t = 2000)]
+    samples: usize,
+    /// Candidates kept per pool by farthest-interior selection.
+    #[arg(long, default_value_t = 12)]
+    interior: usize,
+    /// KDE bandwidth as a multiple of the median nearest-neighbour distance.
+    #[arg(long, default_value_t = 1.5)]
+    bandwidth_factor: f64,
+    /// Null-space control points per scope.
+    #[arg(long, default_value_t = 3)]
+    null_controls: usize,
+    /// Skip the slerp and Poincare-geodesic generators.
+    #[arg(long, default_value_t = false)]
+    no_curved: bool,
+    /// Whiten by the pooled within-specialist window variance (vectors made
+    /// by `alien embed` carry it).
+    #[arg(long, default_value_t = false)]
+    whiten: bool,
+    /// A model from `alien survival train`: rank by gap x predicted survival.
+    #[arg(long)]
+    survival: Option<PathBuf>,
+    /// Write every proposal here as JSONL.
+    #[arg(long)]
+    out: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
+struct AlienEmbedArgs {
+    /// Student checkpoint (`.mpk`); its config is read from the sidecar or
+    /// deployment manifest beside it.
+    #[arg(long)]
+    checkpoint: PathBuf,
+    /// Field corpus (`.bin`, little-endian u16 tokens).
+    #[arg(long)]
+    corpus: PathBuf,
+    /// The specialist's name in the vector file.
+    #[arg(long)]
+    name: String,
+    /// Its category, for `alien rank --per-category`.
+    #[arg(long)]
+    category: Option<String>,
+    /// Windows averaged over, evenly spaced across the corpus.
+    #[arg(long, default_value_t = 32)]
+    windows: usize,
+    /// Tokens per window (default: the student's context).
+    #[arg(long)]
+    window_len: Option<usize>,
+    /// Vector file to add the specialist to (created if absent; an entry of
+    /// the same name is replaced).
+    #[arg(long, default_value = "alien-vectors.json")]
+    out: PathBuf,
+}
+
+#[derive(clap::Args)]
+struct AlienSurvivalTrainArgs {
+    /// Proposals JSONL (from `alien rank --out`).
+    #[arg(long)]
+    proposals: PathBuf,
+    /// Pilot outcomes JSONL: `{"proposal_id", "survived", "notes"?}`.
+    #[arg(long)]
+    outcomes: PathBuf,
+    /// Plans JSONL to validate against the proposals first (optional).
+    #[arg(long)]
+    plans: Option<PathBuf>,
+    /// Where the fitted model is written.
+    #[arg(long, default_value = "alien-survival.json")]
+    out: PathBuf,
 }
 
 /// The field-corpus subcommands.
@@ -1731,6 +2042,578 @@ enum CorpusAction {
         #[arg(long, default_value_t = fieldnorm::DEFAULT_PAIRS_MAX_DOCS)]
         max_docs: usize,
     },
+}
+
+/// Which OpenAI-compatible endpoint a `teacher` subcommand talks to.
+#[derive(clap::Args, Clone)]
+struct TeacherEndpointArgs {
+    /// nim | openrouter | custom. Sets the default base URL
+    /// (integrate.api.nvidia.com/v1, openrouter.ai/api/v1) and key variable
+    /// (NVIDIA_API_KEY, OPENROUTER_API_KEY, TEACHER_API_KEY).
+    #[arg(long, default_value = "nim")]
+    provider: String,
+    /// Override the provider's base URL (required for `custom`).
+    #[arg(long)]
+    base_url: Option<String>,
+    /// Name of the environment variable holding the API key. The key itself
+    /// is never accepted as a flag and never printed.
+    #[arg(long)]
+    api_key_env: Option<String>,
+    /// Per-request timeout, seconds.
+    #[arg(long, default_value_t = 120)]
+    timeout_secs: u64,
+}
+
+/// Which teacher models to use, in priority order.
+#[derive(clap::Args, Clone)]
+struct TeacherPoolArgs {
+    /// Model ids, comma-separated, in priority order (listed first).
+    #[arg(long, value_delimiter = ',')]
+    models: Vec<String>,
+    /// Add the models of a saved `teacher models --out` listing (no network),
+    /// filtered by --free/--match.
+    #[arg(long)]
+    models_from: Option<PathBuf>,
+    /// Keep only free models: zero prompt and completion price, or an id
+    /// ending in `:free`. Without --models-from this lists the provider live.
+    #[arg(long)]
+    free: bool,
+    /// Case-insensitive substrings (comma-separated, any of) a listed
+    /// model's id or name must contain, e.g. `nemotron` or `nvidia`. Without
+    /// --models-from this lists the provider live (GET {base}/models).
+    #[arg(long = "match", value_delimiter = ',')]
+    matches: Vec<String>,
+}
+
+/// How rate limits are waited out.
+#[derive(clap::Args, Clone)]
+struct TeacherPauseArgs {
+    /// Longest wait for a per-minute or overload limit; a reset further away
+    /// benches the model (rotate to the next one) instead.
+    #[arg(long, default_value_t = 900)]
+    max_pause_secs: u64,
+    /// Wait for a daily cap only when it resets within this; otherwise
+    /// rotate to the next model in the pool.
+    #[arg(long, default_value_t = 3600)]
+    max_pause_daily_secs: u64,
+    /// When every model is paused, sleep until the earliest reset if it is
+    /// within this, else stop with the journal saved (rerun the same command
+    /// to resume). 0 stops at once.
+    #[arg(long, default_value_t = 86_400)]
+    max_idle_secs: u64,
+    /// Upper bound of the random jitter added to every pause, ms.
+    #[arg(long, default_value_t = 2000)]
+    jitter_ms: u64,
+    /// Minimum gap between two requests, ms (3000 stays under OpenRouter's
+    /// roughly 20 free requests a minute).
+    #[arg(long, default_value_t = 0)]
+    min_interval_ms: u64,
+    /// Retries per prompt for transport failures and plain 5xx errors.
+    #[arg(long, default_value_t = 3)]
+    max_retries: u32,
+}
+
+/// Teacher models (NVIDIA NIM, OpenRouter incl. free models, custom
+/// OpenAI-compatible endpoints): list/discover free models, screen them on a
+/// probe set, and generate traces through a pool that pauses on rate limits,
+/// rotates on daily caps and resumes after a restart.
+#[derive(clap::Args)]
+struct TeacherCli {
+    #[command(subcommand)]
+    action: Box<TeacherAction>,
+}
+
+/// The `teacher` subcommands.
+#[derive(Subcommand)]
+enum TeacherAction {
+    /// List a provider's models (GET {base}/models), optionally only the free
+    /// ones and only those matching --match, and save the listing with a
+    /// timestamp (--out) for `--models-from`. Prints which free rule matched
+    /// (zero-pricing, free-suffix or both). Needs no key for OpenRouter.
+    Models(TeacherModelsArgs),
+    /// Screen teacher models on a fixed, versioned probe set (coding,
+    /// security, reasoning, integrity traps) and write a leaderboard with a
+    /// recommended pool. A screening heuristic, not a benchmark score; model
+    /// code is never executed. Replies are cached in <out>.replies.jsonl, so
+    /// an interrupted run resumes. Free OpenRouter providers may log or train
+    /// on prompts: do not add private probes.
+    Eval(TeacherEvalArgs),
+    /// Generate per-language teacher traces (the langdata pipeline: seeds,
+    /// teacher, cheat filter, decontamination) through a model pool that
+    /// pauses on rate limits, rotates on daily caps and resumes: each trace is
+    /// fsynced as it arrives and `<lang>/raw/traces.jsonl.state.json` records
+    /// progress, spend and pauses, so rerunning the same command continues.
+    Pipeline(TeacherPipelineArgs),
+}
+
+/// Flags of `dblocks teacher models`.
+#[derive(clap::Args, Clone)]
+struct TeacherModelsArgs {
+    #[command(flatten)]
+    endpoint: TeacherEndpointArgs,
+    /// Keep only free models (zero prompt and completion price and/or a
+    /// `:free` id). NIM's listing carries no prices, so there only `:free`
+    /// ids match.
+    #[arg(long)]
+    free: bool,
+    /// Case-insensitive substrings (comma-separated, any of) the id or name
+    /// must contain, e.g. `nemotron`, `nvidia`, `super`.
+    #[arg(long = "match", value_delimiter = ',')]
+    matches: Vec<String>,
+    /// Save the filtered listing (with its fetch time) as JSON.
+    #[arg(long)]
+    out: Option<PathBuf>,
+    /// Print the listing as JSON instead of a table.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Flags of `dblocks teacher eval`.
+#[derive(clap::Args, Clone)]
+struct TeacherEvalArgs {
+    #[command(flatten)]
+    endpoint: TeacherEndpointArgs,
+    #[command(flatten)]
+    pool: TeacherPoolArgs,
+    #[command(flatten)]
+    pause: TeacherPauseArgs,
+    /// Extra probes, one JSON probe per line, added to the built-in set.
+    #[arg(long)]
+    probes: Option<PathBuf>,
+    /// Leaderboard JSON to write; replies are cached beside it in
+    /// <out>.replies.jsonl.
+    #[arg(long)]
+    out: PathBuf,
+    /// Request cap for this run (default: models x probes x 2).
+    #[arg(long)]
+    max_requests: Option<usize>,
+    /// Replace every probe's token cap (reasoning models may need more).
+    #[arg(long)]
+    max_tokens: Option<u32>,
+    /// Send nothing: rebuild the leaderboard from the cached replies (all
+    /// cached models when no model flags are given).
+    #[arg(long)]
+    score_only: bool,
+    /// Recommendation thresholds as JSON (fields of
+    /// teachereval::EvalThresholds; missing fields keep their defaults).
+    #[arg(long)]
+    thresholds: Option<PathBuf>,
+    /// Successful replies a model needs before it is ranked (default 20).
+    #[arg(long)]
+    min_successes: Option<usize>,
+}
+
+/// Flags of `dblocks teacher pipeline`.
+#[derive(clap::Args, Clone)]
+struct TeacherPipelineArgs {
+    #[command(flatten)]
+    endpoint: TeacherEndpointArgs,
+    #[command(flatten)]
+    pool: TeacherPoolArgs,
+    #[command(flatten)]
+    pause: TeacherPauseArgs,
+    /// langdata PipelineConfig JSON; the flags below override it.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// Output root (one directory per language).
+    #[arg(long)]
+    out_dir: Option<PathBuf>,
+    /// Languages, comma-separated (rust,python,c,cpp,jsts,web,go,java,csharp,php).
+    #[arg(long, value_delimiter = ',')]
+    languages: Vec<String>,
+    /// Task seeds per language.
+    #[arg(long)]
+    tasks_per_language: Option<usize>,
+    /// Request cap per language, counted across resumes (default 8).
+    #[arg(long)]
+    max_requests: Option<usize>,
+    /// Token cap per teacher completion.
+    #[arg(long)]
+    max_tokens: Option<u32>,
+    /// Lock each language's trace file to the first model that serves it;
+    /// never rotate to another model (wait or stop instead).
+    #[arg(long)]
+    forbid_mixing: bool,
+}
+
+/// The client config a `teacher` subcommand's endpoint flags describe.
+fn teacher_config(endpoint: &TeacherEndpointArgs) -> Result<diffusionblocks::nim::NimConfig> {
+    let provider = diffusionblocks::nim::Provider::parse(&endpoint.provider)?;
+    let mut config = diffusionblocks::nim::NimConfig::for_provider(provider);
+    if let Some(url) = &endpoint.base_url {
+        config.base_url = url.clone();
+    }
+    if let Some(var) = &endpoint.api_key_env {
+        config.api_key_env = var.clone();
+    }
+    config.timeout_secs = endpoint.timeout_secs;
+    ensure!(
+        !config.base_url.trim().is_empty(),
+        "--provider {} needs --base-url",
+        provider.as_str()
+    );
+    Ok(config)
+}
+
+/// The pause policy the pause flags describe.
+fn teacher_pause(args: &TeacherPauseArgs) -> diffusionblocks::ratelimit::PausePolicy {
+    diffusionblocks::ratelimit::PausePolicy {
+        max_pause_secs: args.max_pause_secs,
+        max_pause_daily_secs: args.max_pause_daily_secs,
+        max_idle_secs: args.max_idle_secs,
+        jitter_max_ms: args.jitter_ms,
+        min_interval_ms: args.min_interval_ms,
+        ..diffusionblocks::ratelimit::PausePolicy::default()
+    }
+}
+
+/// The key, when its variable is set (discovery works without one).
+fn teacher_key(config: &diffusionblocks::nim::NimConfig) -> Option<String> {
+    std::env::var(&config.api_key_env)
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+}
+
+fn teacher_selection(args: &TeacherPoolArgs) -> diffusionblocks::teacher::ModelSelection {
+    diffusionblocks::teacher::ModelSelection {
+        models: args.models.clone(),
+        models_from: args.models_from.clone(),
+        free: args.free,
+        matches: args.matches.clone(),
+    }
+}
+
+fn teacher_now() -> u64 {
+    use diffusionblocks::teacher::RunEnv as _;
+    diffusionblocks::teacher::SystemEnv.now_unix_ms()
+}
+
+fn cmd_teacher(action: TeacherAction) -> Result<()> {
+    match action {
+        TeacherAction::Models(args) => cmd_teacher_models(&args),
+        TeacherAction::Eval(args) => cmd_teacher_eval(&args),
+        TeacherAction::Pipeline(args) => cmd_teacher_pipeline(&args),
+    }
+}
+
+fn cmd_teacher_models(args: &TeacherModelsArgs) -> Result<()> {
+    use diffusionblocks::teacher::{self as teacher, FreeRule, ModelCache};
+    let config = teacher_config(&args.endpoint)?;
+    let key = teacher_key(&config);
+    let listed = teacher::fetch_models(&config, key.as_deref())?;
+    let kept = teacher::filter_models(&listed, args.free, &args.matches);
+    let now = teacher_now();
+    let cache = ModelCache {
+        version: teacher::MODEL_CACHE_VERSION,
+        provider: config.provider.as_str().to_string(),
+        base_url: config.base_url.clone(),
+        fetched_at_unix_ms: now,
+        fetched_at: diffusionblocks::ratelimit::format_unix_ms(now),
+        free_only: args.free,
+        matches: args.matches.clone(),
+        total_listed: listed.len(),
+        models: kept,
+    };
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&cache)?);
+    } else {
+        println!(
+            "{} of {} model(s) listed by {} ({}) at {}",
+            cache.models.len(),
+            cache.total_listed,
+            cache.provider,
+            cache.base_url,
+            cache.fetched_at
+        );
+        for model in &cache.models {
+            let rule = match model.free {
+                Some(FreeRule::Both) => "free (zero-pricing + :free)",
+                Some(FreeRule::ZeroPricing) => "free (zero-pricing)",
+                Some(FreeRule::FreeSuffix) => "free (:free suffix)",
+                None => "priced",
+            };
+            println!(
+                "  {:<56} {:<28} ctx {:>8}  {}",
+                model.id,
+                rule,
+                model
+                    .context_length
+                    .map_or_else(|| "?".to_string(), |c| c.to_string()),
+                model.name
+            );
+        }
+    }
+    if cache.models.is_empty() && args.free && cache.provider == "nim" {
+        eprintln!(
+            "note: NIM's listing carries no prices, so --free only matches `:free` ids there; \
+             use --provider openrouter to find free models"
+        );
+    }
+    if let Some(out) = &args.out {
+        cache.write(out)?;
+        println!("listing saved to {} (use --models-from)", out.display());
+    }
+    Ok(())
+}
+
+fn cmd_teacher_eval(args: &TeacherEvalArgs) -> Result<()> {
+    use diffusionblocks::teachereval::{self as eval, EvalScope, EvalThresholds};
+    let mut config = teacher_config(&args.endpoint)?;
+    let (probe_set, probes) = eval::probe_set(args.probes.as_deref())?;
+    let mut replies_path = args.out.as_os_str().to_owned();
+    replies_path.push(".replies.jsonl");
+    let replies_path = PathBuf::from(replies_path);
+    let mut thresholds = match &args.thresholds {
+        Some(path) => serde_json::from_str::<EvalThresholds>(
+            &std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?,
+        )
+        .with_context(|| format!("{} is not an EvalThresholds JSON", path.display()))?,
+        None => EvalThresholds::default(),
+    };
+    if let Some(n) = args.min_successes {
+        thresholds.min_successes = n;
+    }
+    let selection = teacher_selection(&args.pool);
+    let nothing_selected = selection.models.is_empty()
+        && selection.models_from.is_none()
+        && !selection.free
+        && selection.matches.is_empty();
+    let models = if args.score_only && nothing_selected {
+        let mut seen = Vec::new();
+        for reply in eval::read_replies(&replies_path)? {
+            if reply.probe_set == probe_set && !seen.contains(&reply.model) {
+                seen.push(reply.model);
+            }
+        }
+        ensure!(
+            !seen.is_empty(),
+            "--score-only: {} holds no replies for probe set {probe_set}",
+            replies_path.display()
+        );
+        seen
+    } else {
+        let key = teacher_key(&config);
+        diffusionblocks::teacher::resolve_models(&selection, &config, key.as_deref())?
+    };
+    if !args.score_only {
+        if let Some(first) = models.first() {
+            config.model = first.clone();
+        }
+        let client = diffusionblocks::nim::NimClient::from_env_config(config.clone())?;
+        let run_config = eval::EvalRunConfig {
+            models: models.clone(),
+            probes: probes.clone(),
+            probe_set: probe_set.clone(),
+            replies_path: replies_path.clone(),
+            max_requests: args
+                .max_requests
+                .unwrap_or(models.len().saturating_mul(probes.len()).saturating_mul(2)),
+            max_tokens_override: args.max_tokens,
+            pause: teacher_pause(&args.pause),
+            max_retries: args.pause.max_retries,
+            backoff_base_ms: config.backoff_base_ms,
+        };
+        eprintln!(
+            "screening {} model(s) on {} probes ({probe_set}); replies cached at {}",
+            models.len(),
+            probes.len(),
+            replies_path.display()
+        );
+        let run = eval::run_probes(&client, &diffusionblocks::teacher::SystemEnv, &run_config)?;
+        println!(
+            "{} request(s) sent, {} new repl(ies), {} already cached",
+            run.requests, run.written, run.skipped_cached
+        );
+        for (model, reason) in &run.stopped_models {
+            println!("unfinished: {model}: {reason} (rerun to resume)");
+        }
+        if run.budget_exhausted {
+            println!("the request cap ended the run; rerun (or raise --max-requests) to continue");
+        }
+    }
+    let replies = eval::read_replies(&replies_path)?;
+    let scope = EvalScope {
+        models: &models,
+        probes: &probes,
+        probe_set: &probe_set,
+        provider: config.provider.as_str(),
+    };
+    let board = eval::build_leaderboard(&scope, &replies, &thresholds, teacher_now(), None)?;
+    board.write(&args.out)?;
+    print!("{}", eval::render_summary(&board));
+    println!("leaderboard written to {}", args.out.display());
+    Ok(())
+}
+
+fn cmd_teacher_pipeline(args: &TeacherPipelineArgs) -> Result<()> {
+    use diffusionblocks::langdata::{self, PipelineConfig};
+    let mut config = teacher_config(&args.endpoint)?;
+    let key = teacher_key(&config);
+    let models = diffusionblocks::teacher::resolve_models(
+        &teacher_selection(&args.pool),
+        &config,
+        key.as_deref(),
+    )?;
+    if let Some(first) = models.first() {
+        config.model = first.clone();
+    }
+    config.max_retries = args.pause.max_retries;
+    config.pause = teacher_pause(&args.pause);
+    let client = diffusionblocks::nim::NimClient::from_env_config(config.clone())?;
+    let mut pipeline = match &args.config {
+        Some(path) => serde_json::from_str::<PipelineConfig>(
+            &std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?,
+        )
+        .with_context(|| format!("{} is not a PipelineConfig JSON", path.display()))?,
+        None => PipelineConfig::default(),
+    };
+    if let Some(dir) = &args.out_dir {
+        pipeline.out_dir = dir.clone();
+    }
+    if !args.languages.is_empty() {
+        pipeline.languages = args
+            .languages
+            .iter()
+            .map(|name| diffusionblocks::student::CodeLanguage::parse(name))
+            .collect::<Result<Vec<_>>>()?;
+    }
+    if let Some(n) = args.tasks_per_language {
+        pipeline.tasks_per_language = n;
+    }
+    if let Some(n) = args.max_requests {
+        pipeline.budget = diffusionblocks::nim::TraceBudget { max_requests: n };
+    }
+    if let Some(n) = args.max_tokens {
+        pipeline.max_tokens = n;
+    }
+    pipeline.teacher_pool = diffusionblocks::teacher::PoolConfig {
+        models: models.clone(),
+        pause: config.pause.clone(),
+        forbid_mixing: args.forbid_mixing,
+    };
+    println!(
+        "teacher pool ({}): {}{}",
+        config.provider.as_str(),
+        models.join(", "),
+        if args.forbid_mixing {
+            " [forbid-mixing]"
+        } else {
+            ""
+        }
+    );
+    let report = langdata::run_pipeline(Some(&client), &pipeline)?;
+    for lang in &report.languages {
+        match &lang.incomplete {
+            Some(reason) => println!("{}: unfinished ({reason})", lang.language),
+            None => println!(
+                "{}: {} kept of {} tasks ({} teacher-missing){}",
+                lang.language,
+                lang.kept,
+                lang.tasks,
+                lang.teacher_missing,
+                if lang.resumed { " [already done]" } else { "" }
+            ),
+        }
+    }
+    match &report.stopped {
+        Some(reason) => println!("stopped: {reason}\nrerun the same command to resume"),
+        None => println!(
+            "done: {} kept, report at {}",
+            report.total_kept(),
+            report.out_dir.join("report.json").display()
+        ),
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+mod teacher_cli_tests {
+    use super::*;
+
+    fn teacher(args: &[&str]) -> TeacherAction {
+        let cli = Cli::try_parse_from(["dblocks", "teacher"].into_iter().chain(args.iter().copied()))
+            .unwrap();
+        let Command::Teacher(teacher) = cli.command else {
+            unreachable!()
+        };
+        *teacher.action
+    }
+
+    #[test]
+    fn teacher_help_is_listed() {
+        let help = Cli::try_parse_from(["dblocks", "--help"])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(help.contains("teacher"), "{help}");
+        assert!(help.contains("Teacher models (NVIDIA NIM, OpenRouter"), "{help}");
+        let eval = Cli::try_parse_from(["dblocks", "teacher", "eval", "--help"])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(eval.contains("Screen teacher models"), "{eval}");
+        assert!(eval.contains("--max-pause-daily-secs"), "{eval}");
+    }
+
+    #[test]
+    fn models_eval_and_pipeline_parse() {
+        let TeacherAction::Models(models) =
+            teacher(&["models", "--provider", "openrouter", "--free", "--match", "nemotron,nvidia"])
+        else {
+            unreachable!()
+        };
+        assert!(models.free);
+        assert_eq!(models.matches, vec!["nemotron", "nvidia"]);
+        let config = teacher_config(&models.endpoint).unwrap();
+        assert_eq!(config.base_url, diffusionblocks::nim::OPENROUTER_BASE_URL);
+        assert_eq!(config.api_key_env, "OPENROUTER_API_KEY");
+
+        let TeacherAction::Eval(eval) = teacher(&[
+            "eval", "--provider", "openrouter", "--free", "--match", "nvidia", "--out", "lb.json",
+            "--max-idle-secs", "0",
+        ]) else {
+            unreachable!()
+        };
+        assert_eq!(eval.out, PathBuf::from("lb.json"));
+        assert_eq!(teacher_pause(&eval.pause).max_idle_secs, 0);
+        assert_eq!(teacher_pause(&eval.pause).max_pause_secs, 900);
+
+        let TeacherAction::Pipeline(pipeline) = teacher(&[
+            "pipeline", "--provider", "nim", "--models", "a,b", "--forbid-mixing",
+            "--languages", "rust,python", "--max-requests", "40",
+        ]) else {
+            unreachable!()
+        };
+        assert_eq!(pipeline.pool.models, vec!["a", "b"]);
+        assert!(pipeline.forbid_mixing);
+        assert_eq!(pipeline.max_requests, Some(40));
+        assert!(teacher_config(&TeacherEndpointArgs {
+            provider: "custom".into(),
+            base_url: None,
+            api_key_env: None,
+            timeout_secs: 5,
+        })
+        .is_err(), "custom needs a base URL");
+    }
 }
 
 /// Where `dblocks student train` looks for traces when `--traces` is not
@@ -2112,10 +2995,12 @@ enum GeomAction {
         #[command(flatten)]
         runtime: LmRuntimeArgs,
     },
-    /// Evaluate answer accuracy over held-out scenes. `--refine-sweep` sweeps
-    /// the relaxation depth at inference: accuracy against the number of
-    /// geometric refinement steps -- the test-time-compute curve for
-    /// reasoning, measured on the same weights.
+    /// Evaluate answer accuracy over scenes sampled from `--corpus`. Training
+    /// samples every scene of its corpus, so the number is held-out only when
+    /// `--corpus` is a separately generated one (`geom data` with another
+    /// seed). `--refine-sweep` sweeps the relaxation depth at inference:
+    /// accuracy against the number of geometric refinement steps -- the
+    /// test-time-compute curve for reasoning, measured on the same weights.
     Eval {
         #[arg(long)]
         checkpoint: PathBuf,
@@ -2219,9 +3104,8 @@ enum GeomAction {
         #[arg(long, default_value_t = 4)]
         seed: u64,
     },
-    /// The trunk-fused geometric stream: Qwen trunk + GeomFusion vector stream
-    /// + MoSME readout. Adapters-only training; every emitted answer is
-    ///
+    /// The trunk-fused geometric stream: Qwen trunk, GeomFusion vector stream
+    /// and MoSME readout. Adapters-only training; every emitted answer is
     /// kernel-checked by `prove`.
     Fused {
         #[command(subcommand)]
@@ -2229,21 +3113,61 @@ enum GeomAction {
     },
 }
 
+/// The paths and architecture flags every `geom fused` subcommand takes, with
+/// one set of defaults.
+///
+/// Flattened rather than repeated per variant for the stack, not for style:
+/// clap's derive builds each argument in the enclosing `augment_subcommands`
+/// frame, and the three variants repeating these fourteen flags made the
+/// `Command -> GeomAction -> FusedAction` builder chain over 2 MB deep in a
+/// debug build -- past a test thread's stack, so any test that parsed the CLI
+/// from a large frame overflowed.
+#[derive(clap::Args, Clone)]
+struct FusedShared {
+    #[arg(long)]
+    corpus: PathBuf,
+    #[arg(long)]
+    meta: PathBuf,
+    #[arg(long)]
+    weights: PathBuf,
+    #[arg(
+        long,
+        default_value = "/srv/m-sdd/unifur/tokenizers/qwen38-source/tokenizer.json"
+    )]
+    tokenizer: PathBuf,
+    #[arg(long, default_value_t = 5120)]
+    hidden_size: usize,
+    #[arg(long, default_value_t = 128)]
+    geom_hidden: usize,
+    #[arg(long, default_value_t = 8)]
+    slots: usize,
+    #[arg(long, default_value_t = 32)]
+    dim: usize,
+    #[arg(long, default_value_t = 2)]
+    num_blocks: usize,
+    #[arg(long, default_value_t = 4)]
+    refine_steps: usize,
+    /// LoRA rank: what `train` attaches. `eval` and `prove` use the rank the
+    /// checkpoint's training state records, and this only when it has none.
+    #[arg(long, default_value_t = 4)]
+    lora_rank: usize,
+    /// LoRA alpha, under the same rule as `--lora-rank`.
+    #[arg(long, default_value_t = 4.0)]
+    lora_alpha: f64,
+    /// EDM data scale for `train --objective diffusion`. `eval` and `prove`
+    /// run the clean answer path and do not use it.
+    #[arg(long, default_value_t = 0.5)]
+    sigma_data: f64,
+    #[command(flatten)]
+    runtime: LmRuntimeArgs,
+}
+
 #[derive(Subcommand)]
 enum FusedAction {
     /// Train the fused model (adapters-only) on a geometric corpus.
     Train {
-        #[arg(long)]
-        corpus: PathBuf,
-        #[arg(long)]
-        meta: PathBuf,
-        #[arg(long)]
-        weights: PathBuf,
-        #[arg(
-            long,
-            default_value = "/srv/m-sdd/unifur/tokenizers/qwen38-source/tokenizer.json"
-        )]
-        tokenizer: PathBuf,
+        #[command(flatten)]
+        shared: FusedShared,
         #[arg(long, default_value_t = 100)]
         steps: usize,
         #[arg(long, default_value_t = 4)]
@@ -2260,123 +3184,54 @@ enum FusedAction {
         log_every: usize,
         #[arg(long, default_value = "checkpoints")]
         out_dir: PathBuf,
-        #[arg(long, default_value_t = 0)]
+        /// Scenes kept out of training at the corpus tail: the region `fused
+        /// eval` and `fused prove` read as held-out. 0 trains on every scene,
+        /// and then no later "held-out" number is one. The default is the
+        /// library's (`FusedTrainConfig::default().holdout`).
+        #[arg(long, default_value_t = 512)]
         holdout: usize,
         #[arg(long, default_value_t = 7)]
         seed: u64,
         /// answer | diffusion.
         #[arg(long, default_value = "answer")]
         objective: String,
-        #[arg(long, default_value_t = 0.5)]
-        sigma_data: f64,
         #[arg(long, default_value_t = 0.01)]
         moe_balance_weight: f64,
         #[arg(long, default_value_t = 0.05)]
         gamma: f64,
         #[arg(long)]
         depth: Option<usize>,
-        #[arg(long, default_value_t = 4)]
-        lora_rank: usize,
-        #[arg(long, default_value_t = 4.0)]
-        lora_alpha: f64,
-        #[arg(long, default_value_t = 5120)]
-        hidden_size: usize,
-        #[arg(long, default_value_t = 128)]
-        geom_hidden: usize,
-        #[arg(long, default_value_t = 8)]
-        slots: usize,
-        #[arg(long, default_value_t = 32)]
-        dim: usize,
-        #[arg(long, default_value_t = 2)]
-        num_blocks: usize,
-        #[arg(long, default_value_t = 4)]
-        refine_steps: usize,
-        #[command(flatten)]
-        runtime: LmRuntimeArgs,
     },
-    /// Evaluate a fused checkpoint on held-out scenes.
+    /// Evaluate a fused checkpoint on held-out scenes: `batches * batch_size`
+    /// of the corpus tail, capped at the holdout its training state records
+    /// (or the corpus size when it records none). `--seed` is unused: the
+    /// tail and the prediction are deterministic.
     Eval {
         #[arg(long)]
         checkpoint: PathBuf,
-        #[arg(long)]
-        corpus: PathBuf,
-        #[arg(long)]
-        meta: PathBuf,
-        #[arg(long)]
-        weights: PathBuf,
-        #[arg(
-            long,
-            default_value = "/srv/m-sdd/unifur/tokenizers/qwen38-source/tokenizer.json"
-        )]
-        tokenizer: PathBuf,
+        #[command(flatten)]
+        shared: FusedShared,
         #[arg(long, default_value_t = 16)]
         batches: usize,
         #[arg(long, default_value_t = 64)]
         batch_size: usize,
-        #[arg(long, default_value_t = 5120)]
-        hidden_size: usize,
-        #[arg(long, default_value_t = 128)]
-        geom_hidden: usize,
-        #[arg(long, default_value_t = 8)]
-        slots: usize,
-        #[arg(long, default_value_t = 32)]
-        dim: usize,
-        #[arg(long, default_value_t = 2)]
-        num_blocks: usize,
-        #[arg(long, default_value_t = 4)]
-        refine_steps: usize,
-        #[arg(long, default_value_t = 4)]
-        lora_rank: usize,
-        #[arg(long, default_value_t = 4.0)]
-        lora_alpha: f64,
-        #[arg(long, default_value_t = 0.5)]
-        sigma_data: f64,
         #[arg(long, default_value_t = 42)]
         seed: u64,
-        #[command(flatten)]
-        runtime: LmRuntimeArgs,
     },
-    /// Kernel-check a fused checkpoint on held-out scenes.
+    /// Kernel-check a fused checkpoint on held-out scenes; `--sweep false`
+    /// skips the refinement sweep.
     Prove {
         #[arg(long)]
         checkpoint: Option<PathBuf>,
-        #[arg(long)]
-        corpus: PathBuf,
-        #[arg(long)]
-        meta: PathBuf,
-        #[arg(long)]
-        weights: PathBuf,
-        #[arg(
-            long,
-            default_value = "/srv/m-sdd/unifur/tokenizers/qwen38-source/tokenizer.json"
-        )]
-        tokenizer: PathBuf,
+        #[command(flatten)]
+        shared: FusedShared,
         #[arg(long, default_value_t = 256)]
         scenes: usize,
         #[arg(long)]
         depth: Option<usize>,
-        #[arg(long, default_value_t = true)]
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set,
+              num_args = 0..=1, default_missing_value = "true")]
         sweep: bool,
-        #[arg(long, default_value_t = 5120)]
-        hidden_size: usize,
-        #[arg(long, default_value_t = 128)]
-        geom_hidden: usize,
-        #[arg(long, default_value_t = 8)]
-        slots: usize,
-        #[arg(long, default_value_t = 32)]
-        dim: usize,
-        #[arg(long, default_value_t = 2)]
-        num_blocks: usize,
-        #[arg(long, default_value_t = 4)]
-        refine_steps: usize,
-        #[arg(long, default_value_t = 4)]
-        lora_rank: usize,
-        #[arg(long, default_value_t = 4.0)]
-        lora_alpha: f64,
-        #[arg(long, default_value_t = 0.5)]
-        sigma_data: f64,
-        #[command(flatten)]
-        runtime: LmRuntimeArgs,
     },
 }
 
@@ -2533,6 +3388,122 @@ enum ExpertsAction {
         #[arg(long)]
         index: PathBuf,
     },
+    /// Print the field / sub-field taxonomy the hierarchical router routes
+    /// over (TRISKELE §13) and how the shipped nina specialists map onto it.
+    Taxonomy {
+        #[command(flatten)]
+        args: ExpertsTaxonomyArgs,
+    },
+}
+
+/// `dblocks experts taxonomy` flags.
+#[derive(clap::Args)]
+struct ExpertsTaxonomyArgs {
+    /// Print the taxonomy document as JSON instead of the tables.
+    #[arg(long, default_value_t = false)]
+    json: bool,
+    /// A taxonomy patch (JSON) merged over the built-in.
+    #[arg(long)]
+    patch: Option<PathBuf>,
+}
+
+/// `dblocks route` flags: the hierarchical router (meta-router -> category
+/// routers -> specialists) on one prompt.
+#[derive(clap::Args)]
+struct RouteArgs {
+    /// The prompt to route.
+    #[arg(long)]
+    prompt: String,
+    /// Memory context the meta-router reads beside the prompt.
+    #[arg(long)]
+    context: Option<String>,
+    /// A trained meta-router (`dblocks router train` writes
+    /// `<out>/meta-router.json`); without one the router abstains.
+    #[arg(long)]
+    meta_router: Option<PathBuf>,
+    /// A nina registry.json to resolve specialists from; the shipped roster
+    /// when neither this nor --index is given.
+    #[arg(long)]
+    registry: Option<PathBuf>,
+    /// An expert index with taxonomy fields (takes precedence over --registry).
+    #[arg(long)]
+    index: Option<PathBuf>,
+    /// A taxonomy patch (JSON) merged over the built-in.
+    #[arg(long)]
+    taxonomy: Option<PathBuf>,
+    /// A student checkpoint: its probe router's box traffic serves the
+    /// coding category at L2.
+    #[arg(long)]
+    student: Option<PathBuf>,
+    /// Route only to active registry models (candidates are admitted by default).
+    #[arg(long, default_value_t = false)]
+    active_only: bool,
+    #[arg(long, default_value_t = 3)]
+    max_categories: usize,
+    #[arg(long, default_value_t = 2)]
+    top_specialists: usize,
+    #[arg(long, default_value_t = 4)]
+    max_specialists: usize,
+}
+
+/// The hierarchical router's training commands.
+#[derive(Subcommand)]
+enum RouterAction {
+    /// Train the meta-router (L3) on (task -> category combination) traces
+    /// and evaluate it on held-out traces.
+    Train {
+        #[command(flatten)]
+        args: RouterTrainArgs,
+    },
+}
+
+/// `dblocks router train` flags.
+#[derive(clap::Args)]
+struct RouterTrainArgs {
+    /// JSONL traces: {"id","text","categories":[{"id","weight"}],"style"?}
+    /// per line. Repeat the flag to train on several files as one set (ids
+    /// must be unique across them).
+    #[arg(long, required = true, action = clap::ArgAction::Append)]
+    traces: Vec<PathBuf>,
+    /// Output directory for meta-router.json and router-train-report.json.
+    #[arg(long)]
+    out: PathBuf,
+    /// Held-out eval traces; without it an id-hash holdout of --traces.
+    #[arg(long)]
+    eval: Option<PathBuf>,
+    /// Percent of --traces held out when --eval is not given.
+    #[arg(long, default_value_t = 20)]
+    holdout_percent: u32,
+    /// Smaller feature table and fewer epochs, for a CPU smoke run.
+    #[arg(long, default_value_t = false)]
+    tiny: bool,
+    /// A taxonomy patch (JSON) merged over the built-in.
+    #[arg(long)]
+    taxonomy: Option<PathBuf>,
+    /// How the calibration slice (temperature + unsure-rule tuning) is drawn:
+    /// `id` (like the fit slice) or `leaf` (whole sub-fields held out, then a
+    /// refit on everything).
+    #[arg(long, default_value = "id")]
+    calibration_split: String,
+    /// Also train the frozen-trunk router on this `lm` checkpoint and
+    /// compare both on the same eval set.
+    #[arg(long)]
+    encoder: Option<PathBuf>,
+    /// External calibration traces (repeatable): fit the temperature and the
+    /// unsure rule on these instead of a training slice. Must not overlap
+    /// --eval.
+    #[arg(long, action = clap::ArgAction::Append)]
+    calibration: Vec<PathBuf>,
+    /// The hashed router's feature set: base | squash | rich.
+    #[arg(long, default_value = "base")]
+    features: String,
+    /// Also train an NCM concept-feature router on this NCM tokenizer
+    /// checkpoint, once per --ncm-levels value.
+    #[arg(long)]
+    ncm_codec: Option<PathBuf>,
+    /// Coarse levels to pool for the NCM router, comma-separated (e.g. 1,2,3).
+    #[arg(long, value_delimiter = ',', default_value = "1,2,3")]
+    ncm_levels: Vec<usize>,
 }
 
 /// The message a panicking thread carried, for reporting a joined thread's
@@ -2547,16 +3518,101 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// `dblocks alien ...`: everything happens in `diffusionblocks::alien`; this
+/// parses, prints the reports, and writes only what was asked for.
+fn cmd_alien(action: AlienAction) -> Result<()> {
+    use diffusionblocks::alien;
+    match action {
+        AlienAction::Rank(args) => {
+            let vectors = alien::read_vectors(&args.vectors)?;
+            let predictor = args
+                .survival
+                .as_deref()
+                .map(alien::SurvivalModel::load)
+                .transpose()?;
+            let options = alien::RankOptions {
+                per_category: args.per_category,
+                whiten: args.whiten,
+                finder: alien::FinderConfig {
+                    simplex_samples: args.samples,
+                    interior: args.interior,
+                    bandwidth_factor: args.bandwidth_factor,
+                    null_controls: args.null_controls,
+                    curved: !args.no_curved,
+                    seed: args.seed,
+                },
+            };
+            let report = alien::rank(&vectors, &options, predictor.as_ref())?;
+            print!("{}", report.render(args.top));
+            if let Some(out) = &args.out {
+                let proposals: Vec<alien::Proposal> = report.proposals().cloned().collect();
+                alien::write_jsonl(out, &proposals)?;
+                println!("\nwrote {} proposals to {}", proposals.len(), out.display());
+            }
+            ensure!(
+                report.proposals().next().is_some(),
+                "no scope could be ranked (see the skipped scopes above)"
+            );
+            Ok(())
+        }
+        AlienAction::Embed(args) => {
+            let options = alien::EmbedOptions {
+                windows: args.windows,
+                window_len: args.window_len,
+            };
+            let vector = alien::embed_student(
+                &args.checkpoint,
+                &args.corpus,
+                &args.name,
+                args.category.as_deref(),
+                &options,
+            )?;
+            let dims = vector.vector.len();
+            let source = vector.source.clone().unwrap_or_default();
+            let replaced = alien::upsert_vector(&args.out, vector)?;
+            println!(
+                "{} specialist '{}' ({dims} dims) in {}\n  {source}",
+                if replaced { "replaced" } else { "added" },
+                args.name,
+                args.out.display()
+            );
+            Ok(())
+        }
+        AlienAction::Survival {
+            action: AlienSurvivalAction::Train(args),
+        } => {
+            let proposals: Vec<alien::Proposal> = alien::read_jsonl(&args.proposals)?;
+            let outcomes: Vec<alien::PilotOutcome> = alien::read_jsonl(&args.outcomes)?;
+            if let Some(path) = &args.plans {
+                let plans: Vec<alien::Plan> = alien::read_jsonl(path)?;
+                alien::check_plans(&plans, &proposals)?;
+                println!("{} plans valid against {} proposals", plans.len(), proposals.len());
+            }
+            let model =
+                alien::train_survival(&proposals, &outcomes, &alien::SurvivalConfig::default())?;
+            print!("{}", model.render());
+            model.save(&args.out)?;
+            println!("wrote {}", args.out.display());
+            Ok(())
+        }
+    }
+}
+
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Sigmas { num_blocks, gamma } => cmd_sigmas(num_blocks, gamma),
         Command::Lm { action } => cmd_lm(action),
+        Command::Ncm { action } => cmd_ncm(*action),
         Command::Tblock { action } => cmd_tblock(action),
         Command::Geom { action } => cmd_geom(action),
         Command::Experts { action } => cmd_experts(action),
+        Command::Route(args) => cmd_route(*args),
+        Command::Router { action } => cmd_router(*action),
         Command::Student { action } => cmd_student(action),
         Command::Nina { action } => cmd_nina(action),
         Command::Corpus { action } => cmd_corpus(action),
+        Command::Teacher(teacher) => cmd_teacher(*teacher.action),
+        Command::Alien { action } => cmd_alien(*action),
         Command::Verify { group } => cmd_verify(group.as_deref()),
         Command::Cheat { action } => match action {
             CheatAction::Scan { root, json, all } => cmd_cheat_scan(&root, json, all),
@@ -2819,6 +3875,41 @@ fn mib(bytes: usize, elapsed: std::time::Duration) -> f64 {
         return 0.0;
     }
     (bytes as f64 / (1u64 << 20) as f64) / secs
+}
+
+/// The command `lm score --external <tool>` runs. The analyzer pipes the
+/// source to the tool's stdin and counts the JSON diagnostics on its stdout,
+/// so each preset must lint stdin: without `-` / `--stdin`, ruff and eslint
+/// lint the working directory instead and score something else entirely.
+/// Clippy has no stdin mode (and no standalone `clippy` binary), so it is
+/// refused rather than run against the wrong input. Any other name is run
+/// as-is, with the source on its stdin.
+fn external_score_command(tool: &str, input: &Path) -> Result<Vec<String>> {
+    let name = input.display().to_string();
+    Ok(match tool {
+        "clippy" => anyhow::bail!(
+            "--external clippy cannot score one file: clippy lints a cargo package and has no \
+             stdin mode; pass ruff, eslint, or a command that reads the source on stdin"
+        ),
+        "ruff" => vec![
+            "ruff".into(),
+            "check".into(),
+            "--output-format".into(),
+            "json".into(),
+            "--stdin-filename".into(),
+            name,
+            "-".into(),
+        ],
+        "eslint" => vec![
+            "eslint".into(),
+            "--stdin".into(),
+            "--stdin-filename".into(),
+            name,
+            "--format".into(),
+            "json".into(),
+        ],
+        other => vec![other.into()],
+    })
 }
 
 /// The rule set a `--rules` flag names, or the built-in one.
@@ -3096,6 +4187,74 @@ struct GeomArch {
     sigma_data: f64,
 }
 
+/// Rebuild a fused model for evaluation, and the holdout it was trained with.
+///
+/// A trained fused checkpoint records its trunk with LoRA adapters attached
+/// (`QwenLinear::Qlora` slots), so the adapters have to be attached -- at the
+/// rank and alpha the training state records, the flags only when it records
+/// none -- before the record can load into the trunk. Without that, the trained
+/// adapters cannot be read back and the evaluation is not of the trained model.
+///
+/// The holdout is what makes the proof's tail held out: a checkpoint trained
+/// with `--holdout 0` has no unseen scenes, and that is refused rather than
+/// reported as a held-out accuracy.
+fn load_fused_for_eval<B: burn::tensor::backend::Backend<FloatElem = f32>>(
+    weights: &Path,
+    fusion_config: &GeomFusionConfig,
+    checkpoint_path: Option<&Path>,
+    lora_flags: qwennet::QwenLoraConfig,
+    device: &B::Device,
+) -> Result<(FusedQwen<B>, Option<usize>)> {
+    let trunk_config = QwenTrunkConfig {
+        num_layers: None,
+        ..QwenTrunkConfig::qwen38()
+    };
+    let trunk = qwennet::load_qwen_trunk_nf4::<B>(weights, &trunk_config, device)?.0;
+    let mut model = FusedQwen::<B>::new(trunk, fusion_config, device)?;
+    let Some(path) = checkpoint_path else {
+        return Ok((model, None));
+    };
+    let recorded = match checkpoint::TrainState::for_model(path)? {
+        Some(state) => {
+            anyhow::ensure!(
+                state.kind == "geomfusion",
+                "{} carries a {:?} training state, not a fused (\"geomfusion\") one",
+                path.display(),
+                state.kind
+            );
+            let config: geomfusion::FusedTrainConfig = serde_json::from_value(state.config)
+                .with_context(|| {
+                    format!(
+                        "parse the training config recorded beside {}",
+                        path.display()
+                    )
+                })?;
+            Some(config)
+        }
+        None => {
+            println!(
+                "note: no training state beside {}: LoRA from the flags, and whether the \
+                 evaluated tail was held out of training is unknown",
+                path.display()
+            );
+            None
+        }
+    };
+    let lora = recorded.as_ref().map_or(lora_flags, |c| c.lora);
+    diffusionblocks::qwentrain::attach_lora(&mut model.trunk, &lora, device)?;
+    let model = checkpoint::load(model, path, device)?;
+    let holdout = recorded.map(|c| c.holdout);
+    if let Some(holdout) = holdout {
+        anyhow::ensure!(
+            holdout > 0,
+            "{} was trained with --holdout 0: every scene was a training scene, so there is \
+             no held-out tail to evaluate on",
+            path.display()
+        );
+    }
+    Ok((model, holdout))
+}
+
 fn load_geom_meta(path: &Path) -> Result<GeomMeta> {
     let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))
@@ -3111,9 +4270,9 @@ fn cmd_geom(action: GeomAction) -> Result<()> {
         | GeomAction::Eval { runtime, .. }
         | GeomAction::Generate { runtime, .. } => Some(runtime),
         GeomAction::Fused { action } => match action.as_ref() {
-            FusedAction::Train { runtime, .. }
-            | FusedAction::Eval { runtime, .. }
-            | FusedAction::Prove { runtime, .. } => Some(runtime),
+            FusedAction::Train { shared, .. }
+            | FusedAction::Eval { shared, .. }
+            | FusedAction::Prove { shared, .. } => Some(&shared.runtime),
         },
     };
     let Some(runtime) = runtime else {
@@ -3553,8 +4712,12 @@ fn cmd_geom_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
                 report.last_accuracy,
                 report.mean_accuracy
             );
-            // The held-out protocol of `geom eval` (its default batches and
-            // seed), so this number lines up with a reasoner evaluated there.
+            // The protocol of `geom eval` (its default batches and seed), so
+            // this number lines up with a reasoner evaluated there. It samples
+            // the corpus the baseline just trained on -- training and
+            // evaluation both draw uniformly from every scene -- so it is
+            // labelled as that, not as held-out; `geom eval --baseline` on a
+            // separately generated corpus is the held-out comparison.
             let (accuracy, seen) = geombaseline::evaluate_geom_baseline::<Train<B>>(
                 &model,
                 &mut corpus,
@@ -3566,7 +4729,7 @@ fn cmd_geom_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
             )?;
             let chance = 1.0 / meta.answer_tokens.len().max(1) as f64;
             println!(
-                "held-out: {} scenes | accuracy {:.4} (chance {:.4}) | {} parameters",
+                "training-corpus eval (not held out): {} scenes | accuracy {:.4} (chance {:.4}) | {} parameters",
                 seen,
                 accuracy,
                 chance,
@@ -3718,7 +4881,7 @@ fn cmd_geom_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
                     &device,
                 )?;
                 println!(
-                    "matched comparison: {seen} held-out scenes (seed {seed}), {batches} batches x {batch_size}, chance {chance:.4}"
+                    "matched comparison: {seen} scenes sampled from --corpus (seed {seed}), {batches} batches x {batch_size}, chance {chance:.4}"
                 );
                 println!("  {:<52} {:>10} {:>9}", "model", "params", "accuracy");
                 println!(
@@ -3754,6 +4917,7 @@ fn cmd_geom_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
         } => {
             let tokenizer = ByteTokenizer::new();
             let tokens = tokenizer.encode(&scene);
+            anyhow::ensure!(!tokens.is_empty(), "--scene is empty");
             let scene_len = tokens.len() + 1;
             let arch = GeomArch {
                 slots,
@@ -3770,10 +4934,20 @@ fn cmd_geom_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
             // -- so the answer set comes from the architecture the checkpoint
             // records beside its weights, exactly as `lm generate` reloads the
             // LM's recorded config. A checkpoint that records none falls back
-            // to the unrestricted vocabulary.
+            // to the unrestricted vocabulary (and says so below); one that
+            // records a config which does not parse is an error, not a
+            // silent fall back to that vocabulary.
             let recorded = checkpoint::TrainState::for_model(&checkpoint)?
                 .and_then(|state| state.config.get("model_config").cloned())
-                .and_then(|value| serde_json::from_value::<GeomConfig>(value).ok());
+                .map(|value| {
+                    serde_json::from_value::<GeomConfig>(value).with_context(|| {
+                        format!(
+                            "parse the model config recorded beside {}",
+                            checkpoint.display()
+                        )
+                    })
+                })
+                .transpose()?;
             let answers: &[u16] = recorded
                 .as_ref()
                 .map(|c| c.answer_tokens.as_slice())
@@ -3811,7 +4985,9 @@ fn cmd_geom_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
                 .convert::<i64>()
                 .iter::<i64>()
                 .next()
-                .unwrap_or(0) as u16;
+                .context("the model returned no logits for the scene")?;
+            let pred = u16::try_from(pred)
+                .map_err(|e| anyhow::anyhow!("the argmax index {pred} is not a token id: {e}"))?;
             let answer = tokenizer.decode_lossy(&[pred]);
             println!(
                 "answer: {answer} | energy {:.4} | displacement {:.6} | refine {} | blocks {}{}",
@@ -3829,10 +5005,23 @@ fn cmd_geom_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
         }
         GeomAction::Fused { action } => match *action {
             FusedAction::Train {
-                corpus,
-                meta,
-                weights,
-                tokenizer,
+                shared:
+                    FusedShared {
+                        corpus,
+                        meta,
+                        weights,
+                        tokenizer,
+                        hidden_size,
+                        geom_hidden,
+                        slots,
+                        dim,
+                        num_blocks,
+                        refine_steps,
+                        lora_rank,
+                        lora_alpha,
+                        sigma_data,
+                        runtime: _,
+                    },
                 steps,
                 batch_size,
                 lr,
@@ -3844,19 +5033,9 @@ fn cmd_geom_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
                 holdout,
                 seed,
                 objective,
-                sigma_data,
                 moe_balance_weight,
                 gamma,
                 depth,
-                lora_rank,
-                lora_alpha,
-                hidden_size,
-                geom_hidden,
-                slots,
-                dim,
-                num_blocks,
-                refine_steps,
-                runtime: _,
             } => {
                 let meta = load_geom_meta(&meta)?;
                 let fusion_config = GeomFusionConfig {
@@ -3930,25 +5109,33 @@ fn cmd_geom_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
             }
             FusedAction::Eval {
                 checkpoint,
-                corpus,
-                meta,
-                weights,
-                tokenizer,
-                batches: _batches,
-                batch_size: _batch_size,
-                hidden_size,
-                geom_hidden,
-                slots,
-                dim,
-                num_blocks,
-                refine_steps,
-                lora_rank: _lora_rank,
-                lora_alpha: _lora_alpha,
-                sigma_data: _sigma_data,
+                shared:
+                    FusedShared {
+                        corpus,
+                        meta,
+                        weights,
+                        tokenizer,
+                        hidden_size,
+                        geom_hidden,
+                        slots,
+                        dim,
+                        num_blocks,
+                        refine_steps,
+                        lora_rank,
+                        lora_alpha,
+                        sigma_data: _sigma_data,
+                        runtime: _,
+                    },
+                batches,
+                batch_size,
                 seed: _seed,
-                runtime: _,
             } => {
+                anyhow::ensure!(
+                    batches > 0 && batch_size > 0,
+                    "batches and batch_size must be positive"
+                );
                 let meta = load_geom_meta(&meta)?;
+                anyhow::ensure!(meta.scene_len > 0, "the metadata's scene length is 0");
                 let fusion_config = GeomFusionConfig {
                     hidden_size,
                     geom_hidden,
@@ -3959,18 +5146,39 @@ fn cmd_geom_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
                     ..GeomFusionConfig::default()
                 };
                 fusion_config.validate()?;
-                let trunk_config = QwenTrunkConfig {
-                    num_layers: None,
-                    ..QwenTrunkConfig::qwen38()
-                };
-                let trunk = qwennet::load_qwen_trunk_nf4::<B>(&weights, &trunk_config, &device)?.0;
-                let model = FusedQwen::<B>::new(trunk, &fusion_config, &device)?;
-                let model = checkpoint::load(model, &checkpoint, &device)?;
-                let tok_text = std::fs::read_to_string(&tokenizer)?;
+                let (model, holdout) = load_fused_for_eval::<B>(
+                    &weights,
+                    &fusion_config,
+                    Some(&checkpoint),
+                    qwennet::QwenLoraConfig {
+                        rank: lora_rank,
+                        alpha: lora_alpha,
+                    },
+                    &device,
+                )?;
+                let tok_text = std::fs::read_to_string(&tokenizer)
+                    .with_context(|| format!("read {}", tokenizer.display()))?;
                 let tokenizer = BpeTokenizer::from_json(&tok_text)?;
                 let mut corpus = TokenCorpus::streaming(&corpus)?;
+                // Only the tail the run held out is unseen; past it the
+                // "held-out" scenes would be training scenes.
+                let available = holdout.unwrap_or(corpus.len() / meta.scene_len);
+                let requested = batches.saturating_mul(batch_size);
+                let scenes = requested.min(available).max(1);
+                if scenes < requested {
+                    println!(
+                        "note: {requested} scenes requested, {scenes} evaluated ({})",
+                        if holdout.is_some() {
+                            "the holdout the checkpoint was trained with"
+                        } else {
+                            "the corpus size"
+                        }
+                    );
+                }
                 let proof = ProofConfig {
-                    scenes: 256.min(corpus.len() / meta.scene_len).max(1),
+                    scenes,
+                    // Eval prints the headline only; the sweep is `prove`'s.
+                    sweep: false,
                     ..ProofConfig::default()
                 };
                 proof.validate()?;
@@ -3996,23 +5204,26 @@ fn cmd_geom_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
             }
             FusedAction::Prove {
                 checkpoint,
-                corpus,
-                meta,
-                weights,
-                tokenizer,
+                shared:
+                    FusedShared {
+                        corpus,
+                        meta,
+                        weights,
+                        tokenizer,
+                        hidden_size,
+                        geom_hidden,
+                        slots,
+                        dim,
+                        num_blocks,
+                        refine_steps,
+                        lora_rank,
+                        lora_alpha,
+                        sigma_data: _sigma_data,
+                        runtime: _,
+                    },
                 scenes,
                 depth,
                 sweep,
-                hidden_size,
-                geom_hidden,
-                slots,
-                dim,
-                num_blocks,
-                refine_steps,
-                lora_rank: _lora_rank,
-                lora_alpha: _lora_alpha,
-                sigma_data: _sigma_data,
-                runtime: _,
             } => {
                 let meta = load_geom_meta(&meta)?;
                 let fusion_config = GeomFusionConfig {
@@ -4025,16 +5236,26 @@ fn cmd_geom_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
                     ..GeomFusionConfig::default()
                 };
                 fusion_config.validate()?;
-                let trunk_config = QwenTrunkConfig {
-                    num_layers: None,
-                    ..QwenTrunkConfig::qwen38()
-                };
-                let trunk = qwennet::load_qwen_trunk_nf4::<B>(&weights, &trunk_config, &device)?.0;
-                let mut model = FusedQwen::<B>::new(trunk, &fusion_config, &device)?;
-                if let Some(path) = &checkpoint {
-                    model = checkpoint::load(model, path, &device)?;
+                let (model, holdout) = load_fused_for_eval::<B>(
+                    &weights,
+                    &fusion_config,
+                    checkpoint.as_deref(),
+                    qwennet::QwenLoraConfig {
+                        rank: lora_rank,
+                        alpha: lora_alpha,
+                    },
+                    &device,
+                )?;
+                if let Some(holdout) = holdout {
+                    anyhow::ensure!(
+                        scenes <= holdout,
+                        "--scenes {scenes} reaches past the {holdout}-scene holdout this \
+                         checkpoint was trained with: the extra scenes are training scenes, \
+                         not held-out ones"
+                    );
                 }
-                let tok_text = std::fs::read_to_string(&tokenizer)?;
+                let tok_text = std::fs::read_to_string(&tokenizer)
+                    .with_context(|| format!("read {}", tokenizer.display()))?;
                 let tokenizer = BpeTokenizer::from_json(&tok_text)?;
                 let mut corpus = TokenCorpus::streaming(&corpus)?;
                 let proof = ProofConfig {
@@ -4126,6 +5347,16 @@ enum TblockAction {
         gen_len: usize,
         #[arg(long, default_value = "target/tblock-bench.json")]
         out: PathBuf,
+        /// The checkpoint's architecture: `tblock train`'s `--context`,
+        /// `--hidden` and `--layers`, with the same defaults. The checkpoint
+        /// records no config beside its weights, so these must match the
+        /// training run's (they used to be fixed at the defaults).
+        #[arg(long, default_value_t = 192)]
+        context: usize,
+        #[arg(long, default_value_t = 64)]
+        hidden: usize,
+        #[arg(long, default_value_t = 3)]
+        layers: usize,
     },
 }
 
@@ -4176,7 +5407,7 @@ fn cmd_tblock(action: TblockAction) -> Result<()> {
             let (model, training) =
                 tb::train_model::<Ad>(&config, &device, train_windows, val_windows, &params)?;
             println!(
-                "final val loss {:.4} ({:.4} bpb), {} steps in {:.1}s",
+                "final val loss {:.4} ({:.4} bits/token), {} steps in {:.1}s",
                 training.final_val_loss, training.final_val_bpb, steps, training.seconds
             );
             for (step, val) in &training.val_curve {
@@ -4196,15 +5427,20 @@ fn cmd_tblock(action: TblockAction) -> Result<()> {
             prompts,
             gen_len,
             out,
+            context,
+            hidden,
+            layers,
         } => {
+            // Built exactly as `tblock train` builds it from the same flags.
             let config = TbConfig {
-                context: 192,
-                hidden_size: 64,
-                num_layers: 3,
+                context,
+                hidden_size: hidden,
+                num_layers: layers,
                 num_heads: 4,
-                intermediate_size: 128,
+                intermediate_size: hidden * 2,
                 ..TbConfig::default()
             };
+            config.validate()?;
             let device = Default::default();
             let model = tb::load_checkpoint(&checkpoint, &config, &device)?;
             let splits = tb::load_stream(&data, bytes, config.context)?;
@@ -4220,19 +5456,32 @@ fn cmd_tblock(action: TblockAction) -> Result<()> {
             let seeds: Vec<Vec<u16>> = test
                 .iter()
                 .take(prompts)
-                .map(|w| w[..prompt_len].to_vec())
-                .collect();
+                .map(|w| {
+                    w.get(..prompt_len).map(<[u16]>::to_vec).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "a test window holds {} tokens, fewer than the {prompt_len}-token prompt",
+                            w.len()
+                        )
+                    })
+                })
+                .collect::<Result<_>>()?;
             println!(
                 "tokenblocks bench: {} prompts x {} tokens, from {}",
                 seeds.len(),
                 gen_len,
                 checkpoint.display()
             );
+            // `continuation_nll` is the model's NLL of its *own* decoded
+            // continuation, not of the held-out text: it measures confidence,
+            // and a lower number is not a better continuation. Labelled so.
+            println!(
+                "self-nll = NLL of each plan's own output (confidence, not quality vs the held-out text)"
+            );
             let mut results = Vec::new();
             for (name, plan) in tb::benchmark_plans(&config) {
                 let r = tb::run_plan(&name, &model, &config, &device, &plan, &seeds, gen_len)?;
                 println!(
-                    "{name:<24} {seconds:>7.2}s  fw={fw:>5} (sizing {sz:>3}, revision {rev:>3})  conf {conf:.3}  nll {nll:.4} ({bpb:.3} bpb)  edits {edits:>4} thrash {thrash}",
+                    "{name:<24} {seconds:>7.2}s  fw={fw:>5} (sizing {sz:>3}, revision {rev:>3})  conf {conf:.3}  self-nll {nll:.4} ({bpb:.3} bits/tok)  edits {edits:>4} thrash {thrash}",
                     seconds = r.seconds,
                     fw = r.forwards,
                     sz = r.sizing_forwards,
@@ -4263,6 +5512,13 @@ fn cmd_tblock(action: TblockAction) -> Result<()> {
             println!("report written to {}", out.display());
         }
     }
+    Ok(())
+}
+
+/// Run an `ncm` action: progress lines as they come, then the report.
+fn cmd_ncm(action: diffusionblocks::ncm::cli::NcmAction) -> Result<()> {
+    let report = diffusionblocks::ncm::cli::run(action, &mut |line| println!("{line}"))?;
+    print!("{}", report.render());
     Ok(())
 }
 
@@ -4371,16 +5627,28 @@ fn cmd_lm_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
                 } else {
                     model.next_token_loss(tokens, 0..config.num_layers)
                 };
+                // The next-token NLL alone: `metrics.loss` also carries every
+                // auxiliary term (MTP, balance, z-loss), which is not what a
+                // loss/perplexity report means. `perplexity` is exp(mean NLL).
+                let nll = f64::from(metrics.perplexity).ln();
                 anyhow::ensure!(
-                    metrics.loss.is_finite(),
-                    "evaluation produced a non-finite loss"
+                    metrics.tokens_counted == 0 || nll.is_finite(),
+                    "evaluation produced a non-finite next-token NLL"
                 );
-                total_loss += f64::from(metrics.loss) * metrics.tokens_counted as f64;
-                total_tokens += metrics.tokens_counted;
+                if metrics.tokens_counted > 0 {
+                    total_loss += nll * metrics.tokens_counted as f64;
+                    total_tokens += metrics.tokens_counted;
+                }
             }
-            let mean = total_loss / total_tokens.max(1) as f64;
+            // No counted target (every one masked) would otherwise print a
+            // perfect "loss 0, ppl 1".
+            anyhow::ensure!(
+                total_tokens > 0,
+                "no target token was counted in {batches} batch(es): every target is masked"
+            );
+            let mean = total_loss / total_tokens as f64;
             println!(
-                "evaluation: {} | {} batches | {} tokens | loss {:.4} ppl {:.2}",
+                "evaluation: {} | {} batches | {} tokens | nll {:.4} ppl {:.2}",
                 config.describe(),
                 batches,
                 total_tokens,
@@ -4503,20 +5771,13 @@ fn cmd_lm_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
             } else {
                 None
             };
-            let external_analyzer = external.as_ref().map(|tool| {
-                // The default invocation is a placeholder: users who care
-                // about this dimension configure their own command via the
-                // analyzer API. The CLI exists so the dimension is reachable
-                // without writing Rust code.
-
-                let args = match tool.as_str() {
-                    "clippy" => vec!["clippy".into(), "--message-format=json".into()],
-                    "ruff" => vec!["ruff".into(), "check".into(), "--output-format=json".into()],
-                    "eslint" => vec!["eslint".into(), "--format=json".into()],
-                    other => vec![other.into()],
-                };
-                ExtTool::new(tool.clone(), args)
-            });
+            let external_analyzer = match &external {
+                Some(tool) => Some(ExtTool::new(
+                    tool.clone(),
+                    external_score_command(tool, &input)?,
+                )),
+                None => None,
+            };
 
             struct Identity(Lang);
             impl diffusionblocks::codequality::CodeAnalyzer for Identity {
@@ -4718,6 +5979,15 @@ fn cmd_lm_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
                 );
             }
             let teacher_weights = parse_weights(&teacher_weights)?;
+            // Empty is uniform; anything else names one weight per teacher. A
+            // short list used to fill the rest with 1.0 and a long one to drop
+            // the extras, both silently.
+            anyhow::ensure!(
+                teacher_weights.is_empty() || teacher_weights.len() == teacher.len(),
+                "{} --teacher-weights for {} --teacher checkpoint(s)",
+                teacher_weights.len(),
+                teacher.len()
+            );
             let mut inputs = train::LmTrainInputs::<Train<B>>::default();
             for (i, path) in teacher.iter().enumerate() {
                 let loaded = checkpoint::load::<Train<B>, _>(
@@ -4851,7 +6121,12 @@ fn cmd_lm_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
                         "heretic: refusals {:.3} -> {:.3} | kl {:.4} | {} parameter(s) ablated (saved as the final checkpoint)",
                         h.baseline_refusals, t.refusals, t.kl, t.touched
                     ),
-                    None => println!("heretic: no trial ran"),
+                    None => println!(
+                        "heretic: {} trial(s), none beat the untouched model (refusals {:.3}); \
+                         the weights are left unablated",
+                        h.trials.len(),
+                        h.baseline_refusals
+                    ),
                 }
             }
             if report.last_distill_loss > 0.0 {
@@ -4975,9 +6250,17 @@ fn cmd_lm_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
                 d.hidden_size(),
                 model.hidden_size()
             );
+            // A direction from a deeper model used to be clamped onto the last
+            // layer and scored there, silently.
+            anyhow::ensure!(
+                d.layer < model.num_layers(),
+                "direction is for layer {}, the model has {} layer(s)",
+                d.layer,
+                model.num_layers()
+            );
             let tokenizer = ByteTokenizer::new();
             let tensor = d.tensor::<Eval>(&device);
-            let layer = d.layer.min(model.num_layers() - 1);
+            let layer = d.layer;
             println!(
                 "{:<40} {:>8} {:>12}{}",
                 "prompts",
@@ -5083,7 +6366,10 @@ fn cmd_lm_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
                     path.display()
                 ),
                 None => println!(
-                    "no trial ran; saved the untouched weights -> {}",
+                    "{} trial(s), none beat the untouched model (refusals {:.3}); saved the \
+                     untouched weights -> {}",
+                    report.trials.len(),
+                    report.baseline_refusals,
                     path.display()
                 ),
             }
@@ -5360,16 +6646,18 @@ fn cmd_lm_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
             };
             let elapsed = started.elapsed();
 
+            // The label names the decoder that ran: `--sampling topk` used to be
+            // reported as "greedy".
+            let decoder = if lookahead > 0 {
+                "lookahead".to_string()
+            } else if cached {
+                format!("{sampling}+kv-cache")
+            } else {
+                sampling.clone()
+            };
             println!(
-                "decoder={} | {} tokens in {}",
-                if lookahead > 0 {
-                    "lookahead"
-                } else if cached {
-                    "greedy+kv-cache"
-                } else {
-                    "greedy"
-                },
-                out.len() - ids.len(),
+                "decoder={decoder} | {} tokens in {}",
+                out.len().saturating_sub(ids.len()),
                 format_duration(elapsed)
             );
             println!("---\n{}\n---", tokenizer.decode_lossy(&out));
@@ -5562,6 +6850,88 @@ fn cmd_experts(action: ExpertsAction) -> Result<()> {
                 index.num_experts(),
                 index.site.name()
             );
+            Ok(())
+        }
+        ExpertsAction::Taxonomy { args } => {
+            let taxonomy =
+                diffusionblocks::taxonomy::Taxonomy::builtin_with_patch(args.patch.as_deref())?;
+            if args.json {
+                println!("{}", taxonomy.to_json()?);
+            } else {
+                print!("{}", taxonomy.render());
+                println!();
+                print!("{}", taxonomy.map_roster().render());
+            }
+            Ok(())
+        }
+    }
+}
+
+fn cmd_route(args: RouteArgs) -> Result<()> {
+    use diffusionblocks::hrouter::{LayeredRouter, LayeredRouterConfig, RouteBounds};
+    let router = LayeredRouter::from_config(&LayeredRouterConfig {
+        meta_router: args.meta_router,
+        taxonomy_patch: args.taxonomy,
+        index: args.index,
+        registry: args.registry.clone(),
+        admit_candidates: !args.active_only,
+        bounds: RouteBounds {
+            max_categories: args.max_categories,
+            top_specialists_per_category: args.top_specialists,
+            max_specialists: args.max_specialists,
+        },
+    })?;
+    let fields = match &args.registry {
+        Some(path) => diffusionblocks::nina::RegistryFile::load(path)?.fields(),
+        None => Vec::new(),
+    };
+    let result = diffusionblocks::nina::route_prompt_with(
+        &args.prompt,
+        args.student.as_deref(),
+        &fields,
+        Some(&router),
+        args.context.as_deref(),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&result)?);
+    Ok(())
+}
+
+/// The frozen encoders `dblocks router train` was asked to compare.
+fn router_encoders(args: &RouterTrainArgs) -> Vec<diffusionblocks::hrouter::EncoderSpec<'_>> {
+    use diffusionblocks::hrouter::EncoderSpec;
+    let mut encoders: Vec<EncoderSpec<'_>> =
+        args.encoder.iter().map(|p| EncoderSpec::Lm(p)).collect();
+    if let Some(codec) = &args.ncm_codec {
+        encoders.extend(args.ncm_levels.iter().map(|levels| EncoderSpec::Ncm {
+            checkpoint: codec,
+            levels: *levels,
+        }));
+    }
+    encoders
+}
+
+fn cmd_router(action: RouterAction) -> Result<()> {
+    match action {
+        RouterAction::Train { args } => {
+            let taxonomy =
+                diffusionblocks::taxonomy::Taxonomy::builtin_with_patch(args.taxonomy.as_deref())?;
+            let o = diffusionblocks::hrouter::train_router_files(
+                &args.traces,
+                &diffusionblocks::hrouter::RouterTrainOptions {
+                    eval: args.eval.as_deref(),
+                    out: &args.out,
+                    tiny: args.tiny,
+                    holdout_percent: args.holdout_percent,
+                    calibration_group: diffusionblocks::hrouter::CalibrationGroup::parse(
+                        &args.calibration_split,
+                    )?,
+                    calibration: &args.calibration,
+                    feature_set: &args.features,
+                    encoders: router_encoders(&args),
+                },
+                &taxonomy,
+            )?;
+            print!("{}", o.render());
             Ok(())
         }
     }
@@ -6287,6 +7657,12 @@ fn cmd_cheat_ml(model: Option<&Path>) -> Result<()> {
 
 fn cmd_verify(group: Option<&str>) -> Result<()> {
     let mut report = verify::run_all();
+    // `passed` is "every certificate passed", which an empty suite satisfies
+    // vacuously; a gate that checked nothing must not report green.
+    anyhow::ensure!(
+        !report.certificates.is_empty(),
+        "the certificate suite is empty: nothing was checked"
+    );
     if let Some(group) = group {
         report.certificates.retain(|c| c.group == group);
         if report.certificates.is_empty() {
@@ -6369,6 +7745,11 @@ fn cmd_train(command: Command) -> Result<()> {
         Some(value) => Some(PathBuf::from(value)),
     };
 
+    let mut sources = dataset_choices(&dataset, data_dir, streaming)?.into_iter();
+    let first_source = sources
+        .next()
+        .context("--dataset needs at least one value")?;
+
     let config = TrainConfig {
         image_size,
         num_labels,
@@ -6381,13 +7762,8 @@ fn cmd_train(command: Command) -> Result<()> {
         log_every,
         seed,
         log_file: log_file.map(PathBuf::from),
-        dataset: DatasetChoice::parse(&dataset[0], data_dir.first().cloned(), streaming)?,
-        extra_datasets: dataset
-            .iter()
-            .enumerate()
-            .skip(1)
-            .map(|(i, name)| DatasetChoice::parse(name, data_dir.get(i).cloned(), streaming))
-            .collect::<Result<Vec<_>>>()?,
+        dataset: first_source,
+        extra_datasets: sources.collect(),
         dataset_weights: parse_weights(&dataset_weights)?,
         mix_mode: diffusionblocks::mix::MixMode::parse(&mix)?,
         objective: Objective::parse(&objective)?,
@@ -6452,53 +7828,14 @@ fn cmd_train(command: Command) -> Result<()> {
         config.objective.name()
     );
 
-    let path = if grad_checkpointing {
+    // Both paths report the same summary: the gradient-checkpointing one used
+    // to print nothing at all, so an aborted run looked like a finished one.
+    let (path, aborted) = if grad_checkpointing {
         let (model, summary) = train::train_generic::<
             burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing,
         >(&config)?;
-        match summary.checkpoint {
-            Some(path) => path,
-            None => checkpoint::save_content_addressed_async(model, out_path, "dblocks")
-                .join()
-                .map_err(|payload| {
-                    anyhow::anyhow!(
-                        "checkpoint save thread panicked: {}",
-                        panic_message(&payload)
-                    )
-                })??,
-        }
-    } else {
-        let (model, summary) = train::train(&config)?;
-        println!(
-            "done: {} steps in {:.1}s (mean loss {:.4}, {} rejected by a quality check, {:.1}% reject rate{})",
-            summary.steps_taken,
-            summary.elapsed_secs,
-            summary.mean_loss,
-            summary.steps_skipped,
-            100.0 * summary.skip_rate(),
-            if summary.steps_accumulated > 0 {
-                format!(", {} micro-batches accumulated", summary.steps_accumulated)
-            } else {
-                String::new()
-            }
-        );
-        if let Some(reason) = &summary.aborted {
-            println!("run stopped early: {reason}");
-        }
-        if summary.steps_clipped > 0 {
-            println!(
-                "{} step(s) had their gradients rescaled by --clip-norm",
-                summary.steps_clipped
-            );
-        }
-        if summary.periodic_verifications > 0 {
-            println!(
-                "live model re-verified {} time(s) during the run",
-                summary.periodic_verifications
-            );
-        }
-        print!("\nper-block quality:\n{}", summary.health.render());
-        match summary.checkpoint {
+        print_train_summary(&summary);
+        let path = match summary.checkpoint {
             Some(path) => path,
             None => {
                 println!("note: --async-save writes the weights only, without a training state");
@@ -6511,7 +7848,26 @@ fn cmd_train(command: Command) -> Result<()> {
                         )
                     })??
             }
-        }
+        };
+        (path, summary.aborted)
+    } else {
+        let (model, summary) = train::train(&config)?;
+        print_train_summary(&summary);
+        let path = match summary.checkpoint {
+            Some(path) => path,
+            None => {
+                println!("note: --async-save writes the weights only, without a training state");
+                checkpoint::save_content_addressed_async(model, out_path, "dblocks")
+                    .join()
+                    .map_err(|payload| {
+                        anyhow::anyhow!(
+                            "checkpoint save thread panicked: {}",
+                            panic_message(&payload)
+                        )
+                    })??
+            }
+        };
+        (path, summary.aborted)
     };
     println!("checkpoint saved: {}", path.display());
 
@@ -6526,16 +7882,98 @@ fn cmd_train(command: Command) -> Result<()> {
             .to_string();
         let index = describe_experts(&trunk.spec, &config, &model_id)?;
         index.write(&index_path)?;
-        println!("expert index saved: {}", index_path.display());
+        println!(
+            "expert index saved: {} (structure only: its per-expert sha256 and enabled mask \
+             are read from a freshly initialized layer, not from the trained weights)",
+            index_path.display()
+        );
+    }
+    // The partial checkpoint is kept (it is what a post-mortem reads), but a
+    // run the quality checks stopped is a failed run, and the exit code says so.
+    if let Some(reason) = aborted {
+        anyhow::bail!(
+            "training stopped early: {reason}; the partial checkpoint is {}",
+            path.display()
+        );
     }
     Ok(())
 }
 
+/// The end-of-run report of `dblocks train`, for either backend strategy.
+fn print_train_summary(summary: &train::TrainSummary) {
+    println!(
+        "done: {} steps in {:.1}s (mean loss {:.4}, {} rejected by a quality check, {:.1}% reject rate{})",
+        summary.steps_taken,
+        summary.elapsed_secs,
+        summary.mean_loss,
+        summary.steps_skipped,
+        100.0 * summary.skip_rate(),
+        if summary.steps_accumulated > 0 {
+            format!(", {} micro-batches accumulated", summary.steps_accumulated)
+        } else {
+            String::new()
+        }
+    );
+    if let Some(reason) = &summary.aborted {
+        println!("run stopped early: {reason}");
+    }
+    if summary.steps_clipped > 0 {
+        println!(
+            "{} step(s) had their gradients rescaled by --clip-norm",
+            summary.steps_clipped
+        );
+    }
+    if summary.periodic_verifications > 0 {
+        println!(
+            "live model re-verified {} time(s) during the run",
+            summary.periodic_verifications
+        );
+    }
+    print!("\nper-block quality:\n{}", summary.health.render());
+}
+
+/// One [`DatasetChoice`] per `--dataset`, with the `--data-dir` values handed
+/// out in order to the datasets that need one -- what the flag's help says.
+/// `synthetic` takes none, so `--dataset synthetic --dataset cifar100
+/// --data-dir D` gives `D` to cifar100 (it used to go to `synthetic`, by
+/// position, leaving cifar100 without one). A directory nothing consumed is an
+/// error rather than silently ignored.
+fn dataset_choices(
+    names: &[String],
+    data_dirs: Vec<PathBuf>,
+    streaming: bool,
+) -> Result<Vec<DatasetChoice>> {
+    let given = data_dirs.len();
+    let mut dirs = data_dirs.into_iter();
+    let choices = names
+        .iter()
+        .map(|name| {
+            let dir = if name == "synthetic" {
+                None
+            } else {
+                dirs.next()
+            };
+            DatasetChoice::parse(name, dir, streaming)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let unused = dirs.count();
+    anyhow::ensure!(
+        unused == 0,
+        "{given} --data-dir value(s) for {} dataset(s) that need one; {unused} would be ignored",
+        given - unused
+    );
+    Ok(choices)
+}
+
 /// Build the manifest for a trained MoSME trunk.
 ///
-/// Rebuilds the model shape from the config to read the live expert modules
-/// back; the index records the *first* hierarchical layer, which is the one an
-/// engine routes with.
+/// Rebuilds the layer *shape* from the config; the index records the *first*
+/// hierarchical layer, which is the one an engine routes with. The module it
+/// reads is freshly initialized, not the trained one -- the library exposes no
+/// public path from a `DblockClassifier` to its `MosmeFeedForward` layers -- so
+/// the names, shapes and parameter counts are right, while the per-expert
+/// `sha256` and the enabled mask describe that fresh layer, not the trained
+/// weights. Reading them from the trained module needs that accessor.
 fn describe_experts(spec: &MosmeSpec, config: &TrainConfig, model_id: &str) -> Result<ExpertIndex> {
     use diffusionblocks::mosme::{MosmeConfig, MosmeFeedForward};
     let vit = config.vit_config();
@@ -7274,10 +8712,31 @@ fn load_lm_eval(
     <Eval as burn::tensor::backend::BackendTypes>::Device,
 )> {
     let device: <Eval as burn::tensor::backend::BackendTypes>::Device = Default::default();
-    let config = if tiny {
-        LmConfig::tiny()
-    } else {
-        LmConfig::default()
+    // The architecture recorded beside the checkpoint wins over `--tiny`, as in
+    // `lm_config_for`. Flags alone would rebuild a checkpoint trained with,
+    // say, a sliding-window schedule as dense attention: the parameter shapes
+    // agree, so the load succeeds and every number after it is of a different
+    // model.
+    let recorded = checkpoint::TrainState::for_model(checkpoint)?.and_then(|state| {
+        state
+            .config
+            .get("model_config")
+            .filter(|value| !value.is_null())
+            .cloned()
+    });
+    let config = match recorded {
+        Some(value) => {
+            let config: LmConfig = serde_json::from_value(value).with_context(|| {
+                format!(
+                    "parse the model config recorded beside {}",
+                    checkpoint.display()
+                )
+            })?;
+            validate_lm_config(&config)?;
+            config
+        }
+        None if tiny => LmConfig::tiny(),
+        None => LmConfig::default(),
     };
     let model = checkpoint::load::<Eval, _>(
         LanguageModel::<Eval>::new(&config, &device)?,
@@ -7719,7 +9178,26 @@ fn resolve_specialist(
         entry.name
     );
     if candidates.len() == 1 {
-        return Ok((candidates.remove(0), None));
+        let only = candidates.remove(0);
+        // The registry names the live checkpoint by the sha256 of its bytes.
+        // A lone file that is not that one is not the registered model: it
+        // used to be served (and logged under the registry's name) unchecked,
+        // which is the one case the stale-sidecar note above promises the
+        // registry hash decides.
+        if !entry.checkpoint_hash.is_empty() {
+            let digest = checkpoint::file_sha256_hex(&only)
+                .with_context(|| format!("hash the candidate checkpoint {}", only.display()))?;
+            anyhow::ensure!(
+                digest == entry.checkpoint_hash,
+                "{} is the only checkpoint in {}, but its sha256 {digest} is not the registry's \
+                 '{}' for '{}'",
+                only.display(),
+                model_dir.display(),
+                entry.checkpoint_hash,
+                entry.name
+            );
+        }
+        return Ok((only, None));
     }
     // Two or more checkpoints: the registry's `checkpoint_hash` is the sha256
     // of the *file bytes*, which is a different digest from the one in the
@@ -8828,12 +10306,14 @@ mod nina_cli_tests {
         )
         .unwrap();
 
+        // The registry names the live checkpoint by its file sha256, which is
+        // what makes falling through to it safe.
         let entry = nina::ModelEntry {
             name: "coding/rust".into(),
             field: "coding".into(),
             subfield: "rust".into(),
             box_id: "coding:rust".into(),
-            checkpoint_hash: "abcdef0123456789".into(),
+            checkpoint_hash: checkpoint::file_sha256_hex(&live).unwrap(),
             status: nina::ModelStatus::Candidate,
             eval: Default::default(),
             datasets: Vec::new(),
@@ -8849,6 +10329,17 @@ mod nina_cli_tests {
             "the dead sidecar's student_config described a checkpoint that is gone; serving \
              the live one under it would be a shape mismatch"
         );
+
+        // A lone checkpoint the registry does not name is refused, not served
+        // under the registry's name.
+        let entry = nina::ModelEntry {
+            checkpoint_hash: "0".repeat(64),
+            ..entry
+        };
+        let err = resolve_specialist(&model_dir, &entry)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("only checkpoint"), "{err}");
     }
 
     /// A sidecar naming a checkpoint that *is* present is still obeyed: that is
@@ -9132,5 +10623,378 @@ mod cheat_cli_tests {
             Err(err) => err.to_string(),
         };
         assert!(err.contains("subcommand"), "{err}");
+    }
+}
+
+#[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+mod ncm_cli_tests {
+    use super::*;
+    use diffusionblocks::ncm::cli::{NcmAction, TokenizerAction};
+
+    #[test]
+    fn ncm_tokenizer_train_parses_repeated_val_corpora() {
+        let flags = "dblocks ncm tokenizer train --corpus all.corpus.bin --out ckpt \
+                     --val-corpus coding.val.corpus.bin --val-corpus cyber.val.corpus.bin";
+        let cli = Cli::try_parse_from(flags.split_whitespace()).unwrap();
+        let Command::Ncm { action } = cli.command else {
+            panic!("not an ncm command")
+        };
+        let NcmAction::Tokenizer {
+            action: TokenizerAction::Train(args),
+        } = *action
+        else {
+            panic!("not tokenizer train")
+        };
+        assert_eq!(args.val_corpus.len(), 2);
+        assert_eq!(args.config, "tiny");
+        assert_eq!((args.steps, args.intent_weight), (300, 0.0));
+        // Evaluation without a held-out corpus is refused at parse time.
+        let eval = "dblocks ncm tokenizer eval --checkpoint x";
+        assert!(Cli::try_parse_from(eval.split_whitespace()).is_err());
+    }
+
+    #[test]
+    fn ncm_generator_train_and_generate_parse() {
+        let cli = Cli::try_parse_from([
+            "dblocks",
+            "ncm",
+            "train",
+            "--tokenizer",
+            "tok.mpk",
+            "--corpus",
+            "c.bin",
+            "--out",
+            "o",
+            "--config",
+            "sudoku",
+            "--steps",
+            "7",
+            "--self-prob",
+            "0.25",
+        ])
+        .unwrap();
+        let Command::Ncm { action } = cli.command else {
+            panic!("not an ncm command")
+        };
+        let NcmAction::Train(args) = *action else {
+            panic!("not ncm train")
+        };
+        assert_eq!(
+            (args.config.as_str(), args.steps, args.self_prob),
+            ("sudoku", 7, Some(0.25))
+        );
+        assert_eq!((args.lr, args.min_lr, args.grad_clip), (3e-4, 3e-5, 1.0));
+        let cli = Cli::try_parse_from([
+            "dblocks",
+            "ncm",
+            "generate",
+            "--tokenizer",
+            "t",
+            "--generator",
+            "g",
+            "--prompt",
+            "hi",
+            "--temperature",
+            "0",
+            "--top-k",
+            "5",
+            "--mbr",
+            "3",
+            "--seed",
+            "9",
+        ])
+        .unwrap();
+        let Command::Ncm { action } = cli.command else {
+            panic!("not an ncm command")
+        };
+        let NcmAction::Generate(args) = *action else {
+            panic!("not ncm generate")
+        };
+        assert_eq!(
+            (args.top_k, args.mbr, args.seed, args.temperature),
+            (5, 3, 9, 0.0)
+        );
+        assert!(Cli::try_parse_from(["dblocks", "ncm", "generate", "--tokenizer", "t"]).is_err());
+    }
+}
+
+#[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+mod alien_cli_tests {
+    use super::*;
+
+    fn alien(args: &[&str]) -> AlienAction {
+        let mut argv = vec!["dblocks", "alien"];
+        argv.extend_from_slice(args);
+        let Command::Alien { action } = Cli::try_parse_from(argv).unwrap().command else {
+            panic!("not an alien command")
+        };
+        *action
+    }
+
+    /// Every `dblocks alien` subcommand parses, with the defaults the docs
+    /// quote, and a required flag cannot be left out.
+    #[test]
+    fn alien_subcommands_parse() {
+        let AlienAction::Rank(args) = alien(&["rank", "--vectors", "v.json"]) else {
+            panic!("not rank")
+        };
+        assert_eq!(args.vectors, PathBuf::from("v.json"));
+        assert!(!args.per_category && !args.whiten && !args.no_curved);
+        assert_eq!((args.top, args.seed, args.samples, args.interior), (20, 7, 2000, 12));
+        assert_eq!((args.bandwidth_factor, args.null_controls), (1.5, 3));
+        let AlienAction::Rank(args) = alien(&[
+            "rank", "--vectors", "v.json", "--per-category", "--top", "5", "--seed", "3",
+            "--survival", "m.json", "--out", "p.jsonl",
+        ]) else {
+            panic!("not rank")
+        };
+        assert!(args.per_category);
+        assert_eq!((args.top, args.seed), (5, 3));
+        assert_eq!(args.survival, Some(PathBuf::from("m.json")));
+        assert_eq!(args.out, Some(PathBuf::from("p.jsonl")));
+
+        let AlienAction::Embed(args) = alien(&[
+            "embed", "--checkpoint", "s.mpk", "--corpus", "f.bin", "--name", "rust", "--windows",
+            "8",
+        ]) else {
+            panic!("not embed")
+        };
+        assert_eq!((args.name.as_str(), args.windows), ("rust", 8));
+        assert_eq!(args.out, PathBuf::from("alien-vectors.json"));
+        assert!(args.category.is_none() && args.window_len.is_none());
+
+        let AlienAction::Survival {
+            action: AlienSurvivalAction::Train(args),
+        } = alien(&["survival", "train", "--proposals", "p.jsonl", "--outcomes", "o.jsonl"])
+        else {
+            panic!("not survival train")
+        };
+        assert_eq!(args.out, PathBuf::from("alien-survival.json"));
+        assert!(args.plans.is_none());
+
+        assert!(Cli::try_parse_from(["dblocks", "alien", "rank"]).is_err());
+        assert!(Cli::try_parse_from(["dblocks", "alien", "embed", "--checkpoint", "x"]).is_err());
+    }
+
+    /// `alien rank` end to end on a planted three-cluster file, then
+    /// `alien survival train` refusing the three outcomes it is given.
+    #[test]
+    fn alien_rank_writes_proposals_and_survival_refuses_three_outcomes() {
+        let dir = std::env::temp_dir().join(format!("alien-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut vectors = Vec::new();
+        for (cluster, field) in ["crypto", "ml", "net"].iter().enumerate() {
+            for i in 0..4 {
+                let vector: Vec<f64> = (0..16)
+                    .map(|d| {
+                        let centre = if d == cluster { 10.0 } else { 0.0 };
+                        centre + 0.3 * ((i * 16 + d) as f64 * 1.7).sin()
+                    })
+                    .collect();
+                vectors.push(serde_json::json!({
+                    "name": format!("{field}-{i}"), "category": field, "vector": vector,
+                }));
+            }
+        }
+        let vfile = dir.join("v.json");
+        std::fs::write(&vfile, serde_json::to_vec(&serde_json::json!({ "vectors": vectors })).unwrap())
+            .unwrap();
+        let out = dir.join("p.jsonl");
+        let (v, o) = (vfile.to_str().unwrap(), out.to_str().unwrap());
+        cmd_alien(alien(&["rank", "--vectors", v, "--samples", "200", "--out", o])).unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        let ids: Vec<String> = text
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["id"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(ids.len(), 36, "12 per pool, three pools");
+
+        let outcomes = dir.join("o.jsonl");
+        let lines: Vec<String> = ids
+            .iter()
+            .take(3)
+            .map(|id| serde_json::json!({ "proposal_id": id, "survived": true }).to_string())
+            .collect();
+        std::fs::write(&outcomes, lines.join("\n")).unwrap();
+        let err = cmd_alien(alien(&[
+            "survival", "train", "--proposals", o, "--outcomes", outcomes.to_str().unwrap(),
+            "--out", dir.join("m.json").to_str().unwrap(),
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("refusing to fit"), "{err}");
+        assert!(!dir.join("m.json").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+// A test says "this must have worked" with `unwrap`, which is the right
+// thing for a test to say. The grant is scoped to this module: production
+// code in the same file is still denied it (see the `[lints]` table in
+// `Cargo.toml` and the contract in the crate docs).
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::todo,
+    clippy::unimplemented,
+    clippy::unreachable,
+    clippy::dbg_macro,
+    clippy::let_underscore_must_use,
+    clippy::redundant_pattern_matching,
+    clippy::mem_forget,
+    clippy::exit,
+    clippy::print_stdout,
+    clippy::print_stderr
+)]
+mod router_cli_tests {
+    use super::*;
+
+    #[test]
+    fn stage4_router_commands_parse() {
+        let cli = Cli::try_parse_from(["dblocks", "experts", "taxonomy", "--json"]).unwrap();
+        let Command::Experts {
+            action: ExpertsAction::Taxonomy { args },
+        } = cli.command
+        else {
+            panic!("expected experts taxonomy");
+        };
+        assert!(args.json);
+        assert!(args.patch.is_none());
+
+        let cli = Cli::try_parse_from([
+            "dblocks",
+            "route",
+            "--prompt",
+            "rust lifetimes",
+            "--meta-router",
+            "m.json",
+            "--max-specialists",
+            "2",
+        ])
+        .unwrap();
+        let Command::Route(args) = cli.command else {
+            panic!("expected route");
+        };
+        assert_eq!(args.prompt, "rust lifetimes");
+        assert_eq!(args.meta_router, Some(PathBuf::from("m.json")));
+        assert_eq!(args.max_specialists, 2);
+        assert_eq!(args.top_specialists, 2);
+        assert!(
+            Cli::try_parse_from(["dblocks", "route"]).is_err(),
+            "--prompt is required"
+        );
+
+        let cli = Cli::try_parse_from([
+            "dblocks", "router", "train", "--traces", "t.jsonl", "--out", "o", "--tiny",
+        ])
+        .unwrap();
+        let Command::Router { action } = cli.command else {
+            panic!("expected router");
+        };
+        let RouterAction::Train { args } = *action;
+        assert!(args.tiny);
+        assert_eq!(args.holdout_percent, 20);
+        assert!(args.eval.is_none());
+    }
+
+    #[test]
+    fn route_command_routes_with_a_trained_meta_router() {
+        let dir = std::env::temp_dir().join(format!("dblocks-route-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let traces = dir.join("t.jsonl");
+        let mut lines = String::new();
+        for round in 0..3 {
+            for (text, category) in [
+                ("write a rust function that parses json", "coding"),
+                ("python script to sort a list of numbers", "coding"),
+                ("solve the quadratic equation x squared minus four", "math"),
+                ("prove the sum of two odd numbers is even", "math"),
+            ] {
+                lines.push_str(
+                    &serde_json::json!({
+                        "id": format!("{category}-{round}-{}", text.len()),
+                        "text": text,
+                        "categories": [{"id": category, "weight": 1.0}],
+                    })
+                    .to_string(),
+                );
+                lines.push('\n');
+            }
+        }
+        std::fs::write(&traces, lines).unwrap();
+        let out = dir.join("router");
+        cmd_router(RouterAction::Train {
+            args: RouterTrainArgs {
+                traces: vec![traces.clone()],
+                out: out.clone(),
+                eval: None,
+                holdout_percent: 25,
+                tiny: true,
+                taxonomy: None,
+                calibration_split: "id".into(),
+                encoder: None,
+                calibration: Vec::new(),
+                features: "base".into(),
+                ncm_codec: None,
+                ncm_levels: vec![1],
+            },
+        })
+        .unwrap();
+        assert!(out.join("meta-router.json").exists());
+        cmd_route(RouteArgs {
+            prompt: "rust function".into(),
+            context: None,
+            meta_router: Some(out.join("meta-router.json")),
+            registry: None,
+            index: None,
+            taxonomy: None,
+            student: None,
+            active_only: false,
+            max_categories: 3,
+            top_specialists: 2,
+            max_specialists: 4,
+        })
+        .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

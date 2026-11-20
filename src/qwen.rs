@@ -81,9 +81,11 @@ impl QwenArchDims {
         self.linear_v_heads * self.linear_head_dim
     }
 
-    /// `true` for 0-based `layer_idx` under the interval convention.
+    /// `true` for 0-based `layer_idx` under the interval convention. An
+    /// interval of `0` (a deserialized config can say so) means no layer is
+    /// full attention, rather than a division-by-zero panic.
     pub fn is_full_attention(&self, layer_idx: usize) -> bool {
-        (layer_idx + 1) % self.full_attention_interval == 0
+        (layer_idx + 1).checked_rem(self.full_attention_interval) == Some(0)
     }
 }
 
@@ -502,8 +504,10 @@ mod tests {
         assert_eq!(reports.len(), entries.len());
         let bad: Vec<_> = reports.iter().filter(|r| !r.shape_ok).collect();
         assert!(bad.is_empty(), "shape mismatches: {bad:?}");
-        // Shard 1 holds the untied lm_head alone: ranged-decode one row
-        // (10 KB of a 2.5 GB file) and require finite, nonzero weights.
+        // Shard 1 holds the untied lm_head alone. `read_tensor_f32` has no
+        // row-range read, so this decodes the WHOLE head (2.5 GB of BF16 ->
+        // ~5 GB of f32 in RAM) and then checks its first row for finite,
+        // nonzero weights.
         let head = read_tensor_f32(&path, &index, "lm_head.weight").expect("ranged head read");
         assert_eq!(head.shape, vec![248320, 5120]);
         let row: Vec<f32> = head.data[..5120].to_vec();
@@ -626,6 +630,12 @@ mod tests {
         assert_eq!((d.key_dim(), d.value_dim()), (2048, 6144));
         // Interval convention: every 4th layer (1-based) is full attention.
         assert!(!d.is_full_attention(0) && d.is_full_attention(3) && d.is_full_attention(63));
+        // A zero interval is "never", not a modulo-by-zero panic.
+        let zero = QwenArchDims {
+            full_attention_interval: 0,
+            ..d
+        };
+        assert!((0..8).all(|i| !zero.is_full_attention(i)));
     }
 
     #[test]

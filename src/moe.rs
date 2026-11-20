@@ -1238,6 +1238,13 @@ mod tests {
     fn test_gates_are_a_probability_distribution() {
         // Renormalized top-k gates must sum to one per token, or the layer
         // silently rescales its own output.
+        //
+        // Checked on the layer's *output*, not by re-normalizing a top-k by
+        // hand (which sums to one by construction and tests nothing): the
+        // layer must produce exactly `sum_k (p_k / sum p) * expert_k(x)` over
+        // the top-k experts of each token, so a missing renormalization, a
+        // gate scattered to the wrong expert, or an expert outside the top-k
+        // leaking in all show up as a mismatch.
         let device = Default::default();
         for top_k in [1usize, 2, 4] {
             let layer = MoELayer::<B>::new(&tiny_config(top_k, 4), &device);
@@ -1251,20 +1258,47 @@ mod tests {
                 burn::tensor::Distribution::Uniform(-1.0, 1.0),
                 &device,
             );
-            let probs = softmax(layer.router_logits(&x, &cond), 1);
-            let (vals, _idx) = probs.topk_with_indices(top_k, 1);
-            let sums = vals.clone() / vals.sum_dim(1).clamp_min(1e-12);
-            let total: Vec<f32> = sums
-                .sum_dim(1)
+            let got: Vec<f32> = layer
+                .forward(x.clone(), cond.clone())
+                .output
+                .reshape([6, 8])
                 .into_data()
                 .convert::<f32>()
                 .iter::<f32>()
                 .collect();
-            for s in total {
-                assert!(
-                    (s - 1.0).abs() < 1e-5,
-                    "gates sum to {s}, not 1 (k={top_k})"
-                );
+
+            let probs = softmax(layer.router_logits(&x, &cond), 1);
+            let (vals, idx) = probs.topk_with_indices(top_k, 1);
+            let vals: Vec<f32> = vals.into_data().convert::<f32>().iter::<f32>().collect();
+            let idx: Vec<i64> = idx.into_data().convert::<i64>().iter::<i64>().collect();
+            let xf = x.reshape([6, 8]);
+            let outs: Vec<Vec<f32>> = layer
+                .experts
+                .iter()
+                .map(|e| {
+                    e.forward(xf.clone())
+                        .into_data()
+                        .convert::<f32>()
+                        .iter::<f32>()
+                        .collect()
+                })
+                .collect();
+            for row in 0..6 {
+                let picked = &vals[row * top_k..(row + 1) * top_k];
+                let mass: f32 = picked.iter().sum();
+                for col in 0..8 {
+                    let want: f32 = (0..top_k)
+                        .map(|j| {
+                            let e = idx[row * top_k + j] as usize;
+                            picked[j] / mass * outs[e][row * 8 + col]
+                        })
+                        .sum();
+                    let g = got[row * 8 + col];
+                    assert!(
+                        (g - want).abs() < 1e-5,
+                        "k={top_k} row {row} col {col}: layer {g} vs renormalized mix {want}"
+                    );
+                }
             }
         }
     }
@@ -1350,25 +1384,58 @@ mod tests {
     fn test_balance_loss_uniform_routing_is_lower_than_collapsed() {
         // Uniform gates give the minimal balance loss for fixed p; a collapsed
         // router (all mass on expert 0, all tokens routed there) gives E.
+        //
+        // Measured through `weighted_switch_loss` itself, not re-derived by
+        // hand, so a wrong `f` (e.g. from soft probabilities), a wrong `p`
+        // (e.g. from the one-hot) or a missing factor `E` all fail here.
         let device = Default::default();
         let e_count = 4usize;
+        let t = 8usize;
+        let ones = Tensor::<B, 2>::ones([t, 1], &device);
+        let top1 = |ids: &[i64]| Tensor::<B, 1, Int>::from_ints(ids, &device).reshape([t, 1]);
 
-        let probs_uniform = Tensor::<B, 2>::full([10, e_count], 1.0 / e_count as f32, &device);
-        let (vals, idx) = probs_uniform.clone().topk_with_indices(2, 1);
-        let _ = (vals, idx);
-        // Compute directly: f uniform=0.25 each, p=0.25 each => aux = 4*4*0.0625 = 1.0
-        let onehot_f: Vec<f32> = vec![0.25; e_count];
-        let f = Tensor::<B, 1>::from_floats(onehot_f.as_slice(), &device);
-        let p = Tensor::<B, 1>::full([e_count], 1.0 / e_count as f32, &device);
-        let aux_uniform: f32 = (f * p).sum().into_scalar() * e_count as f32;
-        assert!((aux_uniform - 1.0).abs() < 1e-6);
+        // Uniform probabilities, tokens spread evenly over the experts:
+        // f = p = 1/E, so the loss is exactly 1.
+        let probs_uniform = Tensor::<B, 2>::full([t, e_count], 1.0 / e_count as f32, &device);
+        let spread = top1(&[0, 1, 2, 3, 0, 1, 2, 3]);
+        let aux_uniform: f32 =
+            weighted_switch_loss(&probs_uniform, &spread, &ones, e_count).into_scalar();
+        assert!((aux_uniform - 1.0).abs() < 1e-6, "uniform gave {aux_uniform}");
 
-        // Collapsed: f = one-hot, p = one-hot => aux = E.
-        let collapsed_p = Tensor::<B, 1>::from_floats([1.0, 0.0, 0.0, 0.0].as_slice(), &device);
-        let collapsed_f = collapsed_p.clone();
-        let aux_collapsed: f32 = (collapsed_f * collapsed_p).sum().into_scalar() * e_count as f32;
-        assert!((aux_collapsed - e_count as f32).abs() < 1e-6);
+        // Collapsed: every token's mass and top-1 on expert 0 => exactly E.
+        let mut collapsed = vec![0.0f32; t * e_count];
+        for row in 0..t {
+            collapsed[row * e_count] = 1.0;
+        }
+        let probs_collapsed =
+            Tensor::<B, 1>::from_floats(collapsed.as_slice(), &device).reshape([t, e_count]);
+        let all_zero = top1(&[0; 8]);
+        let aux_collapsed: f32 =
+            weighted_switch_loss(&probs_collapsed, &all_zero, &ones, e_count).into_scalar();
+        assert!(
+            (aux_collapsed - e_count as f32).abs() < 1e-6,
+            "collapse gave {aux_collapsed}"
+        );
         assert!(aux_collapsed > aux_uniform);
+
+        // `f` comes from the hard assignment, `p` from the soft mass: with
+        // uniform probabilities the loss is 1 whatever the assignment, because
+        // `sum_e f_e = 1` and every `p_e = 1/E`.
+        let aux_hard: f32 =
+            weighted_switch_loss(&probs_uniform, &all_zero, &ones, e_count).into_scalar();
+        assert!((aux_hard - 1.0).abs() < 1e-6, "got {aux_hard}");
+
+        // Token weights: a token with weight zero contributes to neither half.
+        let weights = Tensor::<B, 1>::from_floats([1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0], &device)
+            .reshape([t, 1]);
+        let half_collapsed = top1(&[0, 0, 0, 0, 1, 1, 1, 1]);
+        let aux_weighted: f32 =
+            weighted_switch_loss(&probs_collapsed, &half_collapsed, &weights, e_count)
+                .into_scalar();
+        assert!(
+            (aux_weighted - e_count as f32).abs() < 1e-6,
+            "zero-weight tokens leaked into the loss: {aux_weighted}"
+        );
     }
 
     #[test]
@@ -1460,9 +1527,26 @@ mod tests {
         let z: f32 = out.z_loss.into_scalar();
         assert!(z > 0.0, "the z-loss is still reported, just not charged");
         // The total must be the balance term alone, to the bit.
-        let recomputed = total;
-        assert_eq!(recomputed, total);
+        let balance: f32 = out.balance.into_scalar();
+        assert_eq!(
+            total.to_bits(),
+            balance.to_bits(),
+            "z_level 0 must charge nothing: total {total} vs balance {balance}"
+        );
         assert!(total.is_finite());
+
+        // ...and a non-zero level really is charged on top of the same balance.
+        let on = MoELayer::<B>::new(&tiny_config(2, 4).with_z_level(0.5), &device);
+        let x = Tensor::<B, 3>::random([2, 3, 8], Distribution::Uniform(-1.0, 1.0), &device);
+        let cond = Tensor::<B, 2>::random([2, 4], Distribution::Uniform(-1.0, 1.0), &device);
+        let out = on.forward(x, cond);
+        let total: f32 = out.balance_loss.into_scalar();
+        let balance: f32 = out.balance.into_scalar();
+        let z: f32 = out.z_loss.into_scalar();
+        assert!(
+            (total - (balance + 0.5 * z)).abs() < 1e-6,
+            "total {total} != balance {balance} + 0.5 * z {z}"
+        );
     }
 
     #[test]

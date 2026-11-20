@@ -5,13 +5,15 @@
 //! CDF `Phi` and its inverse (the quantile function). These are implemented
 //! here with f64 precision:
 //!
-//! - [`erf`]: Maclaurin series (|x| < 3), accurate to ~1e-14.
-//! - [`erfc`]: [`erf`] for |x| < 3, otherwise a truncated asymptotic
-//!   expansion `exp(-x^2)/(x*sqrt(pi)) * (1 - 1/(2x^2) + ...)`, accurate to
-//!   better than 1e-11 relative down to deep tails.
+//! - [`erf`]: Maclaurin series for |x| < 2 (~1e-15 relative), otherwise
+//!   the complement of [`erfc`].
+//! - [`erfc`]: `1 - erf(x)` for |x| < 2 (relative error grows to ~1e-13 just
+//!   below the crossover, where `erfc` is ~5e-3), otherwise the A&S 7.1.14
+//!   continued fraction, ~1e-15 relative down to the deep tail.
 //! - [`norm_cdf`]: `Phi(x) = erfc(-x/sqrt(2)) / 2`.
 //! - [`norm_ppf`]: Acklam's rational approximation refined by Newton steps,
-//!   ~1e-15 relative accuracy.
+//!   evaluated on the lower half (`p > 0.5` by symmetry, `1 - p` being exact
+//!   there), ~1e-15 relative accuracy for the given `p`.
 
 use std::f64::consts::{FRAC_1_SQRT_2, FRAC_2_SQRT_PI, PI};
 
@@ -105,6 +107,15 @@ pub fn norm_cdf(x: f64) -> f64 {
 /// giving ~1e-15 relative accuracy.
 pub fn norm_ppf(p: f64) -> f64 {
     assert!(p > 0.0 && p < 1.0, "norm_ppf requires 0 < p < 1, got {p}");
+
+    // Upper half by symmetry. The Newton residual `norm_cdf(x) - p` is
+    // computed as `(1 - tail) - p` up here, which cancels catastrophically in
+    // the tail (p = 1 - 1e-10 came back with ~5e-10 relative error,
+    // p = 1 - 1e-15 with ~1e-9). `1 - p` is exact for p in [0.5, 1)
+    // (Sterbenz), so solving the lower-tail problem loses nothing.
+    if p > 0.5 {
+        return -norm_ppf(1.0 - p);
+    }
 
     const A: [f64; 6] = [
         -3.969683028665376e+01,
@@ -212,11 +223,14 @@ mod tests {
         // scipy.special.erfc references
         assert_relative_eq!(erfc(0.0), 1.0, epsilon = 1e-14);
         assert_relative_eq!(erfc(1.0), 0.15729920705028513, epsilon = 1e-14);
-        assert_relative_eq!(erfc(2.0), 0.004677734981063127, epsilon = 1e-13);
+        // erfc(2) = 4.6777349810472658e-3 (mpmath, 40 digits). Compared
+        // relatively: an absolute 1e-13 on a value of 5e-3 accepted a reference
+        // that was itself wrong in the 12th digit.
+        assert_relative_eq!(erfc(2.0), 0.004_677_734_981_047_266, max_relative = 1e-13);
         assert_relative_eq!(erfc(3.0), 2.209049699858544e-05, max_relative = 1e-11);
         assert_relative_eq!(erfc(4.0), 1.541725790028002e-08, max_relative = 1e-10);
         assert_relative_eq!(erfc(5.0), 1.537459794428035e-12, max_relative = 1e-9);
-        assert_relative_eq!(erfc(-2.0), 1.9953222650189537, epsilon = 1e-13);
+        assert_relative_eq!(erfc(-2.0), 1.995_322_265_018_952_6, epsilon = 1e-15);
         assert_relative_eq!(erfc(10.0), 2.088487583762545e-45, max_relative = 1e-8);
     }
 
@@ -227,8 +241,12 @@ mod tests {
         assert_relative_eq!(norm_cdf(1.96), 0.9750021048517795, epsilon = 1e-14);
         // scipy.stats.norm.cdf(2.5) = 0.9937903346742238
         assert_relative_eq!(norm_cdf(2.5), 0.9937903346742238, epsilon = 1e-14);
-        // scipy.stats.norm.cdf(-3.0) = 0.0013498980316301035
-        assert_relative_eq!(norm_cdf(-3.0), 0.0013498980316301035, max_relative = 1e-11);
+        // Phi(-3) = 1.3498980316300945e-3 (mpmath, 40 digits).
+        assert_relative_eq!(
+            norm_cdf(-3.0),
+            0.001_349_898_031_630_094_6,
+            max_relative = 1e-13
+        );
         // scipy.stats.norm.cdf(-4.6517) = 1.6460488695804655e-06 (sigma_max endpoint)
         assert_relative_eq!(
             norm_cdf(-4.6517),
@@ -248,6 +266,27 @@ mod tests {
         // Deep tail: scipy.stats.norm.ppf(1.457e-5) ~ -4.1787 (used by block sigmas)
         let x = norm_ppf(1.457e-5);
         assert_relative_eq!(norm_cdf(x), 1.457e-5, max_relative = 1e-9);
+    }
+
+    #[test]
+    fn ppf_upper_tail_is_as_accurate_as_the_lower() {
+        // mpmath roots of Phi(x) = p for these exact doubles (50 digits).
+        // Newton on `Phi(x) - p` in the upper half used to cancel to ~5e-10
+        // and ~1e-9 relative here.
+        assert_relative_eq!(
+            norm_ppf(0.9999999999),
+            6.361_340_889_697_422,
+            max_relative = 1e-14
+        );
+        assert_relative_eq!(
+            norm_ppf(0.999999999999999),
+            7.941_444_487_415_979,
+            max_relative = 1e-14
+        );
+        // Exact antisymmetry about the median, at p whose complement is exact.
+        for p in [2f64.powi(-40), 2f64.powi(-20), 2f64.powi(-7), 0.375, 0.4375] {
+            assert_eq!(norm_ppf(1.0 - p), -norm_ppf(p));
+        }
     }
 
     #[test]
