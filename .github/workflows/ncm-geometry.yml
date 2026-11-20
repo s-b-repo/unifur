@@ -1,0 +1,193 @@
+name: NCM geometry training
+
+on:
+  push:
+    branches: [training/ncm-geometry]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_INCREMENTAL: 0
+  RAYON_NUM_THREADS: 4
+  TRAIN_SECONDS: 6300
+
+jobs:
+  test-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Repository gate
+        id: gate
+        run: make gate
+      - name: Unit tests if the gate stops early
+        if: failure() && steps.gate.outcome == 'failure'
+        run: make test-lib
+      - name: Integration and resume tests
+        if: failure() && steps.gate.outcome == 'failure'
+        run: cargo test --locked --test integration --test resume -- --test-threads=1
+
+  tokenizer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 110
+    outputs:
+      steps: ${{ steps.budget.outputs.steps }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ncm-geometry-release
+      - name: Build release CLI
+        run: |
+          cargo build --locked --release --bin dblocks
+          mkdir -p run
+          cp target/release/dblocks run/dblocks
+          rustc -Vv | tee run/toolchain.txt
+          ./run/dblocks --version
+      - name: Prepare pinned MATH data
+        run: |
+          python3 -m venv "$RUNNER_TEMP/math-data"
+          "$RUNNER_TEMP/math-data/bin/python" -m pip install --only-binary=:all: pyarrow==26.0.1
+          "$RUNNER_TEMP/math-data/bin/python" -B experiments/ncm_geometry/prepare.py run/data
+      - name: Train and evaluate the shared tokenizer
+        run: |
+          ./run/dblocks ncm tokenizer train \
+            --config experiments/ncm_geometry/tokenizer.json --corpus run/data/math.train.corpus.bin \
+            --val-corpus run/data/geometry.dev.corpus.bin --val-windows 128 --batch-size 16 \
+            --steps 4500 --eval-every 1500 --log-every 100 --out run/tokenizer | tee run/tokenizer.log
+          sed -n 's/^checkpoint: //p' run/tokenizer.log | tail -n 1 > run/tokenizer.path
+          test -f "$(cat run/tokenizer.path)"
+          ./run/dblocks ncm tokenizer eval --checkpoint "$(cat run/tokenizer.path)" \
+            --val-corpus run/data/geometry.test.corpus.bin --val-windows 256 \
+            | tee run/tokenizer-test.log
+      - name: Measure step time for the two-step generator
+        id: budget
+        run: |
+          ./run/dblocks ncm train \
+            --tokenizer "$(cat run/tokenizer.path)" --config experiments/ncm_geometry/generator.json \
+            --corpus run/data/geometry.train.corpus.bin --steps 96 --batch-size 4 \
+            --warmup 20 --log-every 24 --out probe | tee run/probe.log
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          log = Path('run/probe.log').read_text()
+          match = re.search(r'^concept-field generator: (\d+) params, steps 0\.\.96 .* in ([\d.]+)s$', log, re.M)
+          if not match:
+              raise SystemExit('Could not find the completed generator throughput probe')
+          params, elapsed = int(match[1]), float(match[2])
+          target = int(os.environ['TRAIN_SECONDS'])
+          steps = max(1, int(96 * target / elapsed))
+          plan = {'probe_steps': 96, 'probe_seconds': elapsed, 'slow_variant_target_seconds': target,
+                  'generator_steps': steps, 'generator_parameters': params}
+          Path('run/plan.json').write_text(json.dumps(plan, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              print(f'steps={steps}', file=output)
+          print(json.dumps(plan))
+          PY
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: ncm-geometry-tokenizer-and-inputs
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            run/dblocks
+            run/toolchain.txt
+            run/plan.json
+            run/probe.log
+            run/tokenizer.log
+            run/tokenizer-test.log
+            run/tokenizer.path
+            run/tokenizer/
+            run/data/corpus.json
+            run/data/geometry.train.corpus.bin
+            run/data/geometry.dev.corpus.bin
+            run/data/geometry.integer-test.jsonl
+
+  certificates:
+    needs: tokenizer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ncm-geometry-tokenizer-and-inputs
+          path: run
+      - name: NCM certificates
+        run: |
+          chmod +x run/dblocks
+          ./run/dblocks verify --group ncm
+      - name: Geometry certificates
+        if: ${{ !cancelled() }}
+        run: ./run/dblocks verify --group geom
+
+  generators:
+    needs: tokenizer
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        thinking-steps: [1, 2]
+    env:
+      THINKING_STEPS: ${{ matrix.thinking-steps }}
+      GENERATOR_STEPS: ${{ needs.tokenizer.outputs.steps }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: ncm-geometry-tokenizer-and-inputs
+          path: run
+      - name: Train the geometric concept-field generator
+        run: |
+          chmod +x run/dblocks
+          mkdir -p results
+          cp run/plan.json run/data/corpus.json results/
+          jq --argjson depth "$THINKING_STEPS" '.thinking_steps = $depth' \
+            experiments/ncm_geometry/generator.json > results/generator.json
+          warmup=$(( GENERATOR_STEPS < 100 ? GENERATOR_STEPS : 100 ))
+          interval=$(( (GENERATOR_STEPS + 2) / 3 ))
+          ./run/dblocks ncm train \
+            --tokenizer "$(cat run/tokenizer.path)" --config results/generator.json \
+            --corpus run/data/geometry.train.corpus.bin --val-corpus run/data/geometry.dev.corpus.bin \
+            --steps "$GENERATOR_STEPS" --batch-size 4 \
+            --warmup "$warmup" --val-windows 128 --val-every "$interval" \
+            --checkpoint-every "$interval" --log-every 100 --out results/generator | tee results/train.log
+          sed -n 's/^checkpoint: //p' results/train.log | tail -n 1 > results/generator.path
+          test -f "$(cat results/generator.path)"
+      - name: Score integer answers on the official test split
+        run: |
+          python3 -B experiments/ncm_geometry/score.py \
+            --dblocks ./run/dblocks --tokenizer "$(cat run/tokenizer.path)" \
+            --generator "$(cat results/generator.path)" --cases run/data/geometry.integer-test.jsonl \
+            --out results/heldout-answers.json
+          rg '^(concept-field generator:|validation \()' results/train.log >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: ncm-geometry-depth-${{ matrix.thinking-steps }}
+          retention-days: 14
+          if-no-files-found: error
+          path: results/

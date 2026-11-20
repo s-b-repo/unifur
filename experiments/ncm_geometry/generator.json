@@ -1,0 +1,8 @@
+{
+  "blocks": 3,
+  "hidden": 192,
+  "heads": 6,
+  "prompt_len": 256,
+  "thinking_steps": 2,
+  "attractor": true
+}

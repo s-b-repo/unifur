@@ -1,0 +1,14 @@
+{
+  "vocab": 259,
+  "latent_dim": 64,
+  "codebook_size": 256,
+  "schedule": {"lengths": [2, 4, 8, 16, 32, 64, 128]},
+  "encoder_blocks": 0,
+  "decoder_blocks": 1,
+  "heads": 4,
+  "ema_decay": 0.95,
+  "commitment_beta": 0.25,
+  "nested_dropout": 0.5,
+  "dead_code_threshold": 0.03,
+  "restart_every": 50
+}
