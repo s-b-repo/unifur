@@ -1,0 +1,71 @@
+name: Nina parallel training validation
+
+on:
+  push:
+    tags: ['nina-capacity-*']
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  train:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      max-parallel: 40
+      matrix:
+        seed: [42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61]
+        depth: [1, 2]
+    env:
+      RAYON_NUM_THREADS: '2'
+      MATMUL_NUM_THREADS: '2'
+      SEED: ${{ matrix.seed }}
+      DEPTH: ${{ matrix.depth }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: spatial-runtime
+          run-id: 44881475698
+          github-token: ${{ github.token }}
+          path: runtime
+      - name: Train and score a paired Geometry3K trial
+        run: |
+          chmod +x runtime/dblocks
+          echo 'bf4ebf2034b2ab87790b1f507fcf4dcd6c5be8a891347013c2a45ee4b2c97c2b  runtime/dblocks' | sha256sum -c -
+          python3 -B experiments/model_matrix/nina_capacity.py fit --runtime runtime --out trial \
+            --seed "$SEED" --depth "$DEPTH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: capacity-trial-${{ matrix.seed }}-${{ matrix.depth }}
+          path: trial/
+          if-no-files-found: error
+          retention-days: 14
+
+  report:
+    needs: train
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: capacity-trial-*
+          path: trials
+      - name: Validate and summarize all forty fits
+        run: |
+          python3 -B experiments/model_matrix/nina_capacity.py summarize trials capacity.json
+          jq '{jobs, development_cases, majority_correct, mean_correct_by_depth}' capacity.json \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: capacity-summary
+          path: capacity.json
+          if-no-files-found: error
+          retention-days: 14
