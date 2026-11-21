@@ -62,7 +62,7 @@ jobs:
           chmod +x runtime/fused_scene
           python3 -B experiments/model_matrix/prepare.py data/scenes
           mkdir -p backbone
-          ./runtime/fused_scene warmup --corpus data/scenes/train.geom.bin --steps 3500 --out backbone \
+          ./runtime/fused_scene warmup --corpus data/scenes/train.geom.bin --steps 1500 --max-seconds 1800 --out backbone \
             | tee backbone/train.log
       - uses: actions/upload-artifact@v4
         with:
@@ -100,8 +100,11 @@ jobs:
           chmod +x runtime/fused_scene
           mkdir -p model
           cp inputs/data/scenes/{dataset.json,test.jsonl} model/
-          steps=3000
-          if [[ "$OBJECTIVE" == diffusion ]]; then steps=2400; fi
+          ./runtime/fused_scene train --corpus inputs/data/scenes/train.geom.bin \
+            --meta inputs/data/scenes/train.meta.json --backbone inputs/backbone/qwen-backbone-*.mpk \
+            --objective "$OBJECTIVE" --steps 12 --out probe | tee model/probe.log
+          steps=$(python3 -c 'import json; r=json.load(open("probe/model.json")); print(max(1, min(3000, int(1500 * r["steps_taken"] / r["elapsed_secs"]))))')
+          cp probe/model.json model/throughput.json
           ./runtime/fused_scene train --corpus inputs/data/scenes/train.geom.bin \
             --meta inputs/data/scenes/train.meta.json --backbone inputs/backbone/qwen-backbone-*.mpk \
             --objective "$OBJECTIVE" --steps "$steps" --out model | tee model/train.log
@@ -132,9 +135,19 @@ jobs:
           path: runtime
       - name: Download and verify official CIFAR-100
         run: |
-          curl --fail --silent --show-error --location --retry 3 --max-time 360 \
-            https://cave.cs.toronto.edu/kriz/cifar-100-binary.tar.gz --output "$RUNNER_TEMP/cifar.tar.gz"
-          python3 -B experiments/model_matrix/cifar.py extract "$RUNNER_TEMP/cifar.tar.gz" cifar
+          python3 -m venv "$RUNNER_TEMP/cifar-data"
+          data_python="$RUNNER_TEMP/cifar-data/bin/python"
+          if "$data_python" -m pip install --only-binary=:all: pyarrow==26.0.1 Pillow \
+             && "$data_python" -B experiments/model_matrix/cifar.py mirror cifar; then
+            cat cifar/source.json
+          else
+            archive="$RUNNER_TEMP/cifar.tar.gz"
+            for attempt in 1 2 3 4; do
+              if curl --fail --silent --show-error --location --continue-at - --max-time 900 \
+                https://cave.cs.toronto.edu/kriz/cifar-100-binary.tar.gz --output "$archive"; then break; fi
+            done
+            python3 -B experiments/model_matrix/cifar.py extract "$archive" cifar
+          fi
       - name: Fit the MoSME image classifier
         run: |
           chmod +x runtime/dblocks runtime/mosme_image

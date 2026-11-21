@@ -45,6 +45,8 @@ enum Action {
         #[arg(long)]
         steps: usize,
         #[arg(long)]
+        max_seconds: Option<u64>,
+        #[arg(long)]
         out: PathBuf,
     },
     Train {
@@ -79,7 +81,7 @@ struct Shape {
 
 fn shape() -> Shape {
     let dims = QwenArchDims {
-        num_layers: 3,
+        num_layers: 2,
         hidden_size: 64,
         intermediate_size: 96,
         vocab_size: 128,
@@ -131,8 +133,18 @@ fn scene_tokenizer() -> Result<BpeTokenizer> {
     )
 }
 
-fn warmup(path: &Path, steps: usize, out: &Path, device: &Device) -> Result<()> {
+fn warmup(
+    path: &Path,
+    steps: usize,
+    max_seconds: Option<u64>,
+    out: &Path,
+    device: &Device,
+) -> Result<()> {
     ensure!(steps > 0, "warm-up steps must be positive");
+    ensure!(
+        max_seconds != Some(0),
+        "warm-up time limit must be positive"
+    );
     let mut corpus = TokenCorpus::in_memory(path)?;
     ensure!(
         corpus.len().is_multiple_of(PROMPT + 1),
@@ -147,7 +159,9 @@ fn warmup(path: &Path, steps: usize, out: &Path, device: &Device) -> Result<()> 
     let mut rng = ChaCha12Rng::seed_from_u64(SEED);
     let mut first = 0.0;
     let mut last = 0.0;
-    let batch = 12;
+    let batch = 8;
+    let started = std::time::Instant::now();
+    let mut taken = 0;
     for step in 0..steps {
         let rows = sample_aligned_batch(&mut corpus, PROMPT + 1, batch, &mut rng)?;
         let input: Vec<i64> = rows
@@ -173,8 +187,12 @@ fn warmup(path: &Path, steps: usize, out: &Path, device: &Device) -> Result<()> 
         }
         let gradients = GradientsParams::from_grads(loss.backward(), &model);
         model = optimizer.step(0.001, model, gradients);
+        taken += 1;
         if step % 100 == 0 || step + 1 == steps {
             println!("Qwen warm-up step {} / {steps}: loss {last:.4}", step + 1);
+        }
+        if max_seconds.is_some_and(|seconds| started.elapsed().as_secs() >= seconds) {
+            break;
         }
     }
     let weights = checkpoint::save_content_addressed(model.valid(), out, "qwen-backbone")?;
@@ -184,7 +202,8 @@ fn warmup(path: &Path, steps: usize, out: &Path, device: &Device) -> Result<()> 
         .context("backbone checkpoint lacks a UTF-8 filename")?;
     write_json(
         &out.join("warmup.json"),
-        &json!({"weights": name, "steps": steps, "first_loss": first, "last_loss": last}),
+        &json!({"weights": name, "steps": taken, "steps_requested": steps,
+            "elapsed_secs": started.elapsed().as_secs_f64(), "first_loss": first, "last_loss": last}),
     )
 }
 
@@ -334,7 +353,12 @@ fn use_model(
 fn main() -> Result<()> {
     let device = Device::default();
     match Cli::parse().action {
-        Action::Warmup { corpus, steps, out } => warmup(&corpus, steps, &out, &device),
+        Action::Warmup {
+            corpus,
+            steps,
+            max_seconds,
+            out,
+        } => warmup(&corpus, steps, max_seconds, &out, &device),
         action @ Action::Train { .. } => train(action, &device),
         Action::Use {
             bundle,
