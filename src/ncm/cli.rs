@@ -284,6 +284,9 @@ pub struct GeneratorTrainArgs {
     /// Longest prompt prefix in tokens (0: unconditional).
     #[arg(long)]
     pub prompt_len: Option<usize>,
+    /// Sample complete fixed-width prompt/target records, using the full prompt.
+    #[arg(long)]
+    pub aligned_windows: bool,
     /// Weight of the deep-supervision term on intermediate states.
     #[arg(long)]
     pub deep_supervision: Option<f64>,
@@ -548,6 +551,7 @@ fn generator_config(args: &GeneratorTrainArgs) -> Result<crate::ncm::generator::
         grad_clip: args.grad_clip,
         seed: args.seed,
         estimator,
+        aligned_windows: args.aligned_windows,
         val_every: args.val_every,
         val_windows: args.val_windows,
         checkpoint_every: args.checkpoint_every,

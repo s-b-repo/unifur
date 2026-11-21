@@ -2445,6 +2445,9 @@ pub struct NcmTrainConfig {
     pub grad_clip: f64,
     pub seed: u64,
     pub estimator: LossEstimator,
+    /// Input is prearranged in prompt + target records of a fixed width.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub aligned_windows: bool,
     /// Validate every this many steps (0: only at start and end).
     pub val_every: usize,
     /// Fixed validation windows (evenly spaced over the validation corpus).
@@ -2466,6 +2469,7 @@ impl Default for NcmTrainConfig {
             grad_clip: 1.0,
             seed: 0,
             estimator: LossEstimator::SampledLevel,
+            aligned_windows: false,
             val_every: 0,
             val_windows: 16,
             checkpoint_every: 0,
@@ -2571,18 +2575,27 @@ fn quantiles(mut values: Vec<f64>) -> [f64; 5] {
 
 /// Evenly spaced windows of `span` tokens over a corpus.
 pub fn fixed_windows(corpus: &mut TokenCorpus, count: usize, span: usize) -> Result<Vec<Vec<u16>>> {
+    spaced_windows(corpus, count, span, 1)
+}
+
+fn spaced_windows(
+    corpus: &mut TokenCorpus,
+    count: usize,
+    span: usize,
+    stride: usize,
+) -> Result<Vec<Vec<u16>>> {
     ensure!(
         corpus.len() >= span,
         "{} tokens cannot hold a window of {span}",
         corpus.len()
     );
-    let room = corpus.len() - span;
+    let room = (corpus.len() - span) / stride;
     (0..count)
         .map(|i| {
             let start = if count <= 1 {
                 0
             } else {
-                i * room / (count - 1)
+                (i * room / (count - 1)) * stride
             };
             corpus.window(start, span)
         })
@@ -2925,6 +2938,15 @@ where
         "the training corpus ({} tokens) is shorter than one window of {span}",
         train.len()
     );
+    if config.aligned_windows {
+        ensure!(
+            train.len().is_multiple_of(span)
+                && validation
+                    .as_ref()
+                    .is_none_or(|corpus| corpus.len().is_multiple_of(span)),
+            "aligned train and validation corpora must contain whole records of {span} tokens"
+        );
+    }
     let classes = codec.codebook_size();
     let pad = config.model.pad_id;
     let relax = config.model.relax();
@@ -2955,7 +2977,10 @@ where
         ),
     };
     let val_windows = match validation {
-        Some(corpus) => Some(fixed_windows(corpus, config.val_windows.max(1), span)?),
+        Some(corpus) => {
+            let stride = if config.aligned_windows { span } else { 1 };
+            Some(spaced_windows(corpus, config.val_windows.max(1), span, stride)?)
+        }
         None => None,
     };
     let evaluate = |model: &NcmGenerator<B>| -> Result<Option<LevelEval>> {
@@ -3010,17 +3035,25 @@ where
     for step in start_step..config.steps {
         B::seed(device, crate::train::step_seed(config.seed, step));
         let batch = config.batch_size;
-        let mut windows = Vec::with_capacity(batch);
-        let mut prompt_lens = Vec::with_capacity(batch);
-        for _ in 0..batch {
-            let start = rng.random_range(0..=train.len() - span);
-            windows.push(train.window(start, span)?);
-            prompt_lens.push(if prompt_len > 0 {
-                rng.random_range(0..=prompt_len)
-            } else {
-                0
-            });
-        }
+        let (windows, prompt_lens) = if config.aligned_windows {
+            (
+                crate::geometry::sample_aligned_batch(train, span, batch, &mut rng)?,
+                vec![prompt_len; batch],
+            )
+        } else {
+            let mut windows = Vec::with_capacity(batch);
+            let mut prompt_lens = Vec::with_capacity(batch);
+            for _ in 0..batch {
+                let start = rng.random_range(0..=train.len() - span);
+                windows.push(train.window(start, span)?);
+                prompt_lens.push(if prompt_len > 0 {
+                    rng.random_range(0..=prompt_len)
+                } else {
+                    0
+                });
+            }
+            (windows, prompt_lens)
+        };
         let (prompts, targets) =
             split_windows(&windows, prompt_len, &prompt_lens, pad, codec.vocab_size())?;
         let clean = encode_host(codec, &targets, batch, device)?;
@@ -4752,6 +4785,19 @@ mod tests {
         TokenCorpus::write(&path, &tokens).unwrap();
         let corpus = TokenCorpus::in_memory(&path).unwrap();
         (dir, corpus)
+    }
+
+    #[test]
+    fn aligned_validation_windows_never_split_fixed_records() {
+        let (dir, mut corpus) = tiny_corpus("aligned");
+        let span = corpus.len() / 40;
+        let windows = spaced_windows(&mut corpus, 9, span, span).unwrap();
+        assert!(windows.iter().all(|row| row == &windows[0]));
+        let staggered = fixed_windows(&mut corpus, 9, span).unwrap();
+        assert!(staggered.iter().any(|row| row != &staggered[0]));
+        let config = serde_json::to_value(NcmTrainConfig::default()).unwrap();
+        assert!(config.get("aligned_windows").is_none());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

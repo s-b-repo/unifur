@@ -1,0 +1,115 @@
+name: Train spatial model matrix
+
+on:
+  push:
+    branches: [training/model-matrix]
+    paths:
+      - .github/workflows/model-matrix.yml
+      - experiments/model_matrix/prepare.py
+      - experiments/model_matrix/worker.py
+      - examples/scene_predict.rs
+      - 'src/ncm/**'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_INCREMENTAL: 0
+  RAYON_NUM_THREADS: 4
+
+jobs:
+  runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: spatial-matrix-release
+      - name: Build release binaries
+        run: |
+          cargo build --locked --release --bin dblocks --example scene_predict
+          mkdir -p runtime
+          cp target/release/dblocks target/release/examples/scene_predict runtime/
+      - name: Verify the NCM, MoSME and geometry certificates
+        run: |
+          for group in ncm mosme geom; do
+            ./runtime/dblocks verify --group "$group"
+          done
+      - name: Prepare disjoint diagram groups and train the shared codec
+        run: |
+          python3 -B experiments/model_matrix/prepare.py runtime/scenes
+          python3 -B experiments/model_matrix/worker.py --runtime runtime codec
+      - uses: actions/upload-artifact@v4
+        with:
+          name: spatial-runtime
+          path: runtime/
+          retention-days: 14
+          if-no-files-found: error
+
+  train:
+    needs: runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        model:
+          - ncm-1
+          - ncm-2
+          - mosme-text
+          - geometry-answer
+          - geometry-diffusion
+          - geometry-mosme-answer
+          - geometry-mosme-diffusion
+          - geometry-baseline
+          - vector-student
+    env:
+      MODEL: ${{ matrix.model }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: spatial-runtime
+          path: runtime
+      - name: Fit the model, score held-out queries, and reload for inference
+        run: |
+          chmod +x runtime/dblocks runtime/scene_predict
+          python3 -B experiments/model_matrix/worker.py --runtime runtime train "$MODEL" model
+          python3 -B model/use_model.py --runtime runtime use model | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: model-${{ matrix.model }}
+          path: model/
+          retention-days: 14
+          if-no-files-found: error
+
+  test-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Repository gate
+        id: gate
+        run: make gate
+      - name: NCM unit tests when the gate stops early
+        if: failure() && steps.gate.outcome == 'failure'
+        run: |
+          cargo test --locked --lib ncm:: -- --test-threads=1
+      - name: Geometry integration tests when the gate stops early
+        if: failure() && steps.gate.outcome == 'failure'
+        run: cargo test --locked --test integration geometric -- --test-threads=1
