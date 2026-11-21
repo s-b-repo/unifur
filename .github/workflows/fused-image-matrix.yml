@@ -1,0 +1,158 @@
+name: Train fusion and image models
+
+on:
+  push:
+    branches: [training/model-matrix]
+    paths:
+      - .github/workflows/fused-image-matrix.yml
+      - experiments/model_matrix/cifar.py
+      - examples/fused_scene.rs
+      - examples/mosme_image.rs
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_INCREMENTAL: 0
+  RAYON_NUM_THREADS: 4
+
+jobs:
+  runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 65
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: spatial-matrix-release
+      - name: Build and certify the fused runtime
+        run: |
+          cargo build --locked --release --bin dblocks --example fused_scene --example mosme_image
+          mkdir -p runtime
+          cp target/release/dblocks target/release/examples/{fused_scene,mosme_image} runtime/
+          ./runtime/dblocks verify --group geomfusion
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fusion-image-runtime
+          path: runtime/
+          if-no-files-found: error
+          retention-days: 14
+
+  backbone:
+    needs: runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: fusion-image-runtime
+          path: runtime
+      - name: Warm up the CPU-sized Qwen trunk on annotated-diagram scenes
+        run: |
+          chmod +x runtime/fused_scene
+          python3 -B experiments/model_matrix/prepare.py data/scenes
+          mkdir -p backbone
+          ./runtime/fused_scene warmup --corpus data/scenes/train.geom.bin --steps 3500 --out backbone \
+            | tee backbone/train.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fused-backbone-and-scenes
+          path: |
+            backbone/
+            data/scenes/dataset.json
+            data/scenes/train.geom.bin
+            data/scenes/train.meta.json
+            data/scenes/test.jsonl
+          if-no-files-found: error
+          retention-days: 14
+
+  fusion:
+    needs: backbone
+    runs-on: ubuntu-24.04
+    timeout-minutes: 160
+    strategy:
+      fail-fast: false
+      matrix:
+        objective: [answer, diffusion]
+    env:
+      OBJECTIVE: ${{ matrix.objective }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fusion-image-runtime
+          path: runtime
+      - uses: actions/download-artifact@v4
+        with:
+          name: fused-backbone-and-scenes
+          path: inputs
+      - name: Train, score and use the fused checkpoint
+        run: |
+          chmod +x runtime/fused_scene
+          mkdir -p model
+          cp inputs/data/scenes/{dataset.json,test.jsonl} model/
+          steps=3000
+          if [[ "$OBJECTIVE" == diffusion ]]; then steps=2400; fi
+          ./runtime/fused_scene train --corpus inputs/data/scenes/train.geom.bin \
+            --meta inputs/data/scenes/train.meta.json --backbone inputs/backbone/qwen-backbone-*.mpk \
+            --objective "$OBJECTIVE" --steps "$steps" --out model | tee model/train.log
+          ./runtime/fused_scene use --bundle model --cases model/test.jsonl > model/heldout.json
+          scene=$(python3 -c 'import json; print(json.loads(open("model/test.jsonl").readline())["prompt"])')
+          ./runtime/fused_scene use --bundle model --scene "$scene" | tee model/demo.json
+          python3 -c 'import json; r=json.load(open("model/heldout.json")); print("Exact", r["correct"], "of", r["cases"], "| kernel", r["kernel"])' \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: model-fusion-${{ matrix.objective }}
+          path: model/
+          if-no-files-found: error
+          retention-days: 14
+
+  mosme-image:
+    needs: runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 160
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: fusion-image-runtime
+          path: runtime
+      - name: Download and verify official CIFAR-100
+        run: |
+          curl --fail --silent --show-error --location --retry 3 --max-time 360 \
+            https://cave.cs.toronto.edu/kriz/cifar-100-binary.tar.gz --output "$RUNNER_TEMP/cifar.tar.gz"
+          python3 -B experiments/model_matrix/cifar.py extract "$RUNNER_TEMP/cifar.tar.gz" cifar
+      - name: Fit the MoSME image classifier
+        run: |
+          chmod +x runtime/dblocks runtime/mosme_image
+          mkdir -p model
+          ./runtime/dblocks experts init --out model/experts.json \
+            --box natural:plants,animals --box human-made:tools,vehicles
+          ./runtime/dblocks train --dataset cifar100 --data-dir cifar --objective dblock \
+            --num-blocks 3 --batch-size 16 --steps 1400 --log-every 50 --lr-schedule cosine \
+            --mosme-spec model/experts.json --mosme-every 2 --out-dir model/weights | tee model/train.log
+          python3 -B experiments/model_matrix/cifar.py bundle cifar model
+          ./runtime/mosme_image --bundle model --test > model/heldout.json
+          ./runtime/mosme_image --bundle model | tee model/demo.json
+          python3 -c 'import json; r=json.load(open("model/heldout.json")); print("CIFAR-100 top-1", r["correct"], "of", r["cases"])' \
+            | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: model-mosme-image
+          path: model/
+          if-no-files-found: error
+          retention-days: 14
