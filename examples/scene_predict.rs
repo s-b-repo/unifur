@@ -47,7 +47,7 @@ fn tokens(scene: &str, add_bos: bool, device: &Device) -> Tensor<Cpu, 2, Int> {
         ids.push(i64::from(Special::Bos.id()));
     }
     ids.extend(scene.bytes().map(i64::from));
-    Tensor::from_ints(ids.as_slice(), device).reshape([1, ids.len()])
+    Tensor::<Cpu, 1, Int>::from_ints(ids.as_slice(), device).reshape([1, ids.len()])
 }
 
 fn main() -> Result<()> {
