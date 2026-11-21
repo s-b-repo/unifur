@@ -1,17 +1,17 @@
 //! Train and use the native fused reasoner with a CPU-sized Qwen trunk.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use burn::backend::{Autodiff, NdArray};
 use burn::module::AutodiffModule;
 use burn::nn::loss::CrossEntropyLossConfig;
 use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
-use burn::tensor::{Int, Tensor, backend::Backend};
+use burn::tensor::{backend::Backend, Int, Tensor};
 use clap::{Parser, Subcommand};
 use diffusionblocks::{
     bpe::BpeTokenizer,
     checkpoint::{self, TrainState},
     corpus::TokenCorpus,
-    geometry::{GeomMeta, GeomObjective, sample_aligned_batch},
+    geometry::{sample_aligned_batch, GeomMeta, GeomObjective},
     geomfusion::{self, FusedQwen, FusedQwenTrainer, FusedTrainConfig, GeomFusionConfig},
     qwen::QwenArchDims,
     qwennet::{QwenTrunk, QwenTrunkConfig},
@@ -21,7 +21,7 @@ use diffusionblocks::{
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -30,6 +30,7 @@ type Train = Autodiff<Cpu>;
 type Device = <Cpu as burn::tensor::backend::BackendTypes>::Device;
 const SEED: u64 = 42;
 const PROMPT: usize = 29;
+const BACKBONE_FILE: &str = "backbone.mpk";
 
 #[derive(Parser)]
 struct Cli {
@@ -70,6 +71,11 @@ enum Action {
         scene: Option<String>,
         #[arg(long)]
         cases: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Use the trained diffusion block at its reference noise scale"
+        )]
+        diffusion: bool,
     },
 }
 
@@ -223,9 +229,16 @@ fn train(action: Action, device: &Device) -> Result<()> {
     let meta: GeomMeta = read_json(&meta)?;
     ensure!(meta.scene_len == PROMPT + 1, "expected four-point scenes");
     let shape = shape();
+    std::fs::create_dir_all(&out)?;
+    let bundled_backbone = out.join(BACKBONE_FILE);
+    let backbone_bytes =
+        std::fs::read(&backbone).with_context(|| format!("read {}", backbone.display()))?;
+    std::fs::write(&bundled_backbone, backbone_bytes)
+        .with_context(|| format!("write {}", bundled_backbone.display()))?;
+    let backbone_sha256 = checkpoint::file_sha256_hex(&bundled_backbone)?;
     Train::seed(device, SEED);
     let trunk = QwenTrunk::<Train>::new(shape.trunk.clone(), device);
-    let mut trunk = checkpoint::load(trunk, &backbone, device)?;
+    let mut trunk = checkpoint::load(trunk, &bundled_backbone, device)?;
     trunk.to_nf4()?;
     let model = FusedQwen::new(trunk, &shape.fusion, device)?;
     let train_cfg = FusedTrainConfig {
@@ -259,7 +272,7 @@ fn train(action: Action, device: &Device) -> Result<()> {
             "steps_skipped": report.steps_skipped, "elapsed_secs": report.elapsed_secs,
             "first_loss": report.first_loss, "last_loss": report.last_loss,
             "first_accuracy": report.first_accuracy, "last_accuracy": report.last_accuracy,
-            "backbone_sha256": checkpoint::file_sha256_hex(&backbone)?,
+            "backbone_sha256": backbone_sha256,
         }),
     )
 }
@@ -271,10 +284,45 @@ struct Case {
     kind: String,
 }
 
+fn predict_denoised(
+    model: &FusedQwen<Cpu>,
+    scene: &geomfusion::TokenizedScene,
+    candidates: &[(u16, u32)],
+    block: usize,
+    sigma: f64,
+    device: &Device,
+) -> Result<(u8, f32)> {
+    // As in training, the noncausal fusion path sees only the question prefix.
+    let prefix = &scene.tokens[..=scene.query];
+    let tokens = Tensor::<Cpu, 1, Int>::from_ints(prefix, device).reshape([1, prefix.len()]);
+    let hidden = model.trunk.forward_hidden(tokens);
+    let target = model.fusion.clean_final_state(&hidden, None)?;
+    let step = model
+        .fusion
+        .block_diffusion_step(hidden, block, sigma, sigma, &target)?;
+    let logits = model
+        .trunk
+        .lm_head
+        .forward(step.hidden.narrow(1, scene.query, 1));
+    let vocab = model.trunk.config().dims.vocab_size;
+    let ids: Vec<i64> = candidates.iter().map(|&(_, id)| i64::from(id)).collect();
+    let ids = Tensor::<Cpu, 1, Int>::from_ints(ids.as_slice(), device);
+    let best: i64 = logits
+        .reshape([vocab])
+        .select(0, ids)
+        .argmax(0)
+        .into_scalar();
+    Ok((
+        u8::try_from(candidates[usize::try_from(best)?].0)?,
+        step.mse_value,
+    ))
+}
+
 fn use_model(
     bundle: &Path,
     scene: Option<String>,
     cases: Option<PathBuf>,
+    diffusion: bool,
     device: &Device,
 ) -> Result<()> {
     let shape: Shape = read_json(&bundle.join("shape.json"))?;
@@ -291,7 +339,19 @@ fn use_model(
     );
     state.verify_files(&TrainState::dir_for(&path))?;
     let config: FusedTrainConfig = serde_json::from_value(state.config)?;
-    let mut trunk = QwenTrunk::<Cpu>::new(shape.trunk, device);
+    let backbone_sha256 = card
+        .get("backbone_sha256")
+        .and_then(Value::as_str)
+        .context("missing backbone checksum")?;
+    let backbone = bundle.join(BACKBONE_FILE);
+    ensure!(
+        checkpoint::file_sha256_hex(&backbone)? == backbone_sha256,
+        "backbone checksum mismatch for {}",
+        backbone.display()
+    );
+    // The frozen NF4 tensors are skipped by the fused checkpoint record.
+    let trunk = QwenTrunk::<Cpu>::new(shape.trunk, device);
+    let mut trunk = checkpoint::load(trunk, &backbone, device)?;
     trunk.to_nf4()?;
     let mut model = FusedQwen::<Cpu>::new(trunk, &shape.fusion, device)?;
     attach_lora(&mut model.trunk, &config.lora, device)?;
@@ -299,18 +359,42 @@ fn use_model(
     let tokenizer = scene_tokenizer()?;
     let meta: GeomMeta = read_json(&bundle.join("geometry.json"))?;
     let candidates = geomfusion::answer_token_ids(&tokenizer, &meta)?;
-    let predict = |prompt: &str| -> Result<(String, &'static str)> {
+    let noise = if diffusion {
+        ensure!(
+            matches!(config.objective, GeomObjective::Diffusion),
+            "--diffusion requires a diffusion-trained model"
+        );
+        Cpu::seed(device, SEED);
+        let block = model
+            .fusion
+            .num_blocks()
+            .checked_sub(1)
+            .context("no diffusion block")?;
+        Some((block, config.sigma_data))
+    } else {
+        None
+    };
+    let predict = |prompt: &str| -> Result<(String, &'static str, Option<f32>)> {
         ensure!(
             prompt.len() == PROMPT && prompt.is_ascii() && prompt.ends_with('?'),
             "expected a 29-byte four-point scene ending in '?'"
         );
-        // tokenize_scene needs a label to validate the frame. predict_answer
-        // reads only the prefix through '?', so the placeholder is never fed.
+        // tokenize_scene needs a label to validate the frame. Both prediction
+        // paths read only the prefix through '?'.
         let row: Vec<u16> = prompt.bytes().chain([b'A']).map(u16::from).collect();
         let scene = geomfusion::tokenize_scene(&tokenizer, &row)?;
-        let (answer, _) = model.predict_answer(&scene, &candidates, None, device)?;
+        let (answer, mse) = if let Some((block, sigma)) = noise {
+            let (answer, mse) =
+                predict_denoised(&model, &scene, &candidates, block, sigma, device)?;
+            (answer, Some(mse))
+        } else {
+            (
+                model.predict_answer(&scene, &candidates, None, device)?.0,
+                None,
+            )
+        };
         let verdict = geomfusion::kernel_check(&geomfusion::parse_scene(&row)?, answer)?;
-        Ok((char::from(answer).to_string(), verdict.name()))
+        Ok((char::from(answer).to_string(), verdict.name(), mse))
     };
     if let Some(path) = cases {
         let text = std::fs::read_to_string(path)?;
@@ -318,9 +402,11 @@ fn use_model(
         let mut kernel = BTreeMap::new();
         let mut by_kind = BTreeMap::<String, [usize; 2]>::new();
         let mut correct = 0;
+        let mut mse_sum = 0.0;
         for line in text.lines() {
             let case: Case = serde_json::from_str(line)?;
-            let (answer, verdict) = predict(&case.prompt)?;
+            let (answer, verdict, mse) = predict(&case.prompt)?;
+            mse_sum += f64::from(mse.unwrap_or(0.0));
             let hit = usize::from(answer == case.answer);
             correct += hit;
             *kernel.entry(verdict).or_insert(0) += 1;
@@ -333,19 +419,22 @@ fn use_model(
             );
         }
         ensure!(!records.is_empty(), "no held-out scenes");
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({"cases": records.len(), "correct": correct,
+        let mut report = json!({"cases": records.len(), "correct": correct,
             "accuracy": correct as f64 / records.len() as f64, "kernel": kernel,
-            "by_kind_cases_and_correct": by_kind, "predictions": records}))?
-        );
+            "by_kind_cases_and_correct": by_kind, "predictions": records});
+        if let Some((block, sigma)) = noise {
+            report["denoising"] = json!({"block": block, "sigma": sigma,
+                "mean_latent_mse": mse_sum / records.len() as f64});
+        }
+        println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         let prompt = scene.context("supply --scene or --cases")?;
-        let (answer, verdict) = predict(&prompt)?;
-        println!(
-            "{}",
-            json!({"scene": prompt, "answer": answer, "kernel": verdict})
-        );
+        let (answer, verdict, mse) = predict(&prompt)?;
+        let mut result = json!({"scene": prompt, "answer": answer, "kernel": verdict});
+        if let Some((block, sigma)) = noise {
+            result["denoising"] = json!({"block": block, "sigma": sigma, "latent_mse": mse});
+        }
+        println!("{result}");
     }
     Ok(())
 }
@@ -364,6 +453,7 @@ fn main() -> Result<()> {
             bundle,
             scene,
             cases,
-        } => use_model(&bundle, scene, cases, &device),
+            diffusion,
+        } => use_model(&bundle, scene, cases, diffusion, &device),
     }
 }

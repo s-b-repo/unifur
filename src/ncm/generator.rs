@@ -2979,7 +2979,12 @@ where
     let val_windows = match validation {
         Some(corpus) => {
             let stride = if config.aligned_windows { span } else { 1 };
-            Some(spaced_windows(corpus, config.val_windows.max(1), span, stride)?)
+            Some(spaced_windows(
+                corpus,
+                config.val_windows.max(1),
+                span,
+                stride,
+            )?)
         }
         None => None,
     };

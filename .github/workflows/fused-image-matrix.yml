@@ -1,13 +1,14 @@
 name: Train fusion and image models
 
 on:
+  workflow_dispatch:
   push:
     branches: [training/model-matrix]
+    tags: ['fusion-replay-*']
+    # Start a new fit on data changes. Replay tags rebuild and score saved weights.
     paths:
-      - .github/workflows/fused-image-matrix.yml
+      - experiments/model_matrix/prepare.py
       - experiments/model_matrix/cifar.py
-      - examples/fused_scene.rs
-      - examples/mosme_image.rs
 
 permissions:
   contents: read
@@ -46,6 +47,7 @@ jobs:
           retention-days: 14
 
   backbone:
+    if: github.ref_type == 'branch'
     needs: runtime
     runs-on: ubuntu-24.04
     timeout-minutes: 100
@@ -87,6 +89,9 @@ jobs:
     env:
       OBJECTIVE: ${{ matrix.objective }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: fusion-image-runtime
@@ -108,11 +113,7 @@ jobs:
           ./runtime/fused_scene train --corpus inputs/data/scenes/train.geom.bin \
             --meta inputs/data/scenes/train.meta.json --backbone inputs/backbone/qwen-backbone-*.mpk \
             --objective "$OBJECTIVE" --steps "$steps" --out model | tee model/train.log
-          ./runtime/fused_scene use --bundle model --cases model/test.jsonl > model/heldout.json
-          scene=$(python3 -c 'import json; print(json.loads(open("model/test.jsonl").readline())["prompt"])')
-          ./runtime/fused_scene use --bundle model --scene "$scene" | tee model/demo.json
-          python3 -c 'import json; r=json.load(open("model/heldout.json")); print("Exact", r["correct"], "of", r["cases"], "| kernel", r["kernel"])' \
-            | tee -a "$GITHUB_STEP_SUMMARY"
+          bash experiments/model_matrix/evaluate_fusion.sh ./runtime/fused_scene model "$OBJECTIVE"
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
@@ -122,6 +123,7 @@ jobs:
           retention-days: 14
 
   mosme-image:
+    if: github.ref_type == 'branch'
     needs: runtime
     runs-on: ubuntu-24.04
     timeout-minutes: 160
@@ -166,6 +168,59 @@ jobs:
         if: ${{ !cancelled() }}
         with:
           name: model-mosme-image
+          path: model/
+          if-no-files-found: error
+          retention-days: 14
+
+  replay:
+    if: github.ref_type == 'tag'
+    needs: runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        objective: [answer, diffusion]
+    env:
+      OBJECTIVE: ${{ matrix.objective }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Read source training run from the tag
+        id: source
+        run: |
+          run_id="${GITHUB_REF_NAME#fusion-replay-}"
+          [[ "$run_id" =~ ^[0-9]+$ ]]
+          printf 'run_id=%s\n' "$run_id" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with:
+          name: fusion-image-runtime
+          path: runtime
+      - uses: actions/download-artifact@v4
+        with:
+          name: fused-backbone-and-scenes
+          path: inputs
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: model-fusion-${{ matrix.objective }}
+          path: model
+          run-id: ${{ steps.source.outputs.run_id }}
+          github-token: ${{ github.token }}
+      - name: Restore, score and use the trained checkpoint
+        run: |
+          chmod +x runtime/fused_scene
+          cmp inputs/data/scenes/test.jsonl model/test.jsonl
+          cp inputs/backbone/qwen-backbone-*.mpk model/backbone.mpk
+          bash experiments/model_matrix/evaluate_fusion.sh ./runtime/fused_scene model "$OBJECTIVE"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model-fusion-${{ matrix.objective }}
           path: model/
           if-no-files-found: error
           retention-days: 14

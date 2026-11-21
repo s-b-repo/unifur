@@ -1,14 +1,12 @@
 name: Train spatial model matrix
 
 on:
+  workflow_dispatch:
   push:
     branches: [training/model-matrix]
     paths:
-      - .github/workflows/model-matrix.yml
       - experiments/model_matrix/prepare.py
       - experiments/model_matrix/worker.py
-      - examples/scene_predict.rs
-      - 'src/ncm/**'
 
 permissions:
   contents: read

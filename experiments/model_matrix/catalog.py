@@ -60,9 +60,11 @@ def command(root, name, action, scene, image, diffuse, trace):
     if image:
         raise ValueError("--image applies to mosme-image")
     if name.startswith("fusion-"):
-        if diffuse or trace:
-            raise ValueError("fused checkpoints expose the kernel-checked answer path")
+        if trace or (diffuse and name != "fusion-diffusion"):
+            raise ValueError("fusion-diffusion accepts --diffusion for the denoising path")
         flags = ["--cases", bundle / "test.jsonl"] if test else ["--scene", scene or read_json(bundle / "demo.json")["scene"]]
+        if diffuse:
+            flags.append("--diffusion")
         return [extended / "fused_scene", "use", "--bundle", bundle, *flags]
     if trace:
         if name != "vector-student" or test:
@@ -86,7 +88,7 @@ def main():
     inputs.add_argument("--scene", help="fixed-width four-point scene")
     inputs.add_argument("--query", type=Path, help='JSON with points, kind and refs, e.g. refs ["A"] for nearest')
     inputs.add_argument("--image", type=Path, help="32×32 RGB image in planar byte format")
-    parser.add_argument("--diffusion", action="store_true", help="sample the standalone geometry diffusion path")
+    parser.add_argument("--diffusion", action="store_true", help="use a diffusion model's denoising path")
     parser.add_argument("--trace", action="store_true", help="print the trained vector student's thought trace")
     args = parser.parse_args()
     root = args.artifacts.resolve()
