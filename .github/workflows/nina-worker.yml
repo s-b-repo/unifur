@@ -1,0 +1,139 @@
+name: Nina native NCM worker
+
+on:
+  push:
+    tags: ['nina-worker-smoke-*']
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Worker operation
+        type: choice
+        options: [preflight, gpu-fit]
+        default: preflight
+      corpus:
+        description: Packed corpus directory name on the GPU worker
+        type: string
+      run_key:
+        description: Persistent run directory name shared by codec and generator stages
+        type: string
+      stage:
+        description: Native training stage for gpu-fit
+        type: choice
+        options: [codec, generator]
+        default: codec
+      steps:
+        description: Final optimizer step for this stage
+        type: number
+        default: 1000
+      batch_size:
+        description: Per-step batch on the GPU worker
+        type: number
+        default: 1
+      checkpoint_every:
+        description: Optimizer steps between durable checkpoints
+        type: number
+        default: 50
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_INCREMENTAL: 0
+  RAYON_NUM_THREADS: 4
+  CARGO_PROFILE_RELEASE_LTO: "false"
+  CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+
+jobs:
+  preflight:
+    if: github.event_name == 'push' || inputs.mode == 'preflight'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: nina-native-worker
+      - name: Build the native runtime with CPU and WGPU paths
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          cargo build --locked --release --features wgpu --bin dblocks
+      - name: Train and reload both stages on Geometry3K
+        run: |
+          runtime=target/release/dblocks
+          worker=experiments/model_matrix/nina_worker.py
+          mkdir -p result
+          "$runtime" verify --group ncm | tee result/ncm-certificates.log
+          "$runtime" verify --group geom | tee result/geometry-certificates.log
+          python3 -B experiments/model_matrix/prepare.py scenes
+          python3 -B "$worker" geometry-fixture scenes inputs
+          python3 -B "$worker" validate inputs | tee result/corpus-verification.json
+          for stage in codec generator; do
+            python3 -B "$worker" fit --binary "$runtime" --input inputs --out result \
+              --profile preflight --stage "$stage" --steps 4 --batch-size 4 --checkpoint-every 4 \
+              | tee "result/$stage.log"
+          done
+          head -n 1 scenes/test.jsonl | jq -jr .prompt |
+            "$runtime" ncm generate --generator result/generator/*.mpk --tokenizer result/codec/*.mpk \
+              --prompt-stdin --json --temperature 0 | tee result/reloaded.json
+          jq -e '(.prompt_bytes == 29) and (.text[0] | type == "string")' result/reloaded.json
+          install -m 0755 "$runtime" result/dblocks
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: nina-native-preflight
+          path: result/
+          if-no-files-found: error
+          retention-days: 14
+
+  gpu-fit:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'gpu-fit'
+    runs-on: [self-hosted, linux, x64, nina-gpu]
+    timeout-minutes: 300
+    concurrency:
+      group: nina-training-${{ inputs.run_key }}
+      cancel-in-progress: false
+    env:
+      NINA_ROOT: ${{ vars.NINA_WORKER_ROOT }}
+      CORPUS: ${{ inputs.corpus }}
+      RUN_KEY: ${{ inputs.run_key }}
+      STAGE: ${{ inputs.stage }}
+      STEPS: ${{ inputs.steps }}
+      BATCH_SIZE: ${{ inputs.batch_size }}
+      CHECKPOINT_EVERY: ${{ inputs.checkpoint_every }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate the persistent corpus and checkpoint paths
+        run: |
+          [[ "$NINA_ROOT" == /* && -d "$NINA_ROOT" ]]
+          [[ "$CORPUS" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]
+          [[ "$RUN_KEY" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]]
+          python3 -B experiments/model_matrix/nina_worker.py validate "$NINA_ROOT/corpora/$CORPUS"
+      - name: Build or reuse the run's pinned runtime
+        run: |
+          run="$NINA_ROOT/runs/$RUN_KEY"
+          mkdir -p "$run"
+          if [[ -f "$run/runtime.commit" ]]; then
+            test "$(cat "$run/runtime.commit")" = "$GITHUB_SHA"
+            test -x "$run/dblocks"
+          else
+            rustup show active-toolchain || rustup toolchain install
+            cargo build --locked --release --features wgpu --bin dblocks
+            install -m 0755 target/release/dblocks "$run/.dblocks.tmp"
+            mv "$run/.dblocks.tmp" "$run/dblocks"
+            printf '%s\n' "$GITHUB_SHA" > "$run/runtime.commit"
+          fi
+      - name: Train one stage and keep its optimizer state on the worker
+        run: |
+          run="$NINA_ROOT/runs/$RUN_KEY"
+          python3 -B experiments/model_matrix/nina_worker.py fit --binary "$run/dblocks" \
+            --input "$NINA_ROOT/corpora/$CORPUS" --out "$run" --profile 4b --backend wgpu \
+            --stage "$STAGE" --steps "$STEPS" --batch-size "$BATCH_SIZE" \
+            --checkpoint-every "$CHECKPOINT_EVERY" | tee -a "$run/$STAGE.log"

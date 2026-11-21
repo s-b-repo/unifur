@@ -4,9 +4,7 @@
 //! back: progress lines through the callback, then [`NcmReport::render`].
 //! Nothing here prints.
 //!
-//! Every action runs on the CPU (`NdArray`) backend. The trainers are
-//! generic over the backend, so a GPU run is a different type argument to
-//! [`crate::ncm::tokenizer::train::train_tokenizer`], not a different trainer.
+//! The native trainers and generator share the same CPU and GPU code.
 
 use crate::ncm::tokenizer::train::{
     evaluate_checkpoint, load_student_reader, train_tokenizer, EvalReport, IntentConfig,
@@ -14,11 +12,12 @@ use crate::ncm::tokenizer::train::{
 };
 use crate::ncm::tokenizer::NcmTokenizerConfig;
 use anyhow::Result;
+use burn::backend::Autodiff;
+use burn::tensor::backend::Backend;
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
 
 type Cpu = burn::backend::NdArray<f32>;
-type CpuTrain = burn::backend::Autodiff<Cpu>;
 
 /// Next-Concept Modeling: each stage is one variant.
 #[derive(Subcommand, Debug, Clone)]
@@ -190,6 +189,15 @@ fn train_config(args: TokenizerTrainArgs) -> Result<TokenizerTrainConfig> {
 /// Run one `ncm` action on the CPU backend. Progress lines go to `progress`.
 pub fn run(action: NcmAction, progress: &mut dyn FnMut(&str)) -> Result<NcmReport> {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+    run_native::<Cpu>(action, &device, progress)
+}
+
+/// Run the native NCM pipeline with the selected backend.
+pub fn run_native<B: Backend<FloatElem = f32>>(
+    action: NcmAction,
+    device: &B::Device,
+    progress: &mut dyn FnMut(&str),
+) -> Result<NcmReport> {
     match action {
         NcmAction::Tokenizer { action } => match action {
             TokenizerAction::Train(args) => {
@@ -198,17 +206,17 @@ pub fn run(action: NcmAction, progress: &mut dyn FnMut(&str)) -> Result<NcmRepor
                 let config = train_config(*args)?;
                 let reader = match (&config.intent, reader_path) {
                     (Some(intent), Some(path)) if intent.is_active() => {
-                        Some(load_student_reader::<Cpu>(
+                        Some(load_student_reader::<B>(
                             &path,
                             reader_config.as_deref(),
                             config.tokenizer.seq_len(),
-                            &device,
+                            device,
                         )?)
                     }
                     _ => None,
                 };
-                let reader = reader.as_ref().map(|r| r as &dyn IntentReader<Cpu>);
-                let report = train_tokenizer::<CpuTrain>(&config, reader, &device, progress)?;
+                let reader = reader.as_ref().map(|r| r as &dyn IntentReader<B>);
+                let report = train_tokenizer::<Autodiff<B>>(&config, reader, device, progress)?;
                 Ok(NcmReport::TokenizerTrain(Box::new(report)))
             }
             TokenizerAction::Eval(args) => {
@@ -217,21 +225,21 @@ pub fn run(action: NcmAction, progress: &mut dyn FnMut(&str)) -> Result<NcmRepor
                     .as_deref()
                     .map(NcmTokenizerConfig::resolve)
                     .transpose()?;
-                let report = evaluate_checkpoint::<Cpu>(
+                let report = evaluate_checkpoint::<B>(
                     &args.checkpoint,
                     config,
                     &args.val_corpus,
                     args.val_windows,
                     args.batch_size,
-                    &device,
+                    device,
                 )?;
                 Ok(NcmReport::TokenizerEval(report))
             }
         },
-        NcmAction::Train(args) => train_generator_cli(*args, &device, progress)
+        NcmAction::Train(args) => train_generator_cli::<B>(*args, device, progress)
             .map(|r| NcmReport::GeneratorTrain(Box::new(r))),
         NcmAction::Generate(args) => {
-            generate_cli(*args, &device).map(|r| NcmReport::Generate(Box::new(r)))
+            generate_cli::<B>(*args, device).map(|r| NcmReport::Generate(Box::new(r)))
         }
     }
 }
@@ -334,6 +342,12 @@ pub struct GenerateArgs {
     /// Prompt text (byte-tokenized); omitted generates unconditionally.
     #[arg(long)]
     pub prompt: Option<String>,
+    /// Read the complete UTF-8 prompt from stdin up to the trained prefix width.
+    #[arg(long, conflicts_with = "prompt")]
+    pub prompt_stdin: bool,
+    /// Emit generated text and inference counters as one JSON object.
+    #[arg(long, conflicts_with = "show_thoughts")]
+    pub json: bool,
     /// Code sampling temperature; 0 is greedy.
     #[arg(long, default_value_t = 1.0)]
     pub temperature: f64,
@@ -428,11 +442,23 @@ pub struct GenerateSummary {
     /// `(level, step, text)` for every recorded thought.
     pub thoughts: Vec<(usize, usize, String)>,
     pub levels: usize,
+    json: bool,
+    prompt_bytes: usize,
 }
 
 impl GenerateSummary {
     pub fn render(&self) -> String {
         let g = &self.generation;
+        if self.json {
+            let report = serde_json::json!({
+                "text": self.text,
+                "prompt_bytes": self.prompt_bytes,
+                "levels": self.levels,
+                "level_calls": g.nfe_total,
+                "trunk_evaluations": g.trunk_evals,
+            });
+            return format!("{report}\n");
+        }
         let mut out = format!(
             "NFE {} level calls per sample (K = {}), {} total over {} sample(s); trunk evaluations {}; \
              position-steps {} of budget {} ({} crystallised); codec reconstruct {} decode {}\n",
@@ -561,30 +587,29 @@ fn generator_config(args: &GeneratorTrainArgs) -> Result<crate::ncm::generator::
     Ok(config)
 }
 
-fn train_generator_cli(
+fn train_generator_cli<B: Backend<FloatElem = f32>>(
     args: GeneratorTrainArgs,
-    device: &burn::backend::ndarray::NdArrayDevice,
+    device: &B::Device,
     progress: &mut dyn FnMut(&str),
 ) -> Result<GeneratorTrainSummary> {
     use crate::ncm::generator::{
         resume_point, train_generator, CodecShape, NcmGenerator, NcmTrainData, TrainSession,
     };
     use crate::ncm::ConceptCodec as _;
-    use burn::tensor::backend::Backend as _;
     let config = generator_config(&args)?;
-    let tokenizer = load_tokenizer::<CpuTrain>(&args.tokenizer, device)?;
+    let tokenizer = load_tokenizer::<Autodiff<B>>(&args.tokenizer, device)?;
     let tokenizer_sha256 = crate::checkpoint::file_sha256_hex(&args.tokenizer)?;
     let shape = CodecShape::of(&tokenizer)?;
     let (model, resume) = match &args.resume {
         Some(path) => {
             let (model, point) =
-                resume_point::<CpuTrain>(path, &config, &shape, &tokenizer_sha256, device)?;
+                resume_point::<Autodiff<B>>(path, &config, &shape, &tokenizer_sha256, device)?;
             (model, Some(point))
         }
         None => {
-            CpuTrain::seed(device, args.seed);
+            B::seed(device, args.seed);
             (
-                NcmGenerator::<CpuTrain>::new(&config.model, &shape, device)?,
+                NcmGenerator::<Autodiff<B>>::new(&config.model, &shape, device)?,
                 None,
             )
         }
@@ -596,11 +621,11 @@ fn train_generator_cli(
         shape.codebook_size,
         shape.latent_dim
     ));
-    let mut train = crate::corpus::TokenCorpus::in_memory(&args.corpus)?;
+    let mut train = crate::corpus::TokenCorpus::streaming(&args.corpus)?;
     let mut val = args
         .val_corpus
         .as_ref()
-        .map(|p| crate::corpus::TokenCorpus::in_memory(p))
+        .map(|p| crate::corpus::TokenCorpus::streaming(p))
         .transpose()?;
     let data = NcmTrainData {
         train: &mut train,
@@ -645,17 +670,19 @@ fn train_generator_cli(
     })
 }
 
-fn generate_cli(
+fn generate_cli<B: Backend<FloatElem = f32>>(
     args: GenerateArgs,
-    device: &burn::backend::ndarray::NdArrayDevice,
+    device: &B::Device,
 ) -> Result<GenerateSummary> {
+    use std::io::Read as _;
+
     use crate::ncm::generator::{
         generate, load_generator, thought_readout, CodeSampling, GenerateOptions,
     };
     use crate::ncm::ConceptCodec as _;
-    let tokenizer = load_tokenizer::<Cpu>(&args.tokenizer, device)?;
+    let tokenizer = load_tokenizer::<B>(&args.tokenizer, device)?;
     let tokenizer_sha256 = crate::checkpoint::file_sha256_hex(&args.tokenizer)?;
-    let loaded = load_generator::<Cpu>(&args.generator, device)?;
+    let loaded = load_generator::<B>(&args.generator, device)?;
     anyhow::ensure!(
         loaded.tokenizer_sha256 == tokenizer_sha256,
         "the generator was trained against tokenizer {}, not {}",
@@ -663,10 +690,25 @@ fn generate_cli(
         tokenizer_sha256
     );
     let config = &loaded.spec.config;
-    let prompt = match &args.prompt {
+    let input = if args.prompt_stdin {
+        anyhow::ensure!(config.prompt_len > 0, "this generator has no prompt prefix");
+        let mut text = String::new();
+        std::io::stdin()
+            .take(u64::try_from(config.prompt_len)?.saturating_add(1))
+            .read_to_string(&mut text)?;
+        anyhow::ensure!(
+            text.len() <= config.prompt_len && !text.is_empty(),
+            "stdin needs 1 to {} UTF-8 prompt bytes",
+            config.prompt_len
+        );
+        Some(text)
+    } else {
+        args.prompt
+    };
+    let prompt = match &input {
         Some(text) if config.prompt_len > 0 => {
             let ids = crate::tokenizer::ByteTokenizer::new().encode(text);
-            Some(crate::ncm::generator::prompt_tensor::<Cpu>(
+            Some(crate::ncm::generator::prompt_tensor::<B>(
                 &ids,
                 config.prompt_len,
                 config.pad_id,
@@ -724,5 +766,9 @@ fn generate_cli(
         text,
         thoughts,
         levels: tokenizer.schedule().levels(),
+        json: args.json,
+        prompt_bytes: input
+            .as_ref()
+            .map_or(0, |text| text.len().min(config.prompt_len)),
     })
 }

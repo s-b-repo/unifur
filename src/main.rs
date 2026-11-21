@@ -1802,6 +1802,8 @@ enum Command {
     Ncm {
         #[command(subcommand)]
         action: Box<diffusionblocks::ncm::cli::NcmAction>,
+        #[command(flatten)]
+        runtime: LmRuntimeArgs,
     },
     /// Token-block diffusion substrate (plan items 1-2): a BD3-LM-style
     /// semi-autoregressive byte LM with block-causal attention, per-block KV
@@ -3602,7 +3604,7 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Sigmas { num_blocks, gamma } => cmd_sigmas(num_blocks, gamma),
         Command::Lm { action } => cmd_lm(action),
-        Command::Ncm { action } => cmd_ncm(*action),
+        Command::Ncm { action, runtime } => cmd_ncm(*action, &runtime),
         Command::Tblock { action } => cmd_tblock(action),
         Command::Geom { action } => cmd_geom(action),
         Command::Experts { action } => cmd_experts(action),
@@ -5516,8 +5518,25 @@ fn cmd_tblock(action: TblockAction) -> Result<()> {
 }
 
 /// Run an `ncm` action: progress lines as they come, then the report.
-fn cmd_ncm(action: diffusionblocks::ncm::cli::NcmAction) -> Result<()> {
-    let report = diffusionblocks::ncm::cli::run(action, &mut |line| println!("{line}"))?;
+fn cmd_ncm(
+    action: diffusionblocks::ncm::cli::NcmAction,
+    runtime: &LmRuntimeArgs,
+) -> Result<()> {
+    use diffusionblocks::ncm::cli;
+    runtime.validate()?;
+    let progress = &mut |line: &str| println!("{line}");
+    let report = match runtime.backend {
+        LmBackend::Cpu => cli::run(action, progress)?,
+        LmBackend::Wgpu => {
+            #[cfg(feature = "wgpu")]
+            {
+                let device = lm_wgpu_device(runtime)?;
+                cli::run_native::<burn::backend::Wgpu<f32, i32>>(action, &device, progress)?
+            }
+            #[cfg(not(feature = "wgpu"))]
+            anyhow::bail!("WGPU support is not compiled in; rebuild with --features wgpu");
+        }
+    };
     print!("{}", report.render());
     Ok(())
 }
@@ -10655,7 +10674,7 @@ mod ncm_cli_tests {
         let flags = "dblocks ncm tokenizer train --corpus all.corpus.bin --out ckpt \
                      --val-corpus coding.val.corpus.bin --val-corpus cyber.val.corpus.bin";
         let cli = Cli::try_parse_from(flags.split_whitespace()).unwrap();
-        let Command::Ncm { action } = cli.command else {
+        let Command::Ncm { action, .. } = cli.command else {
             panic!("not an ncm command")
         };
         let NcmAction::Tokenizer {
@@ -10692,7 +10711,7 @@ mod ncm_cli_tests {
             "0.25",
         ])
         .unwrap();
-        let Command::Ncm { action } = cli.command else {
+        let Command::Ncm { action, .. } = cli.command else {
             panic!("not an ncm command")
         };
         let NcmAction::Train(args) = *action else {
@@ -10723,7 +10742,7 @@ mod ncm_cli_tests {
             "9",
         ])
         .unwrap();
-        let Command::Ncm { action } = cli.command else {
+        let Command::Ncm { action, .. } = cli.command else {
             panic!("not an ncm command")
         };
         let NcmAction::Generate(args) = *action else {
