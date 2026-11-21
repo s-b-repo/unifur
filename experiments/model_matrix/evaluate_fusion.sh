@@ -6,13 +6,27 @@ bundle=$2
 objective=$3
 cases="$bundle/test.jsonl"
 
-"$runtime" use --bundle "$bundle" --cases "$cases" > "$bundle/heldout.json"
+save_result() {
+  local output=$1
+  shift
+  local temporary
+  temporary=$(mktemp "$output.XXXXXX")
+  if ! "$runtime" use --bundle "$bundle" "$@" > "$temporary"; then
+    rm -- "$temporary"
+    return 1
+  fi
+  mv -- "$temporary" "$output"
+}
+
+save_result "$bundle/heldout.json" --cases "$cases"
 scene=$(head -n 1 "$cases" | jq -er .prompt)
 reports=(heldout.json)
-"$runtime" use --bundle "$bundle" --scene "$scene" | tee "$bundle/demo.json"
+save_result "$bundle/demo.json" --scene "$scene"
+cat "$bundle/demo.json"
 if [[ "$objective" == diffusion ]]; then
-  "$runtime" use --bundle "$bundle" --cases "$cases" --diffusion > "$bundle/heldout-denoised.json"
-  "$runtime" use --bundle "$bundle" --scene "$scene" --diffusion | tee "$bundle/demo-denoised.json"
+  save_result "$bundle/heldout-denoised.json" --cases "$cases" --diffusion
+  save_result "$bundle/demo-denoised.json" --scene "$scene" --diffusion
+  cat "$bundle/demo-denoised.json"
   reports+=(heldout-denoised.json)
 fi
 
