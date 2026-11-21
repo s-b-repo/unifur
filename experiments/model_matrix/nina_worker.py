@@ -97,6 +97,9 @@ def fit(args):
         raise ValueError("The 4B recipe requires a discrete WGPU training worker")
     if min(args.steps, args.batch_size, args.checkpoint_every) < 1:
         raise ValueError("Training steps, batch size and checkpoint interval must be positive")
+    planned_records = args.steps * args.batch_size
+    if not small and planned_records < data["records"]["train"]:
+        raise ValueError("The 4B run must schedule at least one pass over every packed training record")
 
     args.out.mkdir(parents=True, exist_ok=True)
     directory = args.out / args.stage
@@ -129,7 +132,7 @@ def fit(args):
                                 "decoder_blocks": 1, "heads": 4, "ema_decay": 0.95,
                                 "commitment_beta": 0.25, "nested_dropout": 0.5,
                                 "dead_code_threshold": 0.03})
-        options += ["tokenizer", "train", "--config", config]
+        options += ["tokenizer", "train", "--config", config, "--ordered-records"]
         stream = "codec"
     else:
         _, tokenizer = checkpoint(args.out / "codec", "ncm-tokenizer")
@@ -139,7 +142,7 @@ def fit(args):
         shape = {"blocks": 2, "hidden": 64, "heads": 4, "thinking_steps": 2, "attractor": True} if small else FOUR_BILLION
         write_json(config, {**shape, "prompt_len": data["prompt_width"]})
         options += ["train", "--config", config, "--tokenizer", tokenizer, "--aligned-windows",
-                    "--warmup", min(100, args.steps), "--seed", 42]
+                    "--ordered-records", "--warmup", min(100, args.steps), "--seed", 42]
         stream = "aligned"
     options += ["--corpus", args.input / f"train.{stream}.bin",
                 "--val-corpus", args.input / f"validation.{stream}.bin",
@@ -151,7 +154,9 @@ def fit(args):
     step, final = checkpoint(directory, kind)
     if step != args.steps:
         raise RuntimeError(f"Expected a reloadable checkpoint at step {args.steps}, got {step}")
-    print(json.dumps({"stage": args.stage, "step": step, "checkpoint": str(final)}))
+    full_passes, records_in_next_pass = divmod(planned_records, data["records"]["train"])
+    print(json.dumps({"stage": args.stage, "step": step, "checkpoint": str(final),
+                      "full_passes": full_passes, "records_in_next_pass": records_in_next_pass}))
 
 
 def main():

@@ -5518,10 +5518,7 @@ fn cmd_tblock(action: TblockAction) -> Result<()> {
 }
 
 /// Run an `ncm` action: progress lines as they come, then the report.
-fn cmd_ncm(
-    action: diffusionblocks::ncm::cli::NcmAction,
-    runtime: &LmRuntimeArgs,
-) -> Result<()> {
+fn cmd_ncm(action: diffusionblocks::ncm::cli::NcmAction, runtime: &LmRuntimeArgs) -> Result<()> {
     use diffusionblocks::ncm::cli;
     runtime.validate()?;
     let progress = &mut |line: &str| println!("{line}");

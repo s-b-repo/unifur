@@ -54,6 +54,9 @@ pub struct TokenizerTrainArgs {
     /// none, the corpus tail (`--val-fraction`, cut at a BOS) is held out.
     #[arg(long = "val-corpus")]
     pub val_corpus: Vec<PathBuf>,
+    /// Read whole pre-shuffled response records in order rather than slicing random windows.
+    #[arg(long)]
+    pub ordered_records: bool,
     /// `tiny` (CPU minutes), `paper-owt`, `nina-4k` (GPU), or a JSON file of
     /// `NcmTokenizerConfig` fields.
     #[arg(long, default_value = "tiny")]
@@ -169,6 +172,7 @@ fn train_config(args: TokenizerTrainArgs) -> Result<TokenizerTrainConfig> {
     });
     Ok(TokenizerTrainConfig {
         val_corpora: args.val_corpus,
+        ordered_records: args.ordered_records,
         val_fraction: args.val_fraction,
         steps: args.steps,
         batch_size: args.batch_size,
@@ -295,6 +299,9 @@ pub struct GeneratorTrainArgs {
     /// Sample complete fixed-width prompt/target records, using the full prompt.
     #[arg(long)]
     pub aligned_windows: bool,
+    /// Visit each pre-shuffled prompt/target record before starting the next pass.
+    #[arg(long, requires = "aligned_windows")]
+    pub ordered_records: bool,
     /// Weight of the deep-supervision term on intermediate states.
     #[arg(long)]
     pub deep_supervision: Option<f64>,
@@ -578,6 +585,7 @@ fn generator_config(args: &GeneratorTrainArgs) -> Result<crate::ncm::generator::
         seed: args.seed,
         estimator,
         aligned_windows: args.aligned_windows,
+        ordered_records: args.ordered_records,
         val_every: args.val_every,
         val_windows: args.val_windows,
         checkpoint_every: args.checkpoint_every,

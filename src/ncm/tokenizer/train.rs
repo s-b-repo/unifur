@@ -417,6 +417,9 @@ pub struct TokenizerTrainConfig {
     /// Held-out sets, one report each; empty holds out the corpus tail.
     #[serde(default)]
     pub val_corpora: Vec<PathBuf>,
+    /// Train on whole pre-shuffled response records in corpus order.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ordered_records: bool,
     /// Tail fraction held out when `val_corpora` is empty.
     pub val_fraction: f64,
     pub steps: usize,
@@ -456,6 +459,7 @@ impl TokenizerTrainConfig {
             tokenizer,
             corpus,
             val_corpora: Vec::new(),
+            ordered_records: false,
             val_fraction: 0.05,
             steps: 300,
             batch_size: 16,
@@ -498,6 +502,10 @@ impl TokenizerTrainConfig {
             self.val_fraction
         );
         ensure!(self.val_windows >= 1, "val_windows must be at least 1");
+        ensure!(
+            !self.ordered_records || !self.val_corpora.is_empty(),
+            "ordered codec records require a separate validation corpus"
+        );
         if let Some(intent) = &self.intent {
             ensure!(
                 intent.weight >= 0.0 && intent.weight.is_finite(),
@@ -595,6 +603,10 @@ pub fn tail_cut(tokens: &[u16], fraction: f64) -> usize {
 pub fn load_data(config: &TokenizerTrainConfig) -> Result<(Vec<u16>, Vec<ValSet>)> {
     let l = config.tokenizer.seq_len();
     let tokens = read_tokens(&config.corpus)?;
+    ensure!(
+        !config.ordered_records || tokens.len().is_multiple_of(l),
+        "ordered codec training data must contain whole records of {l} tokens"
+    );
     let make_set = |name: String, stream: &[u16]| -> ValSet {
         let windows = tile_windows(stream, l, config.val_windows);
         let note = windows.is_empty().then(|| {
@@ -621,7 +633,12 @@ pub fn load_data(config: &TokenizerTrainConfig) -> Result<(Vec<u16>, Vec<ValSet>
     } else {
         let mut sets = Vec::with_capacity(config.val_corpora.len());
         for path in &config.val_corpora {
-            sets.push(make_set(set_name(path), &read_tokens(path)?));
+            let tokens = read_tokens(path)?;
+            ensure!(
+                !config.ordered_records || tokens.len().is_multiple_of(l),
+                "ordered codec validation data must contain whole records of {l} tokens"
+            );
+            sets.push(make_set(set_name(path), &tokens));
         }
         (tokens, sets)
     };
@@ -1065,7 +1082,11 @@ pub fn train_tokenizer<B: AutodiffBackend<FloatElem = f32>>(
                         .div_ceil(tok_config.schedule.len_of(0).unwrap_or(1)),
                 )
                 .min(config.batch_size * 8);
-            let windows = draw_windows(&train, l, init_count, &mut rng);
+            let windows = if config.ordered_records {
+                tile_windows(&train, l, init_count)
+            } else {
+                draw_windows(&train, l, init_count, &mut rng)
+            };
             let tokenizer = tokenizer
                 .init_codebooks_from_data(tokens_tensor::<B>(&windows, l, device), &mut rng)?;
             // The head is built after the tokenizer and draws nothing from the
@@ -1133,8 +1154,18 @@ pub fn train_tokenizer<B: AutodiffBackend<FloatElem = f32>>(
         let mut pooled = Vec::new();
         let mut losses = LossParts::default();
         let mut ready = None;
-        for _ in 0..config.accumulate {
-            let windows = draw_windows(&train, l, config.batch_size, &mut rng);
+        for micro in 0..config.accumulate {
+            let windows = if config.ordered_records {
+                let batch_index = step
+                    .checked_mul(config.accumulate)
+                    .and_then(|index| index.checked_add(micro))
+                    .context("ordered codec batch index overflow")?;
+                crate::ncm::ordered_record_offsets(train.len(), l, config.batch_size, batch_index)?
+                    .map(|start| train[start..start + l].to_vec())
+                    .collect()
+            } else {
+                draw_windows(&train, l, config.batch_size, &mut rng)
+            };
             let cutoffs = draw_cutoffs(
                 config.batch_size,
                 levels,

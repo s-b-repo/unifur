@@ -2,6 +2,27 @@
 
 Everything `dblocks train` can do, and how to read what it reports.
 
+## Native Nina workers
+
+Nina uses a frozen multiscale codec and a concept-field generator. Each
+generator level combines geometric metric scoring and latent vector updates
+before committing NCM codes. Train the codec with `dblocks ncm tokenizer train`
+and the generator with `dblocks ncm train`. A checkpoint travels with its
+`.state` sidecar and the exact codec it was trained against.
+
+The [Nina worker](../.github/workflows/nina-worker.yml) builds the WGPU-capable
+runtime, trains and reloads a four-step CPU preflight, or fits one stage on a
+registered `nina-gpu` runner. The [worker script](../experiments/model_matrix/nina_worker.py)
+validates each aligned and codec stream against its corpus manifest. GPU
+runs retain their exact source revision, runtime, data hash and optimizer
+state under a persistent run key. The worker traverses complete records
+in prepared order and resumes at the recorded batch. Train the codec first and evaluate its
+reconstruction on held-out long answers before fitting the generator.
+
+`dblocks ncm generate --prompt-stdin --json` accepts one UTF-8 prompt and
+reports measured level calls and trunk evaluations. Keep persistent context
+in Subnext and pass only the current working set from Omni.
+
 ---
 
 ## In this repository

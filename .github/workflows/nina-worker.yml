@@ -81,7 +81,7 @@ jobs:
           head -n 1 scenes/test.jsonl | jq -jr .prompt |
             "$runtime" ncm generate --generator result/generator/*.mpk --tokenizer result/codec/*.mpk \
               --prompt-stdin --json --temperature 0 | tee result/reloaded.json
-          jq -e '(.prompt_bytes == 29) and (.text[0] | type == "string")' result/reloaded.json
+          jq -e '.prompt_bytes == 29 and .level_calls == 3 and .trunk_evaluations == 6 and (.text[0] | type == "string")' result/reloaded.json
           install -m 0755 "$runtime" result/dblocks
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}

@@ -2448,6 +2448,9 @@ pub struct NcmTrainConfig {
     /// Input is prearranged in prompt + target records of a fixed width.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub aligned_windows: bool,
+    /// Traverse the prepared corpus order for complete training passes.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub ordered_records: bool,
     /// Validate every this many steps (0: only at start and end).
     pub val_every: usize,
     /// Fixed validation windows (evenly spaced over the validation corpus).
@@ -2470,6 +2473,7 @@ impl Default for NcmTrainConfig {
             seed: 0,
             estimator: LossEstimator::SampledLevel,
             aligned_windows: false,
+            ordered_records: false,
             val_every: 0,
             val_windows: 16,
             checkpoint_every: 0,
@@ -2484,6 +2488,10 @@ impl NcmTrainConfig {
         ensure!(
             self.steps >= 1 && self.batch_size >= 1,
             "steps and batch_size must be positive"
+        );
+        ensure!(
+            !self.ordered_records || self.aligned_windows,
+            "ordered records require aligned windows"
         );
         ensure!(
             self.peak_lr.is_finite()
@@ -3040,7 +3048,12 @@ where
     for step in start_step..config.steps {
         B::seed(device, crate::train::step_seed(config.seed, step));
         let batch = config.batch_size;
-        let (windows, prompt_lens) = if config.aligned_windows {
+        let (windows, prompt_lens) = if config.ordered_records {
+            let windows = super::ordered_record_offsets(train.len(), span, batch, step)?
+                .map(|start| train.window(start, span))
+                .collect::<Result<_>>()?;
+            (windows, vec![prompt_len; batch])
+        } else if config.aligned_windows {
             (
                 crate::geometry::sample_aligned_batch(train, span, batch, &mut rng)?,
                 vec![prompt_len; batch],
@@ -3174,11 +3187,19 @@ where
                 .unwrap_or(f32::NAN),
         );
         if !loss_value.is_finite() {
+            ensure!(
+                !config.ordered_records,
+                "non-finite loss in ordered batch at step {step}"
+            );
             report.steps_skipped += 1;
             continue;
         }
         let mut grads = GradientsParams::from_grads(loss.backward(), &model);
         let grad_norm = crate::quality::global_grad_norm(&model, &grads);
+        ensure!(
+            !config.ordered_records || grad_norm.is_finite(),
+            "non-finite gradient in ordered batch at step {step}"
+        );
         let clipped = config.grad_clip > 0.0 && grad_norm > config.grad_clip as f32;
         if clipped {
             crate::schedule::clip_gradients(&mut grads, &model, grad_norm, config.grad_clip as f32);

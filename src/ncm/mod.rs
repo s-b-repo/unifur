@@ -140,6 +140,22 @@ impl LevelSchedule {
     }
 }
 
+/// Traverse the prepared corpus order, starting at a resumable batch index.
+pub(crate) fn ordered_record_offsets(
+    tokens: usize,
+    width: usize,
+    count: usize,
+    batch_index: usize,
+) -> Result<impl Iterator<Item = usize>> {
+    ensure!(
+        width > 0 && tokens >= width && tokens.is_multiple_of(width),
+        "expected whole records of width {width}, got {tokens} tokens"
+    );
+    let records = (tokens / width) as u128;
+    let start = (batch_index as u128 * count as u128) % records;
+    Ok((0..count).map(move |offset| ((start + offset as u128) % records) as usize * width))
+}
+
 /// Codes for every level, coarse to fine: `codes[k]` is `[batch, ℓ_k]` with
 /// values in `0..codebook_size`.
 #[derive(Debug, Clone)]
@@ -247,6 +263,19 @@ pub trait LevelModel<B: Backend> {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordered_batches_cover_each_record_and_resume_at_wrap() {
+        let offsets = |batch| {
+            ordered_record_offsets(20, 4, 3, batch)
+                .unwrap()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(offsets(0), [0, 4, 8]);
+        assert_eq!(offsets(1), [12, 16, 0]);
+        assert_eq!(offsets(2), [4, 8, 12]);
+        assert!(ordered_record_offsets(22, 4, 3, 0).is_err());
+    }
 
     #[test]
     fn test_geometric_schedule_is_strictly_increasing_and_ends_at_l() {
