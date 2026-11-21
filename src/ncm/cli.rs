@@ -500,7 +500,7 @@ impl GenerateSummary {
 
 /// Load a tokenizer checkpoint with the architecture its training state
 /// records, frozen.
-fn load_tokenizer<B: burn::tensor::backend::Backend>(
+pub fn load_tokenizer<B: burn::tensor::backend::Backend>(
     path: &std::path::Path,
     device: &B::Device,
 ) -> Result<crate::ncm::tokenizer::NcmTokenizer<B>> {

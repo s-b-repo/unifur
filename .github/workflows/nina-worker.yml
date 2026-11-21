@@ -62,7 +62,7 @@ jobs:
       - name: Build the native runtime with CPU and WGPU paths
         run: |
           rustup show active-toolchain || rustup toolchain install
-          cargo build --locked --release --features wgpu --bin dblocks
+          cargo build --locked --release --features wgpu --bin dblocks --example ncm_grid_probe
       - name: Train and reload both stages on Geometry3K
         run: |
           runtime=target/release/dblocks
@@ -83,6 +83,11 @@ jobs:
               --prompt-stdin --json --temperature 0 | tee result/reloaded.json
           jq -e '.prompt_bytes == 29 and .level_calls == 3 and .trunk_evaluations == 6 and (.text[0] | type == "string")' result/reloaded.json
           install -m 0755 "$runtime" result/dblocks
+      - name: Verify two synchronous native NCM ranks on CPU
+        run: |
+          RAYON_NUM_THREADS=1 MATMUL_NUM_THREADS=1 target/release/examples/ncm_grid_probe \
+            --workers 2 --codec result/codec/*.mpk --corpus inputs/train.aligned.bin \
+            | tee result/grid-2.json
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
         with:
