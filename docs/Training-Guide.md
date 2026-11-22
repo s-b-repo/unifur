@@ -101,12 +101,52 @@ validation batch. Keep the runtime, matching codec and generator, and both
 `.state` sidecars together. Cosine is the default. WSD remains available for
 measured comparisons.
 
-The standard generation path reuses prompt embeddings, masks and fixed
-codebook statistics. On the local CPU parity set, 64 greedy and eight
+The standard generation path reuses prompt embeddings, masks, the frozen
+concept metric and fixed codebook statistics. On the local CPU parity set, 64 greedy and eight
 seeded sampling requests reproduced the previous reports. For public
 release, verify clean-restart reproducibility and evaluate long-answer
 reconstruction, held-out answer quality, geometry and external-context
 behavior.
+
+### Reproduce the compact grounding pilot
+
+The [grounding scripts](../experiments/nina_grounding/) build paired questions
+with two different supported answers, related distractors and evidence-free
+controls. The codec defaults to 16-byte targets with balanced frequencies,
+disjoint synthetic values and 160 ordered updates. Evaluation uses different
+source identities and paraphrased questions.
+
+```bash
+cargo build --locked --release --bin dblocks
+pilot=experiments/nina_grounding
+run=$(mktemp -d)
+python3 -B "$pilot/grounding.py" prepare --out "$run/corpus"
+python3 -B "$pilot/pilot.py" --data "$run/corpus" --out "$run/codec" \
+  --codec-only --threads 3 --val-windows 24
+tokenizer=$(jq -er '.tokenizer.path' "$run/codec/codec.json")
+python3 -B "$pilot/grounding.py" oracle --cases "$run/corpus/test.jsonl" \
+  --tokenizer "$tokenizer" --out "$run/codec-test.json"
+```
+
+The codec reproduced 60 of 72 targets through EOS, including 24 of 36
+supported answers. The generator trained with this codec scored 0 of 36
+on the supported holdout. `--no-balance-codec`, `--no-augment-codec` and
+`--no-ordered-codec` provide corpus and training controls. Use
+`grounding.py evaluate` to score a generator with the same cases.
+
+`grounding_stress.py` uses the pinned Subnext reader and answerability
+models to measure the trade-off between abstention and exact supported
+answers. Set `NINA_SUBNEXT_SCRIPTS` if Subnext is outside the sibling
+checkout layout. Pass the public SQuAD 2.0 development set with
+`--squad-dev`, the prepared corpus with `--corpus`, the Subnext model
+directory with `--model`, and a report path with `--out`.
+[Subnext semantic model setup](https://github.com/s-b-repo/subnext/blob/main/README.md#learned-retrieval-for-compact-evidence) · [SQuAD 2.0](https://rajpurkar.github.io/SQuAD-explorer/) · [Selective QA under domain shift](https://aclanthology.org/2020.acl-main.503/)
+
+GLM-5.2 uses index reuse to reduce repeated attention selection. The
+Nina runtime applies the related idea to tensors fixed within one request.
+Subnext's hybrid shortlist and reranking follow the same broad two-stage
+pattern as the context selection studied by DeepSeek and MiniMax.
+[GLM-5.2](https://huggingface.co/blog/zai-org/glm-52-blog) · [DeepSeek-V4](https://arxiv.org/abs/2606.19348) · [MiniMax Sparse Attention](https://arxiv.org/abs/2606.13392)
 
 ### Gate a trained candidate
 
