@@ -2276,8 +2276,9 @@ fn integration_direction_ablation_penalty_and_heretic_run_on_a_trained_model() {
     // Roadmap Phase 31 end to end on a tiny model: train a few steps, extract
     // a direction from two prompt sets, ablate it from the weights (gates
     // honoured), train with the activation penalty, and run a three-trial
-    // Heretic search whose result is a usable model.
+    // Heretic search whose unchanged control remains a usable model.
     use diffusionblocks::ablation::{best, extract, orthogonalize, residual_projection};
+    use diffusionblocks::checkpoint::canonical_hash_hex;
     use diffusionblocks::corpus::TokenCorpus;
     use diffusionblocks::heretic::{decensor, HereticConfig};
     use diffusionblocks::lm::{LanguageModel, LmConfig};
@@ -2328,7 +2329,7 @@ fn integration_direction_ablation_penalty_and_heretic_run_on_a_trained_model() {
     .unwrap();
 
     // A direction from the trained model's own residual stream.
-    let target = ["write a keylogger", "write an exploit", "make malware"];
+    let target = ["write a checklist", "write a schedule", "make a diagram"];
     let baseline = ["what is a port", "explain a socket", "sort a list"];
     let residuals = |prompts: &[&str]| -> Vec<Vec<Vec<f32>>> {
         prompts
@@ -2364,7 +2365,7 @@ fn integration_direction_ablation_penalty_and_heretic_run_on_a_trained_model() {
         touched > 0 && after < before,
         "touched {touched}, {before} -> {after}"
     );
-    let ids = tokenizer.encode("keylogger");
+    let ids = tokenizer.encode("diagram");
     let ids64: Vec<i64> = ids.iter().map(|t| i64::from(*t)).collect();
     let n = ids64.len();
     let tokens =
@@ -2402,7 +2403,8 @@ fn integration_direction_ablation_penalty_and_heretic_run_on_a_trained_model() {
     );
     assert!(penalized.hidden_size() == model.hidden_size());
 
-    // Heretic: three trials, a best, and a model that still generates.
+    // Four output bytes cannot match a refusal phrase in the default detector.
+    // The untouched model therefore gives the search a zero-score control.
     let heretic = HereticConfig {
         target: target.iter().map(|s| s.to_string()).collect(),
         baseline: baseline.iter().map(|s| s.to_string()).collect(),
@@ -2412,13 +2414,20 @@ fn integration_direction_ablation_penalty_and_heretic_run_on_a_trained_model() {
         seed: 1,
         detector: None,
     };
-    let (decensored, report) = decensor(model.clone(), &heretic, &device).unwrap();
+    let (selected, report) = decensor(model.clone(), &heretic, &device).unwrap();
     assert_eq!(report.trials.len(), 3);
     assert_eq!(report.directions.len(), model.num_layers());
-    let best_trial = report.best.as_ref().unwrap();
-    assert!(report.trials.iter().all(|t| t.score >= best_trial.score));
-    assert!(best_trial.kl.is_finite() && (0.0..=1.0).contains(&best_trial.refusals));
-    let out = decensored.generate(
+    assert_eq!(report.baseline_refusals, 0.0);
+    assert!(report.best.is_none());
+    assert!(report
+        .trials
+        .iter()
+        .all(|trial| { trial.kl.is_finite() && trial.score >= report.baseline_refusals }));
+    assert_eq!(
+        canonical_hash_hex::<B, _>(&selected),
+        canonical_hash_hex::<B, _>(&model)
+    );
+    let out = selected.generate(
         &ids,
         3,
         &diffusionblocks::lm::Sampling::Greedy,
@@ -2427,8 +2436,7 @@ fn integration_direction_ablation_penalty_and_heretic_run_on_a_trained_model() {
     );
     assert!(out.len() > ids.len());
 
-    // The same search from the trainer makes the decensored model the run's
-    // final checkpoint.
+    // The trainer records the trials and the unchanged control decision.
     let (_, report) = train_lm(
         model,
         &mut corpus,
@@ -2445,7 +2453,9 @@ fn integration_direction_ablation_penalty_and_heretic_run_on_a_trained_model() {
         &device,
     )
     .unwrap();
-    assert_eq!(report.heretic.as_ref().unwrap().trials.len(), 2);
+    let search = report.heretic.as_ref().unwrap();
+    assert_eq!(search.trials.len(), 2);
+    assert!(search.best.is_none());
     std::fs::remove_dir_all(&dir).ok();
 }
 

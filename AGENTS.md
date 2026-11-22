@@ -9,9 +9,8 @@ with warnings as errors, the test suite, the pattern audit, the docs, and the
 numerical certificate suite. It takes several minutes. CI runs exactly these
 targets, so a green `make gate` and a green CI are the same command.
 
-Current state of the tree: 1201 unit tests (1176 lib + 25 `dblocks`-bin), 38
-integration tests, 255/255 certificates. If your change makes a number
-smaller, that is the finding.
+The default suite has 1,620 library tests including seven explicit opt-ins,
+39 CLI tests, 38 integration and resume tests, and 334 numerical certificates.
 
 ---
 
