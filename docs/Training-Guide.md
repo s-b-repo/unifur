@@ -106,14 +106,17 @@ their own training and behavioral evaluations. [Upstream XSum weights](https://h
 
 | Native XSum probe | Result |
 |---|---|
-| Shared-prefix adapter training | Source passes fell from 4 to 1 and concept-level passes from 36 to 33. Adapter biases and held-out losses were identical. |
+| Shared-prefix adapter training | Source passes fell from 4 to 1 and concept-level passes from 36 to 33. The original release probe returned identical adapter biases and held-out losses. |
 | Pooling before the value projection | The isolated diagnostic moved from 360 to 48 value projections with maximum FP32 difference `8.94e-8`. |
 | Certified integer attention | All 48 decisions matched the full integer reference, and 32 of 1,440 token scores were skipped. Agreement with the floating-point readout was 46/48. |
-| Generation and certificates | The reference comparison matched 200 concept codes and 48 output tokens. All 34 NCM certificates passed in the XSum port's validation build with LTO disabled. |
+| Generation and certificates | The reference comparison matched 200 concept codes and 48 output tokens. The original XSum build passed all 34 NCM certificates with LTO disabled. The integrated build matched generation again and passed all 36 NCM and eight NCM-decode certificates. |
 
 Shared-prefix reuse is the adapter training default. The pooled projection
 comparison and integer readout run on demand with
 `--attention-certificate`. Generation uses its floating-point path.
+An integrated two-thread debug replay reproduced the training pass counts
+with maximum differences of `3.63e-7` in adapter biases and `1.06e-5` nats
+in held-out losses. Record the build and thread settings with parity results.
 
 ```bash
 CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
