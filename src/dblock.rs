@@ -732,8 +732,8 @@ pub fn precondition(sigma: f64, sigma_data: f64) -> EdmPreconditioning {
 mod tests {
     use super::*;
     use crate::vit::ViTDiTConfig;
-    use burn::backend::NdArray;
     use burn::tensor::Distribution;
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 

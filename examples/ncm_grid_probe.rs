@@ -3,10 +3,11 @@
 //! conditioning, a frozen codec, and one optimizer.
 
 use anyhow::{anyhow, ensure, Context, Result};
-use burn::backend::{Autodiff, NdArray};
 use burn::module::{Module, ModuleVisitor, Param};
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::tensor::{backend::Backend, backend::BackendTypes, Int, Tensor};
+use burn_autodiff::Autodiff;
+use burn_ndarray::NdArray;
+use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
 use clap::Parser;
 use diffusionblocks::{
     checkpoint,

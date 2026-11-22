@@ -1,8 +1,8 @@
 //! Load a trained spatial model and score unlabeled prompts in its training format.
 
 use anyhow::{ensure, Context, Result};
-use burn::backend::NdArray;
 use burn::tensor::{Int, Tensor};
+use burn_ndarray::NdArray;
 use clap::{Parser, ValueEnum};
 use diffusionblocks::{
     checkpoint,

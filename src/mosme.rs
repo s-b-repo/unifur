@@ -44,9 +44,9 @@
 
 use burn::{
     module::{Module, Param},
-    nn::Linear,
     tensor::{activation::softmax, backend::Backend, Int, Tensor},
 };
+use burn_nn::Linear;
 
 use crate::{
     dblock::DblockClassifier,
@@ -1775,15 +1775,15 @@ impl TrainableSet {
         &self,
         grads: &mut BB::Gradients,
         model: &M,
-    ) -> burn::optim::GradientsParams
+    ) -> burn_optim::GradientsParams
     where
         BB: burn::tensor::backend::AutodiffBackend,
         M: burn::module::AutodiffModule<BB>,
     {
         match &self.ids {
             // Unfiltered, so the common case pays no lookup cost.
-            None => burn::optim::GradientsParams::from_module(grads, model),
-            Some(ids) => burn::optim::GradientsParams::from_params(grads, model, ids),
+            None => burn_optim::GradientsParams::from_module(grads, model),
+            Some(ids) => burn_optim::GradientsParams::from_params(grads, model, ids),
         }
     }
 }
@@ -1848,8 +1848,8 @@ impl<B: Backend> MosmeFeedForward<B> {
 mod tests {
     use super::*;
     use crate::expert_index::{BoxSpec, ExpertSpec};
-    use burn::backend::NdArray;
     use burn::tensor::Distribution;
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 
@@ -2392,9 +2392,9 @@ mod tests {
         // Strictly stronger than the flat LoRA identity: every branch is zero,
         // so the bank equals its base for *any* input and *any* routing
         // condition, not just one adapter at one point.
-        use burn::nn::LinearConfig;
+        use burn_nn::LinearConfig;
         let device = Default::default();
-        let base: burn::nn::Linear<B> = LinearConfig::new(8, 6).init(&device);
+        let base: burn_nn::Linear<B> = LinearConfig::new(8, 6).init(&device);
         crate::tensor_ext::force_initialization(&base);
         let spec = ragged_spec();
         let bank = MosmeAdapterBank::<B>::from_linear(base.clone(), &spec, 4, 4, 4.0, &device);
@@ -2417,9 +2417,9 @@ mod tests {
         // The linearity that makes merging legal:
         //   sum_e g_e (x A_e B_e s_e) == x (sum_e g_e dW_e).
         // Checked with non-trivial adapters, so it is not 0 == 0.
-        use burn::nn::LinearConfig;
+        use burn_nn::LinearConfig;
         let device = Default::default();
-        let base: burn::nn::Linear<B> = LinearConfig::new(8, 6).init(&device);
+        let base: burn_nn::Linear<B> = LinearConfig::new(8, 6).init(&device);
         crate::tensor_ext::force_initialization(&base);
         // Routing must not depend on x here: `merged_for` collapses ONE
         // routing decision into a weight, so the batch has to route uniformly.
@@ -2480,9 +2480,9 @@ mod tests {
 
     #[test]
     fn test_adapter_bank_index_records_rank_and_site() {
-        use burn::nn::LinearConfig;
+        use burn_nn::LinearConfig;
         let device = Default::default();
-        let base: burn::nn::Linear<B> = LinearConfig::new(256, 128).init(&device);
+        let base: burn_nn::Linear<B> = LinearConfig::new(256, 128).init(&device);
         let spec = ragged_spec();
         let bank = MosmeAdapterBank::<B>::from_linear(base, &spec, 4, 8, 16.0, &device);
 
@@ -2511,9 +2511,9 @@ mod tests {
 
     #[test]
     fn test_quantized_bank_base_lands_on_the_nf4_grid() {
-        use burn::nn::LinearConfig;
+        use burn_nn::LinearConfig;
         let device = Default::default();
-        let base: burn::nn::Linear<B> = LinearConfig::new(64, 8).init(&device);
+        let base: burn_nn::Linear<B> = LinearConfig::new(64, 8).init(&device);
         crate::tensor_ext::force_initialization(&base);
         let dense = base.weight.val();
         let spec = MosmeSpec::flat(2);
@@ -2538,10 +2538,10 @@ mod tests {
     fn test_adapter_bank_training_modes() {
         use crate::train::DefaultTrainBackend as A;
         use burn::module::list_param_ids;
-        use burn::nn::LinearConfig;
+        use burn_nn::LinearConfig;
 
         let device = Default::default();
-        let base: burn::nn::Linear<A> = LinearConfig::new(8, 6).init(&device);
+        let base: burn_nn::Linear<A> = LinearConfig::new(8, 6).init(&device);
         let spec = ragged_spec();
         let bank = MosmeAdapterBank::<A>::from_linear(base, &spec, 4, 4, 4.0, &device);
 
@@ -2618,7 +2618,7 @@ mod tests {
         // The operational claim behind "add a specialist without retraining the
         // others", checked by actually taking an optimizer step.
         use crate::train::DefaultTrainBackend as A;
-        use burn::optim::{AdamWConfig, Optimizer};
+        use burn_optim::{AdamWConfig, Optimizer};
 
         let device = Default::default();
         let spec = ragged_spec();

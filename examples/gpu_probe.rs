@@ -31,14 +31,15 @@ use anyhow::Result;
 #[cfg(feature = "wgpu")]
 mod probe {
     use anyhow::{anyhow, Context, Result};
-    use burn::backend::ndarray::NdArrayDevice;
-    use burn::backend::wgpu::graphics::AutoGraphicsApi;
-    use burn::backend::wgpu::{init_setup, RuntimeOptions, WgpuDevice};
-    use burn::backend::{NdArray, Wgpu};
     use burn::module::Module;
     use burn::record::{FullPrecisionSettings, NamedMpkBytesRecorder, Recorder};
     use burn::tensor::backend::Backend;
     use burn::tensor::{Distribution, Int, Tensor};
+    use burn_ndarray::NdArray;
+    use burn_ndarray::NdArrayDevice;
+    use burn_wgpu::graphics::AutoGraphicsApi;
+    use burn_wgpu::Wgpu;
+    use burn_wgpu::{init_setup, RuntimeOptions, WgpuDevice};
     use diffusionblocks::student::{GeometricStudent, StudentConfig};
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::time::Instant;

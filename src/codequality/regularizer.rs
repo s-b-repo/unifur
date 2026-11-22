@@ -112,7 +112,7 @@ impl QualityRegularizer {
 mod tests {
     use super::*;
     use crate::codequality::{Dimension, Language};
-    use burn::backend::NdArray;
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 

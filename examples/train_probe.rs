@@ -149,13 +149,13 @@ fn run_wgpu(
 ) -> Result<RunOutcome> {
     if checkpointed {
         measured_run::<
-            burn::backend::Autodiff<
-                burn::backend::Wgpu<f32>,
-                burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing,
+            burn_autodiff::Autodiff<
+                burn_wgpu::Wgpu<f32>,
+                burn_autodiff::checkpoint::strategy::BalancedCheckpointing,
             >,
         >("wgpu-ckpt", scheduler, batch, language, init, steps)
     } else {
-        measured_run::<burn::backend::Autodiff<burn::backend::Wgpu<f32>>>(
+        measured_run::<burn_autodiff::Autodiff<burn_wgpu::Wgpu<f32>>>(
             "wgpu", scheduler, batch, language, init, steps,
         )
     }
@@ -252,7 +252,7 @@ fn main() -> Result<()> {
     if let Some(dir) = save_init_dir {
         // The CPU build of the scheduler's student at the scheduler's seed,
         // saved once so `--init` can give every backend the same weights.
-        type Cpu = burn::backend::Autodiff<burn::backend::NdArray<f32>>;
+        type Cpu = burn_autodiff::Autodiff<burn_ndarray::NdArray<f32>>;
         let device: <Cpu as BackendTypes>::Device = Default::default();
         <Cpu as Backend>::seed(&device, scheduler.seed);
         let model = GeometricStudent::<Cpu>::new(&scheduler.student, &device)
@@ -291,7 +291,7 @@ fn main() -> Result<()> {
         let checkpointed = scheduler.gpu_checkpointing;
         let run = |steps: usize| -> Result<RunOutcome> {
             match *name {
-                "cpu" => measured_run::<burn::backend::Autodiff<burn::backend::NdArray<f32>>>(
+                "cpu" => measured_run::<burn_autodiff::Autodiff<burn_ndarray::NdArray<f32>>>(
                     "ndarray",
                     &scheduler,
                     &batch,

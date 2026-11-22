@@ -40,7 +40,7 @@ use crate::nina::{ChainedLog, NinaPaths, RegistryFile};
 use crate::tokenizer::{ByteTokenizer, Special};
 
 /// The inference backend the thinking and chat pages run the student on.
-type Eval = burn::backend::NdArray<f32>;
+type Eval = burn_ndarray::NdArray<f32>;
 
 /// Longest accepted request line; longer gets a `400`, not a bigger buffer.
 const MAX_REQUEST_LINE: usize = 8192;

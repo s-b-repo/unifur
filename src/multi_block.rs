@@ -799,7 +799,7 @@ fn merge_kept<B: Backend>(new: &Tensor<B, 2>, old: &Tensor<B, 2>, keep: &[bool])
 )]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 

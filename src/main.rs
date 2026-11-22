@@ -43,7 +43,7 @@ use rand::rngs::StdRng;
 use rand::SeedableRng;
 
 /// Plain (non-autodiff) backend used by every inference-side command.
-type Eval = burn::backend::NdArray<f32>;
+type Eval = burn_ndarray::NdArray<f32>;
 
 #[derive(Parser)]
 #[command(
@@ -246,8 +246,8 @@ fn gpu_kind(kind: &str) -> Result<GpuKind> {
 }
 
 #[cfg(feature = "wgpu")]
-fn lm_wgpu_device(args: &LmRuntimeArgs) -> Result<burn::backend::wgpu::WgpuDevice> {
-    use burn::backend::wgpu::{graphics::AutoGraphicsApi, init_setup, WgpuDevice};
+fn lm_wgpu_device(args: &LmRuntimeArgs) -> Result<burn_wgpu::WgpuDevice> {
+    use burn_wgpu::{graphics::AutoGraphicsApi, init_setup, WgpuDevice};
     use wgpu_types::DeviceType;
     let (kind, index) = parse_gpu_device(args.device.as_deref().unwrap_or("discrete:0"))?;
     let (device, expected) = match gpu_kind(kind)? {
@@ -4361,7 +4361,7 @@ fn cmd_geom(action: GeomAction) -> Result<()> {
         #[cfg(feature = "wgpu")]
         {
             let device = lm_wgpu_device(runtime)?;
-            return cmd_geom_backend::<burn::backend::Wgpu<f32, i32>>(action, device);
+            return cmd_geom_backend::<burn_wgpu::Wgpu<f32, i32>>(action, device);
         }
         #[cfg(not(feature = "wgpu"))]
         anyhow::bail!("WGPU support is not compiled in; rebuild with --features wgpu");
@@ -4528,7 +4528,7 @@ fn cmd_geom_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
     // `Module` in scope for `num_params` (a supertrait method): the baseline
     // comparison prints both models' parameter counts.
     use burn::module::Module as _;
-    type Train<B2> = burn::backend::Autodiff<B2>;
+    type Train<B2> = burn_autodiff::Autodiff<B2>;
     match action {
         // These three are dispatched before a device exists (they are pure data
         // and kernel operations), so they never reach this function. Saying so
@@ -5441,7 +5441,7 @@ fn cmd_tblock(action: TblockAction) -> Result<()> {
                 train_windows.len(),
                 val_windows.len()
             );
-            type Ad = burn::backend::Autodiff<burn::backend::NdArray<f32>>;
+            type Ad = burn_autodiff::Autodiff<burn_ndarray::NdArray<f32>>;
             let device = Default::default();
             let params = TbTrainParams {
                 steps,
@@ -5576,7 +5576,7 @@ fn cmd_ncm(action: diffusionblocks::ncm::cli::NcmAction, runtime: &LmRuntimeArgs
             #[cfg(feature = "wgpu")]
             {
                 let device = lm_wgpu_device(runtime)?;
-                cli::run_native::<burn::backend::Wgpu<f32, i32>>(action, &device, progress)?
+                cli::run_native::<burn_wgpu::Wgpu<f32, i32>>(action, &device, progress)?
             }
             #[cfg(not(feature = "wgpu"))]
             anyhow::bail!("WGPU support is not compiled in; rebuild with --features wgpu");
@@ -5599,7 +5599,7 @@ fn cmd_lm(action: LmAction) -> Result<()> {
             #[cfg(feature = "wgpu")]
             {
                 let device = lm_wgpu_device(runtime)?;
-                return cmd_lm_backend::<burn::backend::Wgpu<f32, i32>>(action, device);
+                return cmd_lm_backend::<burn_wgpu::Wgpu<f32, i32>>(action, device);
             }
             #[cfg(not(feature = "wgpu"))]
             anyhow::bail!("WGPU support is not compiled in; rebuild with --features wgpu");
@@ -5944,7 +5944,7 @@ fn cmd_lm_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
             specialist,
             runtime: _,
         } => {
-            type Train<B> = burn::backend::Autodiff<B>;
+            type Train<B> = burn_autodiff::Autodiff<B>;
             let device = lm_device;
             B::seed(&device, seed);
             let model_config = lm_config_for(&arch, resume.as_ref().or(base_weights.as_ref()))?;
@@ -7005,7 +7005,7 @@ fn cmd_router(action: RouterAction) -> Result<()> {
 
 /// The training backend for `dblocks student train`: CPU autodiff, the same
 /// backend the `lm` trainer defaults to.
-type StudentTrain = burn::backend::Autodiff<Eval>;
+type StudentTrain = burn_autodiff::Autodiff<Eval>;
 
 /// The language flag: a shipped specialist, or `unknown` for unlabeled data
 /// (the fallback SFT corpus). Parsed here so the error names the flag.
@@ -7893,7 +7893,7 @@ fn cmd_train(args: ImageTrainArgs) -> Result<()> {
     // to print nothing at all, so an aborted run looked like a finished one.
     let (path, aborted) = if grad_checkpointing {
         let (model, summary) = train::train_generic::<
-            burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing,
+            burn_autodiff::checkpoint::strategy::BalancedCheckpointing,
         >(&config)?;
         print_train_summary(&summary);
         let path = match summary.checkpoint {

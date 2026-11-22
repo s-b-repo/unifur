@@ -1,11 +1,12 @@
 //! Train and use the native fused reasoner with a CPU-sized Qwen trunk.
 
 use anyhow::{ensure, Context, Result};
-use burn::backend::{Autodiff, NdArray};
 use burn::module::AutodiffModule;
-use burn::nn::loss::CrossEntropyLossConfig;
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::tensor::{backend::Backend, Int, Tensor};
+use burn_autodiff::Autodiff;
+use burn_ndarray::NdArray;
+use burn_nn::loss::CrossEntropyLossConfig;
+use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
 use clap::{Parser, Subcommand};
 use diffusionblocks::{
     bpe::BpeTokenizer,

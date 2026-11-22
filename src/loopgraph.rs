@@ -453,7 +453,7 @@ fn mean_square<B: Backend<FloatElem = f32>>(x: &Tensor<B, 2>) -> f32 {
 )]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 

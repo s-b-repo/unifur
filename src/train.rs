@@ -32,16 +32,15 @@ use crate::{
     lm::{LanguageModel, Unlikelihood},
 };
 use burn::{
-    backend::{
-        autodiff::checkpoint::strategy::{
-            BalancedCheckpointing, CheckpointStrategy, NoCheckpointing,
-        },
-        Autodiff, NdArray,
-    },
     module::Module,
-    optim::{AdamWConfig, GradientsParams, Optimizer},
     tensor::{backend::AutodiffBackend, Distribution, Tensor},
 };
+use burn_autodiff::checkpoint::strategy::{
+    BalancedCheckpointing, CheckpointStrategy, NoCheckpointing,
+};
+use burn_autodiff::Autodiff;
+use burn_ndarray::NdArray;
+use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 
@@ -69,15 +68,15 @@ pub fn step_seed(seed: u64, step: usize) -> u64 {
 }
 
 type TrainBackend<C> = Autodiff<NdArray<f32>, C>;
-type ModelOptim<C> = burn::optim::adaptor::OptimizerAdaptor<
-    burn::optim::AdamW,
+type ModelOptim<C> = burn_optim::adaptor::OptimizerAdaptor<
+    burn_optim::AdamW,
     DblockClassifier<TrainBackend<C>>,
     TrainBackend<C>,
 >;
 type Teachers<C> = Vec<(DblockClassifier<TrainBackend<C>>, f64)>;
 type TeacherRefs<'a, C> = Vec<(&'a DblockClassifier<TrainBackend<C>>, f64)>;
-type HeadOptim<C> = burn::optim::adaptor::OptimizerAdaptor<
-    burn::optim::AdamW,
+type HeadOptim<C> = burn_optim::adaptor::OptimizerAdaptor<
+    burn_optim::AdamW,
     LogVarianceHead<TrainBackend<C>>,
     TrainBackend<C>,
 >;
@@ -2439,8 +2438,8 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
     }
     let save_state = |step: usize,
                       model: &LanguageModel<B>,
-                      optim: &burn::optim::adaptor::OptimizerAdaptor<
-        burn::optim::AdamW,
+                      optim: &burn_optim::adaptor::OptimizerAdaptor<
+        burn_optim::AdamW,
         LanguageModel<B>,
         B,
     >,
@@ -2960,7 +2959,7 @@ mod tests {
 
     fn assert_resident_optimizer(path: &std::path::Path, selected: &crate::mosme::TrainableSet) {
         type B = DefaultTrainBackend;
-        type O = burn::optim::adaptor::OptimizerAdaptor<burn::optim::AdamW, LanguageModel<B>, B>;
+        type O = burn_optim::adaptor::OptimizerAdaptor<burn_optim::AdamW, LanguageModel<B>, B>;
         let state = TrainState::for_model(path).unwrap().unwrap();
         let dir = TrainState::dir_for(path);
         state.verify_files(&dir).unwrap();

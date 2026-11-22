@@ -32,9 +32,9 @@
 
 use burn::{
     module::Module,
-    nn::{Linear, LinearConfig},
     tensor::{backend::Backend, Tensor},
 };
+use burn_nn::{Linear, LinearConfig};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
@@ -457,7 +457,7 @@ fn pick<R: Rng>(rng: &mut R, weights: &[f64]) -> usize {
 )]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
+    use burn_ndarray::NdArray;
     use rand::{rngs::StdRng, SeedableRng};
 
     type B = NdArray<f32>;
@@ -739,8 +739,9 @@ mod tests {
         // The head is only useful if the optimizer can move it. It is a
         // separate module sharing one backward pass with the trunk, which is
         // exactly the arrangement most likely to end up silently detached.
-        use burn::backend::{Autodiff, NdArray};
-        use burn::optim::GradientsParams;
+        use burn_autodiff::Autodiff;
+        use burn_ndarray::NdArray;
+        use burn_optim::GradientsParams;
 
         type AB = Autodiff<NdArray<f32>>;
         let device = Default::default();
@@ -765,8 +766,9 @@ mod tests {
         // the head drives its output to ln(L) -- the closed form the objective
         // is minimized at. If it converged anywhere else, the `+ l` term would
         // not be doing its job and the weighting would be free to lie.
-        use burn::backend::{Autodiff, NdArray};
-        use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
+        use burn_autodiff::Autodiff;
+        use burn_ndarray::NdArray;
+        use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
 
         type AB = Autodiff<NdArray<f32>>;
         let device = Default::default();

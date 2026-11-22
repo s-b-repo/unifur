@@ -76,10 +76,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, ensure, Context, Result};
 use burn::{
-    backend::NdArray,
     module::{Module, ModuleMapper, Param},
     tensor::{backend::Backend, Tensor},
 };
+use burn_ndarray::NdArray;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;

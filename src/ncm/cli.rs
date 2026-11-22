@@ -14,12 +14,12 @@ use crate::ncm::tokenizer::train::{
 };
 use crate::ncm::tokenizer::NcmTokenizerConfig;
 use anyhow::Result;
-use burn::backend::Autodiff;
 use burn::tensor::backend::Backend;
+use burn_autodiff::Autodiff;
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
 
-type Cpu = burn::backend::NdArray<f32>;
+type Cpu = burn_ndarray::NdArray<f32>;
 
 /// Next-Concept Modeling: each stage is one variant.
 #[derive(Subcommand, Debug, Clone)]
@@ -204,7 +204,7 @@ fn train_config(args: TokenizerTrainArgs) -> Result<TokenizerTrainConfig> {
 
 /// Run one `ncm` action on the CPU backend. Progress lines go to `progress`.
 pub fn run(action: NcmAction, progress: &mut dyn FnMut(&str)) -> Result<NcmReport> {
-    let device = burn::backend::ndarray::NdArrayDevice::Cpu;
+    let device = burn_ndarray::NdArrayDevice::Cpu;
     match action {
         NcmAction::Released(args) => super::released::run(*args).map(NcmReport::Released),
         NcmAction::ReleasedTune(args) => {

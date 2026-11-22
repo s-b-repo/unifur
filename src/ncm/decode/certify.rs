@@ -4,9 +4,9 @@
 //! pass, so a check that cannot see a broken decoder is itself a failure.
 
 use anyhow::{anyhow, Result};
-use burn::backend::ndarray::NdArrayDevice;
-use burn::backend::NdArray;
 use burn::tensor::{Int, Tensor};
+use burn_ndarray::NdArray;
+use burn_ndarray::NdArrayDevice;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 

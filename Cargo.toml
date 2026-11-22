@@ -21,11 +21,14 @@ name = "dblocks"
 path = "src/main.rs"
 
 [dependencies]
-burn = { version = "0.21", default-features = false, features = ["ndarray", "std", "simd", "autodiff"] }
-# Feature unification: burn declares burn-ndarray with default-features = false,
-# so simd/multi-threads must be enabled here explicitly. multi-threads turns on
-# rayon for elementwise/reduction ops and threaded GEMM (matrixmultiply).
-burn-ndarray = { version = "0.21", features = ["multi-threads"] }
+# Link the components this crate builds. The umbrella package also locks
+# unrelated backends and their platform dependencies.
+burn = { package = "burn-core", version = "0.21", default-features = false, features = ["std"] }
+burn-autodiff = { version = "0.21", default-features = false, features = ["std"] }
+burn-ndarray = { version = "0.21", features = ["multi-threads", "simd"] }
+burn-nn = { version = "0.21", default-features = false, features = ["std"] }
+burn-optim = { version = "0.21", default-features = false, features = ["std"] }
+burn-wgpu = { version = "0.21", default-features = false, features = ["std"], optional = true }
 wgpu-types = { version = "29", optional = true }
 clap = { version = "4", features = ["derive"] }
 # Already compiled transitively (via idna): exact \p{L}/\p{M}/\p{N} classes
@@ -66,7 +69,7 @@ unicode-normalization = "0.1"
 approx = "0.5"
 
 [features]
-wgpu = ["burn/wgpu", "dep:wgpu-types"]
+wgpu = ["dep:burn-wgpu", "dep:wgpu-types"]
 # Enables the io_uring submission path in the `peregrine` I/O engine. Without
 # it the engine uses positional `pread` on a mirror-striped plan, which is the
 # same reads with more syscalls.

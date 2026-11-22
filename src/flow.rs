@@ -17,10 +17,8 @@ use crate::{
     train::{DefaultTrainBackend, RunningAvg},
     vit::ViTDiTConfig,
 };
-use burn::{
-    optim::{AdamWConfig, GradientsParams, Optimizer},
-    tensor::{backend::Backend, Distribution, Tensor},
-};
+use burn::tensor::{backend::Backend, Distribution, Tensor};
+use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
 /// Flow-matching hyperparameters.
@@ -130,7 +128,7 @@ pub fn train_flow_synthetic(
     let mut optim = AdamWConfig::new()
         .with_weight_decay(config.weight_decay as f32)
         .init();
-    let lr: burn::optim::LearningRate = config.lr;
+    let lr: burn_optim::LearningRate = config.lr;
 
     let mut running = RunningAvg::new(config.log_every);
     let start = std::time::Instant::now();

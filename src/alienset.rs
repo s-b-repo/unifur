@@ -87,12 +87,12 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{bail, ensure, Context, Result};
-use burn::grad_clipping::GradientClippingConfig;
+use burn_optim::grad_clipping::GradientClippingConfig;
 use burn::module::{AutodiffModule, Module, Param};
-use burn::nn::attention::generate_autoregressive_mask;
-use burn::nn::transformer::{TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput};
-use burn::nn::{Embedding, EmbeddingConfig, Initializer, LayerNorm, LayerNormConfig, Linear, LinearConfig};
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
+use burn_nn::attention::generate_autoregressive_mask;
+use burn_nn::transformer::{TransformerEncoder, TransformerEncoderConfig, TransformerEncoderInput};
+use burn_nn::{Embedding, EmbeddingConfig, Initializer, LayerNorm, LayerNormConfig, Linear, LinearConfig};
+use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::record::{FullPrecisionSettings, NamedMpkBytesRecorder, Recorder};
 use burn::tensor::activation::log_softmax;
 use burn::tensor::backend::Backend;
@@ -107,9 +107,9 @@ use crate::interop::write_atomic;
 use crate::verify::Certificate;
 
 /// The CPU inference backend.
-pub type Cpu = burn::backend::NdArray<f32>;
+pub type Cpu = burn_ndarray::NdArray<f32>;
 /// The CPU training backend.
-pub type CpuTrain = burn::backend::Autodiff<Cpu>;
+pub type CpuTrain = burn_autodiff::Autodiff<Cpu>;
 
 /// The paper's `m`: availability is the median of the top-`m` author scores.
 pub const DEFAULT_TOP_M: usize = 10;

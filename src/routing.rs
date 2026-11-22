@@ -41,9 +41,9 @@
 
 use burn::{
     module::Module,
-    nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig},
     tensor::{backend::Backend, Int, Tensor},
 };
+use burn_nn::{LayerNorm, LayerNormConfig, Linear, LinearConfig};
 use serde::{Deserialize, Serialize};
 
 /// Which axis a router decides.
@@ -188,8 +188,8 @@ pub fn top1_to_host<B: Backend>(top1: &Tensor<B, 2, Int>) -> Vec<i64> {
 )]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
     use burn::tensor::Distribution;
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 

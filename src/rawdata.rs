@@ -809,7 +809,7 @@ impl<B: Backend> TrainDataset<B> for RawImageDataset {
 mod tests {
     use super::*;
     use crate::data::{CIFAR100_MEAN, CIFAR100_STD};
-    use burn::backend::NdArray;
+    use burn_ndarray::NdArray;
     use rand::{rngs::StdRng, SeedableRng};
     use std::io::Write;
 

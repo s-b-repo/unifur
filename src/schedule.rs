@@ -22,9 +22,9 @@
 
 use burn::{
     module::{AutodiffModule, Module, ModuleMapper, Param},
-    optim::GradientsParams,
     tensor::{backend::AutodiffBackend, backend::Backend, Tensor},
 };
+use burn_optim::GradientsParams;
 use serde::{Deserialize, Serialize};
 
 /// How the learning rate varies over a run.
@@ -981,9 +981,10 @@ mod tests {
         // micro-batches and stepping on every k-th one silently discards the
         // other k-1 gradients. Folding two identical gradients must give twice
         // one of them, not one of them.
-        use burn::backend::{Autodiff, NdArray};
-        use burn::nn::LinearConfig;
         use burn::tensor::Distribution;
+        use burn_autodiff::Autodiff;
+        use burn_ndarray::NdArray;
+        use burn_nn::LinearConfig;
 
         type A = Autodiff<NdArray<f32>>;
         let device = Default::default();
@@ -1148,7 +1149,7 @@ mod tests {
     fn test_ema_tracks_then_lags_the_live_weights() {
         use crate::dblock::{DblockClassifier, DblockConfig};
         use crate::vit::ViTDiTConfig;
-        use burn::backend::NdArray;
+        use burn_ndarray::NdArray;
 
         type N = NdArray<f32>;
         let device = Default::default();
@@ -1236,7 +1237,7 @@ mod tests {
         // copy of the live weights.
         use crate::dblock::{DblockClassifier, DblockConfig};
         use crate::vit::ViTDiTConfig;
-        use burn::backend::NdArray;
+        use burn_ndarray::NdArray;
 
         type N = NdArray<f32>;
         let device = Default::default();
@@ -1291,7 +1292,7 @@ mod tests {
         // Pairing by traversal order fixes it, and this pins the behaviour.
         use crate::dblock::{DblockClassifier, DblockConfig};
         use crate::vit::ViTDiTConfig;
-        use burn::backend::NdArray;
+        use burn_ndarray::NdArray;
 
         type N = NdArray<f32>;
         let device = Default::default();

@@ -11,12 +11,12 @@ use crate::routing::RoutingState;
 use crate::tensor_ext::{exact_gelu, l2_normalize_rows, silu};
 use burn::{
     module::{Module, Param},
-    nn::{
-        conv::{Conv2d, Conv2dConfig},
-        Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear,
-        LinearConfig,
-    },
     tensor::{activation::softmax, backend::Backend, Distribution, Int, Tensor},
+};
+use burn_nn::{
+    conv::{Conv2d, Conv2dConfig},
+    Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear,
+    LinearConfig,
 };
 use serde::{Deserialize, Serialize};
 
@@ -2261,7 +2261,7 @@ impl<B: Backend> ViTDiTForImageClassification<B> {
     }
 }
 
-fn zero_linear_params<B: Backend>(linear: &mut burn::nn::LinearRecord<B>) {
+fn zero_linear_params<B: Backend>(linear: &mut burn_nn::LinearRecord<B>) {
     let dev = linear.weight.device();
     let sw = linear.weight.shape();
     linear.weight = Param::from_tensor(Tensor::zeros(sw, &dev));
@@ -2293,7 +2293,7 @@ fn zero_linear_params<B: Backend>(linear: &mut burn::nn::LinearRecord<B>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 
@@ -2341,7 +2341,7 @@ mod tests {
 
     #[test]
     fn test_swiglu_formula_and_gradients() {
-        use burn::backend::Autodiff;
+        use burn_autodiff::Autodiff;
         type A = Autodiff<B>;
         let device = Default::default();
         let mut mlp = SwiGluMlp::<A>::new(1, 1, 0.0, &device);

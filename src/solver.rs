@@ -472,7 +472,7 @@ pub fn quadratic_interp_weights(g0: f64, g1: f64) -> [f64; 4] {
 )]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
+    use burn_ndarray::NdArray;
     use rand::{rngs::StdRng, SeedableRng};
 
     type B = NdArray<f32>;

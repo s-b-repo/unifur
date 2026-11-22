@@ -66,12 +66,12 @@
 
 use anyhow::Context;
 use burn::module::{Module, Param};
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::tensor::{
     activation::{log_softmax, softmax},
     backend::Backend,
     Int, Tensor, TensorData,
 };
+use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 use serde::{Deserialize, Serialize};
@@ -824,7 +824,7 @@ pub fn train_translators<B: Backend<FloatElem = f32>>(
     anyhow::ensure!(fit.steps >= 1, "fit steps must be at least 1");
     anyhow::ensure!(fit.lr > 0.0, "fit lr must be positive, got {}", fit.lr);
 
-    type A<B> = burn::backend::Autodiff<B>;
+    type A<B> = burn_autodiff::Autodiff<B>;
     let device_owned: B::Device = Default::default();
     let device = &device_owned;
 
@@ -1142,8 +1142,8 @@ fn decode_hidden<B: Backend<FloatElem = f32>>(
 mod tests {
     use super::*;
     use crate::student::StudentConfig;
-    use burn::backend::NdArray;
-    use burn::nn::LinearConfig;
+    use burn_ndarray::NdArray;
+    use burn_nn::LinearConfig;
 
     type B = NdArray<f32>;
 

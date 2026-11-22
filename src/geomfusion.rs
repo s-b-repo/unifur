@@ -57,11 +57,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use burn::module::{Initializer, Module, ModuleVisitor, Param};
-use burn::nn::{Linear, LinearConfig};
-use burn::optim::{AdamW, AdamWConfig, GradientsParams, Optimizer};
 use burn::tensor::activation::log_softmax;
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{ElementConversion, Int, Tensor};
+use burn_nn::{Linear, LinearConfig};
+use burn_optim::{AdamW, AdamWConfig, GradientsParams, Optimizer};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 use serde::{Deserialize, Serialize};
@@ -1500,7 +1500,7 @@ pub fn segmented_fused_backward<B: AutodiffBackend<FloatElem = f32>>(
 
 /// AdamW over the geometric stream (the trunk's adapters step through
 /// [`crate::qwentrain::QwenOptim`]).
-pub type FusionOptim<B> = burn::optim::adaptor::OptimizerAdaptor<AdamW, GeomFusion<B>, B>;
+pub type FusionOptim<B> = burn_optim::adaptor::OptimizerAdaptor<AdamW, GeomFusion<B>, B>;
 /// The fusion optimizer's record.
 pub type FusionOptimRecord<B> = <FusionOptim<B> as Optimizer<GeomFusion<B>, B>>::Record;
 
@@ -2422,8 +2422,8 @@ pub fn prove<B: Backend<FloatElem = f32>>(
 )]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
     use burn::tensor::Distribution;
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 
@@ -2618,8 +2618,8 @@ mod tests {
     use crate::qwennet::QwenTrunkConfig;
     use crate::qwentrain::{attach_lora, freeze_non_adapter_params};
     use crate::tensor_ext::force_initialization;
-    use burn::backend::Autodiff;
     use burn::module::ParamId;
+    use burn_autodiff::Autodiff;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     type AB = Autodiff<NdArray<f32>>;

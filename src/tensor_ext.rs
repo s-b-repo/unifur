@@ -128,8 +128,8 @@ pub fn l2_normalize_rows<B: Backend>(x: Tensor<B, 2>) -> Tensor<B, 2> {
 )]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
-    use burn::nn::{Linear, LinearConfig};
+    use burn_ndarray::NdArray;
+    use burn_nn::{Linear, LinearConfig};
 
     type B = NdArray<f32>;
 

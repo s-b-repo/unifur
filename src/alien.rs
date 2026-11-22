@@ -2601,7 +2601,7 @@ pub fn embed_student(
     use crate::corpus::TokenCorpus;
     use crate::student::GeometricStudent;
     use burn::tensor::{Int, Tensor};
-    type Eval = burn::backend::NdArray<f32>;
+    type Eval = burn_ndarray::NdArray<f32>;
 
     ensure!(!name.trim().is_empty(), "the specialist needs a name");
     ensure!(options.windows > 0, "embedding needs at least one window");
@@ -3858,7 +3858,7 @@ mod tests {
 
     #[test]
     fn embedding_a_student_checkpoint_is_deterministic_and_corpus_dependent() {
-        type Eval = burn::backend::NdArray<f32>;
+        type Eval = burn_ndarray::NdArray<f32>;
         let dir = scratch("embed");
         let config = tiny_student_config();
         let device = Default::default();

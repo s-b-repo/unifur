@@ -541,7 +541,7 @@ fn accumulate<B: Backend>(acc: Option<Tensor<B, 1>>, term: Tensor<B, 1>) -> Tens
 mod tests {
     use super::*;
     use crate::{dblock::DblockConfig, train::DefaultTrainBackend, vit::ViTDiTConfig};
-    use burn::backend::NdArray;
+    use burn_ndarray::NdArray;
     use rand::{rngs::StdRng, SeedableRng};
 
     type B = NdArray<f32>;
@@ -671,7 +671,7 @@ mod tests {
 
     #[test]
     fn test_distillation_gradients_reach_only_the_student() {
-        use burn::optim::GradientsParams;
+        use burn_optim::GradientsParams;
 
         type A = DefaultTrainBackend;
         let device = Default::default();

@@ -735,8 +735,8 @@ pub fn positions_tensor<B: Backend>(
 )]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
     use burn::tensor::{activation::softmax, Distribution};
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 

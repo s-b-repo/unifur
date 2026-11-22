@@ -549,7 +549,7 @@ fn run<B: Backend<FloatElem = f32>>(
 
 #[cfg(feature = "wgpu")]
 fn run_wgpu(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
-    use burn::backend::wgpu::{graphics::AutoGraphicsApi, init_setup, Wgpu, WgpuDevice};
+    use burn_wgpu::{graphics::AutoGraphicsApi, init_setup, Wgpu, WgpuDevice};
     let device = WgpuDevice::DiscreteGpu(0);
     let setup =
         std::panic::catch_unwind(|| init_setup::<AutoGraphicsApi>(&device, Default::default()))
@@ -565,7 +565,7 @@ fn run_wgpu(a: &Args) -> Result<(), Box<dyn std::error::Error>> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a = parse_args()?;
     match a.backend.as_str() {
-        "cpu" => run::<burn::backend::NdArray<f32>>(&a, Default::default()),
+        "cpu" => run::<burn_ndarray::NdArray<f32>>(&a, Default::default()),
         #[cfg(feature = "wgpu")]
         "wgpu" => run_wgpu(&a),
         other => Err(format!("unknown backend '{other}' (want cpu or wgpu)").into()),

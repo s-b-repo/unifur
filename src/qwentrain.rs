@@ -36,9 +36,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
 use burn::module::{list_param_ids, Module, ModuleVisitor, Param, ParamId};
-use burn::optim::{AdamW, AdamWConfig, GradientsParams, Optimizer};
 use burn::tensor::activation::log_softmax;
 use burn::tensor::{backend::AutodiffBackend, backend::Backend, Int, Tensor};
+use burn_optim::{AdamW, AdamWConfig, GradientsParams, Optimizer};
 use rand_chacha::ChaCha12Rng;
 use serde::{Deserialize, Serialize};
 
@@ -164,7 +164,7 @@ pub fn attach_lora<B: Backend>(
     for layer in &mut trunk.layers {
         for slot in layer_adapter_slots_mut(layer) {
             let placeholder = QwenLinear::F32(
-                burn::nn::LinearConfig::new(1, 1)
+                burn_nn::LinearConfig::new(1, 1)
                     .with_bias(false)
                     .init(device),
             );
@@ -471,7 +471,7 @@ pub fn segmented_next_token_backward<B: AutodiffBackend<FloatElem = f32>>(
 
 /// AdamW over the trunk (state exists only for grad-bearing -- i.e.
 /// adapter -- parameters, burn's `OptimizerAdaptor` creates it lazily).
-pub type QwenOptim<B> = burn::optim::adaptor::OptimizerAdaptor<AdamW, QwenTrunk<B>, B>;
+pub type QwenOptim<B> = burn_optim::adaptor::OptimizerAdaptor<AdamW, QwenTrunk<B>, B>;
 /// The optimizer record: one entry per state-holding parameter.
 pub type QwenOptimRecord<B> = <QwenOptim<B> as Optimizer<QwenTrunk<B>, B>>::Record;
 
@@ -903,7 +903,8 @@ mod tests {
     use crate::qwen::QwenArchDims;
     use crate::qwennet::QwenTrunkConfig;
     use crate::tensor_ext::force_initialization;
-    use burn::backend::{Autodiff, NdArray};
+    use burn_autodiff::Autodiff;
+    use burn_ndarray::NdArray;
     use rand::{Rng, SeedableRng};
     use std::sync::atomic::{AtomicU64, Ordering};
 

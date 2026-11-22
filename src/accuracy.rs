@@ -494,8 +494,8 @@ impl ScalingCurve {
 )]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
     use burn::tensor::Distribution;
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 

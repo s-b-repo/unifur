@@ -46,9 +46,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
 use burn::module::{Module, Param};
-use burn::nn::{Embedding, EmbeddingConfig, Linear, LinearConfig};
 use burn::tensor::activation::{sigmoid, softmax, softplus};
 use burn::tensor::{backend::Backend, Distribution, Int, Tensor, TensorData};
+use burn_nn::{Embedding, EmbeddingConfig, Linear, LinearConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::deltanet::{
@@ -2144,7 +2144,7 @@ mod tests {
     use super::*;
 
     use crate::tensor_ext::force_initialization;
-    use burn::backend::NdArray;
+    use burn_ndarray::NdArray;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     type B = NdArray<f32>;

@@ -56,11 +56,11 @@ use std::ops::Range;
 use std::path::PathBuf;
 
 use burn::module::{Initializer, Module, Param};
-use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig};
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::tensor::activation::{log_softmax, softmax};
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Distribution, Int, Tensor};
+use burn_nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig};
+use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
@@ -2775,8 +2775,8 @@ pub fn evaluate_geom_answers<B: Backend<FloatElem = f32>>(
 )]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
     use burn::tensor::{Shape, TensorData};
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 

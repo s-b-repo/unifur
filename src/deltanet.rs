@@ -285,8 +285,8 @@ pub fn pair_step_flops(head_k_dim: usize, head_v_dim: usize) -> f64 {
 )]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
     use burn::tensor::Distribution;
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 

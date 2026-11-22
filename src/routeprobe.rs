@@ -1094,7 +1094,7 @@ mod tests {
     use crate::student::StudentConfig;
     use crate::tokenizer::VOCAB_SIZE;
     use crate::vit::MoeTrunkConfig;
-    use burn::backend::NdArray;
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 
@@ -1220,7 +1220,7 @@ mod tests {
         let mut student = GeometricStudent::<B>::new(&config, &device).unwrap();
         crate::tensor_ext::force_initialization(&student);
         student.set_geom_readout(
-            burn::nn::LinearConfig::new(config.geom_dim, config.hidden_size)
+            burn_nn::LinearConfig::new(config.geom_dim, config.hidden_size)
                 .with_bias(true)
                 .init(&device),
         );

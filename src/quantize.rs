@@ -29,9 +29,9 @@
 
 use burn::{
     module::{Module, ModuleMapper, Param},
-    nn::{Linear, LinearConfig},
     tensor::{backend::Backend, Distribution, Tensor},
 };
+use burn_nn::{Linear, LinearConfig};
 
 /// Values per quantization block. 64 matches the QLoRA default.
 pub const BLOCK_SIZE: usize = 64;
@@ -748,7 +748,7 @@ impl<B: Backend<FloatElem = f32>> QLoraLinear<B> {
 )]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 

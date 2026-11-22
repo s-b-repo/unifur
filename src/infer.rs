@@ -279,8 +279,8 @@ fn merge_stats(acc: &mut SamplingStats, batch: SamplingStats) {
 mod tests {
     use super::*;
     use crate::{dblock::DblockConfig, vit::ViTDiTConfig};
-    use burn::backend::NdArray;
     use burn::tensor::Distribution;
+    use burn_ndarray::NdArray;
     use rand::{rngs::StdRng, SeedableRng};
 
     type B = NdArray<f32>;

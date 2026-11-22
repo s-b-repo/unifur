@@ -214,8 +214,8 @@ pub fn flatten<B: Backend<FloatElem = f32>, M: Module<B>>(module: &M) -> Vec<f32
 )]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
-    use burn::nn::LinearConfig;
+    use burn_ndarray::NdArray;
+    use burn_nn::LinearConfig;
 
     type B = NdArray<f32>;
 

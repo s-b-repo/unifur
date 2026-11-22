@@ -21,9 +21,9 @@
     clippy::print_stdout,
     clippy::print_stderr
 )]
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::tensor::backend::BackendTypes;
 use burn::{tensor::Distribution, tensor::Tensor};
+use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
 use diffusionblocks::consistency::{ConsistencyConfig, ConsistencyWeights};
 use diffusionblocks::dblock::{DblockClassifier, DblockConfig};
 use diffusionblocks::distill::DistillConfig;
@@ -147,13 +147,13 @@ fn cli_lm_wgpu_requires_compiled_feature() {
 #[test]
 #[ignore = "requires a discrete GPU with native WGPU compute support"]
 fn gpu_lm_parity_cached_backward_and_cli_smoke() {
-    use burn::backend::{
-        wgpu::{graphics::AutoGraphicsApi, init_setup, WgpuDevice},
-        Autodiff, NdArray, Wgpu,
-    };
     use burn::module::{AutodiffModule, Module};
     use burn::record::{FullPrecisionSettings, NamedMpkBytesRecorder, Recorder};
     use burn::tensor::Int;
+    use burn_autodiff::Autodiff;
+    use burn_ndarray::NdArray;
+    use burn_wgpu::Wgpu;
+    use burn_wgpu::{graphics::AutoGraphicsApi, init_setup, WgpuDevice};
     use diffusionblocks::lm::{LanguageModel, LmConfig};
     use diffusionblocks::vit::FfnKind;
     type Cpu = NdArray<f32>;
@@ -480,12 +480,11 @@ fn gpu_lm_resident_mosme_specialist_cli_smoke() {
 #[test]
 #[ignore = "requires a discrete GPU with native WGPU compute support"]
 fn gpu_lm_compact_specialist_export_train_apply() {
-    use burn::backend::{
-        wgpu::{graphics::AutoGraphicsApi, init_setup, CubeBackend, WgpuDevice, WgpuRuntime},
-        NdArray, Wgpu,
-    };
     use burn::module::{Module, ModuleVisitor, Param, ParamId};
     use burn::tensor::{backend::Backend, Int};
+    use burn_ndarray::NdArray;
+    use burn_wgpu::Wgpu;
+    use burn_wgpu::{graphics::AutoGraphicsApi, init_setup, CubeBackend, WgpuDevice, WgpuRuntime};
     use diffusionblocks::checkpoint::{self, TrainState};
     use diffusionblocks::corpus::TokenCorpus;
     use diffusionblocks::lm::{LanguageModel, LmConfig};

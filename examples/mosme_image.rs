@@ -1,8 +1,8 @@
 //! Evaluate a trained CIFAR-100 MoSME diffusion classifier, or classify one image.
 
 use anyhow::{ensure, Context, Result};
-use burn::backend::NdArray;
 use burn::tensor::{backend::Backend, Tensor};
+use burn_ndarray::NdArray;
 use clap::Parser;
 use diffusionblocks::{
     checkpoint, cifar,

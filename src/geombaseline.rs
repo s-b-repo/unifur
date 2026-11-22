@@ -50,11 +50,11 @@
 //! where a mismatch would be caught and adjusted.
 
 use burn::module::{Initializer, Module};
-use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig};
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::tensor::activation::softmax;
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Int, Tensor};
+use burn_nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig};
+use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
@@ -628,7 +628,7 @@ pub fn evaluate_geom_baseline<B: Backend<FloatElem = f32>>(
 )]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 

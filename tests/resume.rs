@@ -28,8 +28,9 @@
     clippy::print_stdout,
     clippy::print_stderr
 )]
-use burn::backend::{Autodiff, NdArray};
 use burn::tensor::backend::BackendTypes;
+use burn_autodiff::Autodiff;
+use burn_ndarray::NdArray;
 
 type B = Autodiff<NdArray<f32>>;
 type Device = <B as BackendTypes>::Device;

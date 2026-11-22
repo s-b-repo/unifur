@@ -67,10 +67,8 @@ use crate::{
 use anyhow::Context as _;
 use rand::SeedableRng;
 
-use burn::{
-    backend::NdArray,
-    tensor::{activation::softmax, Distribution, Int, Tensor},
-};
+use burn::tensor::{activation::softmax, Distribution, Int, Tensor};
+use burn_ndarray::NdArray;
 
 type B = NdArray<f32>;
 
@@ -1128,7 +1126,7 @@ fn quantize_certificates() -> Vec<Certificate> {
     let packed = PackedNf4Tensor::quantize(&w).with_double_quantization();
     let deq = packed.dequantize();
     let nf4 = Nf4Linear::<B>::from_packed(packed, 8, 6, None);
-    let f32lin = burn::nn::Linear::<B> {
+    let f32lin = burn_nn::Linear::<B> {
         weight: burn::module::Param::from_tensor(
             Tensor::<B, 1>::from_floats(deq.as_slice(), &device).reshape([8, 6]),
         ),
@@ -2027,7 +2025,7 @@ fn mosme_checks() -> anyhow::Result<Vec<Certificate>> {
     // is EXACTLY its frozen base -- for any input and any routing condition.
     // Strictly stronger than the flat LoRA identity, which covers one adapter
     // at one point.
-    let base: burn::nn::Linear<B> = burn::nn::LinearConfig::new(8, 6).init(&device);
+    let base: burn_nn::Linear<B> = burn_nn::LinearConfig::new(8, 6).init(&device);
     crate::tensor_ext::force_initialization(&base);
     let bank = crate::mosme::MosmeAdapterBank::<B>::from_linear(
         base.clone(),
@@ -4281,7 +4279,7 @@ fn geomfusion_checks() -> anyhow::Result<Vec<Certificate>> {
         None,
         0.01,
     )?;
-    let one_shot = burn::optim::GradientsParams::from_grads(loss.loss.backward(), &amodel);
+    let one_shot = burn_optim::GradientsParams::from_grads(loss.loss.backward(), &amodel);
     let segmented = crate::geomfusion::segmented_fused_backward(
         &amodel,
         batch,
@@ -4292,8 +4290,8 @@ fn geomfusion_checks() -> anyhow::Result<Vec<Certificate>> {
         1.0,
     )?;
     struct GradDiff<'a> {
-        a: &'a burn::optim::GradientsParams,
-        b: &'a burn::optim::GradientsParams,
+        a: &'a burn_optim::GradientsParams,
+        b: &'a burn_optim::GradientsParams,
         worst: f32,
         /// Parameters that carried a gradient on both sides. Zero means the
         /// comparison was vacuous: two backward passes that both produced no
@@ -5687,8 +5685,8 @@ fn antipattern_checks() -> anyhow::Result<Vec<Certificate>> {
     use crate::corpus::TokenCorpus;
     use crate::lm::{label_weights, unlikelihood, LanguageModel, LmConfig, Unlikelihood};
     use crate::train::DefaultTrainBackend as A;
-    use burn::optim::{GradientsParams, Optimizer, SgdConfig};
     use burn::tensor::activation::log_softmax;
+    use burn_optim::{GradientsParams, Optimizer, SgdConfig};
 
     let device = Default::default();
     let labeler = Labeler::builtin()?;
@@ -6010,7 +6008,7 @@ fn codequality_certificates() -> Vec<Certificate> {
         QualityScore::from_dimensions(Language::Rust, vec![Dimension::new("synthetic", 0.3)], 10),
     ];
     let (loss_off, scalar_off) =
-        QualityRegularizer::off().loss::<burn::backend::NdArray<f32>>(&scores, &device);
+        QualityRegularizer::off().loss::<burn_ndarray::NdArray<f32>>(&scores, &device);
     let bits: u32 = loss_off.into_scalar().to_bits();
     let identity_err = f64::from(u8::from(bits != 0.0_f32.to_bits())) + (scalar_off.abs() as f64);
 
@@ -6478,9 +6476,9 @@ fn optim_certificates() -> Vec<Certificate> {
     // gradients away -- a formula is not an implementation, and a certificate
     // that never touches the code path cannot tell the difference.
     use crate::train::DefaultTrainBackend as A;
-    use burn::nn::{Linear, LinearConfig};
-    use burn::optim::GradientsParams;
     use burn::tensor::backend::AutodiffBackend;
+    use burn_nn::{Linear, LinearConfig};
+    use burn_optim::GradientsParams;
 
     let ad_device = Default::default();
     <A as burn::tensor::backend::Backend>::seed(&ad_device, 4242);
@@ -6568,18 +6566,18 @@ fn optim_certificates() -> Vec<Certificate> {
     // correction entirely pass this certificate: the inline copy stayed
     // correct while the implementation did not.
     let ema_device: <A2 as burn::tensor::backend::BackendTypes>::Device = Default::default();
-    let probe: burn::nn::Linear<A2> = burn::nn::LinearConfig::new(2, 2)
+    let probe: burn_nn::Linear<A2> = burn_nn::LinearConfig::new(2, 2)
         .with_bias(false)
         .init(&ema_device);
     // A second, independently initialized module to serve as the shadow, so
     // the blend has two different endpoints. Both are forced before any
     // clone (an unforced `Param` draws fresh weights on each clone).
-    let shadow_probe: burn::nn::Linear<A2> = burn::nn::LinearConfig::new(2, 2)
+    let shadow_probe: burn_nn::Linear<A2> = burn_nn::LinearConfig::new(2, 2)
         .with_bias(false)
         .init(&ema_device);
     crate::tensor_ext::force_initialization(&probe);
     crate::tensor_ext::force_initialization(&shadow_probe);
-    let weights_of = |m: &burn::nn::Linear<A2>| -> Vec<f64> {
+    let weights_of = |m: &burn_nn::Linear<A2>| -> Vec<f64> {
         m.weight
             .val()
             .into_data()
@@ -7277,8 +7275,8 @@ fn multisource_checks() -> anyhow::Result<Vec<Certificate>> {
     use crate::merge::{flatten, merge_into, ParamSnapshot};
     use crate::mix::{CorpusMix, MixMode, MixWeights};
     use crate::train::DefaultTrainBackend as A;
-    use burn::nn::LinearConfig;
-    use burn::optim::{GradientsParams, Optimizer, SgdConfig};
+    use burn_nn::LinearConfig;
+    use burn_optim::{GradientsParams, Optimizer, SgdConfig};
     use rand::SeedableRng;
 
     let device = Default::default();
@@ -7847,8 +7845,8 @@ fn ablation_checks() -> anyhow::Result<Vec<Certificate>> {
     };
     use crate::lm::{DirectionPenalty, LanguageModel, LmConfig, LmExtras};
     use crate::train::DefaultTrainBackend as A;
-    use burn::optim::{GradientsParams, Optimizer, SgdConfig};
     use burn::tensor::activation::softmax;
+    use burn_optim::{GradientsParams, Optimizer, SgdConfig};
 
     let device = Default::default();
     let model = LanguageModel::<B>::new(
@@ -8585,7 +8583,7 @@ fn vecread_checks() -> anyhow::Result<Vec<Certificate>> {
     // certificate pins that), which would make both claims vacuously false;
     // so this student gets its readout nudged off zero first, giving the
     // stream a visible write to read. The claim is about the mechanism.
-    use burn::nn::LinearConfig;
+    use burn_nn::LinearConfig;
     let mut writing = GeometricStudent::<B>::new(&config, &device)?;
     crate::tensor_ext::force_initialization(&writing);
     writing.set_geom_readout(
@@ -9326,7 +9324,7 @@ mod tests {
             let mut writing = GeometricStudent::<B>::new(&config, &device).unwrap();
             crate::tensor_ext::force_initialization(&writing);
             writing.set_geom_readout(
-                burn::nn::LinearConfig::new(config.geom_dim, config.hidden_size)
+                burn_nn::LinearConfig::new(config.geom_dim, config.hidden_size)
                     .with_bias(true)
                     .init(&device),
             );

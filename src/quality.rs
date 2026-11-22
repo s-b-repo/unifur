@@ -754,7 +754,7 @@ impl TrainingHealth {
 /// which is the normal case in block-wise training -- contribute nothing, so
 /// this is the norm of the update that would actually be applied, not of some
 /// larger notional one.
-pub fn global_grad_norm<B, M>(module: &M, grads: &burn::optim::GradientsParams) -> f32
+pub fn global_grad_norm<B, M>(module: &M, grads: &burn_optim::GradientsParams) -> f32
 where
     B: burn::tensor::backend::AutodiffBackend<FloatElem = f32>,
     M: burn::module::AutodiffModule<B>,
@@ -769,7 +769,7 @@ where
 }
 
 struct GradNormVisitor<'a, B: burn::tensor::backend::AutodiffBackend> {
-    grads: &'a burn::optim::GradientsParams,
+    grads: &'a burn_optim::GradientsParams,
     sum_sq: f64,
     _backend: std::marker::PhantomData<B>,
 }
@@ -847,7 +847,7 @@ pub fn grad_norm_ok(norm: f32, min_norm: f32, max_norm: f32) -> bool {
 )]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 

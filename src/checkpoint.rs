@@ -210,7 +210,7 @@ pub fn latest_in_dir(dir: &Path, stem: &str) -> anyhow::Result<Option<PathBuf>> 
 
 /// The recorder's file extension does not depend on the backend, but the
 /// trait method does; this alias pins one so callers need not.
-type B32 = burn::backend::NdArray<f32>;
+type B32 = burn_ndarray::NdArray<f32>;
 
 /// sha256 over a module's parameters, hex-encoded.
 ///
@@ -713,9 +713,9 @@ mod tests {
     use super::*;
     use crate::dblock::{DblockClassifier, DblockConfig};
     use crate::vit::ViTDiTConfig;
-    use burn::backend::NdArray;
     use burn::tensor::backend::BackendTypes;
     use burn::tensor::Tensor;
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
     type Device = <B as BackendTypes>::Device;

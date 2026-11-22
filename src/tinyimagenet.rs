@@ -92,7 +92,7 @@ pub fn open(
 mod tests {
     use super::*;
     use crate::data::TrainDataset;
-    use burn::backend::NdArray;
+    use burn_ndarray::NdArray;
     use rand::{rngs::StdRng, SeedableRng};
     use std::io::Write;
 

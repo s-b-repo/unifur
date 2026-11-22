@@ -127,6 +127,8 @@ jobs:
   deps:
     name: dependencies are current and audited
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
       - run: rustup show active-toolchain || rustup toolchain install
@@ -134,9 +136,9 @@ jobs:
       # `-D warnings` catches the unused-dependency lint this tree would
       # otherwise trip on any Cargo version that enables it by default.
       - name: Advisory database for known-vulnerable crates
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cargo install cargo-audit --locked --version 0.23.0
+          cargo audit --file Cargo.lock
 
       - name: Report duplicate dependency versions
         run: cargo tree --duplicates

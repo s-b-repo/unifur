@@ -128,14 +128,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use burn::module::{AutodiffModule, Module, Param};
-use burn::nn::{
-    Dropout, DropoutConfig, Embedding, EmbeddingConfig, Initializer, LayerNorm, LayerNormConfig,
-    Linear, LinearConfig,
-};
-use burn::optim::{AdamW, AdamWConfig, GradientsParams, Optimizer};
 use burn::tensor::activation::{log_softmax, silu, softmax};
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Bool, Distribution, Int, Tensor, TensorData};
+use burn_nn::{
+    Dropout, DropoutConfig, Embedding, EmbeddingConfig, Initializer, LayerNorm, LayerNormConfig,
+    Linear, LinearConfig,
+};
+use burn_optim::{AdamW, AdamWConfig, GradientsParams, Optimizer};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 use serde::{Deserialize, Serialize};
@@ -2647,7 +2647,7 @@ impl NcmTrainConfig {
 }
 
 /// The generator's optimizer: AdamW with `β = (0.9, 0.95)`.
-pub type GeneratorOptim<B> = burn::optim::adaptor::OptimizerAdaptor<AdamW, NcmGenerator<B>, B>;
+pub type GeneratorOptim<B> = burn_optim::adaptor::OptimizerAdaptor<AdamW, NcmGenerator<B>, B>;
 /// Its record.
 pub type GeneratorOptimRecord<B> = <GeneratorOptim<B> as Optimizer<NcmGenerator<B>, B>>::Record;
 
@@ -3628,7 +3628,7 @@ fn ncm_cert(
     }
 }
 
-type CertBackend = burn::backend::NdArray<f32>;
+type CertBackend = burn_ndarray::NdArray<f32>;
 
 fn max_abs_diff<B: Backend, const D: usize>(a: &Tensor<B, D>, b: &Tensor<B, D>) -> Result<f64> {
     let x = host_f32(a.clone())?;
@@ -3689,7 +3689,7 @@ fn cert_config() -> NcmGeneratorConfig {
 }
 
 /// A prompt `[2, 4]` whose second row is half padding.
-fn cert_prompt(device: &burn::backend::ndarray::NdArrayDevice) -> Tensor<CertBackend, 2, Int> {
+fn cert_prompt(device: &burn_ndarray::NdArrayDevice) -> Tensor<CertBackend, 2, Int> {
     let pad = default_pad_id() as i64;
     int_tensor::<CertBackend>(&[72, 101, 108, 112, pad, pad, 111, 33], 2, 4, device)
 }
@@ -4009,7 +4009,7 @@ fn cert_weighted_loss() -> Result<f64> {
 fn random_metric(
     dim: usize,
     rng: &mut ChaCha12Rng,
-    device: &burn::backend::ndarray::NdArrayDevice,
+    device: &burn_ndarray::NdArrayDevice,
 ) -> Tensor<CertBackend, 2> {
     let mut l = vec![0.0f32; dim * dim];
     for i in 0..dim {
@@ -4842,8 +4842,8 @@ fn cert_invariant_reuse() -> Result<f64> {
 mod tests {
     use super::*;
 
-    type B = burn::backend::NdArray<f32>;
-    type AB = burn::backend::Autodiff<B>;
+    type B = burn_ndarray::NdArray<f32>;
+    type AB = burn_autodiff::Autodiff<B>;
 
     #[test]
     fn test_resize_windows_partition_and_pool() {

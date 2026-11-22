@@ -1866,7 +1866,7 @@ impl<B: Backend> Run<'_, B> {
 mod tests {
     use super::doubles::{CountingCodec, CountingModel, ToyCodec, ToyModel};
     use super::*;
-    use burn::backend::NdArray;
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 

@@ -5,9 +5,9 @@
 
 use burn::{
     module::Module,
-    nn::{Linear, LinearConfig},
     tensor::{backend::Backend, Tensor},
 };
+use burn_nn::{Linear, LinearConfig};
 
 /// Halting head configuration.
 #[derive(Debug, Clone)]
@@ -130,7 +130,7 @@ pub fn early_exit_step(halting_probs: &[f32], threshold: f32) -> usize {
 )]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 

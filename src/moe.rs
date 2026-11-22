@@ -20,9 +20,9 @@
 use burn::tensor::ElementConversion;
 use burn::{
     module::{Module, Param},
-    nn::{Linear, LinearConfig},
     tensor::{activation::softmax, backend::Backend, Int, Tensor},
 };
+use burn_nn::{Linear, LinearConfig};
 use serde::{Deserialize, Serialize};
 
 /// Router + expert-pool configuration.
@@ -1009,8 +1009,8 @@ impl<B: Backend> MoELayer<B> {
 )]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
     use burn::tensor::Distribution;
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 

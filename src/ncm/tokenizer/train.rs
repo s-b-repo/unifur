@@ -60,10 +60,10 @@ use crate::quality::global_grad_norm;
 use crate::schedule::{clip_gradients, Cycle, GradientAccumulator, LrSchedule};
 use anyhow::{bail, ensure, Context as _, Result};
 use burn::module::{AutodiffModule, Module, ModuleVisitor, Param};
-use burn::nn::{Linear, LinearConfig};
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Int, Tensor};
+use burn_nn::{Linear, LinearConfig};
+use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 use serde::{Deserialize, Serialize};
@@ -919,7 +919,7 @@ fn describe_eval(eval: &EvalReport) -> Vec<String> {
     lines
 }
 
-type Optim<B> = burn::optim::adaptor::OptimizerAdaptor<burn::optim::AdamW, NcmTrainee<B>, B>;
+type Optim<B> = burn_optim::adaptor::OptimizerAdaptor<burn_optim::AdamW, NcmTrainee<B>, B>;
 
 struct SaveContext<'a> {
     config: &'a TokenizerTrainConfig,
@@ -1547,7 +1547,7 @@ pub(crate) struct IntentOffCheck {
 /// so they are compared exactly; gradients come from separate backward
 /// passes and are compared to [`super::CROSS_PASS_GRADIENT_TOLERANCE`].
 pub(crate) fn intent_off_check() -> Result<IntentOffCheck> {
-    type Ad = burn::backend::Autodiff<burn::backend::NdArray<f32>>;
+    type Ad = burn_autodiff::Autodiff<burn_ndarray::NdArray<f32>>;
     let device = Default::default();
     let (model, tokens) = super::micro_tokenizer::<Ad>(61, 3, &device)?;
     let vocab = model.config().vocab;
@@ -1637,7 +1637,7 @@ mod tests {
     use crate::ncm::LevelSchedule;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    type Ad = burn::backend::Autodiff<burn::backend::NdArray<f32>>;
+    type Ad = burn_autodiff::Autodiff<burn_ndarray::NdArray<f32>>;
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -1782,7 +1782,7 @@ mod tests {
             b.losses.total
         );
         // A checkpoint evaluates to exactly what its run reported.
-        let eval = evaluate_checkpoint::<burn::backend::NdArray<f32>>(
+        let eval = evaluate_checkpoint::<burn_ndarray::NdArray<f32>>(
             full.checkpoint.as_ref().unwrap(),
             None,
             &[val],

@@ -132,14 +132,14 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use burn::{
     module::{Initializer, Module},
-    nn::{Linear, LinearConfig},
-    optim::{AdamWConfig, Optimizer},
     tensor::{
         activation::{log_softmax, softmax},
         backend::Backend,
         Int, Tensor,
     },
 };
+use burn_nn::{Linear, LinearConfig};
+use burn_optim::{AdamWConfig, Optimizer};
 use rand::{seq::SliceRandom, Rng, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 use serde::{Deserialize, Serialize};
@@ -2235,8 +2235,8 @@ pub fn train_language_specialist<B: burn::tensor::backend::AutodiffBackend<Float
 
     let save_state = |step: usize,
                       model: &GeometricStudent<B>,
-                      optim: &burn::optim::adaptor::OptimizerAdaptor<
-        burn::optim::AdamW,
+                      optim: &burn_optim::adaptor::OptimizerAdaptor<
+        burn_optim::AdamW,
         GeometricStudent<B>,
         B,
     >,
@@ -2384,7 +2384,7 @@ pub fn train_language_specialist<B: burn::tensor::backend::AutodiffBackend<Float
             }
             let total_counted: usize = counted.iter().sum();
             let mut accumulator = crate::schedule::GradientAccumulator::new(k);
-            let mut summed: Option<burn::optim::GradientsParams> = None;
+            let mut summed: Option<burn_optim::GradientsParams> = None;
             let mut obs = StepObs {
                 loss: 0.0,
                 ce: 0.0,
@@ -2569,8 +2569,8 @@ pub fn train_language_specialist<B: burn::tensor::backend::AutodiffBackend<Float
 mod tests {
     use super::*;
     use crate::expert_index::coding_student_spec;
-    use burn::backend::NdArray;
     use burn::tensor::TensorData;
+    use burn_ndarray::NdArray;
 
     type B = NdArray<f32>;
 
@@ -3789,7 +3789,7 @@ mod tests {
 
     #[test]
     fn test_specialist_training_falls_and_teaches_the_router() {
-        type AB = burn::backend::Autodiff<B>;
+        type AB = burn_autodiff::Autodiff<B>;
         let device = Default::default();
         let dir = unique_tmp("specialist");
         let fixture = synthetic_trace_fixture(&dir, 8);
@@ -3916,7 +3916,7 @@ mod tests {
         //   order restores through the serialized host RNG and the
         //   optimizer moments through their record; the bounded
         //   continuation is what exercises both.
-        type AB = burn::backend::Autodiff<B>;
+        type AB = burn_autodiff::Autodiff<B>;
         let device = Default::default();
         let dir = unique_tmp("specialist-resume");
         let fixture = synthetic_trace_fixture(&dir, 4);
@@ -4209,7 +4209,7 @@ mod tests {
 
     #[test]
     fn test_field_supervision_trains_the_field_box() {
-        type AB = burn::backend::Autodiff<B>;
+        type AB = burn_autodiff::Autodiff<B>;
         let device = Default::default();
         let dir = unique_tmp("fieldbox");
         std::fs::create_dir_all(&dir).unwrap();
@@ -4289,7 +4289,7 @@ mod tests {
     /// `coding:go` (box 6) exactly as it does for a shipped language.
     #[test]
     fn test_extended_language_supervision_trains_the_go_box() {
-        type AB = burn::backend::Autodiff<B>;
+        type AB = burn_autodiff::Autodiff<B>;
         let device = Default::default();
         let dir = unique_tmp("gobox");
         std::fs::create_dir_all(&dir).unwrap();
@@ -4407,7 +4407,7 @@ mod tests {
     /// that does not divide `batch_size` is a config error naming the field.
     #[test]
     fn test_micro_batch_accumulation_matches_the_direct_batch() {
-        type AB = burn::backend::Autodiff<B>;
+        type AB = burn_autodiff::Autodiff<B>;
         let device = Default::default();
         let dir = unique_tmp("accum");
         let fixture = synthetic_trace_fixture(&dir, 8);

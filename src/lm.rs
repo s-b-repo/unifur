@@ -29,13 +29,13 @@
 
 use burn::{
     module::{Module, Param},
-    nn::{Embedding, EmbeddingConfig, Linear, LinearConfig},
     tensor::{
         activation::{log_softmax, softmax},
         backend::Backend,
         Distribution, Int, Tensor,
     },
 };
+use burn_nn::{Embedding, EmbeddingConfig, Linear, LinearConfig};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
@@ -2331,7 +2331,7 @@ impl Sampling {
 mod tests {
     use super::*;
     use crate::tokenizer::ByteTokenizer;
-    use burn::backend::NdArray;
+    use burn_ndarray::NdArray;
     use rand::{rngs::StdRng, SeedableRng};
 
     type B = NdArray<f32>;
@@ -2383,7 +2383,7 @@ mod tests {
         use crate::train::DefaultTrainBackend as A;
         use crate::vit::MosmeTrunkConfig;
         use burn::module::{ModuleMapper, ModuleVisitor, ParamId};
-        use burn::optim::{AdamWConfig, Optimizer};
+        use burn_optim::{AdamWConfig, Optimizer};
         let device = Default::default();
         let mut spec = MosmeSpec::flat(3);
         spec.boxes.push(BoxSpec::new(

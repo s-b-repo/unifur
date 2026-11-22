@@ -1037,9 +1037,9 @@ impl Registry {
 // ---------------------------------------------------------------------------
 
 /// The inference backend the router, eval and scheduler paths run on.
-type EvalBackend = burn::backend::NdArray<f32>;
+type EvalBackend = burn_ndarray::NdArray<f32>;
 /// The autodiff backend the scheduler trains on.
-type TrainBackend = burn::backend::Autodiff<EvalBackend>;
+type TrainBackend = burn_autodiff::Autodiff<EvalBackend>;
 
 /// Recover the `StudentConfig` a checkpoint was trained with: the
 /// training-state sidecar first; a deployed checkpoint travels without one,

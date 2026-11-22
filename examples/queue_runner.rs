@@ -72,9 +72,9 @@ fn drain_wgpu(root: &Path, scheduler: &SchedulerConfig) -> Result<usize> {
             root,
             scheduler,
             nina::train_tick_with::<
-                burn::backend::Autodiff<
-                    burn::backend::Wgpu<f32>,
-                    burn::backend::autodiff::checkpoint::strategy::BalancedCheckpointing,
+                burn_autodiff::Autodiff<
+                    burn_wgpu::Wgpu<f32>,
+                    burn_autodiff::checkpoint::strategy::BalancedCheckpointing,
                 >,
             >,
         )
@@ -82,7 +82,7 @@ fn drain_wgpu(root: &Path, scheduler: &SchedulerConfig) -> Result<usize> {
         drain(
             root,
             scheduler,
-            nina::train_tick_with::<burn::backend::Autodiff<burn::backend::Wgpu<f32>>>,
+            nina::train_tick_with::<burn_autodiff::Autodiff<burn_wgpu::Wgpu<f32>>>,
         )
     }
 }

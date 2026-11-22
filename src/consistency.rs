@@ -374,7 +374,7 @@ mod tests {
             dblock::DblockConfig,
             vit::{MoeTrunkConfig, ViTDiTConfig},
         };
-        use burn::backend::NdArray;
+        use burn_ndarray::NdArray;
         use rand::{rngs::StdRng, SeedableRng};
         type B = NdArray<f32>;
 

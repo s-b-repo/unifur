@@ -395,9 +395,9 @@ pub fn residual_projection<B: Backend<FloatElem = f32>, M: Module<B>>(
 )]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
-    use burn::nn::LinearConfig;
     use burn::tensor::Distribution;
+    use burn_ndarray::NdArray;
+    use burn_nn::LinearConfig;
 
     type B = NdArray<f32>;
 
@@ -500,8 +500,8 @@ mod tests {
     fn test_orthogonalize_zeroes_the_output_side_and_is_idempotent() {
         #[derive(Module, Debug)]
         struct Block<B: Backend> {
-            dense: burn::nn::Linear<B>,
-            query: burn::nn::Linear<B>,
+            dense: burn_nn::Linear<B>,
+            query: burn_nn::Linear<B>,
         }
         let device = Default::default();
         let block = Block::<B> {

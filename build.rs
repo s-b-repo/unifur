@@ -44,7 +44,7 @@ fn burn_version() -> Result<String, String> {
         std::fs::read_to_string("Cargo.lock").map_err(|err| format!("read Cargo.lock: {err}"))?;
     let mut lines = lock.lines();
     while let Some(line) = lines.next() {
-        if line.trim() == "name = \"burn\"" {
+        if line.trim() == "name = \"burn-core\"" {
             return lines
                 .next()
                 .and_then(|v| {
@@ -52,10 +52,12 @@ fn burn_version() -> Result<String, String> {
                         .strip_prefix("version = \"")
                         .map(|v| v.trim_end_matches('"').to_string())
                 })
-                .ok_or_else(|| "the burn entry in Cargo.lock has no version line".to_string());
+                .ok_or_else(|| {
+                    "the burn-core entry in Cargo.lock has no version line".to_string()
+                });
         }
     }
-    Err("Cargo.lock has no entry for burn".into())
+    Err("Cargo.lock has no entry for burn-core".into())
 }
 
 fn main() {

@@ -51,11 +51,11 @@ use std::time::Instant;
 
 use anyhow::{Context as _, Result};
 use burn::module::Module;
-use burn::nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig};
-use burn::optim::{AdamWConfig, GradientsParams, Optimizer};
 use burn::tensor::activation::{log_softmax, softmax};
 use burn::tensor::backend::{AutodiffBackend, Backend};
 use burn::tensor::{Int, Tensor};
+use burn_nn::{Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig};
+use burn_optim::{AdamWConfig, GradientsParams, Optimizer};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -1289,7 +1289,7 @@ pub fn evaluate_loss<B: AutodiffBackend<FloatElem = f32>>(
 /// checks.
 pub fn certificates() -> Vec<crate::verify::Certificate> {
     use crate::verify::Certificate;
-    type Nd = burn::backend::NdArray<f32>;
+    type Nd = burn_ndarray::NdArray<f32>;
     let device = Default::default();
 
     // 1. The block-causal mask refuses future positions, exactly.
@@ -1771,10 +1771,10 @@ pub fn save_checkpoint<B: Backend>(
 pub fn load_checkpoint(
     path: &std::path::Path,
     config: &TbConfig,
-    device: &<burn::backend::NdArray<f32> as burn::tensor::backend::BackendTypes>::Device,
-) -> Result<TokenBlockModel<burn::backend::NdArray<f32>>> {
+    device: &<burn_ndarray::NdArray<f32> as burn::tensor::backend::BackendTypes>::Device,
+) -> Result<TokenBlockModel<burn_ndarray::NdArray<f32>>> {
     type Rec = burn::record::NamedMpkFileRecorder<burn::record::FullPrecisionSettings>;
-    type Nd = burn::backend::NdArray<f32>;
+    type Nd = burn_ndarray::NdArray<f32>;
     TokenBlockModel::<Nd>::new(config, device)?
         .load_file(path, &Rec::new(), device)
         .map_err(|err| anyhow::anyhow!("load {}: {err}", path.display()))
@@ -1796,8 +1796,8 @@ mod tests {
     use super::*;
     use burn::module::AutodiffModule;
 
-    type Nd = burn::backend::NdArray<f32>;
-    type Ad = burn::backend::Autodiff<Nd>;
+    type Nd = burn_ndarray::NdArray<f32>;
+    type Ad = burn_autodiff::Autodiff<Nd>;
 
     fn device() -> <Nd as burn::tensor::backend::BackendTypes>::Device {
         Default::default()

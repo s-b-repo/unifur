@@ -89,12 +89,12 @@ use super::{ConceptCodec, LevelCodes, LevelSchedule, SoftConceptCodec};
 use crate::tensor_ext::exact_gelu;
 use anyhow::{bail, ensure, Context as _, Result};
 use burn::module::{Module, Param, ParamId};
-use burn::nn::{
-    Embedding, EmbeddingConfig, Initializer, LayerNorm, LayerNormConfig, Linear, LinearConfig,
-};
 use burn::tensor::activation::{log_softmax, softmax};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Distribution, IndexingUpdateOp, Int, Tensor};
+use burn_nn::{
+    Embedding, EmbeddingConfig, Initializer, LayerNorm, LayerNormConfig, Linear, LinearConfig,
+};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
@@ -1147,8 +1147,8 @@ pub fn code_usage(histogram: &[u64]) -> (usize, f64) {
 
 // ------------------------------------------------------------ certificates --
 
-type CertBackend = burn::backend::NdArray<f32>;
-type CertAutodiff = burn::backend::Autodiff<CertBackend>;
+type CertBackend = burn_ndarray::NdArray<f32>;
+type CertAutodiff = burn_autodiff::Autodiff<CertBackend>;
 
 fn ncm_cert(
     name: &'static str,
