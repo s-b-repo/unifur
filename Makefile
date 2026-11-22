@@ -79,8 +79,9 @@ test: test-lib test-integration ## Every test target
 test-lib: ## Unit tests, including the numerical certificate suite
 	$(CARGO) test --lib -- --test-threads=$(TEST_THREADS)
 
-test-integration: ## Integration and resume tests
-	$(CARGO) test --tests -- --test-threads=$(TEST_THREADS)
+# Named integration targets and binary unit tests complement test-lib.
+test-integration: ## Binary unit, integration and resume tests
+	$(CARGO) test --bins --test '*' -- --test-threads=$(TEST_THREADS)
 
 # --------------------------------------------------------------------------
 # Static audit
