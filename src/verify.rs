@@ -354,6 +354,7 @@ pub fn run_all() -> Report {
         crate::ncm::tokenizer::certificate_checks,
     ));
     certificates.extend(checks_or_failed("ncm", crate::ncm::generator::certificates));
+    certificates.extend(checks_or_failed("ncm", crate::ncm::released::certificates));
     certificates.extend(checks_or_failed(
         "ncm-decode",
         crate::ncm::decode::certificate_checks,

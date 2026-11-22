@@ -1800,10 +1800,10 @@ enum Command {
     /// (`diffusionblocks::ncm::cli`), and boxing keeps its builder frames off
     /// the stack of whatever parses the root `Cli`.
     Ncm {
-        #[command(subcommand)]
-        action: Box<diffusionblocks::ncm::cli::NcmAction>,
         #[command(flatten)]
         runtime: LmRuntimeArgs,
+        #[command(subcommand)]
+        action: Box<diffusionblocks::ncm::cli::NcmAction>,
     },
     /// Token-block diffusion substrate (plan items 1-2): a BD3-LM-style
     /// semi-autoregressive byte LM with block-causal attention, per-block KV
@@ -5519,12 +5519,16 @@ fn cmd_tblock(action: TblockAction) -> Result<()> {
 
 /// Run an `ncm` action: progress lines as they come, then the report.
 fn cmd_ncm(action: diffusionblocks::ncm::cli::NcmAction, runtime: &LmRuntimeArgs) -> Result<()> {
-    use diffusionblocks::ncm::cli;
+    use diffusionblocks::ncm::cli::{self, NcmAction};
     runtime.validate()?;
     let progress = &mut |line: &str| println!("{line}");
     let report = match runtime.backend {
         LmBackend::Cpu => cli::run(action, progress)?,
         LmBackend::Wgpu => {
+            anyhow::ensure!(
+                !matches!(&action, NcmAction::Released(_) | NcmAction::ReleasedTune(_)),
+                "converted release inference and tuning require the CPU runtime"
+            );
             #[cfg(feature = "wgpu")]
             {
                 let device = lm_wgpu_device(runtime)?;
@@ -10706,9 +10710,10 @@ mod ncm_cli_tests {
             "7",
             "--self-prob",
             "0.25",
+            "--aligned-windows",
         ])
         .unwrap();
-        let Command::Ncm { action, .. } = cli.command else {
+        let Command::Ncm { runtime, action } = cli.command else {
             panic!("not an ncm command")
         };
         let NcmAction::Train(args) = *action else {
@@ -10718,10 +10723,16 @@ mod ncm_cli_tests {
             (args.config.as_str(), args.steps, args.self_prob),
             ("sudoku", 7, Some(0.25))
         );
+        assert!(args.aligned_windows);
+        assert_eq!(runtime.backend, LmBackend::Cpu);
         assert_eq!((args.lr, args.min_lr, args.grad_clip), (3e-4, 3e-5, 1.0));
         let cli = Cli::try_parse_from([
             "dblocks",
             "ncm",
+            "--backend",
+            "wgpu",
+            "--device",
+            "discrete:0",
             "generate",
             "--tokenizer",
             "t",
@@ -10739,9 +10750,11 @@ mod ncm_cli_tests {
             "9",
         ])
         .unwrap();
-        let Command::Ncm { action, .. } = cli.command else {
+        let Command::Ncm { runtime, action } = cli.command else {
             panic!("not an ncm command")
         };
+        assert_eq!(runtime.backend, LmBackend::Wgpu);
+        assert_eq!(runtime.device.as_deref(), Some("discrete:0"));
         let NcmAction::Generate(args) = *action else {
             panic!("not ncm generate")
         };

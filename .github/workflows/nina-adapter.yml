@@ -1,0 +1,87 @@
+name: Nina 1B expert adaptation
+
+on:
+  workflow_dispatch:
+    inputs:
+      corpus_run_id:
+        description: Workflow run containing the labeled training and validation JSONL artifact
+        required: true
+        type: string
+      corpus_artifact:
+        description: Name of the labeled corpus artifact
+        default: nina-labeled-corpus
+        type: string
+      epochs:
+        description: Number of passes over the frozen concept states
+        default: 6
+        type: number
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  tune:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      RAYON_NUM_THREADS: 4
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      EPOCHS: ${{ inputs.epochs }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.corpus_run_id }}
+          name: ${{ inputs.corpus_artifact }}
+          path: input
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and verify native NCM
+        run: |
+          cargo build --locked --release --bin dblocks
+          mkdir -p result
+          target/release/dblocks verify --group ncm | tee result/certificates.txt
+      - name: Convert pinned NCM weights
+        run: |
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.10.0+cpu
+          python -m pip install safetensors==0.8.0 numpy
+          python experiments/nina_1b/convert_release.py --download --checkpoints weights
+          cp weights/nina-1b/manifest.json result/model.json
+      - name: Adapt experts and evaluate held-out code loss
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          labels = json.loads(Path("input/manifest.json").read_text())
+          model = json.loads(Path("result/model.json").read_text())
+          expected_levels = [4, 6, 10, 14, 20, 26, 32, 40, 48]
+          if (labels["version"] != 1 or labels["levels"] != expected_levels
+                  or labels["tokenizer_sha256"] != model["checkpoint_sha256"]["tokenizer.pt"]):
+              raise SystemExit("Corpus code labels do not belong to this tokenizer")
+          PY
+          target/release/dblocks ncm released-tune --model weights/nina-1b \
+            --train input/train.jsonl --validation input/validation.jsonl \
+            --epochs "$EPOCHS" --out result/expert-adapter.json 2>&1 | tee result/training.log
+      - name: Check generated answers
+        run: |
+          prior=()
+          if test -f input/domain-priors.json; then
+            prior=(--prior input/domain-priors.json)
+          fi
+          python experiments/nina_1b/evaluate_answers.py --dblocks target/release/dblocks \
+            --model weights/nina-1b --adapter result/expert-adapter.json \
+            "${prior[@]}" --out result/free-running-qa.json
+          sha256sum result/expert-adapter.json result/free-running-qa.json > result/SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nina-expert-adapter-candidate
+          path: result
+          if-no-files-found: error

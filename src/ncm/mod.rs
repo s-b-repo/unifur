@@ -53,6 +53,7 @@ use serde::{Deserialize, Serialize};
 pub mod cli;
 pub mod decode;
 pub mod generator;
+pub mod released;
 pub mod tokenizer;
 
 /// The level lengths `ℓ_1 < … < ℓ_K = L`.

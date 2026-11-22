@@ -4,7 +4,8 @@
 //! back: progress lines through the callback, then [`NcmReport::render`].
 //! Nothing here prints.
 //!
-//! The native trainers and generator share the same CPU and GPU code.
+//! The native trainers and generator share a backend-generic path.
+//! Converted release checkpoints use the CPU runtime.
 
 use crate::ncm::decode::{DecodeBudget, DecodeConfig, DecodeReport};
 use crate::ncm::tokenizer::train::{
@@ -33,6 +34,10 @@ pub enum NcmAction {
     Train(Box<GeneratorTrainArgs>),
     /// Generate with a trained generator (NFE = K level calls per sample).
     Generate(Box<GenerateArgs>),
+    /// Run a converted NCM release with native MoSME and concept geometry.
+    Released(Box<crate::ncm::released::ReleasedArgs>),
+    /// Fit the released model's final MoSME expert biases.
+    ReleasedTune(Box<crate::ncm::released::TuneArgs>),
 }
 
 /// What `ncm tokenizer` does.
@@ -142,6 +147,7 @@ pub enum NcmReport {
     TokenizerEval(EvalReport),
     GeneratorTrain(Box<GeneratorTrainSummary>),
     Generate(Box<GenerateSummary>),
+    Released(String),
 }
 
 impl NcmReport {
@@ -152,6 +158,7 @@ impl NcmReport {
             Self::TokenizerEval(report) => report.render(),
             Self::GeneratorTrain(report) => report.render(),
             Self::Generate(report) => report.render(),
+            Self::Released(report) => report.clone(),
         }
     }
 }
@@ -194,10 +201,16 @@ fn train_config(args: TokenizerTrainArgs) -> Result<TokenizerTrainConfig> {
 /// Run one `ncm` action on the CPU backend. Progress lines go to `progress`.
 pub fn run(action: NcmAction, progress: &mut dyn FnMut(&str)) -> Result<NcmReport> {
     let device = burn::backend::ndarray::NdArrayDevice::Cpu;
-    run_native::<Cpu>(action, &device, progress)
+    match action {
+        NcmAction::Released(args) => super::released::run(*args).map(NcmReport::Released),
+        NcmAction::ReleasedTune(args) => {
+            super::released::tune(*args, progress).map(NcmReport::Released)
+        }
+        action => run_native::<Cpu>(action, &device, progress),
+    }
 }
 
-/// Run the native NCM pipeline with the selected backend.
+/// Run a native NCM tokenizer, trainer, or generator on the selected backend.
 pub fn run_native<B: Backend<FloatElem = f32>>(
     action: NcmAction,
     device: &B::Device,
@@ -245,6 +258,9 @@ pub fn run_native<B: Backend<FloatElem = f32>>(
             .map(|r| NcmReport::GeneratorTrain(Box::new(r))),
         NcmAction::Generate(args) => {
             generate_cli::<B>(*args, device).map(|r| NcmReport::Generate(Box::new(r)))
+        }
+        NcmAction::Released(_) | NcmAction::ReleasedTune(_) => {
+            anyhow::bail!("converted release inference and tuning require the CPU runtime")
         }
     }
 }

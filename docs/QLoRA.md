@@ -49,6 +49,11 @@ the memory footprint by:
 
 This enables training 3× more blocks per GPU.
 
+The native Nina 4B worker uses full FP32 generator training. Its optimizer
+and memory estimates apply to that recipe. Adapter training over frozen
+weights has a different memory profile and learns a smaller set of
+parameters. [Nina training resources](Training-Guide.md#training-resources)
+
 ## Quantization
 
 ### 4-bit NormalFloat

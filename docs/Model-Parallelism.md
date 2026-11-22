@@ -8,6 +8,15 @@ short answer is **no**, and the long answer explains why, what
 *can* be done, and where this codebase's existing block-wise
 training actually sits in the landscape.
 
+## Nina worker scaling
+
+Forty independent Geometry3K fits finished in the hosted capacity trial,
+with 20 active fits at the peak. The native NCM probe also checked gradients
+and an AdamW update for two or 40 CPU ranks on one machine. A full 4B Nina
+job needs resident state for a full replica or a qualified sharded runtime
+that synchronizes updates, sample order, and resume across accelerators.
+[Measured worker capacity and memory](Training-Guide.md#training-resources)
+
 ## The question
 
 The idea is appealing: a 700B-parameter model is too big to train

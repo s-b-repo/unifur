@@ -25,6 +25,9 @@
 - Core idea: RL for diffusion LMs; variance decomposition of sequence-level ELBO; group sampling optimized by correctness reward.
 
 ### GPU-budget references
+- The native Nina worker guide records measured laptop and GitHub capacity,
+  the 4B memory and checkpoint budget, and how to dispatch reproducible
+  training stages. [Training resources](Training-Guide.md#training-resources)
 - "Can A Gamer Train A Mathematical Reasoning Model?": https://arxiv.org/html/2506.08935
 - "d1: Scaling Reasoning in Diffusion Large Language Models": https://arxiv.org/pdf/2504.12216
 

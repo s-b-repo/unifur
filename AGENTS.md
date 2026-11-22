@@ -170,60 +170,24 @@ in and fix what the compiler finds before trusting any claim about it.
 
 ## Training feasibility on the dev laptop (for agents)
 
-Read this before you promise a user that a model "can be trained here", or
-before you start a long training run on this machine. The numbers are
-estimates until the measured line below is filled in. Recompute them; don't
-round them up.
+The laptop has an i5-1235U with 12 threads, 23 GiB RAM and no discrete GPU.
+Release-build Burn NdArray samples measured 3.9 GFLOP/s for the tiny codec
+and 2.7–15.3 GFLOP/s for generator widths 64–512. Use it for CPU pilots,
+corpus preparation, and checkpoint replay. Profile the exact batch, sequence
+and latent depth before budgeting a larger fit.
 
-**Machine (2026-11-20):** i5-1235U (12 threads, AVX2, no AVX-512), 23 GB RAM,
-**no GPU**. Training here runs on Burn's `NdArray` CPU backend. The GPU box
-is a single RTX 3090 (24 GB).
+Public GitHub Actions completed 40 independent Geometry3K fits, with up to
+20 active jobs and 80 verified checkpoints. The single-device 4B recipe
+needs about 64 GB of FP32 parameter, gradient, and AdamW state before
+activations and codec buffers. A 24 GiB GPU can run smaller pilots.
+Qualify a device for a full replica or verify a sharded backend before
+scheduling the production run.
 
-**Rules:**
-
-1. **NCM's speed-up is a decode result, not a training result.** The paper
-   (arXiv:2610.14162) reports 10–31× fewer *generation-time* network calls
-   (NFE = K level calls instead of many diffusion steps). It does not reduce
-   training FLOPs, and the paper's models were trained on GPUs for
-   50k–350k updates. Never cite it as a reason training is cheap.
-2. **Training cost** is about `FLOPs ≈ 6 · N · D`, where N is the parameter
-   count and D is the number of training tokens.
-   - The unified TRISKELE generator (`ncm::generator`, the concept-field
-     operator) re-runs its block once per thinking step. Its generator cost is
-     therefore × `(1 + thinking_steps)`: with 2 thinking steps it costs ≈ 3×
-     plain NCM.
-   - The NCM tokenizer (0 encoder + 1 decoder block) is cheap by comparison.
-     It is trained once and shared by every field.
-3. **Throughput assumption: 2e10–1e11 FLOP/s**, for the `NdArray` backend in
-   a *release* build. A debug build is roughly 10× slower: never time or
-   train in debug (the debug tokenizer smoke run took ~2.5 s/step).
-4. **Decision rule:**
-   `days ≈ 6 · N · D · (1 + T) / (throughput · 86 400)`. Train here only if
-   that is ≤ ~10 days. Anything bigger goes to the 3090, which is roughly
-   30–100× faster.
-
-| N (params) | D (tokens, ≈20·N) | Laptop time at T = 0 | Verdict |
-|---|---|---|---|
-| ~5M | ~100M | ~8 h – 2 days | train here |
-| ~10M | ~200M | ~1.5 – 7 days | train here (slow) |
-| ~25M (paper's smallest, Sudoku config) | ~500M | ~9 – 43 days | 3090 |
-| ~90M (paper's TinyStories config) | ~2B | ~4 – 20 months | 3090 only |
-
-**Why small fused models work here:**
-- The on-device target is small anyway: 2–10M parameters per field.
-- At D ≈ 20·N, that is 3e15–1.2e16 FLOPs, which is hours to days at the
-  stated throughput.
-- 23 GB RAM holds activations for an unrolled thinking loop at these sizes.
-
-**The real blocker is data, not compute.** The shared tokenizer corpus is
-~142k tokens (`nina-data/field-corpora/all-fields.corpus.bin`, 2026-11-20).
-That is enough for smoke tests only; a useful specialist needs tens of
-millions of tokens per field.
-
-**Measured:** _pending._ Replace the throughput assumption with the measured
-release-build step time from `dblocks ncm tokenizer train` and
-`dblocks ncm train` (`cargo build --release --bin dblocks`, then
-`target/release/dblocks ...`). Then recompute the table.
+Use the relevant manifest for the 367 million byte-token archive or the
+145,310-record combined instruction training split. The latter has about
+33 million non-padding target tokens per pass. Measure training throughput
+separately from NCM generation call counts.
+[Training resources and worker dispatch](docs/Training-Guide.md#training-resources)
 
 ## Where things are
 

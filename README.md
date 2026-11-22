@@ -897,6 +897,11 @@ uv run python -m diffusionblocks.main test cifar100 \
 
 ## Training Guide
 
+For Nina's native concept-field models, the worker guide covers the shared
+codec, two latent updates per level, measured CPU and GitHub capacity, the
+4B memory budget, and the converted XSum adapter workflow.
+[Native Nina workers](docs/Training-Guide.md#native-nina-workers)
+
 ### Data Supported
 
 | Dataset | Image Size | Classes | Config Name |

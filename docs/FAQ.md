@@ -43,6 +43,14 @@ The original DiffusionBlocks trains one block per step. DiffusionBlocks++ adds:
 
 ## Training
 
+### What hardware does Nina training need?
+
+Standard public GitHub Actions jobs handle the four-step CPU preflight and
+independent small fits. The full 4B generator takes about 64 GB of FP32
+parameter, gradient and AdamW state before activations and codec buffers.
+Choose an accelerator and checkpoint storage using a measured footprint and
+throughput for the target shape. [Nina training resources](Training-Guide.md#training-resources)
+
 ### How much memory does it use?
 
 | Configuration | Memory per GPU |

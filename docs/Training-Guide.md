@@ -4,24 +4,131 @@ Everything `dblocks train` can do, and how to read what it reports.
 
 ## Native Nina workers
 
-Nina uses a frozen multiscale codec and a concept-field generator. Each
-generator level combines geometric metric scoring and latent vector updates
-before committing NCM codes. Train the codec with `dblocks ncm tokenizer train`
-and the generator with `dblocks ncm train`. A checkpoint travels with its
-`.state` sidecar and the exact codec it was trained against.
+Nina trains a multiscale residual-VQ codec with `dblocks ncm tokenizer train`.
+The concept-field generator uses the frozen codec and combines geometric
+scoring with latent vector updates at each NCM level. The 4B worker recipe
+uses two latent updates per level. At inference, Omni passes the current
+question and a bounded Subnext working set to `dblocks ncm generate
+--prompt-stdin --json`. Subnext stores durable context, and the generator
+reports its level calls and trunk evaluations. [Omni contract](https://github.com/s-b-repo/omni/blob/main/docs/CONTRACT.md#the-native-nina-route)
 
-The [Nina worker](../.github/workflows/nina-worker.yml) builds the WGPU-capable
-runtime, trains and reloads a four-step CPU preflight, or fits one stage on a
-registered `nina-gpu` runner. The [worker script](../experiments/model_matrix/nina_worker.py)
-validates each aligned and codec stream against its corpus manifest. GPU
-runs retain their exact source revision, runtime, data hash and optimizer
-state under a persistent run key. The worker traverses complete records
-in prepared order and resumes at the recorded batch. Train the codec first and evaluate its
-reconstruction on held-out long answers before fitting the generator.
+### Training resources
 
-`dblocks ncm generate --prompt-stdin --json` accepts one UTF-8 prompt and
-reports measured level calls and trunk evaluations. Keep persistent context
-in Subnext and pass only the current working set from Omni.
+| Resource | Verified work and limits |
+|---|---|
+| Laptop, i5-1235U, 12 threads, 23 GiB RAM | CPU pilots, corpus preparation and checkpoint replay. Release-build samples measured 3.9 GFLOP/s for the tiny codec and 2.7–15.3 GFLOP/s for generator widths 64–512. |
+| Standard public GitHub Ubuntu runner | 4 vCPUs, 16 GB RAM and 14 GB SSD per job. The capacity run completed 40 independent Geometry3K fits of 384 updates each, peaked at 20 active fits, and verified 80 checkpoints. |
+| Single discrete GPU worker | The self-hosted workflow uses one WGPU device. Profile peak memory, scratch disk, sustained non-padding tokens per second and resume on the actual device. A 24 GiB card can run smaller pilots. |
+| Multi-GPU worker group | The native gradient probe compares synchronized CPU ranks with a full-batch update on one machine. Production multi-host collectives and sharded resume still require implementation and profiling. |
+
+The 40-job run validated independent fits. One hosted checkpoint resumed on
+the laptop at step 192 and agreed on all 120 development predictions through
+step 384. The two final weight hashes differ. The local gradient probe with a
+trained codec passed at two and 40 ranks. The four-step codec exceeded the
+gradient tolerance at 40 ranks, so the hosted preflight checks two ranks.
+[Hosted capacity run](https://github.com/s-b-repo/unifur/actions/runs/44946149797)
+· [Gradient probe](../examples/ncm_grid_probe.rs)
+
+Standard hosted jobs have a six-hour cap. GitHub lists 20, 40 and 60 concurrent
+standard jobs for Free, Pro and Team respectively. Concurrent jobs each get
+their own VM and memory. GitHub lists larger CPU runners up to 96 vCPUs and
+384 GB RAM and a larger GPU option with a 16 GB T4. Access and billing depend
+on the repository's account and runner group.
+[Hosted runner specs](https://docs.github.com/en/actions/reference/runners/github-hosted-runners)
+· [Actions limits](https://docs.github.com/en/actions/reference/limits)
+· [Larger runner specs](https://docs.github.com/en/actions/reference/runners/larger-runners)
+
+The proposed **3.98 billion generator parameters per text model** use 35
+blocks, width 3,072, 48 heads and aligned 1,024-byte prompt and target
+records. FP32 weights, gradients and two AdamW moments alone take about
+64 GB (59 GiB). A checkpoint retaining weights and both moments needs
+roughly 48 GB (45 GiB) of uncompressed tensor data before codec files,
+staging copies and retained checkpoints. The full fit and its wall time
+are unverified. Qualify one full replica per device or verify the sharded
+backend, then estimate duration from measured throughput at the chosen
+batch and sequence size.
+
+### Dispatch a worker
+
+Run the public four-step codec and generator preflight with the [Nina worker workflow](../.github/workflows/nina-worker.yml).
+
+```bash
+gh workflow run nina-worker.yml --repo s-b-repo/unifur --ref main -f mode=preflight
+```
+
+For a full fit, set the repository variable `NINA_WORKER_ROOT` to durable
+storage on the authorized runner labeled `nina-gpu`. Place the corpus under
+`$NINA_WORKER_ROOT/corpora/$corpus_id` with `manifest.json` and each of
+`{train,validation}.{aligned,codec}.bin`. The [worker script](../experiments/model_matrix/nina_worker.py)
+validates the hashes, record widths, split counts and disjoint packed IDs.
+The current combined instruction pack has 145,310 training and 7,662
+validation records, with about 33.0 million non-padding target tokens per
+training pass. Its inputs include an expanded pool of 120,807 training and
+6,711 validation pairs and 110,178 packed longer-response records. The
+367 million byte-token field archive is a separate corpus. Track unique
+target tokens and repeated exposures explicitly if the campaign also targets
+four billion **training tokens**.
+
+```bash
+records=$(python3 -B experiments/model_matrix/nina_worker.py \
+  validate "$NINA_WORKER_ROOT/corpora/$corpus_id" | jq -er .records.train)
+codec_steps=$(( (records + codec_batch - 1) / codec_batch ))
+gh workflow run nina-worker.yml --repo s-b-repo/unifur --ref "$training_ref" \
+  -f mode=gpu-fit -f stage=codec -f corpus="$corpus_id" -f run_key="$run_key" \
+  -F steps="$codec_steps" -F batch_size="$codec_batch" -F checkpoint_every="$save_every"
+```
+
+Pin `training_ref` to the same revision with a branch or tag for both
+stages and any retries. Choose the batch size and checkpoint interval from
+the hardware profile. After held-out codec reconstruction passes, dispatch
+`stage=generator` with the same corpus and run key and the chosen generator
+step and batch counts. The worker visits the prepared records in order and
+requires at least one full pass. Keep the runtime, manifest, matching codec,
+generator and both `.state` sidecars together. Re-dispatch an interrupted
+stage with the same recipe. Cosine is the default generator schedule. WSD
+remains an option for measured comparisons.
+
+The standard generation path reuses prompt embeddings, masks and fixed
+codebook statistics. On the local CPU parity set, 64 greedy and eight
+seeded sampling requests reproduced the previous reports. For public
+release, verify clean-restart
+reproducibility and evaluate long-answer reconstruction, held-out answer
+quality, geometry and external-context behavior.
+
+### Converted XSum checkpoints
+
+The native Rust CLI also loads the converted Hazy Research XSum release with
+MoSME routing and geometric scoring. The bundle includes the trained codec,
+shared generator and 17 initially byte-identical expert shards with
+`specialized_training_steps: 0`. The optional adapter fits expert output
+biases. Full expert specialization and public instruction quality need
+their own training and behavioral evaluations. [Upstream XSum weights](https://huggingface.co/hazyresearch/ncm-checkpoints/tree/main/xsum)
+
+| Native XSum probe | Result |
+|---|---|
+| Shared-prefix adapter training | Source passes fell from 4 to 1 and concept-level passes from 36 to 33. Adapter biases and held-out losses were identical. |
+| Pooling before the value projection | The isolated diagnostic moved from 360 to 48 value projections with maximum FP32 difference `8.94e-8`. |
+| Certified integer attention | All 48 decisions matched the full integer reference, and 32 of 1,440 token scores were skipped. Agreement with the floating-point readout was 46/48. |
+| Generation and certificates | The reference comparison matched 200 concept codes and 48 output tokens. All 34 NCM certificates passed in the XSum port's validation build with LTO disabled. |
+
+Shared-prefix reuse is the adapter training default. The pooled projection
+comparison and integer readout run on demand with
+`--attention-certificate`. Generation uses its floating-point path.
+
+```bash
+CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16 \
+  cargo build --locked --release --bin dblocks
+target/release/dblocks ncm released --model weights/nina-1b \
+  --prompt 'The library approved its revised opening schedule.' \
+  --attention-certificate --json
+```
+
+Prepare `weights/nina-1b` with
+[the release converter](../experiments/nina_1b/convert_release.py). Run
+`ncm released-tune` with disjoint labeled training and validation JSONL
+files, or dispatch the [CPU adapter workflow](../.github/workflows/nina-adapter.yml)
+with the run ID of a labeled corpus artifact. Use `--no-share-prefix` for a
+reference run with the same records and optimizer settings.
 
 ---
 
