@@ -8,11 +8,20 @@ import subprocess
 import sys
 import unicodedata
 from collections import defaultdict
+from contextlib import nullcontext
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter
 
-from nina_worker import checkpoint, digest, read_json, validate, verify_checkpoint, write_json
+from nina_worker import (
+    checkpoint,
+    digest,
+    read_json,
+    run_lock,
+    validate,
+    verify_checkpoint,
+    write_json,
+)
 
 
 def text_key(text):
@@ -317,6 +326,60 @@ def report_results(rows, validation, policy):
     return fields, context, failures
 
 
+def run_evaluation(args):
+    data = validate(args.corpus)
+    inputs = {"runtime": args.binary, "cases": args.cases, "policy": args.policy}
+    for name in ("omni", "dcr"):
+        if (binary := getattr(args, name)) is not None:
+            inputs[name] = binary
+    fingerprints = {name: digest(path) for name, path in inputs.items()}
+    cases, policy = load_cases(args.cases), read_json(args.policy)
+    if args.run:
+        trained_fields = read_json(args.corpus / "manifest.json")["packed_by_split_and_field"][
+            "train"
+        ]
+        require(
+            set(trained_fields).issubset(policy["fields"]),
+            "The release policy must cover each trained field",
+        )
+        require("context" in policy, "The release policy must cover external context")
+    check_policy(policy, cases)
+    check_held_out(cases, args.corpus, data)
+    tokenizer, generator, codec, model_state, validation = candidate(
+        args, data, fingerprints["runtime"]
+    )
+    rows = list(evaluate(args, cases, tokenizer, generator, data["prompt_width"]))
+    for name, path in inputs.items():
+        require(digest(path) == fingerprints[name], f"The {name} file changed during evaluation")
+    fields, context, failures = report_results(rows, validation, policy)
+    report = {
+        "version": 1,
+        "policy_passed": not failures,
+        "release_eligible": bool(args.run) and not failures,
+        "runtime_sha256": fingerprints["runtime"],
+        "corpus": data,
+        "backend": args.backend,
+        "codec_sha256": codec["model"]["sha256"],
+        "generator_sha256": model_state["model"]["sha256"],
+        "cases_sha256": fingerprints["cases"],
+        "policy_sha256": fingerprints["policy"],
+        "context_runtime_sha256": {
+            key: fingerprints[key] for key in ("omni", "dcr") if key in fingerprints
+        },
+        "codec_reconstruction": validation,
+        "fields": fields,
+        "context": context,
+        "failures": failures,
+        "predictions": rows,
+    }
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    write_json(args.out, report)
+    print(
+        json.dumps({key: report[key] for key in ("policy_passed", "release_eligible", "failures")})
+    )
+    return int(bool(failures))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     model = parser.add_mutually_exclusive_group(required=True)
@@ -341,48 +404,10 @@ def main():
             all(path is None or args.out.resolve() != path.resolve() for path in inputs),
             "Release report must use a separate output path",
         )
-        data = validate(args.corpus)
-        cases, policy = load_cases(args.cases), read_json(args.policy)
         if args.run:
-            trained_fields = read_json(args.corpus / "manifest.json")["packed_by_split_and_field"][
-                "train"
-            ]
-            require(
-                set(trained_fields).issubset(policy["fields"]),
-                "The release policy must cover each trained field",
-            )
-            require("context" in policy, "The release policy must cover external context")
-        check_policy(policy, cases)
-        check_held_out(cases, args.corpus, data)
-        runtime_hash = digest(args.binary)
-        tokenizer, generator, codec, model_state, validation = candidate(args, data, runtime_hash)
-        rows = list(evaluate(args, cases, tokenizer, generator, data["prompt_width"]))
-        fields, context, failures = report_results(rows, validation, policy)
-        report = {
-            "version": 1,
-            "policy_passed": not failures,
-            "release_eligible": bool(args.run) and not failures,
-            "runtime_sha256": runtime_hash,
-            "corpus": data,
-            "backend": args.backend,
-            "codec_sha256": codec["model"]["sha256"],
-            "generator_sha256": model_state["model"]["sha256"],
-            "cases_sha256": digest(args.cases),
-            "policy_sha256": digest(args.policy),
-            "codec_reconstruction": validation,
-            "fields": fields,
-            "context": context,
-            "failures": failures,
-            "predictions": rows,
-        }
-        args.out.parent.mkdir(parents=True, exist_ok=True)
-        write_json(args.out, report)
-        print(
-            json.dumps(
-                {key: report[key] for key in ("policy_passed", "release_eligible", "failures")}
-            )
-        )
-        return int(bool(failures))
+            require(args.run.is_dir(), "The worker run directory does not exist")
+        with run_lock(args.run) if args.run else nullcontext():
+            return run_evaluation(args)
     except (
         OSError,
         RuntimeError,

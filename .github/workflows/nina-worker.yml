@@ -170,7 +170,8 @@ jobs:
             cargo build --locked --release --features wgpu --bin dblocks
             install -m 0755 target/release/dblocks "$run/.dblocks.tmp"
             mv "$run/.dblocks.tmp" "$run/dblocks"
-            printf '%s\n' "$GITHUB_SHA" > "$run/runtime.commit"
+            printf '%s\n' "$GITHUB_SHA" > "$run/.runtime.commit.tmp"
+            mv "$run/.runtime.commit.tmp" "$run/runtime.commit"
           fi
       - name: Qualify or train one stage with a fixed schedule
         if: inputs.mode != 'gpu-release-eval'
