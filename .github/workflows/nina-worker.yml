@@ -33,6 +33,11 @@ on:
         description: Optimizer steps between durable checkpoints
         type: number
         default: 50
+      generator_lr_schedule:
+        description: Learning-rate schedule when training the generator
+        type: choice
+        options: [cosine, wsd]
+        default: cosine
 
 permissions:
   contents: read
@@ -74,14 +79,26 @@ jobs:
           python3 -B "$worker" geometry-fixture scenes inputs
           python3 -B "$worker" validate inputs | tee result/corpus-verification.json
           for stage in codec generator; do
+            schedule=()
+            if [[ "$stage" == generator ]]; then
+              schedule=(--generator-lr-schedule wsd)
+            fi
             python3 -B "$worker" fit --binary "$runtime" --input inputs --out result \
               --profile preflight --stage "$stage" --steps 4 --batch-size 4 --checkpoint-every 4 \
+              "${schedule[@]}" \
               | tee "result/$stage.log"
           done
           head -n 1 scenes/test.jsonl | jq -jr .prompt |
             "$runtime" ncm generate --generator result/generator/*.mpk --tokenizer result/codec/*.mpk \
               --prompt-stdin --json --temperature 0 | tee result/reloaded.json
           jq -e '.prompt_bytes == 29 and .level_calls == 3 and .trunk_evaluations == 6 and (.text[0] | type == "string")' result/reloaded.json
+          printf '%s\n' '{"decode":{"speculation":{"draft_levels":2}},"budget":{"max_level_calls":3,"max_draft_calls":6},"draft_thinking_steps":0}' > result/speculation.json
+          head -n 1 scenes/test.jsonl | jq -jr .prompt |
+            "$runtime" ncm generate --generator result/generator/*.mpk --tokenizer result/codec/*.mpk \
+              --prompt-stdin --json --decode-policy result/speculation.json | tee result/speculated.json
+          jq -e --slurpfile plain result/reloaded.json \
+            '.text == $plain[0].text and .decode.target_trunk_evaluations == 6 and .decode.draft_calls > 0 and .decode.draft_trunk_evaluations == 0 and (.decode.stopped_by_budget | not)' \
+            result/speculated.json
           install -m 0755 "$runtime" result/dblocks
       - name: Verify two synchronous native NCM ranks on CPU
         run: |
@@ -111,6 +128,7 @@ jobs:
       STEPS: ${{ inputs.steps }}
       BATCH_SIZE: ${{ inputs.batch_size }}
       CHECKPOINT_EVERY: ${{ inputs.checkpoint_every }}
+      GENERATOR_LR_SCHEDULE: ${{ inputs.generator_lr_schedule }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -138,7 +156,12 @@ jobs:
       - name: Train one stage and keep its optimizer state on the worker
         run: |
           run="$NINA_ROOT/runs/$RUN_KEY"
+          schedule=()
+          if [[ "$STAGE" == generator ]]; then
+            schedule=(--generator-lr-schedule "$GENERATOR_LR_SCHEDULE")
+          fi
           python3 -B experiments/model_matrix/nina_worker.py fit --binary "$run/dblocks" \
             --input "$NINA_ROOT/corpora/$CORPUS" --out "$run" --profile 4b --backend wgpu \
             --stage "$STAGE" --steps "$STEPS" --batch-size "$BATCH_SIZE" \
+            "${schedule[@]}" \
             --checkpoint-every "$CHECKPOINT_EVERY" | tee -a "$run/$STAGE.log"

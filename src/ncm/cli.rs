@@ -6,6 +6,7 @@
 //!
 //! The native trainers and generator share the same CPU and GPU code.
 
+use crate::ncm::decode::{DecodeBudget, DecodeConfig, DecodeReport};
 use crate::ncm::tokenizer::train::{
     evaluate_checkpoint, load_student_reader, train_tokenizer, EvalReport, IntentConfig,
     IntentLoss, IntentReader, TokenizerTrainConfig, TokenizerTrainReport,
@@ -278,6 +279,12 @@ pub struct GeneratorTrainArgs {
     pub min_lr: f64,
     #[arg(long, default_value_t = 20)]
     pub warmup: usize,
+    /// Learning-rate schedule for full-backpropagation generator training.
+    #[arg(long, default_value = "cosine", value_parser = ["cosine", "wsd"])]
+    pub lr_schedule: String,
+    /// Zero-based step where WSD begins to decay. Defaults to 80% of the run.
+    #[arg(long)]
+    pub wsd_decay_start: Option<usize>,
     #[arg(long, default_value_t = 0.01)]
     pub weight_decay: f64,
     #[arg(long, default_value_t = 1.0)]
@@ -355,6 +362,9 @@ pub struct GenerateArgs {
     /// Emit generated text and inference counters as one JSON object.
     #[arg(long, conflicts_with = "show_thoughts")]
     pub json: bool,
+    /// Run a budgeted experimental decoder with sampling and strategy settings from JSON.
+    #[arg(long, conflicts_with_all = ["temperature", "top_k", "token_temperature", "seed", "mbr", "show_thoughts"])]
+    pub decode_policy: Option<PathBuf>,
     /// Code sampling temperature; 0 is greedy.
     #[arg(long, default_value_t = 1.0)]
     pub temperature: f64,
@@ -451,19 +461,40 @@ pub struct GenerateSummary {
     pub levels: usize,
     json: bool,
     prompt_bytes: usize,
+    experimental: Option<ExperimentalDecodeReport>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecodePolicy {
+    decode: DecodeConfig,
+    budget: DecodeBudget,
+    /// Same generator weights read out at a shallower depth, including zero.
+    draft_thinking_steps: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ExperimentalDecodeReport {
+    #[serde(flatten)]
+    counters: DecodeReport,
+    target_trunk_evaluations: usize,
+    draft_trunk_evaluations: usize,
 }
 
 impl GenerateSummary {
     pub fn render(&self) -> String {
         let g = &self.generation;
         if self.json {
-            let report = serde_json::json!({
+            let mut report = serde_json::json!({
                 "text": self.text,
                 "prompt_bytes": self.prompt_bytes,
                 "levels": self.levels,
                 "level_calls": g.nfe_total,
                 "trunk_evaluations": g.trunk_evals,
             });
+            if let Some(experimental) = &self.experimental {
+                report["decode"] = serde_json::json!(experimental);
+            }
             return format!("{report}\n");
         }
         let mut out = format!(
@@ -484,6 +515,15 @@ impl GenerateSummary {
             out.push_str(&format!(
                 "MBR over {} samples (normalised Hamming medoid): chosen {:?}, mean distance {:.3?}\n",
                 mbr.samples, mbr.chosen, mbr.mean_distance
+            ));
+        }
+        if let Some(experimental) = &self.experimental {
+            let counters = &experimental.counters;
+            out.push_str(&format!(
+                "decode used {} levels, {} particles, {} drafted calls, {} accepted levels, {} rejected levels, {} probes, budget stopped {}\n",
+                counters.levels_used, counters.particles, counters.draft_calls,
+                counters.accepted_drafts, counters.rejected_drafts, counters.probes,
+                counters.stopped_by_budget
             ));
         }
         for (level, step, text) in &self.thoughts {
@@ -531,7 +571,7 @@ pub fn load_tokenizer<B: burn::tensor::backend::Backend>(
 
 fn generator_config(args: &GeneratorTrainArgs) -> Result<crate::ncm::generator::NcmTrainConfig> {
     use crate::ncm::generator::{
-        AdaptiveThinking, LossEstimator, NcmGeneratorConfig, NcmTrainConfig,
+        AdaptiveThinking, LossEstimator, LrShape, NcmGeneratorConfig, NcmTrainConfig,
     };
     let mut model = match NcmGeneratorConfig::preset(&args.config) {
         Ok(config) => config,
@@ -573,6 +613,17 @@ fn generator_config(args: &GeneratorTrainArgs) -> Result<crate::ncm::generator::
         "all" => LossEstimator::AllLevels,
         other => anyhow::bail!("unknown estimator {other:?} (sampled, all)"),
     };
+    let lr_shape = match (args.lr_schedule.as_str(), args.wsd_decay_start) {
+        ("wsd", start) => LrShape::WarmupStableDecay {
+            decay_start: start.unwrap_or_else(|| {
+                args.steps
+                    .saturating_sub((args.steps / 5).max(1))
+                    .max(args.warmup)
+            }),
+        },
+        ("cosine", None) => LrShape::WarmupCosine,
+        _ => anyhow::bail!("--wsd-decay-start requires --lr-schedule wsd"),
+    };
     let config = NcmTrainConfig {
         model,
         steps: args.steps,
@@ -580,6 +631,7 @@ fn generator_config(args: &GeneratorTrainArgs) -> Result<crate::ncm::generator::
         peak_lr: args.lr,
         min_lr: args.min_lr,
         warmup_steps: args.warmup,
+        lr_shape,
         weight_decay: args.weight_decay,
         grad_clip: args.grad_clip,
         seed: args.seed,
@@ -678,6 +730,112 @@ fn train_generator_cli<B: Backend<FloatElem = f32>>(
     })
 }
 
+fn decode_with_policy<B: Backend<FloatElem = f32>>(
+    model: &crate::ncm::generator::NcmGenerator<B>,
+    tokenizer: &crate::ncm::tokenizer::NcmTokenizer<B>,
+    prompt: Option<burn::tensor::Tensor<B, 2, burn::tensor::Int>>,
+    relax: crate::ncm::generator::RelaxOptions,
+    policy: DecodePolicy,
+    device: &B::Device,
+) -> Result<(crate::ncm::generator::Generation, ExperimentalDecodeReport)> {
+    use crate::ncm::decode::Decoder;
+    use crate::ncm::generator::{ConceptFieldLm, Generation, LevelTrace};
+    use anyhow::ensure;
+
+    ensure!(
+        relax.steps > 0,
+        "target generation needs at least one latent step"
+    );
+    ensure!(
+        policy.decode.outline_cache.is_none(),
+        "outline caching needs a persistent decoder and is unavailable for a single request"
+    );
+    ensure!(
+        policy.decode.speculation.is_some() == policy.draft_thinking_steps.is_some(),
+        "speculation and draft_thinking_steps must be set together"
+    );
+    let target = ConceptFieldLm::new(model, tokenizer, relax)?;
+    let draft = policy
+        .draft_thinking_steps
+        .map(|depth| {
+            ensure!(
+                depth < relax.steps,
+                "draft depth must be lower than target depth"
+            );
+            ConceptFieldLm::new(
+                model,
+                tokenizer,
+                crate::ncm::generator::RelaxOptions {
+                    steps: depth,
+                    adaptive: None,
+                    ..relax
+                },
+            )
+        })
+        .transpose()?;
+    let mut decoder = Decoder::new(tokenizer, &target, device);
+    if let Some(draft) = &draft {
+        decoder = decoder.with_draft(draft);
+    }
+    let result = decoder.decode(prompt, 1, &policy.decode, &policy.budget, None)?;
+    let target_traces = target.take_traces()?;
+    let draft_traces = match &draft {
+        Some(draft) => draft.take_traces()?,
+        None => Vec::new(),
+    };
+    let trunk_calls =
+        |traces: &[LevelTrace]| traces.iter().map(|trace| trace.usage.rounds).sum::<usize>();
+    let target_trunk_evaluations = trunk_calls(&target_traces);
+    let draft_trunk_evaluations = trunk_calls(&draft_traces);
+    let usages = target_traces
+        .iter()
+        .chain(&draft_traces)
+        .map(|trace| &trace.usage);
+    let tokens = result
+        .tokens
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(u32::try_from)
+                .collect::<std::result::Result<_, _>>()
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    let codes = result
+        .codes
+        .into_iter()
+        .map(|level| {
+            level
+                .into_iter()
+                .flatten()
+                .map(i64::try_from)
+                .collect::<std::result::Result<_, _>>()
+        })
+        .collect::<std::result::Result<_, _>>()?;
+    let report = result.report;
+    Ok((
+        Generation {
+            tokens,
+            codes,
+            nfe_per_sample: report.level_calls,
+            nfe_total: report.level_calls,
+            samples: 1,
+            trunk_evals: target_trunk_evaluations + draft_trunk_evaluations,
+            position_steps: usages.clone().flat_map(|usage| &usage.position_steps).sum(),
+            position_budget: usages.clone().flat_map(|usage| &usage.budget).sum(),
+            crystallised: usages.flat_map(|usage| &usage.crystallised).sum(),
+            reconstruct_calls: report.reconstructs,
+            decode_calls: report.decodes,
+            thoughts: Vec::new(),
+            mbr: None,
+        },
+        ExperimentalDecodeReport {
+            counters: report,
+            target_trunk_evaluations,
+            draft_trunk_evaluations,
+        },
+    ))
+}
+
 fn generate_cli<B: Backend<FloatElem = f32>>(
     args: GenerateArgs,
     device: &B::Device,
@@ -742,7 +900,20 @@ fn generate_cli<B: Backend<FloatElem = f32>>(
         relax,
         record_thoughts: args.show_thoughts,
     };
-    let generation = generate(&loaded.model, &tokenizer, prompt, 1, &options)?;
+    let (generation, experimental) = if let Some(path) = args.decode_policy {
+        use anyhow::Context as _;
+        let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+        let policy = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse decode policy {}", path.display()))?;
+        let (generation, report) =
+            decode_with_policy(&loaded.model, &tokenizer, prompt, relax, policy, device)?;
+        (generation, Some(report))
+    } else {
+        (
+            generate(&loaded.model, &tokenizer, prompt, 1, &options)?,
+            None,
+        )
+    };
     let bytes = crate::tokenizer::ByteTokenizer::new();
     let render = |ids: &[u32]| -> String {
         let ids: Vec<u16> = ids
@@ -778,5 +949,6 @@ fn generate_cli<B: Backend<FloatElem = f32>>(
         prompt_bytes: input
             .as_ref()
             .map_or(0, |text| text.len().min(config.prompt_len)),
+        experimental,
     })
 }

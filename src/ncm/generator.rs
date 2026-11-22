@@ -572,7 +572,10 @@ pub struct RelaxOptions {
 
 impl RelaxOptions {
     pub fn validate(&self) -> Result<()> {
-        ensure!(self.steps >= 1, "relaxation needs at least one step");
+        ensure!(
+            self.steps > 0 || self.adaptive.is_none(),
+            "adaptive relaxation needs at least one step"
+        );
         ensure!(
             self.step_size.is_finite() && self.step_size > 0.0 && self.step_size <= 2.0,
             "step_size must be in (0, 2], got {}",
@@ -722,6 +725,24 @@ pub fn metric_sq_dist<B: Backend>(
     a: &Tensor<B, 2>,
     g: &Tensor<B, 2>,
 ) -> Tensor<B, 3> {
+    metric_sq_dist_with_norms(u, a, g, None)
+}
+
+fn attractor_metric_norms<B: Backend>(a: &Tensor<B, 2>, g: &Tensor<B, 2>) -> Tensor<B, 2> {
+    let [codes, _] = a.dims();
+    a.clone()
+        .matmul(g.clone())
+        .mul(a.clone())
+        .sum_dim(1)
+        .reshape([1, codes])
+}
+
+fn metric_sq_dist_with_norms<B: Backend>(
+    u: &Tensor<B, 3>,
+    a: &Tensor<B, 2>,
+    g: &Tensor<B, 2>,
+    norms: Option<&Tensor<B, 2>>,
+) -> Tensor<B, 3> {
     let [batch, n, hidden] = u.dims();
     let [codes, _] = a.dims();
     let ug = u.clone().reshape([batch * n, hidden]).matmul(g.clone());
@@ -729,8 +750,9 @@ pub fn metric_sq_dist<B: Backend>(
         .clone()
         .mul(u.clone().reshape([batch * n, hidden]))
         .sum_dim(1); // [bn, 1]
-    let ag = a.clone().matmul(g.clone());
-    let aga = ag.mul(a.clone()).sum_dim(1).reshape([1, codes]); // [1, V]
+    let aga = norms
+        .cloned()
+        .unwrap_or_else(|| attractor_metric_norms(a, g)); // [1, V]
     let cross = ug.matmul(a.clone().transpose()); // [bn, V]
     cross
         .mul_scalar(-2.0)
@@ -1218,6 +1240,18 @@ impl<B: Backend<FloatElem = f32>> NcmGenerator<B> {
         prompt: Option<&Tensor<B, 2, Int>>,
         relax: &RelaxOptions,
     ) -> Result<LevelForward<B>> {
+        self.forward_level_prepared(codec, level, zhat_coarser, prompt, None, relax)
+    }
+
+    fn forward_level_prepared<C: SoftConceptCodec<B>>(
+        &self,
+        codec: &C,
+        level: usize,
+        zhat_coarser: Tensor<B, 3>,
+        prompt: Option<&Tensor<B, 2, Int>>,
+        prepared: Option<&PromptContext<B>>,
+        relax: &RelaxOptions,
+    ) -> Result<LevelForward<B>> {
         relax.validate()?;
         self.check_codec(codec)?;
         let schedule = codec.schedule();
@@ -1235,19 +1269,27 @@ impl<B: Backend<FloatElem = f32>> NcmGenerator<B> {
         let attractors = self.attractors(codec, level)?;
         let metric = self.full_metric();
         let u0 = self.initial_state(level, len, zhat_coarser)?;
-        let context = prompt.map(|p| self.prompt_context(p, batch)).transpose()?;
-        let prompt_len = prompt.map_or(0, |p| p.dims()[1]);
-        let frame = self.frame(
-            batch,
-            len,
-            seq_len,
-            context.as_ref().map(|c| (c.valid.as_slice(), prompt_len)),
-            &metric,
-            &device,
-        );
+        let fresh;
+        let context = if prepared.is_some() {
+            prepared
+        } else {
+            fresh = prompt.map(|p| self.prompt_context(p, batch)).transpose()?;
+            fresh.as_ref()
+        };
+        let prompt_valid = context
+            .map(|context| {
+                let [rows, width, _] = context.embedded.dims();
+                ensure!(
+                    rows == batch,
+                    "prompt has {rows} rows, the level input has {batch}"
+                );
+                Ok((context.valid.as_slice(), width))
+            })
+            .transpose()?;
+        let frame = self.frame(batch, len, seq_len, prompt_valid, &metric, &device);
         self.relax(
             u0,
-            context.map(|c| c.embedded),
+            context.map(|c| c.embedded.clone()),
             &frame,
             &attractors,
             &metric,
@@ -1285,17 +1327,24 @@ impl<B: Backend<FloatElem = f32>> NcmGenerator<B> {
         let mut states = Vec::new();
         let mut active_record = Vec::new();
         let mut prompt_states = Vec::new();
-        let mut frozen = vec![false; batch * len];
-        let mut steps_taken = vec![0usize; batch * len];
+        let adaptive_positions = relax.adaptive.map_or(0, |_| batch * len);
+        let mut frozen = vec![false; adaptive_positions];
+        let mut steps_taken = vec![0usize; adaptive_positions];
         let mut state = u0;
+        let need_logits = relax.attractor || relax.adaptive.is_some() || relax.record_step_logits;
+        // The attractors and metric are fixed for this level. Keep the
+        // original autodiff graph, including its gradient reduction order.
+        let norms = (!B::ad_enabled(&device) && need_logits && relax.max_rounds() > 0)
+            .then(|| attractor_metric_norms(attractors, metric));
+        let logits_at = |state: &Tensor<B, 3>| {
+            metric_sq_dist_with_norms(state, attractors, metric, norms.as_ref())
+                .div_scalar(-2.0 * self.temperature)
+        };
         if relax.record_states {
             states.push(state.clone());
         }
         for _ in 0..relax.max_rounds() {
-            let need_logits =
-                relax.attractor || relax.adaptive.is_some() || relax.record_step_logits;
-            let logits =
-                need_logits.then(|| distance_logits(&state, attractors, metric, self.temperature));
+            let logits = need_logits.then(|| logits_at(&state));
             let active_mask = match (&relax.adaptive, &logits) {
                 (Some(adaptive), Some(logits)) => {
                     let confidence = max_probability(logits)?;
@@ -1394,7 +1443,7 @@ impl<B: Backend<FloatElem = f32>> NcmGenerator<B> {
                 active_record.push(active_mask.unwrap_or_else(|| vec![true; batch * len]));
             }
         }
-        let logits = distance_logits(&state, attractors, metric, self.temperature);
+        let logits = logits_at(&state);
         Ok(LevelForward {
             logits,
             step_logits,
@@ -1799,6 +1848,7 @@ pub struct ConceptFieldLm<'a, B: Backend, C> {
     model: &'a NcmGenerator<B>,
     codec: &'a C,
     relax: RelaxOptions,
+    prepared_prompt: Option<PromptContext<B>>,
     traces: RefCell<Vec<LevelTrace>>,
 }
 
@@ -1810,6 +1860,7 @@ impl<'a, B: Backend<FloatElem = f32>, C: SoftConceptCodec<B>> ConceptFieldLm<'a,
             model,
             codec,
             relax,
+            prepared_prompt: None,
             traces: RefCell::new(Vec::new()),
         })
     }
@@ -1833,13 +1884,24 @@ impl<B: Backend<FloatElem = f32>, C: SoftConceptCodec<B>> LevelModel<B>
         zhat_coarser: Tensor<B, 3>,
         prompt: Option<Tensor<B, 2, Int>>,
     ) -> Result<Tensor<B, 3>> {
-        let forward = self.model.forward_level(
-            self.codec,
-            level,
-            zhat_coarser,
-            prompt.as_ref(),
-            &self.relax,
-        )?;
+        let forward = if let Some(prepared) = &self.prepared_prompt {
+            self.model.forward_level_prepared(
+                self.codec,
+                level,
+                zhat_coarser,
+                None,
+                Some(prepared),
+                &self.relax,
+            )
+        } else {
+            self.model.forward_level(
+                self.codec,
+                level,
+                zhat_coarser,
+                prompt.as_ref(),
+                &self.relax,
+            )
+        }?;
         let mut state_codes = Vec::new();
         if self.relax.record_step_logits {
             let classes = self.model.codebook_size();
@@ -2267,12 +2329,20 @@ pub fn generate<B: Backend<FloatElem = f32>, C: SoftConceptCodec<B>>(
 ) -> Result<Generation> {
     ensure!(batch >= 1, "generate needs at least one sequence");
     ensure!(options.mbr_samples >= 1, "mbr_samples must be at least 1");
+    ensure!(
+        options.relax.steps > 0,
+        "target generation needs at least one latent step"
+    );
     let mut relax = options.relax;
     relax.record_step_logits = options.record_thoughts && options.mbr_samples == 1;
     relax.record_states = false;
     relax.record_prompt = false;
     let counting_codec = CountingCodec::new(codec);
-    let field = ConceptFieldLm::new(model, &counting_codec, relax)?;
+    let mut field = ConceptFieldLm::new(model, &counting_codec, relax)?;
+    // Every level and every MBR sample receives the same prompt here.
+    if let Some(prompt) = prompt.as_ref().filter(|p| !B::ad_enabled(&p.device())) {
+        field.prepared_prompt = Some(model.prompt_context(prompt, batch)?);
+    }
     let counted = CountingLevelModel::new(&field);
     let mut sample_tokens = Vec::with_capacity(options.mbr_samples);
     let mut sample_codes = Vec::with_capacity(options.mbr_samples);
@@ -2431,6 +2501,22 @@ pub fn prompt_tensor<B: Backend>(
 
 // ----------------------------------------------------------- training --
 
+/// Learning-rate schedules for the concept-field generator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LrShape {
+    /// Linear warmup, then cosine from the peak to the minimum.
+    #[default]
+    WarmupCosine,
+    /// Linear warmup, a plateau at the peak, then linear decay.
+    WarmupStableDecay { decay_start: usize },
+}
+
+impl LrShape {
+    fn is_cosine(&self) -> bool {
+        *self == Self::WarmupCosine
+    }
+}
+
 /// The training run's configuration (the model's is inside it).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -2441,6 +2527,9 @@ pub struct NcmTrainConfig {
     pub peak_lr: f64,
     pub min_lr: f64,
     pub warmup_steps: usize,
+    /// Cosine is omitted from checkpoint state for compatibility with older runs.
+    #[serde(skip_serializing_if = "LrShape::is_cosine")]
+    pub lr_shape: LrShape,
     pub weight_decay: f64,
     pub grad_clip: f64,
     pub seed: u64,
@@ -2468,6 +2557,7 @@ impl Default for NcmTrainConfig {
             peak_lr: 3e-4,
             min_lr: 3e-5,
             warmup_steps: 20,
+            lr_shape: LrShape::WarmupCosine,
             weight_decay: 0.01,
             grad_clip: 1.0,
             seed: 0,
@@ -2506,6 +2596,14 @@ impl NcmTrainConfig {
             self.weight_decay.is_finite() && self.weight_decay >= 0.0,
             "weight_decay must be non-negative"
         );
+        if let LrShape::WarmupStableDecay { decay_start } = self.lr_shape {
+            ensure!(
+                self.warmup_steps <= decay_start && decay_start < self.steps,
+                "WSD requires warmup <= decay start < steps, got {} <= {decay_start} < {}",
+                self.warmup_steps,
+                self.steps
+            );
+        }
         ensure!(
             self.grad_clip.is_finite() && self.grad_clip >= 0.0,
             "grad_clip must be non-negative"
@@ -2519,6 +2617,26 @@ impl NcmTrainConfig {
             min_lr: self.min_lr,
             warmup_steps: self.warmup_steps,
             total_steps: self.steps,
+        }
+    }
+
+    /// Learning rate at an absolute optimizer step, including after a restart.
+    pub fn learning_rate(&self, step: usize) -> f64 {
+        match self.lr_shape {
+            LrShape::WarmupCosine => self.lr_schedule().at(step),
+            LrShape::WarmupStableDecay { decay_start } => {
+                if step < self.warmup_steps {
+                    return self.lr_schedule().at(step);
+                }
+                if step <= decay_start {
+                    return self.peak_lr;
+                }
+                if step >= self.steps {
+                    return self.min_lr;
+                }
+                let progress = (step - decay_start) as f64 / (self.steps - decay_start) as f64;
+                self.peak_lr + (self.min_lr - self.peak_lr) * progress
+            }
         }
     }
 }
@@ -2961,7 +3079,6 @@ where
     let mut relax_train = relax;
     relax_train.record_step_logits = config.model.deep_supervision > 0.0;
     let q = level_sampling_distribution(&schedule, config.model.alpha)?;
-    let lr = config.lr_schedule();
     let inner_codec = InnerCodec::<B, C>::new(codec);
     let inner_device = device.clone();
     let corruption = CorruptionContext {
@@ -3205,7 +3322,7 @@ where
             crate::schedule::clip_gradients(&mut grads, &model, grad_norm, config.grad_clip as f32);
             report.steps_clipped += 1;
         }
-        let rate = lr.at(step);
+        let rate = config.learning_rate(step);
         model = optim.step(rate, model, grads);
         if report.steps_taken == 0 {
             report.first_loss = loss_value;
@@ -3452,6 +3569,12 @@ where
         differences.is_empty(),
         "refusing to resume: configuration differs in {differences:?}"
     );
+    if !config.lr_shape.is_cosine() {
+        ensure!(
+            state.config.get("steps") == current.get("steps"),
+            "WSD resume requires the original total steps"
+        );
+    }
     ensure!(
         state.step <= config.steps,
         "the checkpoint is at step {}, past the requested {} steps",
@@ -4498,6 +4621,26 @@ fn cert_crystals_hold() -> Result<f64> {
 
 /// The generator's certificates (group `ncm`).
 pub fn certificates() -> Result<Vec<Certificate>> {
+    let wsd = NcmTrainConfig {
+        steps: 16,
+        warmup_steps: 4,
+        peak_lr: 0.25,
+        min_lr: 0.0625,
+        lr_shape: LrShape::WarmupStableDecay { decay_start: 8 },
+        ..NcmTrainConfig::default()
+    };
+    wsd.validate()?;
+    let wsd_residual = (0..=17)
+        .map(|step| {
+            let expected = match step {
+                0..=3 => (step + 1) as f64 / 16.0,
+                4..=8 => 0.25,
+                9..=15 => (64 - 6 * (step - 8)) as f64 / 256.0,
+                _ => 0.0625,
+            };
+            (wsd.learning_rate(step) - expected).abs()
+        })
+        .fold(0.0, f64::max);
     let operator_on = RelaxOptions {
         steps: 3,
         adaptive: Some(AdaptiveThinking {
@@ -4513,6 +4656,18 @@ pub fn certificates() -> Result<Vec<Certificate>> {
         ..cert_config().relax()
     };
     Ok(vec![
+        ncm_cert(
+            "prepare_prompt_and_attractor_norms_preserves_logits",
+            "Reusing the fixed prompt and attractor norms gives bit-identical CPU logits to recomputing them at every level and latent step.",
+            cert_invariant_reuse()?,
+            0.0,
+        ),
+        ncm_cert(
+            "warmup_stable_decay_schedule",
+            "The WSD learning rate follows linear warmup, a stable plateau, and linear decay at every absolute step of a dyadic fixture.",
+            wsd_residual,
+            0.0,
+        ),
         ncm_cert(
             "generation_takes_exactly_k_calls",
             "Concept-field generation makes exactly K level calls per sample (K·n with n MBR samples) and K·T trunk evaluations at fixed depth, counted by a wrapper; a model that loops is caught by the same count.",
@@ -4592,6 +4747,67 @@ pub fn certificates() -> Result<Vec<Certificate>> {
             0.0,
         ),
     ])
+}
+
+fn cert_invariant_reuse() -> Result<f64> {
+    let config = cert_config();
+    let (codec, model) = cert_fixture(&config)?;
+    let device = Default::default();
+    let prompt = cert_prompt(&device);
+    let batch = prompt.dims()[0];
+    let prepared = model.prompt_context(&prompt, batch)?;
+    let relax = RelaxOptions {
+        steps: 3,
+        record_states: true,
+        record_step_logits: true,
+        ..config.relax()
+    };
+    let input = codec.reconstruct(&[], batch)?;
+    let mut residual = 0;
+    for level in 0..codec.schedule().levels() {
+        let normal = model.forward_level(&codec, level, input.clone(), Some(&prompt), &relax)?;
+        let reused = model.forward_level_prepared(
+            &codec,
+            level,
+            input.clone(),
+            None,
+            Some(&prepared),
+            &relax,
+        )?;
+        let attractors = model.attractors(&codec, level)?;
+        let metric = model.full_metric();
+        ensure!(
+            normal.usage == reused.usage,
+            "cached work changed latent counters"
+        );
+        ensure!(
+            reused.states.len() == reused.step_logits.len() + 1,
+            "cached readout did not record every state"
+        );
+        for (state, (uncached, cached)) in reused.states.iter().zip(
+            normal
+                .step_logits
+                .iter()
+                .chain([&normal.logits])
+                .zip(reused.step_logits.iter().chain([&reused.logits])),
+        ) {
+            let reference = distance_logits(state, &attractors, &metric, model.temperature());
+            let unprepared = host_f32(uncached.clone())?;
+            let cached = host_f32(cached.clone())?;
+            let recomputed = host_f32(reference)?;
+            ensure!(
+                unprepared.len() == cached.len() && cached.len() == recomputed.len(),
+                "cached readouts changed tensor shape"
+            );
+            residual += unprepared
+                .iter()
+                .zip(&cached)
+                .zip(&recomputed)
+                .filter(|((a, b), c)| a.to_bits() != b.to_bits() || b.to_bits() != c.to_bits())
+                .count();
+        }
+    }
+    Ok(residual as f64)
 }
 
 #[cfg(test)]
@@ -5008,6 +5224,6 @@ mod tests {
             .map(|c| format!("{}: residual {} > {}", c.name, c.residual, c.tolerance))
             .collect();
         assert!(failed.is_empty(), "{failed:#?}");
-        assert_eq!(certificates.len(), 13);
+        assert_eq!(certificates.len(), 15);
     }
 }

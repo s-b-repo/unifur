@@ -97,6 +97,8 @@ def fit(args):
         raise ValueError("The 4B recipe requires a discrete WGPU training worker")
     if min(args.steps, args.batch_size, args.checkpoint_every) < 1:
         raise ValueError("Training steps, batch size and checkpoint interval must be positive")
+    if args.generator_lr_schedule != "cosine" and args.stage != "generator":
+        raise ValueError("The generator learning-rate schedule only applies to the generator stage")
     planned_records = args.steps * args.batch_size
     if not small and planned_records < data["records"]["train"]:
         raise ValueError("The 4B run must schedule at least one pass over every packed training record")
@@ -116,6 +118,10 @@ def fit(args):
         "batch_size": args.batch_size, "checkpoint_every": args.checkpoint_every, "device": args.device,
         "stage": args.stage, "binary_sha256": digest(args.binary),
     }
+    if args.generator_lr_schedule != "cosine":
+        immutable["generator_lr_schedule"] = args.generator_lr_schedule
+    if args.seed != 42:
+        immutable["seed"] = args.seed
     recipe = args.out / f"{args.stage}-recipe.json"
     if recipe.exists() and read_json(recipe) != immutable:
         raise ValueError("The run directory belongs to a different recipe")
@@ -141,12 +147,18 @@ def fit(args):
         config = args.out / "generator.json"
         shape = {"blocks": 2, "hidden": 64, "heads": 4, "thinking_steps": 2, "attractor": True} if small else FOUR_BILLION
         write_json(config, {**shape, "prompt_len": data["prompt_width"]})
-        options += ["train", "--config", config, "--tokenizer", tokenizer, "--aligned-windows",
-                    "--ordered-records", "--warmup", min(100, args.steps), "--seed", 42]
+        warmup = min(100, args.steps)
+        options += ["train"]
+        if args.generator_lr_schedule == "wsd":
+            warmup = min(100, args.steps // 20)
+            options += ["--lr-schedule", "wsd"]
+        options += ["--config", config, "--tokenizer", tokenizer, "--aligned-windows",
+                    "--ordered-records", "--warmup", warmup]
         stream = "aligned"
     options += ["--corpus", args.input / f"train.{stream}.bin",
                 "--val-corpus", args.input / f"validation.{stream}.bin",
                 "--steps", args.steps, "--batch-size", args.batch_size, "--out", directory,
+                "--seed", args.seed,
                 "--checkpoint-every", args.checkpoint_every, "--val-windows", 8 if small else 128]
     if resume is not None:
         options += ["--resume", resume]
@@ -176,6 +188,8 @@ def main():
     job.add_argument("--backend", choices=("cpu", "wgpu"), default="cpu")
     job.add_argument("--device", default="discrete:0")
     job.add_argument("--steps", type=int, required=True)
+    job.add_argument("--seed", type=int, default=42)
+    job.add_argument("--generator-lr-schedule", choices=("cosine", "wsd"), default="cosine")
     job.add_argument("--batch-size", type=int, default=1)
     job.add_argument("--checkpoint-every", type=int, default=100)
     args = parser.parse_args()

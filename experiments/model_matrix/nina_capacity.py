@@ -26,7 +26,7 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def fit(runtime, bundle, seed, depth, resume):
+def fit(runtime, bundle, seed, depth, resume, schedule):
     binary = runtime / "dblocks"
     codec = checkpoint(runtime / "codec/weights")
     train = runtime / "scenes/train.ncm.bin"
@@ -40,10 +40,11 @@ def fit(runtime, bundle, seed, depth, resume):
 
     if resume is not None:
         previous = read_json(resume.parent.parent / "trial.json")
-        if (previous["inputs"], previous["seed"], previous["depth"], state(resume)["step"]) != (
-            inputs, seed, depth, MIDPOINT
+        if (previous["inputs"], previous["seed"], previous["depth"],
+            previous.get("schedule", "cosine"), state(resume)["step"]) != (
+            inputs, seed, depth, schedule, MIDPOINT
         ):
-            raise ValueError("Resume requires the same runtime, inputs, seed, depth, and midpoint")
+            raise ValueError("Resume requires the same runtime, inputs, seed, depth, schedule and midpoint")
 
     bundle.mkdir(parents=True)
     config = bundle / "generator.json"
@@ -51,12 +52,13 @@ def fit(runtime, bundle, seed, depth, resume):
                         "attractor": True, "thinking_steps": depth})
     weights = bundle / "weights"
     resume_args = [] if resume is None else ["--resume", resume]
+    schedule_args = [] if schedule == "cosine" else ["--lr-schedule", schedule]
     started = perf_counter()
     run(binary, "ncm", "train", "--aligned-windows", "--config", config, "--tokenizer", codec,
         "--corpus", train, "--val-corpus", validation, "--out", weights,
         "--estimator", "all", "--seed", seed, "--batch-size", 8, "--warmup", 24,
         "--val-windows", 32, "--log-every", 48, "--steps", FINAL_STEP,
-        "--checkpoint-every", MIDPOINT, *resume_args, log=bundle / "train.log")
+        "--checkpoint-every", MIDPOINT, *schedule_args, *resume_args, log=bundle / "train.log")
     train_seconds = perf_counter() - started
     checkpoints = {state(path)["step"]: path.relative_to(bundle).as_posix()
                    for path in sorted(weights.glob("*.mpk"))}
@@ -68,7 +70,7 @@ def fit(runtime, bundle, seed, depth, resume):
     cases = [json.loads(line) for line in queries.read_text(encoding="utf-8").splitlines()][:120]
     score = report(runtime, bundle, manifest, cases)
     write_json(bundle / "development.json", score)
-    trial = {"seed": seed, "depth": depth, "checkpoints": checkpoints, "inputs": inputs,
+    trial = {"seed": seed, "depth": depth, "schedule": schedule, "checkpoints": checkpoints, "inputs": inputs,
              "parameters_sha256_prefix": Path(manifest["checkpoint"]).stem.rsplit("-", 1)[1],
              "resumed_from": None if resume is None else resume.name, "train_seconds": train_seconds,
              **{key: score[key] for key in ("cases", "correct", "per_kind_majority_correct")}}
@@ -82,8 +84,9 @@ def summarize(trials, output):
     if len(reports) != len(expected) or observed != expected:
         raise ValueError(f"Incomplete or duplicate trials. Missing {sorted(expected - observed)}")
     first = reports[0]
-    if any(row["inputs"] != first["inputs"] or row["cases"] != first["cases"] for row in reports):
-        raise ValueError("Trials used different runtime inputs or development cases")
+    if any((row["inputs"], row["cases"], row.get("schedule", "cosine")) !=
+           (first["inputs"], first["cases"], first.get("schedule", "cosine")) for row in reports):
+        raise ValueError("Trials used different runtime inputs, development cases or learning-rate schedules")
     by_depth = {depth: [row["correct"] for row in reports if row["depth"] == depth] for depth in DEPTHS}
     write_json(output, {"jobs": len(reports), "development_cases": first["cases"],
                         "majority_correct": first["per_kind_majority_correct"],
@@ -99,13 +102,14 @@ def main():
     trial.add_argument("--out", type=Path, required=True)
     trial.add_argument("--seed", type=int, choices=SEEDS, required=True)
     trial.add_argument("--depth", type=int, choices=DEPTHS, required=True)
+    trial.add_argument("--schedule", choices=("cosine", "wsd"), default="cosine")
     trial.add_argument("--resume", type=Path)
     collect = commands.add_parser("summarize")
     collect.add_argument("trials", type=Path)
     collect.add_argument("output", type=Path)
     args = parser.parse_args()
     if args.command == "fit":
-        fit(args.runtime.resolve(), args.out.resolve(), args.seed, args.depth, args.resume)
+        fit(args.runtime.resolve(), args.out.resolve(), args.seed, args.depth, args.resume, args.schedule)
     else:
         summarize(args.trials, args.output)
 
