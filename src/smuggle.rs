@@ -2477,7 +2477,7 @@ fn push_utf8(out: &mut Vec<u8>, c: char) {
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
     let digits: Vec<u32> = s.chars().map(|c| c.to_digit(16)).collect::<Option<_>>()?;
-    if digits.len() % 2 != 0 {
+    if !digits.len().is_multiple_of(2) {
         return None;
     }
     digits
@@ -2539,7 +2539,7 @@ pub(crate) fn decode_base64(s: &str) -> Option<Vec<u8>> {
 }
 
 fn decode_base32(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 8 != 0 {
+    if !s.len().is_multiple_of(8) {
         return None;
     }
     let body = s.trim_end_matches('=');
@@ -5218,7 +5218,7 @@ fn encode_bits(bytes: &[u8], alphabet: &[u8], width: u32, group: usize) -> Strin
         out.push(char::from(alphabet.get(k).copied().unwrap_or(b'A')));
     }
     if group > 0 {
-        while out.len() % group != 0 {
+        while !out.len().is_multiple_of(group) {
             out.push('=');
         }
     }

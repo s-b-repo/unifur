@@ -766,7 +766,7 @@ impl Candidate {
 ///
 /// Every single move is measured before the group is cut to `count`, best
 /// first. Cutting while enumerating (as an earlier version did) filled the
-/// group from the head of [`ALL_CLASSES`] every round, so with the default
+/// group from the head of `ALL_CLASSES` every round, so with the default
 /// `K = 8` the last five classes and both mixing thresholds were never
 /// proposed at all — and a head class whose escalation never helps held its
 /// slot forever.

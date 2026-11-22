@@ -1897,7 +1897,7 @@ fn ensure_linear_layer(layer_idx: usize, dims: &QwenArchDims) -> Result<()> {
         "layer {layer_idx} is a full-attention layer; it has no linear_attn tensors"
     );
     ensure!(
-        dims.linear_k_groups > 0 && dims.linear_v_heads % dims.linear_k_groups == 0,
+        dims.linear_k_groups > 0 && dims.linear_v_heads.is_multiple_of(dims.linear_k_groups),
         "value heads {} not a positive multiple of key groups {}",
         dims.linear_v_heads,
         dims.linear_k_groups
@@ -1917,13 +1917,13 @@ fn open_audited_shards(dir: &Path, config: &QwenTrunkConfig) -> Result<ShardMap>
         dims.num_layers
     );
     ensure!(
-        dims.linear_k_groups > 0 && dims.linear_v_heads % dims.linear_k_groups == 0,
+        dims.linear_k_groups > 0 && dims.linear_v_heads.is_multiple_of(dims.linear_k_groups),
         "value heads {} not a positive multiple of key groups {}",
         dims.linear_v_heads,
         dims.linear_k_groups
     );
     ensure!(
-        dims.num_kv_heads > 0 && dims.num_q_heads % dims.num_kv_heads == 0,
+        dims.num_kv_heads > 0 && dims.num_q_heads.is_multiple_of(dims.num_kv_heads),
         "query heads {} not a positive multiple of kv heads {}",
         dims.num_q_heads,
         dims.num_kv_heads

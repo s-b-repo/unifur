@@ -219,8 +219,7 @@ pub fn t_quantile_975(df: usize) -> f64 {
             let g1 = (x3 + x) / 4.0;
             let g2 = (5.0 * x5 + 16.0 * x3 + 3.0 * x) / 96.0;
             let g3 = (3.0 * x7 + 19.0 * x5 + 17.0 * x3 - 15.0 * x) / 384.0;
-            let g4 =
-                (79.0 * x9 + 776.0 * x7 + 1482.0 * x5 - 1920.0 * x3 - 945.0 * x) / 92160.0;
+            let g4 = (79.0 * x9 + 776.0 * x7 + 1482.0 * x5 - 1920.0 * x3 - 945.0 * x) / 92160.0;
             x + g1 / n + g2 / n.powi(2) + g3 / n.powi(3) + g4 / n.powi(4)
         }
         _ => 1.9600,
@@ -468,7 +467,10 @@ mod tests {
             (120, 1.9799),
         ] {
             let got = t_quantile_975(df);
-            assert!((got - want).abs() < 6e-5, "t(0.975, {df}) = {got}, want {want}");
+            assert!(
+                (got - want).abs() < 6e-5,
+                "t(0.975, {df}) = {got}, want {want}"
+            );
         }
         // Non-increasing in df across the table/expansion/normal seams.
         let mut last = f64::INFINITY;

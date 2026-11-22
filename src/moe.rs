@@ -1400,7 +1400,10 @@ mod tests {
         let spread = top1(&[0, 1, 2, 3, 0, 1, 2, 3]);
         let aux_uniform: f32 =
             weighted_switch_loss(&probs_uniform, &spread, &ones, e_count).into_scalar();
-        assert!((aux_uniform - 1.0).abs() < 1e-6, "uniform gave {aux_uniform}");
+        assert!(
+            (aux_uniform - 1.0).abs() < 1e-6,
+            "uniform gave {aux_uniform}"
+        );
 
         // Collapsed: every token's mass and top-1 on expert 0 => exactly E.
         let mut collapsed = vec![0.0f32; t * e_count];
@@ -1426,8 +1429,9 @@ mod tests {
         assert!((aux_hard - 1.0).abs() < 1e-6, "got {aux_hard}");
 
         // Token weights: a token with weight zero contributes to neither half.
-        let weights = Tensor::<B, 1>::from_floats([1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0], &device)
-            .reshape([t, 1]);
+        let weights =
+            Tensor::<B, 1>::from_floats([1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0], &device)
+                .reshape([t, 1]);
         let half_collapsed = top1(&[0, 0, 0, 0, 1, 1, 1, 1]);
         let aux_weighted: f32 =
             weighted_switch_loss(&probs_collapsed, &half_collapsed, &weights, e_count)

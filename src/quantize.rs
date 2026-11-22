@@ -329,7 +329,7 @@ impl PackedNf4Tensor {
     /// One code of value `i` (low nibble first).
     fn code(&self, i: usize) -> u8 {
         let byte = self.codes[i / 2];
-        if i % 2 == 0 {
+        if i.is_multiple_of(2) {
             byte & 0x0F
         } else {
             byte >> 4

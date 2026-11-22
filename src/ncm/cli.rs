@@ -70,6 +70,9 @@ pub struct TokenizerTrainArgs {
     /// Optimizer steps.
     #[arg(long, default_value_t = 300)]
     pub steps: usize,
+    /// Save and stop at this optimizer step while keeping the full schedule.
+    #[arg(long)]
+    pub stop_at: Option<usize>,
     #[arg(long, default_value_t = 16)]
     pub batch_size: usize,
     /// Micro-batches per optimizer step.
@@ -183,6 +186,7 @@ fn train_config(args: TokenizerTrainArgs) -> Result<TokenizerTrainConfig> {
         ordered_records: args.ordered_records,
         val_fraction: args.val_fraction,
         steps: args.steps,
+        stop_at: args.stop_at,
         batch_size: args.batch_size,
         accumulate: args.accumulate,
         weight_decay: args.weight_decay,
@@ -286,6 +290,9 @@ pub struct GeneratorTrainArgs {
     pub config: String,
     #[arg(long, default_value_t = 300)]
     pub steps: usize,
+    /// Save and stop at this optimizer step while keeping the full schedule.
+    #[arg(long)]
+    pub stop_at: Option<usize>,
     #[arg(long, default_value_t = 8)]
     pub batch_size: usize,
     /// Peak learning rate (warmup, then cosine to `--min-lr`).
@@ -643,6 +650,7 @@ fn generator_config(args: &GeneratorTrainArgs) -> Result<crate::ncm::generator::
     let config = NcmTrainConfig {
         model,
         steps: args.steps,
+        stop_at: args.stop_at,
         batch_size: args.batch_size,
         peak_lr: args.lr,
         min_lr: args.min_lr,

@@ -256,7 +256,7 @@ impl NcmTokenizerConfig {
         ensure!(self.latent_dim >= 1, "latent_dim must be at least 1");
         ensure!(self.codebook_size >= 1, "codebook_size must be at least 1");
         ensure!(
-            self.heads >= 1 && self.latent_dim % self.heads == 0,
+            self.heads >= 1 && self.latent_dim.is_multiple_of(self.heads),
             "heads ({}) must be at least 1 and divide latent_dim ({})",
             self.heads,
             self.latent_dim
@@ -443,7 +443,7 @@ impl<B: Backend> NcmBlock<B> {
         device: &B::Device,
     ) -> Result<Self> {
         ensure!(
-            heads >= 1 && width % heads == 0,
+            heads >= 1 && width.is_multiple_of(heads),
             "{heads} heads do not divide width {width}"
         );
         let linear = |i: usize, o: usize| LinearConfig::new(i, o).with_bias(true).init(device);
@@ -1234,7 +1234,7 @@ pub(crate) fn micro_tokenizer<B: Backend>(
 /// d(u, e_best))` over the rows, by a brute-force f64 scan of the codebook.
 pub fn nearest_code_gap(rows: &[f64], codebook: &[f64], chosen: &[usize], d: usize) -> Result<f64> {
     ensure!(
-        d >= 1 && rows.len() % d == 0 && codebook.len() % d == 0,
+        d >= 1 && rows.len().is_multiple_of(d) && codebook.len().is_multiple_of(d),
         "ragged rows"
     );
     let n = rows.len() / d;

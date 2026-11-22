@@ -172,7 +172,7 @@ impl TbConfig {
             self.num_heads
         );
         anyhow::ensure!(
-            self.hidden_size > 0 && self.hidden_size % self.num_heads == 0,
+            self.hidden_size > 0 && self.hidden_size.is_multiple_of(self.num_heads),
             "hidden_size ({}) must be a positive multiple of num_heads ({})",
             self.hidden_size,
             self.num_heads
@@ -1201,7 +1201,7 @@ pub fn train_model<B: AutodiffBackend<FloatElem = f32>>(
     // evaluation: each point on the curve scores the *same* corrupted
     // windows (so points are comparable), and evaluating never advances the
     // training stream (so `eval_every` cannot change which batches train).
-    let eval_seed = seed ^ 0x5eed_0f_e7a1_u64;
+    let eval_seed = seed ^ 0x005e_ed0f_e7a1_u64;
     let mut report = TbTrainReport::default();
     let started = Instant::now();
     let n = config.context;

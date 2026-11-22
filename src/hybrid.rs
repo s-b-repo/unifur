@@ -468,7 +468,7 @@ pub fn rotary_tables<B: Backend>(
     device: &B::Device,
 ) -> (Tensor<B, 4>, Tensor<B, 4>) {
     assert!(
-        dim % 2 == 0,
+        dim.is_multiple_of(2),
         "rotary positions need an even head dimension, got {dim}"
     );
     let half = dim / 2;
@@ -535,7 +535,7 @@ pub fn apply_rotary_partial<B: Backend>(
 ) -> Tensor<B, 4> {
     let [_, _, n, dim] = x.dims();
     assert!(
-        rotary_dim <= dim && rotary_dim % 2 == 0,
+        rotary_dim <= dim && rotary_dim.is_multiple_of(2),
         "rotary cover {rotary_dim} must be an even number of columns of {dim}"
     );
     if rotary_dim == dim {

@@ -1388,7 +1388,8 @@ mod tests {
 
         // At least as many tokens as the stream has slots (8 in `tiny`).
         let ids: Vec<i64> = vec![80, 48, 49, 50, 65, 66, 67, 68, 69, 70];
-        let tokens = Tensor::<B, 1, Int>::from_ints(ids.as_slice(), &device).reshape([1, ids.len()]);
+        let tokens =
+            Tensor::<B, 1, Int>::from_ints(ids.as_slice(), &device).reshape([1, ids.len()]);
         let reader = VecReader {
             positions: PositionSelection::All,
             top_k: 3,
@@ -1434,7 +1435,12 @@ mod tests {
                 .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0)))
                 .map(|(i, _)| i)
                 .unwrap();
-            assert_eq!(usize::from(dec.top[0].id), argmax, "position {}", dec.position);
+            assert_eq!(
+                usize::from(dec.top[0].id),
+                argmax,
+                "position {}",
+                dec.position
+            );
         }
 
         // A configured tuned lens is refused rather than silently dropped.
@@ -1448,7 +1454,8 @@ mod tests {
             }]),
             ..VecReader::default()
         };
-        let tokens = Tensor::<B, 1, Int>::from_ints(ids.as_slice(), &device).reshape([1, ids.len()]);
+        let tokens =
+            Tensor::<B, 1, Int>::from_ints(ids.as_slice(), &device).reshape([1, ids.len()]);
         let err = tuned
             .read_fused_thinking(&model, tokens, &[1])
             .unwrap_err()

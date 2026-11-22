@@ -91,7 +91,7 @@ fn greedy<B: Backend<FloatElem = f32>>(
         let next = u16::try_from(arg)?;
         ids.push(next);
         out.push(next);
-        if out.len() % 16 == 0 {
+        if out.len().is_multiple_of(16) {
             let s = tok.decode_lossy(&out);
             if stop.iter().any(|p| s.contains(p)) {
                 break;

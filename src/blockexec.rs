@@ -660,7 +660,10 @@ mod tests {
                     Ok(i)
                 })
             });
-            (mode, result.unwrap_or_else(|_| Err(anyhow::anyhow!("map itself unwound"))))
+            (
+                mode,
+                result.unwrap_or_else(|_| Err(anyhow::anyhow!("map itself unwound"))),
+            )
         })
         .collect();
         std::panic::set_hook(previous);

@@ -1122,7 +1122,10 @@ mod tests {
         // last block to the strict bound, or the MSE gate rejects nothing.
         let gates =
             LayerGates::tightening(4, QualityGateConfig::lenient(), QualityGateConfig::strict());
-        assert_eq!(gates.for_block(3).max_mse, QualityGateConfig::strict().max_mse);
+        assert_eq!(
+            gates.for_block(3).max_mse,
+            QualityGateConfig::strict().max_mse
+        );
         assert!(gates.for_block(0).max_mse.is_infinite());
         let device = Default::default();
         let prev = Tensor::<B, 2>::zeros([1, 4], &device);
@@ -1133,7 +1136,10 @@ mod tests {
         );
         let mut prev_mse = f32::INFINITY;
         for b in 0..4 {
-            assert!(gates.for_block(b).max_mse <= prev_mse, "mse gate must tighten");
+            assert!(
+                gates.for_block(b).max_mse <= prev_mse,
+                "mse gate must tighten"
+            );
             prev_mse = gates.for_block(b).max_mse;
         }
     }

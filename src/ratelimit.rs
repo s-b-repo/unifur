@@ -224,14 +224,7 @@ fn first_token(value: &str) -> &str {
 /// OpenRouter's daily message ("…free-models-per-day. Add 10 credits to
 /// unlock 1000 free model requests per day") mentions credits too.
 const DAILY_MARKERS: &[&str] = &[
-    "per-day",
-    "per day",
-    "/day",
-    "daily",
-    "rpd",
-    "24 hours",
-    "24h",
-    "per 24",
+    "per-day", "per day", "/day", "daily", "rpd", "24 hours", "24h", "per 24",
 ];
 
 /// Phrases that mark a short-window limit.
@@ -342,7 +335,10 @@ fn read_error_value(error: &serde_json::Value) -> ErrorBody {
                 None => text.push(raw.to_string()),
             }
         }
-        if let Some(headers) = metadata.get("headers").and_then(serde_json::Value::as_object) {
+        if let Some(headers) = metadata
+            .get("headers")
+            .and_then(serde_json::Value::as_object)
+        {
             for (name, value) in headers {
                 let value = match value.as_str() {
                     Some(text) => text.to_string(),
@@ -998,8 +994,8 @@ pub fn plan_pause(
             }
         }
         RateLimitKind::PerMinute | RateLimitKind::Unknown => {
-            let base = hint_ms
-                .unwrap_or_else(|| policy.fallback_pause_secs.saturating_mul(MS_PER_SEC));
+            let base =
+                hint_ms.unwrap_or_else(|| policy.fallback_pause_secs.saturating_mul(MS_PER_SEC));
             if base <= max_pause {
                 let total = base.saturating_add(jitter).min(max_pause);
                 let jitter = total - base;
@@ -1058,7 +1054,11 @@ pub fn plan_pause(
 /// divided by `remaining + 1` when it is at or below
 /// [`PausePolicy::low_remaining`], and nothing otherwise. Capped at
 /// `max_pause_secs`; `None` when the quota says nothing usable.
-pub fn pacing_delay(quota: &QuotaSnapshot, now_unix_ms: u64, policy: &PausePolicy) -> Option<Duration> {
+pub fn pacing_delay(
+    quota: &QuotaSnapshot,
+    now_unix_ms: u64,
+    policy: &PausePolicy,
+) -> Option<Duration> {
     let remaining = quota.remaining?;
     let reset = quota.reset_at_unix_ms?;
     let window = reset.checked_sub(now_unix_ms).filter(|w| *w > 0)?;
@@ -1125,7 +1125,11 @@ mod tests {
         assert_eq!(signal.kind, RateLimitKind::PerMinute);
         assert_eq!(signal.retry_after, Some(Duration::from_secs(30)));
         assert!(signal.evidence.contains("HTTP 429"), "{}", signal.evidence);
-        assert!(signal.evidence.contains("retry-after=30"), "{}", signal.evidence);
+        assert!(
+            signal.evidence.contains("retry-after=30"),
+            "{}",
+            signal.evidence
+        );
     }
 
     #[test]
@@ -1157,11 +1161,21 @@ mod tests {
         let as_delta = "45";
         let as_duration = "45s";
         let as_rfc3339 = "2026-11-20T12:00:45Z";
-        for value in [as_ms.as_str(), as_s.as_str(), as_delta, as_duration, as_rfc3339] {
+        for value in [
+            as_ms.as_str(),
+            as_s.as_str(),
+            as_delta,
+            as_duration,
+            as_rfc3339,
+        ] {
             let signal = classify(
                 &response(
                     429,
-                    &[("X-RateLimit-Limit", "20"), ("X-RateLimit-Remaining", "0"), ("X-RateLimit-Reset", value)],
+                    &[
+                        ("X-RateLimit-Limit", "20"),
+                        ("X-RateLimit-Remaining", "0"),
+                        ("X-RateLimit-Reset", value),
+                    ],
                     "",
                 ),
                 NOW,
@@ -1180,8 +1194,16 @@ mod tests {
         let signal = classify(&response(200, &[], body), NOW).unwrap();
         assert_eq!(signal.kind, RateLimitKind::PerMinute);
         assert_eq!(signal.reset_at_unix_ms, Some(NOW + 60_000));
-        assert!(signal.evidence.contains("HTTP 200 carrying error code 429"), "{}", signal.evidence);
-        assert!(signal.evidence.contains("free-models-per-min"), "{}", signal.evidence);
+        assert!(
+            signal.evidence.contains("HTTP 200 carrying error code 429"),
+            "{}",
+            signal.evidence
+        );
+        assert!(
+            signal.evidence.contains("free-models-per-min"),
+            "{}",
+            signal.evidence
+        );
         // An upstream failure reported in a 200 is an overload.
         let upstream = r#"{"choices":[{"finish_reason":"error","error":{"code":502,"message":"Provider returned error"}}]}"#;
         let signal = classify(&response(200, &[], upstream), NOW).unwrap();
@@ -1198,10 +1220,15 @@ mod tests {
             r#"{{"error":{{"code":429,"message":"Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day","metadata":{{"headers":{{"X-RateLimit-Limit":"50","X-RateLimit-Remaining":"0","X-RateLimit-Reset":"{midnight}"}}}}}}}}"#
         );
         let signal = classify(&response(429, &[], &daily), NOW).unwrap();
-        assert_eq!(signal.kind, RateLimitKind::Daily, "credits mention must not win");
+        assert_eq!(
+            signal.kind,
+            RateLimitKind::Daily,
+            "credits mention must not win"
+        );
         assert_eq!(signal.reset_at_unix_ms, Some(midnight));
 
-        let minute = r#"{"error":{"code":429,"message":"Rate limit exceeded: free-models-per-min."}}"#;
+        let minute =
+            r#"{"error":{"code":429,"message":"Rate limit exceeded: free-models-per-min."}}"#;
         assert_eq!(
             classify(&response(429, &[], minute), NOW).unwrap().kind,
             RateLimitKind::PerMinute
@@ -1210,11 +1237,15 @@ mod tests {
         let far = (NOW + 5 * 3_600_000).to_string();
         let near = (NOW + 30_000).to_string();
         assert_eq!(
-            classify(&response(429, &[("x-ratelimit-reset", &far)], "{}"), NOW).unwrap().kind,
+            classify(&response(429, &[("x-ratelimit-reset", &far)], "{}"), NOW)
+                .unwrap()
+                .kind,
             RateLimitKind::Daily
         );
         assert_eq!(
-            classify(&response(429, &[("x-ratelimit-reset", &near)], "{}"), NOW).unwrap().kind,
+            classify(&response(429, &[("x-ratelimit-reset", &near)], "{}"), NOW)
+                .unwrap()
+                .kind,
             RateLimitKind::PerMinute
         );
         assert_eq!(
@@ -1228,7 +1259,10 @@ mod tests {
         let body = r#"{"error":{"code":402,"message":"Insufficient credits. Add more using https://openrouter.ai/credits"}}"#;
         let signal = classify(&response(402, &[], body), NOW).unwrap();
         assert_eq!(signal.kind, RateLimitKind::Credits);
-        assert_eq!(plan_pause(&signal, NOW, 0, &policy(), 0.5).verdict, PauseVerdict::Disable);
+        assert_eq!(
+            plan_pause(&signal, NOW, 0, &policy(), 0.5).verdict,
+            PauseVerdict::Disable
+        );
     }
 
     #[test]
@@ -1247,7 +1281,11 @@ mod tests {
         let signal = classify(&response(429, &[], body), NOW).unwrap();
         assert_eq!(signal.retry_after, Some(Duration::from_secs(20)));
         assert_eq!(signal.kind, RateLimitKind::PerMinute);
-        assert!(signal.evidence.contains("Too Many Requests"), "{}", signal.evidence);
+        assert!(
+            signal.evidence.contains("Too Many Requests"),
+            "{}",
+            signal.evidence
+        );
         // The same document in a 200 is still a limit.
         assert!(classify(&response(200, &[], body), NOW).is_some());
     }
@@ -1256,12 +1294,18 @@ mod tests {
     fn ordinary_failures_are_not_signals() {
         for (status, body) in [
             (401, r#"{"error":"bad key"}"#),
-            (400, r#"{"error":{"code":400,"message":"model is not a valid model ID"}}"#),
+            (
+                400,
+                r#"{"error":{"code":400,"message":"model is not a valid model ID"}}"#,
+            ),
             (404, ""),
             (500, r#"{"error":"boom"}"#),
             (200, "not json"),
         ] {
-            assert!(classify(&response(status, &[], body), NOW).is_none(), "{status} {body}");
+            assert!(
+                classify(&response(status, &[], body), NOW).is_none(),
+                "{status} {body}"
+            );
         }
         // A status document without title/detail is not a problem document.
         assert!(classify(&response(200, &[], r#"{"status":429}"#), NOW).is_none());
@@ -1290,9 +1334,18 @@ mod tests {
     #[test]
     fn durations_and_dates_parse() {
         assert_eq!(parse_duration_text("1m30s"), Some(Duration::from_secs(90)));
-        assert_eq!(parse_duration_text("250ms"), Some(Duration::from_millis(250)));
-        assert_eq!(parse_duration_text("0.5s"), Some(Duration::from_millis(500)));
-        assert_eq!(parse_duration_text("20 seconds"), Some(Duration::from_secs(20)));
+        assert_eq!(
+            parse_duration_text("250ms"),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            parse_duration_text("0.5s"),
+            Some(Duration::from_millis(500))
+        );
+        assert_eq!(
+            parse_duration_text("20 seconds"),
+            Some(Duration::from_secs(20))
+        );
         assert_eq!(parse_duration_text("12"), None, "a number needs a unit");
         assert_eq!(parse_duration_text("5 parsecs"), None);
         assert_eq!(parse_http_date("not a date"), None);
@@ -1441,9 +1494,18 @@ mod tests {
             remaining: Some(remaining),
             reset_at_unix_ms: Some(NOW + 30_000),
         };
-        assert_eq!(pacing_delay(&quota(0), NOW, &p), Some(Duration::from_secs(30)));
-        assert_eq!(pacing_delay(&quota(2), NOW, &p), Some(Duration::from_secs(10)));
-        assert_eq!(pacing_delay(&quota(1), NOW, &p), Some(Duration::from_secs(15)));
+        assert_eq!(
+            pacing_delay(&quota(0), NOW, &p),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            pacing_delay(&quota(2), NOW, &p),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            pacing_delay(&quota(1), NOW, &p),
+            Some(Duration::from_secs(15))
+        );
         assert_eq!(pacing_delay(&quota(15), NOW, &p), None);
         let expired = QuotaSnapshot {
             reset_at_unix_ms: Some(NOW - 1),

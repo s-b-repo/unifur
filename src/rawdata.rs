@@ -162,7 +162,7 @@ impl RawImageFormat {
         if len == 0 {
             anyhow::bail!("{} is empty", path.display());
         }
-        if len % record != 0 {
+        if !len.is_multiple_of(record) {
             anyhow::bail!(
                 "{}: size {len} is not a multiple of the {record}-byte record size",
                 path.display()
@@ -1073,7 +1073,11 @@ mod tests {
                 "unhelpful error: {err:#}"
             );
         }
-        assert_eq!(split.reads_issued(), 0, "no read was issued for a bad batch");
+        assert_eq!(
+            split.reads_issued(),
+            0,
+            "no read was issued for a bad batch"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

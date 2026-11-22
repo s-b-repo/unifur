@@ -8,7 +8,7 @@ on:
       mode:
         description: Worker operation
         type: choice
-        options: [preflight, gpu-fit]
+        options: [preflight, gpu-qualify, gpu-fit, gpu-release-eval]
         default: preflight
       corpus:
         description: Packed corpus directory name on the GPU worker
@@ -17,7 +17,7 @@ on:
         description: Persistent run directory name shared by codec and generator stages
         type: string
       stage:
-        description: Native training stage for gpu-fit
+        description: Native stage for gpu-qualify or gpu-fit
         type: choice
         options: [codec, generator]
         default: codec
@@ -38,6 +38,14 @@ on:
         type: choice
         options: [cosine, wsd]
         default: cosine
+      stop_at:
+        description: Save and end gpu-fit at this absolute optimizer step (0 uses the full schedule)
+        type: number
+        default: 0
+      validation_windows:
+        description: Validation records per training evaluation (0 uses the profile default)
+        type: number
+        default: 0
 
 permissions:
   contents: read
@@ -83,18 +91,23 @@ jobs:
             if [[ "$stage" == generator ]]; then
               schedule=(--generator-lr-schedule wsd)
             fi
-            python3 -B "$worker" fit --binary "$runtime" --input inputs --out result \
-              --profile preflight --stage "$stage" --steps 4 --batch-size 4 --checkpoint-every 4 \
-              "${schedule[@]}" \
-              | tee "result/$stage.log"
+            recipe=(--binary "$runtime" --input inputs --out result --profile preflight --stage "$stage"
+              --steps 4 --batch-size 4 --checkpoint-every 4 "${schedule[@]}")
+            python3 -B "$worker" qualify "${recipe[@]}" --probe-steps 2 | tee "result/$stage-qualify.log"
+            jq -e '.resume_verified and .invocations[1].resumed_from == 1 and .recipe.steps == 4' \
+              "result/$stage-qualification.json"
+            python3 -B "$worker" fit "${recipe[@]}" | tee "result/$stage.log"
+            tail -n 1 "result/$stage.log" | jq -e '.step == 4 and .resumed_from == 2'
           done
+          codec=$(tail -n 1 result/codec.log | jq -er .checkpoint)
+          generator=$(tail -n 1 result/generator.log | jq -er .checkpoint)
           head -n 1 scenes/test.jsonl | jq -jr .prompt |
-            "$runtime" ncm generate --generator result/generator/*.mpk --tokenizer result/codec/*.mpk \
+            "$runtime" ncm generate --generator "$generator" --tokenizer "$codec" \
               --prompt-stdin --json --temperature 0 | tee result/reloaded.json
           jq -e '.prompt_bytes == 29 and .level_calls == 3 and .trunk_evaluations == 6 and (.text[0] | type == "string")' result/reloaded.json
           printf '%s\n' '{"decode":{"speculation":{"draft_levels":2}},"budget":{"max_level_calls":3,"max_draft_calls":6},"draft_thinking_steps":0}' > result/speculation.json
           head -n 1 scenes/test.jsonl | jq -jr .prompt |
-            "$runtime" ncm generate --generator result/generator/*.mpk --tokenizer result/codec/*.mpk \
+            "$runtime" ncm generate --generator "$generator" --tokenizer "$codec" \
               --prompt-stdin --json --decode-policy result/speculation.json | tee result/speculated.json
           jq -e --slurpfile plain result/reloaded.json \
             '.text == $plain[0].text and .decode.target_trunk_evaluations == 6 and .decode.draft_calls > 0 and .decode.draft_trunk_evaluations == 0 and (.decode.stopped_by_budget | not)' \
@@ -102,8 +115,9 @@ jobs:
           install -m 0755 "$runtime" result/dblocks
       - name: Verify two synchronous native NCM ranks on CPU
         run: |
+          codec=$(tail -n 1 result/codec.log | jq -er .checkpoint)
           RAYON_NUM_THREADS=1 MATMUL_NUM_THREADS=1 target/release/examples/ncm_grid_probe \
-            --workers 2 --codec result/codec/*.mpk --corpus inputs/train.aligned.bin \
+            --workers 2 --codec "$codec" --corpus inputs/train.aligned.bin \
             | tee result/grid-2.json
       - uses: actions/upload-artifact@v4
         if: ${{ !cancelled() }}
@@ -114,7 +128,7 @@ jobs:
           retention-days: 14
 
   gpu-fit:
-    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'gpu-fit'
+    if: github.event_name == 'workflow_dispatch' && inputs.mode != 'preflight'
     runs-on: [self-hosted, linux, x64, nina-gpu]
     timeout-minutes: 300
     concurrency:
@@ -129,6 +143,11 @@ jobs:
       BATCH_SIZE: ${{ inputs.batch_size }}
       CHECKPOINT_EVERY: ${{ inputs.checkpoint_every }}
       GENERATOR_LR_SCHEDULE: ${{ inputs.generator_lr_schedule }}
+      MODE: ${{ inputs.mode }}
+      STOP_AT: ${{ inputs.stop_at }}
+      VALIDATION_WINDOWS: ${{ inputs.validation_windows }}
+      NINA_OMNI_BIN: ${{ vars.NINA_OMNI_BIN }}
+      NINA_DCR_BIN: ${{ vars.NINA_DCR_BIN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -153,15 +172,40 @@ jobs:
             mv "$run/.dblocks.tmp" "$run/dblocks"
             printf '%s\n' "$GITHUB_SHA" > "$run/runtime.commit"
           fi
-      - name: Train one stage and keep its optimizer state on the worker
+      - name: Qualify or train one stage with a fixed schedule
+        if: inputs.mode != 'gpu-release-eval'
         run: |
           run="$NINA_ROOT/runs/$RUN_KEY"
-          schedule=()
+          options=()
           if [[ "$STAGE" == generator ]]; then
-            schedule=(--generator-lr-schedule "$GENERATOR_LR_SCHEDULE")
+            options+=(--generator-lr-schedule "$GENERATOR_LR_SCHEDULE")
           fi
-          python3 -B experiments/model_matrix/nina_worker.py fit --binary "$run/dblocks" \
+          if [[ "$VALIDATION_WINDOWS" != 0 ]]; then
+            options+=(--validation-windows "$VALIDATION_WINDOWS")
+          fi
+          if [[ "$MODE" == gpu-qualify ]]; then
+            operation=qualify
+          else
+            operation=fit
+            if [[ "$STOP_AT" != 0 ]]; then
+              options+=(--stop-at "$STOP_AT")
+            fi
+          fi
+          python3 -B experiments/model_matrix/nina_worker.py "$operation" --binary "$run/dblocks" \
             --input "$NINA_ROOT/corpora/$CORPUS" --out "$run" --profile 4b --backend wgpu \
             --stage "$STAGE" --steps "$STEPS" --batch-size "$BATCH_SIZE" \
-            "${schedule[@]}" \
+            "${options[@]}" \
             --checkpoint-every "$CHECKPOINT_EVERY" | tee -a "$run/$STAGE.log"
+      - name: Score a completed model with the staged release policy
+        if: inputs.mode == 'gpu-release-eval'
+        run: |
+          run="$NINA_ROOT/runs/$RUN_KEY"
+          evaluation="$NINA_ROOT/evaluations/$RUN_KEY"
+          options=()
+          if [[ -n "${NINA_OMNI_BIN:-}" && -n "${NINA_DCR_BIN:-}" ]]; then
+            options+=(--omni "$NINA_OMNI_BIN" --dcr "$NINA_DCR_BIN")
+          fi
+          python3 -B experiments/model_matrix/nina_release.py --binary "$run/dblocks" \
+            --backend wgpu --run "$run" --corpus "$NINA_ROOT/corpora/$CORPUS" \
+            --cases "$evaluation/cases.jsonl" --policy "$evaluation/policy.json" \
+            --out "$evaluation/report.json" "${options[@]}"

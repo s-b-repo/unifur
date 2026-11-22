@@ -3063,7 +3063,10 @@ fn has_literal_branch(lines: &[LineView<'_>], i: usize) -> bool {
                         .rev()
                         .find(|&p| !chars[p].is_whitespace())
                         .map_or((None, None), |p| {
-                            (chars.get(p).copied(), p.checked_sub(1).and_then(|q| chars.get(q).copied()))
+                            (
+                                chars.get(p).copied(),
+                                p.checked_sub(1).and_then(|q| chars.get(q).copied()),
+                            )
                         });
                     (chars[k].is_ascii_digit()
                         && chars[start].is_ascii_digit()
@@ -3083,7 +3086,9 @@ fn has_literal_branch(lines: &[LineView<'_>], i: usize) -> bool {
                         .collect();
                     let operator_after = (k + token.chars().count()..chars.len())
                         .find(|&p| !chars[p].is_whitespace())
-                        .map_or((None, None), |p| (chars.get(p).copied(), chars.get(p + 1).copied()));
+                        .map_or((None, None), |p| {
+                            (chars.get(p).copied(), chars.get(p + 1).copied())
+                        });
                     (numeric && !is_base_case_literal(&token) && !arithmetic(operator_after))
                         || chars[k] == '"'
                         || chars[k] == '\''
@@ -3854,20 +3859,58 @@ fn is_placeholder_value(value: &str) -> bool {
     let lower = value.to_ascii_lowercase();
     let trimmed = lower.trim_matches(|c: char| !c.is_ascii_alphanumeric());
     const MARKERS: &[&str] = &[
-        "${", "{{", "$(", "%(", "<", ">", "environ", "getenv", "process.env", "env(", "env.",
-        "example", "placeholder", "changeme", "change_me", "change-me", "your_", "your-",
-        "yourkey", "redacted", "dummy", "secret_here", "token_here", "key_here", "xxxx", "****",
-        "....", "\u{2026}",
+        "${",
+        "{{",
+        "$(",
+        "%(",
+        "<",
+        ">",
+        "environ",
+        "getenv",
+        "process.env",
+        "env(",
+        "env.",
+        "example",
+        "placeholder",
+        "changeme",
+        "change_me",
+        "change-me",
+        "your_",
+        "your-",
+        "yourkey",
+        "redacted",
+        "dummy",
+        "secret_here",
+        "token_here",
+        "key_here",
+        "xxxx",
+        "****",
+        "....",
+        "\u{2026}",
     ];
     trimmed.is_empty()
         || MARKERS.iter().any(|m| lower.contains(m))
         || lower.starts_with('$')
         || matches!(
             trimmed,
-            "password" | "passwd" | "pass" | "secret" | "token" | "none" | "null" | "true"
-                | "false" | "test" | "admin" | "root" | "user" | "username"
+            "password"
+                | "passwd"
+                | "pass"
+                | "secret"
+                | "token"
+                | "none"
+                | "null"
+                | "true"
+                | "false"
+                | "test"
+                | "admin"
+                | "root"
+                | "user"
+                | "username"
         )
-        || trimmed.chars().all(|c| c == trimmed.chars().next().unwrap_or('x'))
+        || trimmed
+            .chars()
+            .all(|c| c == trimmed.chars().next().unwrap_or('x'))
 }
 
 /// One credential found in a line: the byte span of the secret value, and the
@@ -3924,7 +3967,10 @@ fn prefix_spans(raw: &str, out: &mut Vec<SecretSpan>) {
             let mixed = *prefix != "SK"
                 || (value.chars().any(|c| c.is_ascii_digit())
                     && value.chars().any(|c| c.is_ascii_alphabetic()));
-            if run >= *min_len && bounded && mixed && !value.to_ascii_lowercase().contains("example")
+            if run >= *min_len
+                && bounded
+                && mixed
+                && !value.to_ascii_lowercase().contains("example")
             {
                 out.push(SecretSpan {
                     start: idx,
@@ -3975,7 +4021,9 @@ fn paired_token_spans(raw: &str, out: &mut Vec<SecretSpan>) {
         let open = from + q;
         let inner = open + 1;
         let run = run_len(raw, inner, |c| c.is_ascii_hexdigit());
-        let closes = raw.get(inner + run..).is_some_and(|r| r.starts_with(['"', '\'']));
+        let closes = raw
+            .get(inner + run..)
+            .is_some_and(|r| r.starts_with(['"', '\'']));
         let value = raw.get(inner..inner + run).unwrap_or("");
         if run == 32
             && closes
@@ -4006,7 +4054,13 @@ fn url_credential_spans(raw: &str, out: &mut Vec<SecretSpan>) {
         }
         let rest = &raw[at + 3..];
         let authority_end = rest
-            .find(|c: char| c == '/' || c == '?' || c == '#' || c.is_whitespace() || matches!(c, '"' | '\'' | '`' | ')' | ']' | '>' | ','))
+            .find(|c: char| {
+                c == '/'
+                    || c == '?'
+                    || c == '#'
+                    || c.is_whitespace()
+                    || matches!(c, '"' | '\'' | '`' | ')' | ']' | '>' | ',')
+            })
             .unwrap_or(rest.len());
         let authority = &rest[..authority_end];
         let Some(atsign) = authority.rfind('@') else {
@@ -4082,11 +4136,15 @@ fn named_value_spans(raw: &str, out: &mut Vec<SecretSpan>) {
             if lower[end..].starts_with(|c: char| c.is_ascii_alphanumeric()) {
                 continue;
             }
-            end += run_len(&lower, end, |c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+            end += run_len(&lower, end, |c| {
+                c.is_ascii_alphanumeric() || c == '_' || c == '-'
+            });
             let rest = &raw[end..];
             let trimmed = rest.trim_start_matches([' ', '\t', '"', '\'', ']']);
             let space_sep = *keyword == "requirepass" && rest.starts_with([' ', '\t']);
-            let op = trimmed.strip_prefix(":=").or_else(|| trimmed.strip_prefix([':', '=']));
+            let op = trimmed
+                .strip_prefix(":=")
+                .or_else(|| trimmed.strip_prefix([':', '=']));
             let after_op = match (op, space_sep) {
                 (Some(v), _) => v,
                 (None, true) => trimmed,
@@ -4204,10 +4262,10 @@ fn private_key_block(raws: &[&str], i: usize) -> bool {
         .and_then(|p| armour.get(p + 5..))
         .and_then(|r| r.find("-----").and_then(|q| r.get(q + 5..)))
         .unwrap_or("");
-    if after
-        .split("\\n")
-        .any(|seg| !seg.contains("-----END") && material(seg))
-    {
+    let same_line_body = after
+        .split_once("-----END ")
+        .map_or(after, |(body, _)| body);
+    if same_line_body.split("\\n").any(material) {
         return true;
     }
     for body in raws.iter().skip(i + 1).take(80) {
@@ -4255,7 +4313,8 @@ fn encoded_credential(raws: &[&str], i: usize) -> Option<String> {
             let value = &value[..value.find(['"', ',', '}', ' ']).unwrap_or(value.len())];
             if let Some(text) = decoded_text(value) {
                 if let Some((user, pass)) = text.split_once(':') {
-                    if !user.is_empty() && pass.chars().count() >= 4 && !is_placeholder_value(pass) {
+                    if !user.is_empty() && pass.chars().count() >= 4 && !is_placeholder_value(pass)
+                    {
                         return Some(format!(
                             "{} <redacted base64 user:credential, {} chars>",
                             marker.trim_end_matches(':').trim_matches('"'),
@@ -4387,7 +4446,10 @@ pub fn redact_secrets(text: &str) -> String {
         spans.sort_by_key(|s| s.start);
         let mut last = 0usize;
         for span in spans {
-            if span.start < last || !line.is_char_boundary(span.start) || !line.is_char_boundary(span.end) {
+            if span.start < last
+                || !line.is_char_boundary(span.start)
+                || !line.is_char_boundary(span.end)
+            {
                 continue;
             }
             out.push_str(&line[last..span.start]);

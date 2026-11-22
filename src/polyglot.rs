@@ -25,7 +25,7 @@
 //! *gate-side* check — one the snippet path never runs, such as `autotests =
 //! false` in a manifest or a `clippy.toml` threshold of 1000 — are kept,
 //! because a trace that *is* a manifest is otherwise unread, and each carries
-//! [`Rule::overlap`] naming the cheat.rs function that also sees it, so a
+//! `Rule::overlap` naming the cheat.rs function that also sees it, so a
 //! caller running both over a candidate tree can drop the duplicates.
 //!
 //! # Directive position
@@ -2465,7 +2465,7 @@ pub fn applicable_rules(lang: Lang) -> impl Iterator<Item = &'static Rule> {
 }
 
 /// The catalog entry behind a [`Hit::rule`], e.g. to drop hits whose
-/// [`Rule::overlap`] a gate-side scan already reports.
+/// `Rule::overlap` a gate-side scan already reports.
 pub fn rule_by_id(id: &str) -> Option<&'static Rule> {
     Lang::ALL
         .iter()

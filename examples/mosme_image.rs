@@ -71,7 +71,7 @@ fn main() -> Result<()> {
 
     if args.test {
         let split = cifar::read_split(&args.bundle.join("heldout.bin"))?;
-        ensure!(split.len() > 0, "the held-out image split is empty");
+        ensure!(!split.is_empty(), "the held-out image split is empty");
         let pixels: Vec<f32> = (0..split.len())
             .flat_map(|index| normalized(split.record(index)))
             .collect();

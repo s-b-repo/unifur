@@ -111,7 +111,7 @@ impl GeomBaselineConfig {
 
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.hidden_size >= self.num_heads && self.hidden_size % self.num_heads == 0,
+            self.hidden_size >= self.num_heads && self.hidden_size.is_multiple_of(self.num_heads),
             "hidden size {} must be a multiple of the {} heads",
             self.hidden_size,
             self.num_heads
@@ -382,7 +382,7 @@ pub fn train_geom_baseline<B: AutodiffBackend<FloatElem = f32>>(
         model.scene_len()
     );
     anyhow::ensure!(
-        corpus.len() % meta.scene_len == 0,
+        corpus.len().is_multiple_of(meta.scene_len),
         "the corpus holds {} tokens, not a multiple of the {}-token scene length",
         corpus.len(),
         meta.scene_len
@@ -534,7 +534,8 @@ pub fn train_geom_baseline<B: AutodiffBackend<FloatElem = f32>>(
                 )?;
             }
         }
-        if config.checkpoint_every > 0 && report.steps_taken % config.checkpoint_every == 0 {
+        if config.checkpoint_every > 0 && report.steps_taken.is_multiple_of(config.checkpoint_every)
+        {
             if let Some(dir) = &config.out_dir {
                 let path = checkpoint::save_content_addressed(model.clone(), dir, "geom-baseline")?;
                 println!("checkpointed at step {step}: {}", path.display());

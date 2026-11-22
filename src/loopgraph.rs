@@ -510,7 +510,11 @@ mod tests {
         assert_eq!(planner.next(0.9), Decision::Stop);
         assert!((w0 + w1 - 0.51).abs() < 1e-6, "{w0} + {w1}");
         let rest = planner.settle();
-        assert!((w0 + w1 + rest - 1.0).abs() < 1e-6, "mass {}", w0 + w1 + rest);
+        assert!(
+            (w0 + w1 + rest - 1.0).abs() < 1e-6,
+            "mass {}",
+            w0 + w1 + rest
+        );
         assert_eq!(planner.settle(), 0.0, "settling twice spends nothing more");
     }
 

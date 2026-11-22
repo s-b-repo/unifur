@@ -63,7 +63,7 @@ pub fn hex(bytes: &[u8]) -> String {
 }
 
 pub fn unhex(text: &str) -> anyhow::Result<Vec<u8>> {
-    anyhow::ensure!(text.len() % 2 == 0, "odd-length hex");
+    anyhow::ensure!(text.len().is_multiple_of(2), "odd-length hex");
     // Only ASCII hex digits: slicing a multi-byte character in half would
     // panic, and `from_str_radix` would also accept a leading `+`.
     anyhow::ensure!(

@@ -1570,19 +1570,16 @@ pub fn paper_subsets(catalog: &AtomCatalog, papers: &[usize], k: usize) -> HashS
 }
 
 /// Score a pool of sets (coherence already computed) and keep the top.
-#[allow(clippy::too_many_arguments)]
 fn finish_ranking(
     catalog: &AtomCatalog,
     index: &AvailabilityIndex,
     inside: &HashSet<Vec<u16>>,
     target_mask: Option<&[bool]>,
     pool: Vec<Vec<u16>>,
-    coherence: Vec<f64>,
-    beta: f64,
-    top: usize,
-    coherence_seconds: f64,
-    min_targets: usize,
+    scored: (Vec<f64>, f64),
+    options: &SetsRankArgs,
 ) -> Result<(Vec<RankedSet>, RankSummary)> {
+    let (coherence, coherence_seconds) = scored;
     let k = pool.first().map(Vec::len).unwrap_or(0);
     let t0 = Instant::now();
     let availability = index.availability_many(&pool)?;
@@ -1590,8 +1587,8 @@ fn finish_ranking(
     let t1 = Instant::now();
     let zc = zscores(&coherence)?;
     let zu = zscores(&availability.iter().map(|a| -a).collect::<Vec<_>>())?;
-    let fused = fuse(&coherence, &availability, beta)?;
-    let best = top_indices(&fused, top);
+    let fused = fuse(&coherence, &availability, options.beta)?;
+    let best = top_indices(&fused, options.top);
     let fusion_seconds = t1.elapsed().as_secs_f64();
     let mut rows = Vec::with_capacity(best.len());
     for (rank, &i) in best.iter().enumerate() {
@@ -1623,11 +1620,11 @@ fn finish_ranking(
     let top_a: Vec<f64> = rows.iter().map(|r| r.availability).collect();
     let summary = RankSummary {
         k,
-        beta,
+        beta: options.beta,
         pool: pool.len(),
         top: rows.len(),
         restricted_to_targets: target_mask.is_some(),
-        min_targets,
+        min_targets: options.min_targets,
         coherence_seconds,
         availability_seconds,
         fusion_seconds,
@@ -2079,7 +2076,15 @@ pub fn run_cli(action: SetsAction, progress: &mut dyn FnMut(&str)) -> Result<()>
             };
             ensure!(pool.len() >= 2, "the candidate pool has {} sets; nothing to rank", pool.len());
             let coherence_seconds = t0.elapsed().as_secs_f64();
-            let (rows, summary) = finish_ranking(&catalog, &index, &inside, mask.as_deref(), pool, coherence, args.beta, args.top, coherence_seconds, args.min_targets)?;
+            let (rows, summary) = finish_ranking(
+                &catalog,
+                &index,
+                &inside,
+                mask.as_deref(),
+                pool,
+                (coherence, coherence_seconds),
+                &args,
+            )?;
             let mut text = String::new();
             for row in &rows {
                 text.push_str(&serde_json::to_string(row)?);

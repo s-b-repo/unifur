@@ -695,8 +695,12 @@ impl Emptiest {
 
 fn midpoint(known: &[Vec<f64>], i: usize, j: usize) -> Result<Candidate> {
     let (a, b) = (
-        known.get(i).ok_or_else(|| anyhow::anyhow!("no known {i}"))?,
-        known.get(j).ok_or_else(|| anyhow::anyhow!("no known {j}"))?,
+        known
+            .get(i)
+            .ok_or_else(|| anyhow::anyhow!("no known {i}"))?,
+        known
+            .get(j)
+            .ok_or_else(|| anyhow::anyhow!("no known {j}"))?,
     );
     Ok(Candidate {
         point: a.iter().zip(b).map(|(x, y)| (x + y) / 2.0).collect(),
@@ -707,7 +711,9 @@ fn midpoint(known: &[Vec<f64>], i: usize, j: usize) -> Result<Candidate> {
 
 /// Every pairwise midpoint -- the simplest "between two ideas".
 pub fn midpoints(known: &[Vec<f64>]) -> Result<Vec<Candidate>> {
-    pairs(known.len()).map(|(i, j)| midpoint(known, i, j)).collect()
+    pairs(known.len())
+        .map(|(i, j)| midpoint(known, i, j))
+        .collect()
 }
 
 fn simplex_blend(known: &[Vec<f64>], rng: &mut StdRng) -> Result<Candidate> {
@@ -732,7 +738,11 @@ fn simplex_blend(known: &[Vec<f64>], rng: &mut StdRng) -> Result<Candidate> {
 
 /// `count` interior blends `Σ λ_i v_i`, `λ ~ Dirichlet(1)`: several known
 /// ideas at once.
-pub fn simplex_blends(known: &[Vec<f64>], count: usize, rng: &mut StdRng) -> Result<Vec<Candidate>> {
+pub fn simplex_blends(
+    known: &[Vec<f64>],
+    count: usize,
+    rng: &mut StdRng,
+) -> Result<Vec<Candidate>> {
     (0..count).map(|_| simplex_blend(known, rng)).collect()
 }
 
@@ -750,7 +760,12 @@ pub fn farthest_interior(known: &[Vec<f64>], pool: Vec<Candidate>, k: usize) -> 
 /// port of the prototype's `slerp`, refusing the cases it would divide by
 /// zero in).
 pub fn slerp(a: &[f64], b: &[f64], t: f64) -> Result<Vec<f64>> {
-    ensure!(a.len() == b.len(), "slerp: dimensions {} and {}", a.len(), b.len());
+    ensure!(
+        a.len() == b.len(),
+        "slerp: dimensions {} and {}",
+        a.len(),
+        b.len()
+    );
     let (na, nb) = (norm(a), norm(b));
     ensure!(
         na > 0.0 && nb > 0.0 && na.is_finite() && nb.is_finite(),
@@ -774,8 +789,18 @@ pub fn slerp(a: &[f64], b: &[f64], t: f64) -> Result<Vec<f64>> {
 /// `None` when the pair has no unique slerp (a known at the centroid, or
 /// antipodal directions).
 fn slerp_midpoint(known: &[Vec<f64>], c: &[f64], i: usize, j: usize) -> Result<Option<Candidate>> {
-    let a = sub(known.get(i).ok_or_else(|| anyhow::anyhow!("no known {i}"))?, c);
-    let b = sub(known.get(j).ok_or_else(|| anyhow::anyhow!("no known {j}"))?, c);
+    let a = sub(
+        known
+            .get(i)
+            .ok_or_else(|| anyhow::anyhow!("no known {i}"))?,
+        c,
+    );
+    let b = sub(
+        known
+            .get(j)
+            .ok_or_else(|| anyhow::anyhow!("no known {j}"))?,
+        c,
+    );
     let (na, nb) = (norm(&a), norm(&b));
     if na <= 0.0 || nb <= 0.0 {
         return Ok(None);
@@ -787,7 +812,11 @@ fn slerp_midpoint(known: &[Vec<f64>], c: &[f64], i: usize, j: usize) -> Result<O
     let direction = slerp(&a, &b, 0.5)?;
     let radius = 0.5 * (na + nb);
     Ok(Some(Candidate {
-        point: c.iter().zip(&direction).map(|(ci, d)| ci + radius * d).collect(),
+        point: c
+            .iter()
+            .zip(&direction)
+            .map(|(ci, d)| ci + radius * d)
+            .collect(),
         generator: Generator::Slerp,
         weights: vec![(i, 0.5), (j, 0.5)],
     }))
@@ -839,7 +868,12 @@ fn into_ball(x: &[f64], what: &str) -> Result<Vec<f64>> {
 
 /// Möbius addition `x ⊕ y` in the Poincaré ball.
 pub fn mobius_add(x: &[f64], y: &[f64]) -> Result<Vec<f64>> {
-    ensure!(x.len() == y.len(), "mobius_add: dimensions {} and {}", x.len(), y.len());
+    ensure!(
+        x.len() == y.len(),
+        "mobius_add: dimensions {} and {}",
+        x.len(),
+        y.len()
+    );
     let (x2, y2, xy) = (dot(x, x), dot(y, y), dot(x, y));
     // 1 + 2<x,y> + |x|^2 |y|^2, written by Lagrange's identity as
     // (1 + <x,y>)^2 + (|x|^2 |y|^2 - <x,y>^2): a sum of two non-negative
@@ -850,7 +884,10 @@ pub fn mobius_add(x: &[f64], y: &[f64]) -> Result<Vec<f64>> {
         "mobius_add: denominator {den} (are both points inside the ball?)"
     );
     let (cx, cy) = (1.0 + 2.0 * xy + y2, 1.0 - x2);
-    Ok(x.iter().zip(y).map(|(a, b)| (cx * a + cy * b) / den).collect())
+    Ok(x.iter()
+        .zip(y)
+        .map(|(a, b)| (cx * a + cy * b) / den)
+        .collect())
 }
 
 /// Möbius scalar multiplication `r ⊗ x = tanh(r · artanh‖x‖) x / ‖x‖`.
@@ -892,10 +929,7 @@ struct PoincareChart {
 impl PoincareChart {
     fn new(known: &[Vec<f64>]) -> Result<Self> {
         let centre = centroid(known);
-        let radius = known
-            .iter()
-            .map(|v| dist(v, &centre))
-            .fold(0.0, f64::max);
+        let radius = known.iter().map(|v| dist(v, &centre)).fold(0.0, f64::max);
         ensure!(
             radius > 0.0 && radius.is_finite(),
             "the known vectors all coincide; there is no chart to draw geodesics in"
@@ -918,12 +952,24 @@ impl PoincareChart {
             return self.centre.clone();
         }
         let s = self.radius * artanh_clamped(n) / n;
-        self.centre.iter().zip(y).map(|(c, yi)| c + s * yi).collect()
+        self.centre
+            .iter()
+            .zip(y)
+            .map(|(c, yi)| c + s * yi)
+            .collect()
     }
 
     fn midpoint(&self, known: &[Vec<f64>], i: usize, j: usize) -> Result<Candidate> {
-        let a = self.enter_ball(known.get(i).ok_or_else(|| anyhow::anyhow!("no known {i}"))?);
-        let b = self.enter_ball(known.get(j).ok_or_else(|| anyhow::anyhow!("no known {j}"))?);
+        let a = self.enter_ball(
+            known
+                .get(i)
+                .ok_or_else(|| anyhow::anyhow!("no known {i}"))?,
+        );
+        let b = self.enter_ball(
+            known
+                .get(j)
+                .ok_or_else(|| anyhow::anyhow!("no known {j}"))?,
+        );
         Ok(Candidate {
             point: self.leave_ball(&poincare_geodesic(&a, &b, 0.5)?),
             generator: Generator::PoincareGeodesic,
@@ -958,7 +1004,12 @@ pub fn nullspace_controls(
         let u = hull.project_out(&gaussian_vector(rng, hull.dim()))?;
         let n = norm(&u);
         if n > NULL_DIRECTION_FLOOR {
-            out.push(c.iter().zip(&u).map(|(ci, ui)| ci + ui / n * reach).collect());
+            out.push(
+                c.iter()
+                    .zip(&u)
+                    .map(|(ci, ui)| ci + ui / n * reach)
+                    .collect(),
+            );
         }
     }
     Ok(out)
@@ -993,8 +1044,7 @@ pub struct VectorFile {
 /// this crate's `serde_json` keeps number lexemes (`arbitrary_precision`),
 /// and serde's untagged buffering cannot hand those to an `f64`.
 fn parse_vector_file(path: &Path) -> Result<Vec<SpecialistVector>> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let value: serde_json::Value =
         serde_json::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
     // Through the `Value`, the f64s are parsed correctly rounded (see
@@ -1066,8 +1116,15 @@ fn validate_vectors_allow_one(vectors: &[SpecialistVector]) -> Result<usize> {
     let dim = first.vector.len();
     ensure!(dim > 0, "specialist '{}' has an empty vector", first.name);
     for v in vectors {
-        ensure!(!v.name.trim().is_empty(), "a specialist vector has an empty name");
-        ensure!(names.insert(v.name.as_str()), "specialist '{}' appears twice", v.name);
+        ensure!(
+            !v.name.trim().is_empty(),
+            "a specialist vector has an empty name"
+        );
+        ensure!(
+            names.insert(v.name.as_str()),
+            "specialist '{}' appears twice",
+            v.name
+        );
         ensure!(
             v.vector.len() == dim,
             "specialist '{}' has dimension {}, '{}' has {dim}",
@@ -1268,7 +1325,10 @@ fn sort_proposals(proposals: &mut [Proposal]) {
     proposals.sort_by(|a, b| {
         b.rank_score
             .total_cmp(&a.rank_score)
-            .then(b.nearest_distance_scaled.total_cmp(&a.nearest_distance_scaled))
+            .then(
+                b.nearest_distance_scaled
+                    .total_cmp(&a.nearest_distance_scaled),
+            )
             .then_with(|| a.id.cmp(&b.id))
     });
 }
@@ -1406,7 +1466,10 @@ pub fn find_in_scope(
     cross_scope: bool,
     density: Option<&[Vec<f64>]>,
 ) -> Result<ScopeReport> {
-    ensure!(config.interior > 0, "the finder must keep at least one candidate per pool");
+    ensure!(
+        config.interior > 0,
+        "the finder must keep at least one candidate per pool"
+    );
     let names: Vec<String> = members.iter().map(|m| m.name.clone()).collect();
     let categories: Vec<Option<String>> = members.iter().map(|m| m.category.clone()).collect();
     let known: Vec<Vec<f64>> = members.iter().map(|m| m.vector.clone()).collect();
@@ -1502,7 +1565,11 @@ pub fn find_in_scope(
                 })
             })
             .collect();
-        between.sort_by(|a, b| b.weight.total_cmp(&a.weight).then_with(|| a.specialist.cmp(&b.specialist)));
+        between.sort_by(|a, b| {
+            b.weight
+                .total_cmp(&a.weight)
+                .then_with(|| a.specialist.cmp(&b.specialist))
+        });
         let mut near: Vec<Nearest> = known
             .iter()
             .zip(&names)
@@ -1555,7 +1622,11 @@ pub fn find_in_scope(
         on_known_worst: worst,
         null_space: null_scores.len(),
         null_mean_coherence: mean(&null_coh),
-        null_max_coherence: if null_coh.is_empty() { 0.0 } else { max_of(&null_coh) },
+        null_max_coherence: if null_coh.is_empty() {
+            0.0
+        } else {
+            max_of(&null_coh)
+        },
     };
 
     // The prototype's four self-checks.
@@ -1729,7 +1800,13 @@ pub fn rank(
             }
         }
     } else {
-        scopes.push(find_in_scope("all", &vectors, &options.finder, false, None)?);
+        scopes.push(find_in_scope(
+            "all",
+            &vectors,
+            &options.finder,
+            false,
+            None,
+        )?);
     }
     let ranking = match predictor {
         None => RankingMode::GapOnly,
@@ -1975,8 +2052,7 @@ fn from_json_exact<T: serde::de::DeserializeOwned>(text: &str) -> serde_json::Re
 
 /// Read a JSONL file (blank lines skipped; errors name the line).
 pub fn read_jsonl<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     text.lines()
         .enumerate()
         .filter(|(_, line)| !line.trim().is_empty())
@@ -2017,7 +2093,12 @@ pub fn proposal_features(p: &Proposal) -> Vec<f64> {
         x.push(if p.generator == g { 1.0 } else { 0.0 });
     }
     x.push(p.nearest_distance_scaled);
-    x.push(p.between.iter().filter(|s| s.weight >= BLEND_WEIGHT).count() as f64);
+    x.push(
+        p.between
+            .iter()
+            .filter(|s| s.weight >= BLEND_WEIGHT)
+            .count() as f64,
+    );
     x.push(if p.category_cross { 1.0 } else { 0.0 });
     x
 }
@@ -2103,10 +2184,18 @@ fn in_holdout(id: &str, every: u8) -> bool {
 /// Solve `A x = b` for symmetric positive-definite `A` (Cholesky).
 fn cholesky_solve(a: &[Vec<f64>], b: &[f64]) -> Result<Vec<f64>> {
     let n = b.len();
-    ensure!(a.len() == n, "cholesky: {}x? matrix against {n} right-hand sides", a.len());
+    ensure!(
+        a.len() == n,
+        "cholesky: {}x? matrix against {n} right-hand sides",
+        a.len()
+    );
     let mut l: Vec<Vec<f64>> = Vec::with_capacity(n);
     for (i, row) in a.iter().enumerate() {
-        ensure!(row.len() == n, "cholesky: row {i} has {} entries, not {n}", row.len());
+        ensure!(
+            row.len() == n,
+            "cholesky: row {i} has {} entries, not {n}",
+            row.len()
+        );
         let mut li: Vec<f64> = Vec::with_capacity(i + 1);
         for (j, &aij) in row.iter().enumerate().take(i + 1) {
             if j == i {
@@ -2118,9 +2207,13 @@ fn cholesky_solve(a: &[Vec<f64>], b: &[f64]) -> Result<Vec<f64>> {
                 );
                 li.push(d.sqrt());
             } else {
-                let lj = l.get(j).ok_or_else(|| anyhow::anyhow!("cholesky: row {j}"))?;
+                let lj = l
+                    .get(j)
+                    .ok_or_else(|| anyhow::anyhow!("cholesky: row {j}"))?;
                 let s: f64 = li.iter().zip(lj).take(j).map(|(x, y)| x * y).sum();
-                let ljj = *lj.get(j).ok_or_else(|| anyhow::anyhow!("cholesky: pivot {j}"))?;
+                let ljj = *lj
+                    .get(j)
+                    .ok_or_else(|| anyhow::anyhow!("cholesky: pivot {j}"))?;
                 li.push((aij - s) / ljj);
             }
         }
@@ -2130,7 +2223,9 @@ fn cholesky_solve(a: &[Vec<f64>], b: &[f64]) -> Result<Vec<f64>> {
     let mut y: Vec<f64> = Vec::with_capacity(n);
     for (li, bi) in l.iter().zip(b) {
         let s: f64 = li.iter().zip(&y).map(|(x, yk)| x * yk).sum();
-        let d = *li.last().ok_or_else(|| anyhow::anyhow!("cholesky: empty row"))?;
+        let d = *li
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("cholesky: empty row"))?;
         y.push((bi - s) / d);
     }
     // Lᵀ x = y, from the bottom up.
@@ -2227,7 +2322,10 @@ pub fn train_survival(
     outcomes: &[PilotOutcome],
     config: &SurvivalConfig,
 ) -> Result<SurvivalModel> {
-    ensure!(config.holdout_every >= 2, "holdout_every must be at least 2");
+    ensure!(
+        config.holdout_every >= 2,
+        "holdout_every must be at least 2"
+    );
     ensure!(
         config.ridge > 0.0 && config.ridge.is_finite(),
         "the ridge penalty must be positive and finite"
@@ -2374,7 +2472,13 @@ impl SurvivalModel {
             .zip(&self.mean)
             .zip(&self.std)
             .zip(&self.weights)
-            .map(|(((xk, mk), sk), wk)| if *sk > 1e-12 { wk * (xk - mk) / sk } else { 0.0 })
+            .map(|(((xk, mk), sk), wk)| {
+                if *sk > 1e-12 {
+                    wk * (xk - mk) / sk
+                } else {
+                    0.0
+                }
+            })
             .sum();
         Ok(sigmoid(z + self.bias))
     }
@@ -2393,7 +2497,11 @@ impl SurvivalModel {
         let model: Self =
             from_json_exact(&text).with_context(|| format!("parse {}", path.display()))?;
         ensure!(
-            model.features.iter().map(String::as_str).eq(FEATURES.iter().copied()),
+            model
+                .features
+                .iter()
+                .map(String::as_str)
+                .eq(FEATURES.iter().copied()),
             "{} was fitted on features {:?}, this build scores {:?}",
             path.display(),
             model.features,
@@ -2610,13 +2718,24 @@ type PlantedSet = (Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<usize>);
 type DemoSet = (Vec<Vec<f64>>, Vec<usize>, Vec<Vec<f64>>);
 
 /// Orthonormal vectors (Gram-Schmidt, twice) of `R^dim`, continuing `frame`.
-fn extend_frame(rng: &mut StdRng, frame: &mut Vec<Vec<f64>>, count: usize, dim: usize) -> Result<()> {
-    ensure!(frame.len() + count <= dim, "cannot fit {count} more orthonormal vectors in R^{dim}");
+fn extend_frame(
+    rng: &mut StdRng,
+    frame: &mut Vec<Vec<f64>>,
+    count: usize,
+    dim: usize,
+) -> Result<()> {
+    ensure!(
+        frame.len() + count <= dim,
+        "cannot fit {count} more orthonormal vectors in R^{dim}"
+    );
     let target = frame.len() + count;
     let mut attempts = 0;
     while frame.len() < target {
         attempts += 1;
-        ensure!(attempts <= 10 * target + 10, "Gram-Schmidt kept producing degenerate vectors");
+        ensure!(
+            attempts <= 10 * target + 10,
+            "Gram-Schmidt kept producing degenerate vectors"
+        );
         let mut g = gaussian_vector(rng, dim);
         for _ in 0..2 {
             for q in frame.iter() {
@@ -2707,7 +2826,10 @@ fn hull_exactness_residual(reconstruct: &Reconstruct) -> Result<f64> {
     }
     // Control: a known orthogonal offset must come back as exactly that.
     extend_frame(&mut rng, &mut frame, 1, planted.ambient_dim)?;
-    let w = frame.last().cloned().ok_or_else(|| anyhow::anyhow!("no orthogonal direction"))?;
+    let w = frame
+        .last()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no orthogonal direction"))?;
     let base = combination(&known, &[(0, 0.3), (5, 0.7)])?;
     for offset in [1.0, 0.37, 5.0] {
         let p: Vec<f64> = base.iter().zip(&w).map(|(b, wi)| b + offset * wi).collect();
@@ -2793,9 +2915,18 @@ fn known_obvious_residual(score: &Scorer) -> Result<f64> {
     let (between_scores, known_scores) = scores
         .split_at_checked(n_between)
         .ok_or_else(|| anyhow::anyhow!("scorer returned too few scores"))?;
-    ensure!(known_scores.len() == known.len(), "scorer returned the wrong number of scores");
-    let worst_known = known_scores.iter().map(|s| s.gap).fold(f64::NEG_INFINITY, f64::max);
-    let best_between = between_scores.iter().map(|s| s.gap).fold(f64::NEG_INFINITY, f64::max);
+    ensure!(
+        known_scores.len() == known.len(),
+        "scorer returned the wrong number of scores"
+    );
+    let worst_known = known_scores
+        .iter()
+        .map(|s| s.gap)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let best_between = between_scores
+        .iter()
+        .map(|s| s.gap)
+        .fold(f64::NEG_INFINITY, f64::max);
     Ok(worst_known.max(1.0 - best_between))
 }
 
@@ -2916,7 +3047,7 @@ fn synthetic_proposal(i: usize, rng: &mut StdRng) -> (Proposal, bool) {
         generator,
         nearest_knowns: Vec::new(),
         nearest_distance_scaled: 1.0 + rng.random::<f64>(),
-        category_cross: i % 3 == 0,
+        category_cross: i.is_multiple_of(3),
         residual: 0.0,
         likelihood_raw: 0.0,
         survival: None,
@@ -2971,7 +3102,12 @@ fn survival_refusal_residual(config: &SurvivalConfig) -> Result<f64> {
     Ok(worst)
 }
 
-fn alien_cert(name: &'static str, theorem: &'static str, residual: f64, tolerance: f64) -> Certificate {
+fn alien_cert(
+    name: &'static str,
+    theorem: &'static str,
+    residual: f64,
+    tolerance: f64,
+) -> Certificate {
     Certificate {
         group: "alien",
         name,
@@ -2988,7 +3124,10 @@ pub fn certificate_checks() -> Result<Vec<Certificate>> {
     let reconstruct = |known: &[Vec<f64>], p: &[f64]| AffineHull::fit(known)?.reconstruct(p);
     let coherence_of = |known: &[Vec<f64>], p: &[f64]| -> Result<f64> {
         let s = scales(known, DEFAULT_BANDWIDTH_FACTOR)?;
-        Ok(coherence_from_residual(AffineHull::fit(known)?.residual(p)?, s.scale))
+        Ok(coherence_from_residual(
+            AffineHull::fit(known)?.residual(p)?,
+            s.scale,
+        ))
     };
     let survival = survival_refusal_residual(&SurvivalConfig::default())?;
     Ok(vec![
@@ -3077,10 +3216,7 @@ mod tests {
     fn scratch(tag: &str) -> PathBuf {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "alien-test-{tag}-{}-{n}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("alien-test-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -3173,14 +3309,20 @@ mod tests {
                 sc.residual,
                 residual[k]
             );
-            assert!((sc.coherence - coherence[k]).abs() <= 1e-9, "candidate {k} coherence");
+            assert!(
+                (sc.coherence - coherence[k]).abs() <= 1e-9,
+                "candidate {k} coherence"
+            );
             assert!(
                 (sc.likelihood_raw - kde[k]).abs() <= 1e-9 * kde[k] + 1e-300,
                 "candidate {k}: kde {} vs {}",
                 sc.likelihood_raw,
                 kde[k]
             );
-            assert!((sc.likelihood - lik[k]).abs() <= 1e-9, "candidate {k} likelihood");
+            assert!(
+                (sc.likelihood - lik[k]).abs() <= 1e-9,
+                "candidate {k} likelihood"
+            );
             assert!((sc.gap - gap[k]).abs() <= 1e-9, "candidate {k} gap");
         }
 
@@ -3190,7 +3332,12 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|p| (p[0].as_u64().unwrap() as usize, p[1].as_u64().unwrap() as usize))
+            .map(|p| {
+                (
+                    p[0].as_u64().unwrap() as usize,
+                    p[1].as_u64().unwrap() as usize,
+                )
+            })
             .collect();
         let mine: Vec<(usize, usize)> = picked
             .iter()
@@ -3221,7 +3368,11 @@ mod tests {
         let specs = fixture_specialists();
         let report = find_in_scope("all", &specs, &FinderConfig::default(), false, None).unwrap();
         assert!(report.discriminates());
-        assert!(report.self_checks.iter().all(|c| c.passed), "{:?}", report.self_checks);
+        assert!(
+            report.self_checks.iter().all(|c| c.passed),
+            "{:?}",
+            report.self_checks
+        );
         let top: Vec<&Proposal> = report.proposals.iter().take(12).collect();
         for p in &top {
             assert!(p.coherence > 0.999, "{p:?}");
@@ -3229,8 +3380,16 @@ mod tests {
             assert!(p.gap > 0.99, "{p:?}");
             assert!(p.category_cross, "a top candidate within one field: {p:?}");
         }
-        assert!(report.controls.on_known_max_gap < 0.15, "{:?}", report.controls);
-        assert!(report.controls.null_max_coherence < 1e-3, "{:?}", report.controls);
+        assert!(
+            report.controls.on_known_max_gap < 0.15,
+            "{:?}",
+            report.controls
+        );
+        assert!(
+            report.controls.null_max_coherence < 1e-3,
+            "{:?}",
+            report.controls
+        );
         assert_eq!(report.manifold.affine_rank, 17);
         assert_eq!(report.manifold.codimension, 47);
     }
@@ -3250,7 +3409,10 @@ mod tests {
         let scores = hull_scorer(&known, &points).unwrap();
         let mut order: Vec<usize> = (0..scores.len()).collect();
         order.sort_by(|a, b| scores[*b].gap.total_cmp(&scores[*a].gap));
-        assert!(order.iter().take(12).all(|&i| i < 12), "a control ranked in the top 12");
+        assert!(
+            order.iter().take(12).all(|&i| i < 12),
+            "a control ranked in the top 12"
+        );
         for s in &scores[..12] {
             assert!(s.coherence > 0.999 && s.likelihood < 0.01, "{s:?}");
         }
@@ -3268,8 +3430,17 @@ mod tests {
         let certs = certificate_checks().unwrap();
         assert_eq!(certs.len(), 6);
         for c in &certs {
-            println!("alien::{:<58} residual {:.3e}  tolerance {:.1e}", c.name, c.residual, c.tolerance);
-            assert!(c.passed(), "{} residual {} > {}", c.name, c.residual, c.tolerance);
+            println!(
+                "alien::{:<58} residual {:.3e}  tolerance {:.1e}",
+                c.name, c.residual, c.tolerance
+            );
+            assert!(
+                c.passed(),
+                "{} residual {} > {}",
+                c.name,
+                c.residual,
+                c.tolerance
+            );
         }
     }
 
@@ -3313,7 +3484,10 @@ mod tests {
     #[test]
     fn geodesic_certificate_fails_for_a_chord_and_for_the_prototype_midpoint() {
         let chord = |a: &[f64], b: &[f64], t: f64| -> Result<Vec<f64>> {
-            Ok(a.iter().zip(b).map(|(x, y)| (1.0 - t) * x + t * y).collect())
+            Ok(a.iter()
+                .zip(b)
+                .map(|(x, y)| (1.0 - t) * x + t * y)
+                .collect())
         };
         assert!(geodesic_residual(&chord).unwrap() > 1e-3);
         // The prototype's composition: Euclidean scaling of the Mobius
@@ -3367,7 +3541,9 @@ mod tests {
         assert_eq!(AffineHull::fit(&same).unwrap().rank(), 0);
         assert!(scales(&same, 1.5).is_err());
         // Collinear knowns: rank 1, a point on the line reconstructs.
-        let line: Vec<Vec<f64>> = (0..5).map(|i| vec![i as f64, 2.0 * i as f64, 1.0]).collect();
+        let line: Vec<Vec<f64>> = (0..5)
+            .map(|i| vec![i as f64, 2.0 * i as f64, 1.0])
+            .collect();
         let hull = AffineHull::fit(&line).unwrap();
         assert_eq!(hull.rank(), 1);
         assert!(hull.residual(&[10.0, 20.0, 1.0]).unwrap() < 1e-12);
@@ -3397,7 +3573,10 @@ mod tests {
         // The true midpoint is equidistant; the prototype's point is not.
         let (a, b) = (vec![0.6, 0.1], vec![-0.2, 0.7]);
         let m = poincare_geodesic(&a, &b, 0.5).unwrap();
-        let (da, db) = (poincare_distance(&a, &m).unwrap(), poincare_distance(&m, &b).unwrap());
+        let (da, db) = (
+            poincare_distance(&a, &m).unwrap(),
+            poincare_distance(&m, &b).unwrap(),
+        );
         assert!((da - db).abs() < 1e-12);
         let neg: Vec<f64> = a.iter().map(|x| -x).collect();
         let proto = mobius_add(&a, &scaled(&mobius_add(&neg, &b).unwrap(), 0.5)).unwrap();
@@ -3419,7 +3598,11 @@ mod tests {
             .chain(poincare_midpoints(&known).unwrap().iter())
         {
             let r = hull.residual(&c.point).unwrap();
-            assert!(r < 1e-9 * (1.0 + norm(&c.point)), "{:?} residual {r}", c.generator);
+            assert!(
+                r < 1e-9 * (1.0 + norm(&c.point)),
+                "{:?} residual {r}",
+                c.generator
+            );
         }
         let s = slerp(&[1.0, 0.0, 0.0], &[0.0, 1.0, 0.0], 0.5).unwrap();
         assert!((norm(&s) - 1.0).abs() < 1e-15);
@@ -3444,7 +3627,12 @@ mod tests {
         let scopes: Vec<&str> = report.scopes.iter().map(|s| s.scope.as_str()).collect();
         assert_eq!(
             scopes,
-            ["category:crypto", "category:ml", "category:networking", "top-level"]
+            [
+                "category:crypto",
+                "category:ml",
+                "category:networking",
+                "top-level"
+            ]
         );
         assert_eq!(report.skipped.len(), 1);
         assert_eq!(report.skipped[0].scope, "category:solo");
@@ -3491,13 +3679,19 @@ mod tests {
     #[test]
     fn survival_predictor_reports_honestly_and_ranks_with_it() {
         let (p, o) = synthetic_outcomes(12, 1);
-        let err = train_survival(&p, &o, &SurvivalConfig::default()).unwrap_err().to_string();
+        let err = train_survival(&p, &o, &SurvivalConfig::default())
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("refusing to fit"), "{err}");
 
         let (p, o) = synthetic_outcomes(60, 2);
         let model = train_survival(&p, &o, &SurvivalConfig::default()).unwrap();
         assert!(model.report.holdout_accuracy.is_none());
-        assert!(model.render().contains("not reported"), "{}", model.render());
+        assert!(
+            model.render().contains("not reported"),
+            "{}",
+            model.render()
+        );
 
         let (mut p, mut o) = synthetic_outcomes(400, 3);
         o.push(PilotOutcome {
@@ -3510,7 +3704,10 @@ mod tests {
         assert_eq!(r.unmatched, 1);
         assert_eq!(r.train + r.holdout, 400);
         let acc = r.holdout_accuracy.unwrap();
-        assert!(acc >= 0.9 && acc > r.majority_baseline_accuracy.unwrap(), "{r:?}");
+        assert!(
+            acc >= 0.9 && acc > r.majority_baseline_accuracy.unwrap(),
+            "{r:?}"
+        );
         let (lo, hi) = r.holdout_accuracy_interval.unwrap();
         assert!(lo <= acc && acc <= hi);
         // The planted rule: coherence raises survival.
@@ -3523,7 +3720,12 @@ mod tests {
         model.save(&path).unwrap();
         let loaded = SurvivalModel::load(&path).unwrap();
         assert_eq!(loaded, model);
-        let report = rank(&fixture_specialists(), &RankOptions::default(), Some(&loaded)).unwrap();
+        let report = rank(
+            &fixture_specialists(),
+            &RankOptions::default(),
+            Some(&loaded),
+        )
+        .unwrap();
         assert!(report.render(3).contains("predicted survival"));
         for prop in report.proposals() {
             let s = prop.survival.unwrap();
@@ -3663,8 +3865,8 @@ mod tests {
         <Eval as burn::tensor::backend::Backend>::seed(&device, 3);
         let model = crate::student::GeometricStudent::<Eval>::new(&config, &device).unwrap();
         crate::tensor_ext::force_initialization(&model);
-        let ckpt = crate::checkpoint::save_content_addressed::<Eval, _>(model, &dir, "student")
-            .unwrap();
+        let ckpt =
+            crate::checkpoint::save_content_addressed::<Eval, _>(model, &dir, "student").unwrap();
         std::fs::write(
             dir.join("config.json"),
             serde_json::to_vec(&serde_json::json!({ "student_config": config })).unwrap(),
@@ -3694,7 +3896,11 @@ mod tests {
         assert_eq!(a.vector, again.vector);
         assert!(dist(&a.vector, &b.vector) > 1e-6);
         assert_eq!(a.window_var.as_ref().unwrap().len(), 32);
-        assert!(a.source.as_ref().unwrap().contains("3 windows of 16 tokens"));
+        assert!(a
+            .source
+            .as_ref()
+            .unwrap()
+            .contains("3 windows of 16 tokens"));
         // A token outside the vocabulary is refused.
         let bad = dir.join("bad.bin");
         crate::corpus::TokenCorpus::write(&bad, &[1, 2, 60000, 4]).unwrap();

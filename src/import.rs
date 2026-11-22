@@ -253,7 +253,7 @@ pub fn read_tensor_f32(path: &Path, index: &SafetensorsIndex, name: &str) -> Res
     let data = match meta.dtype {
         ImportDtype::F32 => {
             ensure!(
-                len % 4 == 0,
+                len.is_multiple_of(4),
                 "F32 tensor {name:?} has non-multiple-of-4 length"
             );
             buf.chunks_exact(4)
@@ -261,13 +261,13 @@ pub fn read_tensor_f32(path: &Path, index: &SafetensorsIndex, name: &str) -> Res
                 .collect()
         }
         ImportDtype::F16 => {
-            ensure!(len % 2 == 0, "F16 tensor {name:?} has odd length");
+            ensure!(len.is_multiple_of(2), "F16 tensor {name:?} has odd length");
             buf.chunks_exact(2)
                 .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect()
         }
         ImportDtype::BF16 => {
-            ensure!(len % 2 == 0, "BF16 tensor {name:?} has odd length");
+            ensure!(len.is_multiple_of(2), "BF16 tensor {name:?} has odd length");
             buf.chunks_exact(2)
                 .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
                 .collect()

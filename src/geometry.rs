@@ -189,7 +189,7 @@ impl GeomConfig {
             "blocks and refinement steps must be positive"
         );
         anyhow::ensure!(
-            self.frequency_embedding_size >= 2 && self.frequency_embedding_size % 2 == 0,
+            self.frequency_embedding_size >= 2 && self.frequency_embedding_size.is_multiple_of(2),
             "the frequency embedding size must be even"
         );
         anyhow::ensure!(self.sigma_data > 0.0, "sigma_data must be positive");
@@ -2056,7 +2056,7 @@ pub fn generate_corpus_weighted(
         // and equals `scene_idx`'s parity whenever `n` is odd, so every
         // odd-kind-count corpus (the 5-kind default included) is unchanged.
         let desired = match &cumulative {
-            None => (kind_idx + scene_idx / kinds.len()) % 2 == 0,
+            None => (kind_idx + scene_idx / kinds.len()).is_multiple_of(2),
             Some(_) => scene_idx % 2 == 0,
         };
         let (refs, answer): (Vec<usize>, u8) = match kind {
@@ -2336,7 +2336,7 @@ pub fn train_geom<B: AutodiffBackend<FloatElem = f32>>(
         model.scene_len()
     );
     anyhow::ensure!(
-        corpus.len() % meta.scene_len == 0,
+        corpus.len().is_multiple_of(meta.scene_len),
         "the corpus holds {} tokens, not a multiple of the {}-token scene length",
         corpus.len(),
         meta.scene_len
@@ -2601,7 +2601,8 @@ pub fn train_geom<B: AutodiffBackend<FloatElem = f32>>(
                 )?;
             }
         }
-        if config.checkpoint_every > 0 && report.steps_taken % config.checkpoint_every == 0 {
+        if config.checkpoint_every > 0 && report.steps_taken.is_multiple_of(config.checkpoint_every)
+        {
             if let Some(dir) = &config.out_dir {
                 let path = checkpoint::save_content_addressed(model.clone(), dir, "geom")?;
                 println!("checkpointed at step {step}: {}", path.display());

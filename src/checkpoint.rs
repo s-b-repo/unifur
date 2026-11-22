@@ -534,7 +534,7 @@ impl TrainState {
     }
 
     /// Write atomically and durably: to a unique temporary name, flushed to
-    /// disk, then renamed into place (see [`publish`]).
+    /// disk, then renamed into place by `publish`.
     pub fn write(&self, dir: &Path) -> anyhow::Result<PathBuf> {
         fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         let path = Self::json_path(dir);
@@ -778,9 +778,9 @@ mod tests {
 
         // Three distinct checkpoints, so a permutation would be visible.
         let mut paths = Vec::new();
-        for i in 0..3 {
-            let sub = dir.join(format!("m{i}"));
-            let model = tiny_model_with_blocks(&device, blocks[i]);
+        for (index, &count) in blocks.iter().enumerate() {
+            let sub = dir.join(format!("m{index}"));
+            let model = tiny_model_with_blocks(&device, count);
             paths.push(save_content_addressed(model, &sub, "ckpt").expect("save"));
         }
 
@@ -914,7 +914,9 @@ mod tests {
             extras: serde_json::Value::Null,
             saved_unix_secs: 0,
         };
-        let err = state.verify_files(&dir).expect_err("a wrong hash must fail");
+        let err = state
+            .verify_files(&dir)
+            .expect_err("a wrong hash must fail");
         assert!(format!("{err}").contains("corrupted"), "{err}");
 
         // ...and the real hash passes, so the check is a comparison and not a

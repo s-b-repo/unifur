@@ -386,7 +386,7 @@ impl TokenCorpus {
 
     fn token_count(bytes: usize, path: &Path) -> Result<usize> {
         anyhow::ensure!(
-            bytes % TOKEN_BYTES == 0,
+            bytes.is_multiple_of(TOKEN_BYTES),
             "{} is {bytes} bytes, not a whole number of {TOKEN_BYTES}-byte tokens",
             path.display()
         );

@@ -163,8 +163,6 @@ dbg_macro = "deny"
 # legitimate case impossible to write.
 
 # --- misc hygiene ----------------------------------------------------------
-# Integer remainder checks can rely on `%` panicking on a zero divisor.
-manual_is_multiple_of = "allow"
 # `use foo::*;` makes it impossible to see what a file depends on.
 wildcard_imports = "deny"
 # `mem::forget` leaks whatever it is handed.

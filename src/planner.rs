@@ -1022,7 +1022,13 @@ mod tests {
             if path.depth() > 0 {
                 return Vec::new();
             }
-            vec![(1, f64::NAN), (2, 0.5), (3, f64::NAN), (4, 0.9), (5, f64::NAN)]
+            vec![
+                (1, f64::NAN),
+                (2, 0.5),
+                (3, f64::NAN),
+                (4, 0.9),
+                (5, f64::NAN),
+            ]
         });
         assert_eq!(plan.commit(), Some(&4), "the best real score wins");
         assert!(plan.score().is_finite());

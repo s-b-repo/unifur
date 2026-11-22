@@ -569,14 +569,14 @@ impl StudentConfig {
         );
         anyhow::ensure!(self.hidden_size >= 1, "hidden_size must be positive");
         anyhow::ensure!(
-            self.num_heads >= 1 && self.hidden_size % self.num_heads == 0,
+            self.num_heads >= 1 && self.hidden_size.is_multiple_of(self.num_heads),
             "hidden_size ({}) must be divisible by num_heads ({})",
             self.hidden_size,
             self.num_heads
         );
         let head_dim = self.hidden_size / self.num_heads;
         anyhow::ensure!(
-            head_dim % 2 == 0,
+            head_dim.is_multiple_of(2),
             "the head dim ({head_dim}) must be even for rotary positions \
              (hidden_size {} / num_heads {})",
             self.hidden_size,
@@ -585,7 +585,7 @@ impl StudentConfig {
         anyhow::ensure!(
             self.num_kv_heads >= 1
                 && self.num_kv_heads <= self.num_heads
-                && self.num_heads % self.num_kv_heads == 0,
+                && self.num_heads.is_multiple_of(self.num_kv_heads),
             "num_kv_heads ({}) must divide num_heads ({}) from below",
             self.num_kv_heads,
             self.num_heads
@@ -605,7 +605,7 @@ impl StudentConfig {
             "cond_hidden_size must be positive"
         );
         anyhow::ensure!(
-            self.frequency_embedding_size >= 2 && self.frequency_embedding_size % 2 == 0,
+            self.frequency_embedding_size >= 2 && self.frequency_embedding_size.is_multiple_of(2),
             "frequency_embedding_size must be even and at least 2, got {}",
             self.frequency_embedding_size
         );
@@ -661,7 +661,7 @@ impl StudentConfig {
             "geom_cond_hidden must be positive"
         );
         anyhow::ensure!(
-            self.geom_frequency >= 2 && self.geom_frequency % 2 == 0,
+            self.geom_frequency >= 2 && self.geom_frequency.is_multiple_of(2),
             "geom_frequency must be even and at least 2, got {}",
             self.geom_frequency
         );
@@ -2107,7 +2107,7 @@ pub fn train_language_specialist<B: burn::tensor::backend::AutodiffBackend<Float
         config.micro_batch
     };
     anyhow::ensure!(
-        config.batch_size % micro_batch == 0,
+        config.batch_size.is_multiple_of(micro_batch),
         "micro_batch ({micro_batch}) must divide batch_size ({}) evenly",
         config.batch_size
     );

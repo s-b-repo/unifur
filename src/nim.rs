@@ -926,7 +926,9 @@ fn curl_exchange(
         .arg("--request")
         .arg(method);
     if body_file.is_some() {
-        command.arg("--header").arg("Content-Type: application/json");
+        command
+            .arg("--header")
+            .arg("Content-Type: application/json");
     }
     if config.provider == Provider::OpenRouter {
         command
@@ -992,10 +994,8 @@ impl BodyFile {
         use std::os::unix::fs::OpenOptionsExt;
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "dblocks-nim-body-{}-{n}.json",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("dblocks-nim-body-{}-{n}.json", std::process::id()));
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -1705,7 +1705,10 @@ mod tests {
             .generate_traces(&sample_prompts(3), &dir, TraceBudget { max_requests: 2 })
             .expect("generate traces");
         assert_eq!(server.request_count(), 2, "the budget is a request cap");
-        assert_eq!(report.failed, 1, "the first prompt spent the budget retrying");
+        assert_eq!(
+            report.failed, 1,
+            "the first prompt spent the budget retrying"
+        );
         assert_eq!(report.skipped_budget, 2);
         assert_eq!(report.served, 0);
     }
@@ -2093,7 +2096,9 @@ mod tests {
             }
         });
         let client = test_client(&server.url());
-        let reply = client.complete(&chat_request()).expect("completion after pause");
+        let reply = client
+            .complete(&chat_request())
+            .expect("completion after pause");
         assert_eq!(reply.content, "after the pause");
         assert_eq!(server.request_count(), 2);
     }
@@ -2141,9 +2146,19 @@ mod tests {
         let nim = test_client(&server.url());
         nim.send_chat(&chat_request()).expect("exchange");
         let heads = server.heads();
-        assert!(heads[0].to_lowercase().contains("x-title: unifur"), "{}", heads[0]);
+        assert!(
+            heads[0].to_lowercase().contains("x-title: unifur"),
+            "{}",
+            heads[0]
+        );
         assert!(!heads[1].to_lowercase().contains("x-title"), "{}", heads[1]);
-        assert_eq!(heads[0].to_lowercase().matches("authorization: bearer test-key").count(), 1);
+        assert_eq!(
+            heads[0]
+                .to_lowercase()
+                .matches("authorization: bearer test-key")
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -2154,7 +2169,9 @@ mod tests {
         let open = NimConfig::for_provider(Provider::OpenRouter);
         assert_eq!(open.base_url, OPENROUTER_BASE_URL);
         assert_eq!(open.api_key_env, OPENROUTER_API_KEY_ENV);
-        assert!(NimConfig::for_provider(Provider::Custom).base_url.is_empty());
+        assert!(NimConfig::for_provider(Provider::Custom)
+            .base_url
+            .is_empty());
         // An old sidecar without the new fields still parses, as NIM.
         let old: NimConfig = serde_json::from_str("{\"model\":\"m\"}").unwrap();
         assert_eq!(old.provider, Provider::Nim);
@@ -2162,7 +2179,10 @@ mod tests {
         let line = "{\"id\":\"a\",\"language\":\"rust\",\"prompt\":\"p\",\"completion\":\"c\",\"model\":\"m\",\"usage\":{},\"seed\":0}";
         let record: TraceRecord = serde_json::from_str(line).unwrap();
         assert!(record.provider.is_empty() && record.requested_model.is_empty());
-        assert!(!serde_json::to_string(&record).unwrap().contains("provider"), "empty provenance stays off the wire");
+        assert!(
+            !serde_json::to_string(&record).unwrap().contains("provider"),
+            "empty provenance stays off the wire"
+        );
     }
 
     /// Real-API smoke test. Ignored by default AND gated on the key: without

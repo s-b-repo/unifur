@@ -827,8 +827,16 @@ mod tests {
         for _ in 0..5 {
             stats.record(&origin, 2.0);
         }
-        assert!((stats.mean_loss(0) - 2.0).abs() < 1e-6, "{}", stats.mean_loss(0));
-        assert!((stats.mean_loss(1) - 2.0).abs() < 1e-6, "{}", stats.mean_loss(1));
+        assert!(
+            (stats.mean_loss(0) - 2.0).abs() < 1e-6,
+            "{}",
+            stats.mean_loss(0)
+        );
+        assert!(
+            (stats.mean_loss(1) - 2.0).abs() < 1e-6,
+            "{}",
+            stats.mean_loss(1)
+        );
     }
 
     #[test]

@@ -296,13 +296,13 @@ fn validate_lm_config(config: &LmConfig) -> Result<()> {
         "hidden size, layer count, head count and intermediate size must be positive"
     );
     anyhow::ensure!(
-        config.hidden_size % config.num_heads == 0,
+        config.hidden_size.is_multiple_of(config.num_heads),
         "hidden size must be divisible by head count"
     );
     config.validate_attention()?;
     anyhow::ensure!(config.context >= 2, "context must be at least 2");
     anyhow::ensure!(
-        config.num_layers % config.num_blocks.max(1) == 0,
+        config.num_layers.is_multiple_of(config.num_blocks.max(1)),
         "layer count must be divisible by block count"
     );
     if let Some(mosme) = &config.mosme {
@@ -1436,6 +1436,8 @@ enum LmAction {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
+    /// Print the versioned file-channel contract built into this runtime.
+    InteropContract,
     /// Block-wise training.
     Train {
         /// Dataset: synthetic | cifar100 | tiny-imagenet. Repeatable
@@ -2136,7 +2138,7 @@ enum TeacherAction {
     /// Screen teacher models on a fixed, versioned probe set (coding,
     /// security, reasoning, integrity traps) and write a leaderboard with a
     /// recommended pool. A screening heuristic, not a benchmark score; model
-    /// code is never executed. Replies are cached in <out>.replies.jsonl, so
+    /// code is never executed. Replies are cached in `<out>.replies.jsonl`, so
     /// an interrupted run resumes. Free OpenRouter providers may log or train
     /// on prompts: do not add private probes.
     Eval(TeacherEvalArgs),
@@ -2183,7 +2185,7 @@ struct TeacherEvalArgs {
     #[arg(long)]
     probes: Option<PathBuf>,
     /// Leaderboard JSON to write; replies are cached beside it in
-    /// <out>.replies.jsonl.
+    /// `<out>.replies.jsonl`.
     #[arg(long)]
     out: PathBuf,
     /// Request cap for this run (default: models x probes x 2).
@@ -2552,8 +2554,12 @@ mod teacher_cli_tests {
     use super::*;
 
     fn teacher(args: &[&str]) -> TeacherAction {
-        let cli = Cli::try_parse_from(["dblocks", "teacher"].into_iter().chain(args.iter().copied()))
-            .unwrap();
+        let cli = Cli::try_parse_from(
+            ["dblocks", "teacher"]
+                .into_iter()
+                .chain(args.iter().copied()),
+        )
+        .unwrap();
         let Command::Teacher(teacher) = cli.command else {
             unreachable!()
         };
@@ -2567,7 +2573,10 @@ mod teacher_cli_tests {
             .unwrap()
             .to_string();
         assert!(help.contains("teacher"), "{help}");
-        assert!(help.contains("Teacher models (NVIDIA NIM, OpenRouter"), "{help}");
+        assert!(
+            help.contains("Teacher models (NVIDIA NIM, OpenRouter"),
+            "{help}"
+        );
         let eval = Cli::try_parse_from(["dblocks", "teacher", "eval", "--help"])
             .err()
             .unwrap()
@@ -2578,9 +2587,14 @@ mod teacher_cli_tests {
 
     #[test]
     fn models_eval_and_pipeline_parse() {
-        let TeacherAction::Models(models) =
-            teacher(&["models", "--provider", "openrouter", "--free", "--match", "nemotron,nvidia"])
-        else {
+        let TeacherAction::Models(models) = teacher(&[
+            "models",
+            "--provider",
+            "openrouter",
+            "--free",
+            "--match",
+            "nemotron,nvidia",
+        ]) else {
             unreachable!()
         };
         assert!(models.free);
@@ -2590,8 +2604,16 @@ mod teacher_cli_tests {
         assert_eq!(config.api_key_env, "OPENROUTER_API_KEY");
 
         let TeacherAction::Eval(eval) = teacher(&[
-            "eval", "--provider", "openrouter", "--free", "--match", "nvidia", "--out", "lb.json",
-            "--max-idle-secs", "0",
+            "eval",
+            "--provider",
+            "openrouter",
+            "--free",
+            "--match",
+            "nvidia",
+            "--out",
+            "lb.json",
+            "--max-idle-secs",
+            "0",
         ]) else {
             unreachable!()
         };
@@ -2600,21 +2622,32 @@ mod teacher_cli_tests {
         assert_eq!(teacher_pause(&eval.pause).max_pause_secs, 900);
 
         let TeacherAction::Pipeline(pipeline) = teacher(&[
-            "pipeline", "--provider", "nim", "--models", "a,b", "--forbid-mixing",
-            "--languages", "rust,python", "--max-requests", "40",
+            "pipeline",
+            "--provider",
+            "nim",
+            "--models",
+            "a,b",
+            "--forbid-mixing",
+            "--languages",
+            "rust,python",
+            "--max-requests",
+            "40",
         ]) else {
             unreachable!()
         };
         assert_eq!(pipeline.pool.models, vec!["a", "b"]);
         assert!(pipeline.forbid_mixing);
         assert_eq!(pipeline.max_requests, Some(40));
-        assert!(teacher_config(&TeacherEndpointArgs {
-            provider: "custom".into(),
-            base_url: None,
-            api_key_env: None,
-            timeout_secs: 5,
-        })
-        .is_err(), "custom needs a base URL");
+        assert!(
+            teacher_config(&TeacherEndpointArgs {
+                provider: "custom".into(),
+                base_url: None,
+                api_key_env: None,
+                timeout_secs: 5,
+            })
+            .is_err(),
+            "custom needs a base URL"
+        );
     }
 }
 
@@ -3588,7 +3621,11 @@ fn cmd_alien(action: AlienAction) -> Result<()> {
             if let Some(path) = &args.plans {
                 let plans: Vec<alien::Plan> = alien::read_jsonl(path)?;
                 alien::check_plans(&plans, &proposals)?;
-                println!("{} plans valid against {} proposals", plans.len(), proposals.len());
+                println!(
+                    "{} plans valid against {} proposals",
+                    plans.len(),
+                    proposals.len()
+                );
             }
             let model =
                 alien::train_survival(&proposals, &outcomes, &alien::SurvivalConfig::default())?;
@@ -3602,6 +3639,10 @@ fn cmd_alien(action: AlienAction) -> Result<()> {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::InteropContract => {
+            println!("{}", diffusionblocks::interop::contract_json()?);
+            Ok(())
+        }
         Command::Sigmas { num_blocks, gamma } => cmd_sigmas(num_blocks, gamma),
         Command::Lm { action } => cmd_lm(action),
         Command::Ncm { action, runtime } => cmd_ncm(*action, &runtime),
@@ -10807,11 +10848,24 @@ mod alien_cli_tests {
         };
         assert_eq!(args.vectors, PathBuf::from("v.json"));
         assert!(!args.per_category && !args.whiten && !args.no_curved);
-        assert_eq!((args.top, args.seed, args.samples, args.interior), (20, 7, 2000, 12));
+        assert_eq!(
+            (args.top, args.seed, args.samples, args.interior),
+            (20, 7, 2000, 12)
+        );
         assert_eq!((args.bandwidth_factor, args.null_controls), (1.5, 3));
         let AlienAction::Rank(args) = alien(&[
-            "rank", "--vectors", "v.json", "--per-category", "--top", "5", "--seed", "3",
-            "--survival", "m.json", "--out", "p.jsonl",
+            "rank",
+            "--vectors",
+            "v.json",
+            "--per-category",
+            "--top",
+            "5",
+            "--seed",
+            "3",
+            "--survival",
+            "m.json",
+            "--out",
+            "p.jsonl",
         ]) else {
             panic!("not rank")
         };
@@ -10821,7 +10875,14 @@ mod alien_cli_tests {
         assert_eq!(args.out, Some(PathBuf::from("p.jsonl")));
 
         let AlienAction::Embed(args) = alien(&[
-            "embed", "--checkpoint", "s.mpk", "--corpus", "f.bin", "--name", "rust", "--windows",
+            "embed",
+            "--checkpoint",
+            "s.mpk",
+            "--corpus",
+            "f.bin",
+            "--name",
+            "rust",
+            "--windows",
             "8",
         ]) else {
             panic!("not embed")
@@ -10832,7 +10893,14 @@ mod alien_cli_tests {
 
         let AlienAction::Survival {
             action: AlienSurvivalAction::Train(args),
-        } = alien(&["survival", "train", "--proposals", "p.jsonl", "--outcomes", "o.jsonl"])
+        } = alien(&[
+            "survival",
+            "train",
+            "--proposals",
+            "p.jsonl",
+            "--outcomes",
+            "o.jsonl",
+        ])
         else {
             panic!("not survival train")
         };
@@ -10864,15 +10932,32 @@ mod alien_cli_tests {
             }
         }
         let vfile = dir.join("v.json");
-        std::fs::write(&vfile, serde_json::to_vec(&serde_json::json!({ "vectors": vectors })).unwrap())
-            .unwrap();
+        std::fs::write(
+            &vfile,
+            serde_json::to_vec(&serde_json::json!({ "vectors": vectors })).unwrap(),
+        )
+        .unwrap();
         let out = dir.join("p.jsonl");
         let (v, o) = (vfile.to_str().unwrap(), out.to_str().unwrap());
-        cmd_alien(alien(&["rank", "--vectors", v, "--samples", "200", "--out", o])).unwrap();
+        cmd_alien(alien(&[
+            "rank",
+            "--vectors",
+            v,
+            "--samples",
+            "200",
+            "--out",
+            o,
+        ]))
+        .unwrap();
         let text = std::fs::read_to_string(&out).unwrap();
         let ids: Vec<String> = text
             .lines()
-            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["id"].as_str().unwrap().to_string())
+            .map(|l| {
+                serde_json::from_str::<serde_json::Value>(l).unwrap()["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
             .collect();
         assert_eq!(ids.len(), 36, "12 per pool, three pools");
 
@@ -10884,8 +10969,14 @@ mod alien_cli_tests {
             .collect();
         std::fs::write(&outcomes, lines.join("\n")).unwrap();
         let err = cmd_alien(alien(&[
-            "survival", "train", "--proposals", o, "--outcomes", outcomes.to_str().unwrap(),
-            "--out", dir.join("m.json").to_str().unwrap(),
+            "survival",
+            "train",
+            "--proposals",
+            o,
+            "--outcomes",
+            outcomes.to_str().unwrap(),
+            "--out",
+            dir.join("m.json").to_str().unwrap(),
         ]))
         .unwrap_err()
         .to_string();

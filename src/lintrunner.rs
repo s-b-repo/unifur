@@ -1516,7 +1516,10 @@ mod tests {
             (Lang::Php, "<?php\nfunction f( {\n"),
             (Lang::Ruby, "def f\n  x = 1\nend\n"),
             (Lang::JavaScript, "function f( {\n"),
-            (Lang::Python, "import os\n"),
+            (
+                Lang::Python,
+                "import os\n\nvalue: int = \"text\"\nassert value\n",
+            ),
             (Lang::Shell, "rm $1\n"),
             (Lang::PowerShell, "Write-Host 'x'\n"),
             (Lang::CSharp, "class C { void M() { int x; } }\n"),

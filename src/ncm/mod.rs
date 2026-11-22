@@ -34,21 +34,28 @@
 //! multiplies that by `(1 + thinking_steps)`. The tokenizer (0 encoder + 1
 //! decoder block) is cheap by comparison and is trained once for every field.
 //!
-//! On the CPU-only dev laptop (`NdArray`, release build, assumed
-//! 2e10–1e11 FLOP/s) that works out to roughly:
-//!
-//! - 5M parameters on 100M tokens: 8 hours to 2 days;
-//! - 10M parameters on 200M tokens: 1.5 to 7 days;
-//! - 25M parameters on 500M tokens: 9 to 43 days.
-//!
-//! So small fused specialists can be trained there, and 25M and up belong on
-//! the GPU. `AGENTS.md` § "Training feasibility on the dev laptop" holds the
-//! decision rule and the table. Replace the throughput assumption with a
-//! measured release-build step time before relying on it.
+//! Release-build NdArray samples on the dev laptop measured 2.7–15.3 GFLOP/s
+//! on generator widths 64–512. Use the Training Guide's worker qualification
+//! procedure to measure the intended batch, sequence length, device and
+//! latent depth before budgeting a full fit.
 
 use anyhow::{bail, ensure, Result};
 use burn::tensor::{backend::Backend, Int, Tensor};
 use serde::{Deserialize, Serialize};
+
+fn check_stop_step(steps: usize, stop_at: Option<usize>, can_checkpoint: bool) -> Result<()> {
+    if let Some(step) = stop_at {
+        ensure!(
+            step > 0 && step <= steps,
+            "stop_at must be between 1 and the planned {steps} steps, got {step}"
+        );
+        ensure!(
+            can_checkpoint,
+            "stop_at requires a checkpoint output directory"
+        );
+    }
+    Ok(())
+}
 
 pub mod cli;
 pub mod decode;
@@ -104,7 +111,10 @@ impl LevelSchedule {
         ensure!(first >= 1, "level 1 must have at least one code");
         for pair in self.lengths.windows(2) {
             if let [a, b] = pair {
-                ensure!(a < b, "level lengths must strictly increase, got {a} then {b}");
+                ensure!(
+                    a < b,
+                    "level lengths must strictly increase, got {a} then {b}"
+                );
             }
         }
         Ok(())
@@ -134,10 +144,24 @@ impl LevelSchedule {
     /// generator loss `−Σ_k w_k Σ_i log p(r_k^i | z̃^(k-1))`. `α = 0` weights
     /// every code equally; `α = 1` weights every level equally.
     pub fn loss_weights(&self, alpha: f64) -> Result<Vec<f64>> {
-        ensure!(alpha.is_finite() && (0.0..=1.0).contains(&alpha), "alpha must be in [0, 1], got {alpha}");
-        let norm: f64 = self.lengths.iter().map(|&l| (l as f64).powf(1.0 - alpha)).sum();
-        ensure!(norm > 0.0 && norm.is_finite(), "degenerate schedule for loss weights");
-        Ok(self.lengths.iter().map(|&l| (l as f64).powf(-alpha) / norm).collect())
+        ensure!(
+            alpha.is_finite() && (0.0..=1.0).contains(&alpha),
+            "alpha must be in [0, 1], got {alpha}"
+        );
+        let norm: f64 = self
+            .lengths
+            .iter()
+            .map(|&l| (l as f64).powf(1.0 - alpha))
+            .sum();
+        ensure!(
+            norm > 0.0 && norm.is_finite(),
+            "degenerate schedule for loss weights"
+        );
+        Ok(self
+            .lengths
+            .iter()
+            .map(|&l| (l as f64).powf(-alpha) / norm)
+            .collect())
     }
 }
 
@@ -280,11 +304,23 @@ mod tests {
 
     #[test]
     fn test_geometric_schedule_is_strictly_increasing_and_ends_at_l() {
-        for (l, k) in [(1024, 32), (128, 12), (48, 8), (64, 11), (4096, 32), (8, 8), (5, 1)] {
+        for (l, k) in [
+            (1024, 32),
+            (128, 12),
+            (48, 8),
+            (64, 11),
+            (4096, 32),
+            (8, 8),
+            (5, 1),
+        ] {
             let s = LevelSchedule::geometric(l, k).unwrap();
             assert_eq!(s.levels(), k);
             assert_eq!(s.seq_len(), l);
-            assert!(s.lengths().windows(2).all(|w| w[0] < w[1]), "{l}/{k}: {:?}", s.lengths());
+            assert!(
+                s.lengths().windows(2).all(|w| w[0] < w[1]),
+                "{l}/{k}: {:?}",
+                s.lengths()
+            );
             assert!(s.lengths()[0] >= 1);
         }
     }

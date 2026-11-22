@@ -360,11 +360,11 @@ impl LmConfig {
             "KV heads ({kv}) must divide the query heads ({q}) from below"
         );
         anyhow::ensure!(
-            q % kv == 0,
+            q.is_multiple_of(kv),
             "query heads ({q}) must be a multiple of KV heads ({kv})"
         );
         anyhow::ensure!(
-            self.hidden_size % q == 0,
+            self.hidden_size.is_multiple_of(q),
             "hidden size must be divisible by head count"
         );
         anyhow::ensure!(
@@ -654,7 +654,7 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         config.validate_ffn()?;
         config.validate_attention()?;
         anyhow::ensure!(
-            config.num_layers % config.num_blocks.max(1) == 0,
+            config.num_layers.is_multiple_of(config.num_blocks.max(1)),
             "num_layers ({}) must be divisible by num_blocks ({})",
             config.num_layers,
             config.num_blocks
@@ -739,11 +739,11 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         self.specialist_trainable(config, expert_id)?;
         anyhow::ensure!(
             config.num_heads > 0
-                && config.hidden_size % config.num_heads == 0
+                && config.hidden_size.is_multiple_of(config.num_heads)
                 && config.num_layers > 0
-                && config.num_layers % config.num_blocks.max(1) == 0
+                && config.num_layers.is_multiple_of(config.num_blocks.max(1))
                 && config.frequency_embedding_size > 0
-                && config.frequency_embedding_size % 2 == 0,
+                && config.frequency_embedding_size.is_multiple_of(2),
             "invalid specialist dimensions"
         );
         anyhow::ensure!(

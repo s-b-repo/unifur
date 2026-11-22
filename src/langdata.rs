@@ -2887,10 +2887,7 @@ pub fn run_pipeline(
                 language.name()
             );
             report.languages.push(language_report);
-            report.stopped = Some(format!(
-                "{} unfinished: {reason}",
-                language.name()
-            ));
+            report.stopped = Some(format!("{} unfinished: {reason}", language.name()));
             break;
         }
         write_json(&report_path, &language_report)?;

@@ -73,27 +73,60 @@ four billion **training tokens**.
 records=$(python3 -B experiments/model_matrix/nina_worker.py \
   validate "$NINA_WORKER_ROOT/corpora/$corpus_id" | jq -er .records.train)
 codec_steps=$(( (records + codec_batch - 1) / codec_batch ))
+recipe=(-f stage=codec -f corpus="$corpus_id" -f run_key="$run_key"
+  -F steps="$codec_steps" -F batch_size="$codec_batch" -F checkpoint_every="$save_every")
 gh workflow run nina-worker.yml --repo s-b-repo/unifur --ref "$training_ref" \
-  -f mode=gpu-fit -f stage=codec -f corpus="$corpus_id" -f run_key="$run_key" \
-  -F steps="$codec_steps" -F batch_size="$codec_batch" -F checkpoint_every="$save_every"
+  -f mode=gpu-qualify "${recipe[@]}"
+gh workflow run nina-worker.yml --repo s-b-repo/unifur --ref "$training_ref" \
+  -f mode=gpu-fit -F stop_at="$next_step" "${recipe[@]}"
 ```
 
-Pin `training_ref` to the same revision with a branch or tag for both
-stages and any retries. Choose the batch size and checkpoint interval from
-the hardware profile. After held-out codec reconstruction passes, dispatch
-`stage=generator` with the same corpus and run key and the chosen generator
-step and batch counts. The worker visits the prepared records in order and
-requires at least one full pass. Keep the runtime, manifest, matching codec,
-generator and both `.state` sidecars together. Re-dispatch an interrupted
-stage with the same recipe. Cosine is the default generator schedule. WSD
-remains an option for measured comparisons.
+Pin `training_ref` for both stages and any retries. Wait for qualification
+before the first fit. Qualification performs four updates of the full
+schedule and reloads a verified model and optimizer after the first step.
+It records end-to-end non-padding target throughput, peak host RSS, sampled
+GPU framebuffer use and the runtime, corpus and recipe fingerprints. Use
+a discrete WGPU accelerator with NVIDIA or AMD Linux framebuffer telemetry.
+Generator qualification checks the FP32 parameter-state lower bound and
+room for two checkpoint writes before allocating the model.
+
+Set `next_step` to an absolute optimizer step above the saved step. Choose
+slices that fit the workflow's 300-minute runtime and retain the planned
+total `steps` across retries. Training uses that total for the learning-rate
+schedule and visits prepared records in order. The codec must finish
+before generator qualification. Use the same run key and corpus with
+`stage=generator` and the generator batch and step counts. Set
+`validation_windows` in both dispatches if the chosen GPU needs a smaller
+validation batch. Keep the runtime, matching codec and generator, and both
+`.state` sidecars together. Cosine is the default. WSD remains available for
+measured comparisons.
 
 The standard generation path reuses prompt embeddings, masks and fixed
 codebook statistics. On the local CPU parity set, 64 greedy and eight
 seeded sampling requests reproduced the previous reports. For public
-release, verify clean-restart
-reproducibility and evaluate long-answer reconstruction, held-out answer
-quality, geometry and external-context behavior.
+release, verify clean-restart reproducibility and evaluate long-answer
+reconstruction, held-out answer quality, geometry and external-context
+behavior.
+
+### Gate a trained candidate
+
+Stage `cases.jsonl` and `policy.json` under
+`$NINA_WORKER_ROOT/evaluations/$run_key` and dispatch `mode=gpu-release-eval`
+with the corpus, run key and training revision. Set the worker variables
+`NINA_OMNI_BIN` and `NINA_DCR_BIN` for the external-context cases.
+
+Each case carries `id`, `field`, `source`, `prompt` and `answers`
+(accepted answer strings). Context cases also carry `context.relevant`
+and `context.distractor` source text. The policy gives
+`min_codec_token_accuracy`, a `fields` map with `min_cases` and
+`min_accuracy` for every trained field, and a `context` section with
+`min_cases`, `min_relevant_accuracy` and `min_distractor_accuracy`.
+Use reviewed held-out questions with answers that normalized exact match
+can score. The evaluator checks case IDs and normalized prompts against both
+packed splits, verifies the checkpoint digests, and compares one and two
+latent updates. It uses isolated Subnext stores for the context controls
+and writes the pass or fail report and fingerprints to `report.json`.
+[Evaluator source](../experiments/model_matrix/nina_release.py)
 
 ### Converted XSum checkpoints
 

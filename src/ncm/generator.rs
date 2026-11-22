@@ -417,13 +417,13 @@ impl NcmGeneratorConfig {
         ensure!(self.blocks >= 1, "blocks must be at least 1");
         ensure!(self.hidden >= 2, "hidden must be at least 2");
         ensure!(
-            self.heads >= 1 && self.hidden % self.heads == 0,
+            self.heads >= 1 && self.hidden.is_multiple_of(self.heads),
             "hidden {} must be a multiple of heads {}",
             self.hidden,
             self.heads
         );
         ensure!(
-            self.head_dim() % 2 == 0,
+            self.head_dim().is_multiple_of(2),
             "rotary positions need an even head dimension, got {}",
             self.head_dim()
         );
@@ -2112,7 +2112,7 @@ pub fn sample_rows<R: Rng>(
     rng: &mut R,
 ) -> Result<Vec<i64>> {
     ensure!(
-        classes >= 1 && logits.len() % classes == 0,
+        classes >= 1 && logits.len().is_multiple_of(classes),
         "logits are not whole rows of {classes}"
     );
     ensure!(
@@ -2523,6 +2523,9 @@ impl LrShape {
 pub struct NcmTrainConfig {
     pub model: NcmGeneratorConfig,
     pub steps: usize,
+    /// End this invocation after saving the given step of the full schedule.
+    #[serde(skip)]
+    pub stop_at: Option<usize>,
     pub batch_size: usize,
     pub peak_lr: f64,
     pub min_lr: f64,
@@ -2553,6 +2556,7 @@ impl Default for NcmTrainConfig {
         Self {
             model: NcmGeneratorConfig::tiny(),
             steps: 200,
+            stop_at: None,
             batch_size: 8,
             peak_lr: 3e-4,
             min_lr: 3e-5,
@@ -2579,6 +2583,7 @@ impl NcmTrainConfig {
             self.steps >= 1 && self.batch_size >= 1,
             "steps and batch_size must be positive"
         );
+        super::check_stop_step(self.steps, self.stop_at, self.out_dir.is_some())?;
         ensure!(
             !self.ordered_records || self.aligned_windows,
             "ordered records require aligned windows"
@@ -3101,6 +3106,11 @@ where
             new_optimizer::<B>(config),
         ),
     };
+    let end_step = config.stop_at.unwrap_or(config.steps);
+    ensure!(
+        start_step <= end_step,
+        "checkpoint step {start_step} exceeds this invocation's final step {end_step}"
+    );
     let val_windows = match validation {
         Some(corpus) => {
             let stride = if config.aligned_windows { span } else { 1 };
@@ -3162,7 +3172,7 @@ where
     };
     let started = std::time::Instant::now();
     let mut loss_sum = 0.0;
-    for step in start_step..config.steps {
+    for step in start_step..end_step {
         B::seed(device, crate::train::step_seed(config.seed, step));
         let batch = config.batch_size;
         let (windows, prompt_lens) = if config.ordered_records {
@@ -3347,7 +3357,10 @@ where
             level_rows,
             val,
         });
-        if config.checkpoint_every > 0 && (step + 1) % config.checkpoint_every == 0 {
+        if step + 1 < end_step
+            && config.checkpoint_every > 0
+            && (step + 1) % config.checkpoint_every == 0
+        {
             if let Some(dir) = &config.out_dir {
                 save_generator_checkpoint(&model, &optim, dir, step + 1, &rng, &meta)?;
             }
@@ -3355,6 +3368,11 @@ where
     }
     report.elapsed_secs = started.elapsed().as_secs_f64();
     report.mean_loss = loss_sum / report.steps_taken.max(1) as f64;
+    if let Some(dir) = &config.out_dir {
+        report.checkpoint = Some(save_generator_checkpoint(
+            &model, &optim, dir, end_step, &rng, &meta,
+        )?);
+    }
     report.val_end = evaluate(&model)?;
     if let Some(windows) = &val_windows {
         let inner = model.valid();
@@ -3366,16 +3384,6 @@ where
             pad,
             &relax,
             &inner_device,
-        )?);
-    }
-    if let Some(dir) = &config.out_dir {
-        report.checkpoint = Some(save_generator_checkpoint(
-            &model,
-            &optim,
-            dir,
-            config.steps,
-            &rng,
-            &meta,
         )?);
     }
     Ok((model, report))
@@ -3575,11 +3583,12 @@ where
             "WSD resume requires the original total steps"
         );
     }
+    let end_step = config.stop_at.unwrap_or(config.steps);
     ensure!(
-        state.step <= config.steps,
+        state.step <= end_step,
         "the checkpoint is at step {}, past the requested {} steps",
         state.step,
-        config.steps
+        end_step
     );
     let fresh = NcmGenerator::new(&extras.spec.config, &extras.spec.codec, device)?;
     let model = checkpoint::load(fresh, path, device)?;

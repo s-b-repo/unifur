@@ -3673,10 +3673,7 @@ mod tests {
                 ]
             }
         });
-        assert_eq!(
-            nvd_severity(&cve).as_deref(),
-            Some("HIGH (base score 7.5)")
-        );
+        assert_eq!(nvd_severity(&cve).as_deref(), Some("HIGH (base score 7.5)"));
         // Secondary only: it is the fallback.
         let cve = serde_json::json!({
             "metrics": {"cvssMetricV30": [

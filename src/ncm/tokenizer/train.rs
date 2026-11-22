@@ -32,7 +32,7 @@
 //! interrupted run's. Later steps agree only to rounding, because on the
 //! `NdArray` backend the backward pass is not bit-reproducible (two identical
 //! backward passes differ by ~1e-6 relative; measured, see
-//! [`super::CROSS_PASS_GRADIENT_TOLERANCE`]).
+//! `super::CROSS_PASS_GRADIENT_TOLERANCE`).
 //!
 //! # Optional intent alignment (off by default, unvalidated)
 //!
@@ -423,6 +423,9 @@ pub struct TokenizerTrainConfig {
     /// Tail fraction held out when `val_corpora` is empty.
     pub val_fraction: f64,
     pub steps: usize,
+    /// End this invocation after saving the given step of the full schedule.
+    #[serde(skip)]
+    pub stop_at: Option<usize>,
     pub batch_size: usize,
     /// Micro-batches per optimizer step.
     pub accumulate: usize,
@@ -462,6 +465,7 @@ impl TokenizerTrainConfig {
             ordered_records: false,
             val_fraction: 0.05,
             steps: 300,
+            stop_at: None,
             batch_size: 16,
             accumulate: 1,
             lr,
@@ -481,6 +485,7 @@ impl TokenizerTrainConfig {
     pub fn validate(&self) -> Result<()> {
         self.tokenizer.validate()?;
         ensure!(self.steps >= 1, "steps must be at least 1");
+        super::super::check_stop_step(self.steps, self.stop_at, self.out_dir.is_some())?;
         ensure!(self.batch_size >= 1, "batch_size must be at least 1");
         ensure!(self.accumulate >= 1, "accumulate must be at least 1");
         ensure!(
@@ -1103,6 +1108,11 @@ pub fn train_tokenizer<B: AutodiffBackend<FloatElem = f32>>(
             }
         }
     };
+    let end_step = config.stop_at.unwrap_or(config.steps);
+    ensure!(
+        start_step <= end_step,
+        "checkpoint step {start_step} exceeds this invocation's final step {end_step}"
+    );
     let ctx = SaveContext {
         config,
         config_json: &config_json,
@@ -1146,7 +1156,7 @@ pub fn train_tokenizer<B: AutodiffBackend<FloatElem = f32>>(
     let clock = std::time::Instant::now();
     let elapsed_before = extras.elapsed_secs;
     let mut last_checkpoint = None;
-    for step in start_step..config.steps {
+    for step in start_step..end_step {
         B::seed(device, crate::train::step_seed(config.seed, step));
         let lr = schedule.at(step);
         let mut accumulator = GradientAccumulator::new(config.accumulate);
@@ -1219,7 +1229,7 @@ pub fn train_tokenizer<B: AutodiffBackend<FloatElem = f32>>(
             tokenizer,
             intent: head,
         };
-        let done = step + 1 == config.steps;
+        let done = step + 1 == end_step;
         if config.log_every > 0 && (step % config.log_every == 0 || done) {
             let log = StepLog {
                 step: step + 1,
@@ -1275,7 +1285,7 @@ pub fn train_tokenizer<B: AutodiffBackend<FloatElem = f32>>(
         config: tok_config.clone(),
         trainable_parameters: trainable_parameters::<B, _>(&trainee),
         codebook_floats,
-        total_steps: config.steps,
+        total_steps: end_step,
         resumed_from: start_step,
         train_tokens: train.len(),
         windows_seen: extras.windows_seen,

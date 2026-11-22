@@ -445,11 +445,11 @@ impl ViTDiTConfig {
             "KV heads ({kv}) must divide the query heads ({q}) from below"
         );
         anyhow::ensure!(
-            q % kv == 0,
+            q.is_multiple_of(kv),
             "query heads ({q}) must be a multiple of KV heads ({kv})"
         );
         anyhow::ensure!(
-            self.hidden_size % q == 0,
+            self.hidden_size.is_multiple_of(q),
             "hidden size must be divisible by head count"
         );
         anyhow::ensure!(
@@ -460,7 +460,7 @@ impl ViTDiTConfig {
         // Rotary turns column pairs, so an odd head dimension cannot be
         // rotated; `Attention::new` would otherwise abort on it mid-build.
         anyhow::ensure!(
-            !self.rotary || self.head_dim() % 2 == 0,
+            !self.rotary || self.head_dim().is_multiple_of(2),
             "rotary positions need an even head dimension, got {} ({} / {} heads)",
             self.head_dim(),
             self.hidden_size,
@@ -2806,7 +2806,8 @@ mod tests {
                 let mut outputs = Vec::new();
                 let mut at = 0;
                 for size in chunks.iter().copied() {
-                    outputs.push(attention.forward_state(x.clone().narrow(1, at, size), &mut state));
+                    outputs
+                        .push(attention.forward_state(x.clone().narrow(1, at, size), &mut state));
                     at += size;
                 }
                 assert_eq!(state.positions, n);
@@ -2894,7 +2895,9 @@ mod tests {
         // norm: every block's residual branches are gated by zero.
         let t = Tensor::<B, 1>::from_floats([0.3f32], &device);
         let (emb, cond) = model.vit().embed(pixels.clone(), zt.clone(), t.clone());
-        let through = model.vit().forward_block(0..cfg.num_hidden_layers, pixels, zt, t);
+        let through = model
+            .vit()
+            .forward_block(0..cfg.num_hidden_layers, pixels, zt, t);
         let expected = model.vit().final_layernorm.forward(emb);
         assert_eq!(
             (through.last_hidden_state - expected)

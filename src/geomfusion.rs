@@ -163,7 +163,7 @@ impl GeomFusionConfig {
             "cond_hidden_size must be positive"
         );
         anyhow::ensure!(
-            self.frequency_embedding_size >= 2 && self.frequency_embedding_size % 2 == 0,
+            self.frequency_embedding_size >= 2 && self.frequency_embedding_size.is_multiple_of(2),
             "frequency_embedding_size must be even"
         );
         anyhow::ensure!(self.layer_norm_eps > 0.0, "layer_norm_eps must be positive");
@@ -2073,7 +2073,7 @@ pub fn train_fused_qwen<B: AutodiffBackend<FloatElem = f32>>(
     out_dir: Option<&Path>,
 ) -> anyhow::Result<FusedTrainReport> {
     anyhow::ensure!(
-        corpus.len() % meta.scene_len == 0,
+        corpus.len().is_multiple_of(meta.scene_len),
         "the corpus holds {} tokens, not a multiple of the {}-token scene length",
         corpus.len(),
         meta.scene_len
@@ -2292,7 +2292,7 @@ pub fn prove<B: Backend<FloatElem = f32>>(
 ) -> anyhow::Result<ProofReport> {
     anyhow::ensure!(config.scenes >= 1, "scenes must be positive");
     anyhow::ensure!(
-        corpus.len() % meta.scene_len == 0,
+        corpus.len().is_multiple_of(meta.scene_len),
         "the corpus holds {} tokens, not a multiple of the {}-token scene length",
         corpus.len(),
         meta.scene_len

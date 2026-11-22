@@ -359,10 +359,7 @@ pub fn run_all() -> Report {
         "ncm-decode",
         crate::ncm::decode::certificate_checks,
     ));
-    certificates.extend(checks_or_failed(
-        "alien",
-        crate::alien::certificate_checks,
-    ));
+    certificates.extend(checks_or_failed("alien", crate::alien::certificate_checks));
     certificates.extend(checks_or_failed(
         "integrity",
         crate::integrity::certificate_checks,

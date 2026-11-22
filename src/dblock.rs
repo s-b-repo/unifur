@@ -148,7 +148,9 @@ impl<B: Backend<FloatElem = f32>> DblockClassifier<B> {
             dblock_config.num_blocks
         );
         anyhow::ensure!(
-            vit_config.num_hidden_layers % dblock_config.num_blocks == 0,
+            vit_config
+                .num_hidden_layers
+                .is_multiple_of(dblock_config.num_blocks),
             "num_hidden_layers ({}) must be divisible by num_blocks ({})",
             vit_config.num_hidden_layers,
             dblock_config.num_blocks

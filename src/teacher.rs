@@ -336,7 +336,10 @@ impl ModelPool {
         let mut slots = Vec::with_capacity(models.len());
         for id in models {
             let id = id.trim();
-            ensure!(!id.is_empty(), "the teacher model pool holds a blank model id");
+            ensure!(
+                !id.is_empty(),
+                "the teacher model pool holds a blank model id"
+            );
             ensure!(
                 seen.insert(id.to_string()),
                 "model `{id}` appears twice in the teacher model pool"
@@ -606,7 +609,12 @@ pub trait RequestObserver {
     }
 
     /// `model` was taken out of the run.
-    fn on_disabled(&mut self, _model: &str, _reason: &str, _now_unix_ms: u64) -> anyhow::Result<()> {
+    fn on_disabled(
+        &mut self,
+        _model: &str,
+        _reason: &str,
+        _now_unix_ms: u64,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -820,8 +828,10 @@ impl<'a> Requester<'a> {
                     for &i in &affected {
                         self.pool.apply(i, &plan);
                     }
-                    let affected_ids: Vec<String> =
-                        affected.iter().map(|&i| self.pool.id(i).to_string()).collect();
+                    let affected_ids: Vec<String> = affected
+                        .iter()
+                        .map(|&i| self.pool.id(i).to_string())
+                        .collect();
                     let when = if plan.verdict == PauseVerdict::Disable {
                         "for the rest of the run".to_string()
                     } else {
@@ -1595,7 +1605,11 @@ pub fn parse_model_listing(json: &str) -> anyhow::Result<Vec<ListedModel>> {
 
 /// Keep the models that are free (when `free_only`) and whose id or name
 /// contains any of `needles` (case-insensitive; no needles keeps all).
-pub fn filter_models(models: &[ListedModel], free_only: bool, needles: &[String]) -> Vec<ListedModel> {
+pub fn filter_models(
+    models: &[ListedModel],
+    free_only: bool,
+    needles: &[String],
+) -> Vec<ListedModel> {
     let needles: Vec<String> = needles
         .iter()
         .map(|n| n.trim().to_lowercase())
@@ -1717,7 +1731,11 @@ pub fn resolve_models(
     }
     let discovered = if let Some(path) = &selection.models_from {
         let cache = ModelCache::read(path)?;
-        Some(filter_models(&cache.models, selection.free, &selection.matches))
+        Some(filter_models(
+            &cache.models,
+            selection.free,
+            &selection.matches,
+        ))
     } else if selection.free || !selection.matches.is_empty() {
         let listed = fetch_models(config, api_key)?;
         Some(filter_models(&listed, selection.free, &selection.matches))
@@ -1890,10 +1908,8 @@ mod tests {
     fn unique_tmp_dir(tag: &str) -> PathBuf {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "dblocks-teacher-{tag}-{}-{n}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dblocks-teacher-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -1935,15 +1951,28 @@ mod tests {
     #[test]
     fn interpret_reads_each_shape() {
         let o = interpret(ok("hi"), "m", "K", NOW);
-        assert!(matches!(o, Outcome::Reply(ref r) if r.content.as_deref() == Some("hi") && r.served_model == "m"));
-        assert!(matches!(interpret(per_minute(5), "m", "K", NOW), Outcome::Limited(_)));
+        assert!(
+            matches!(o, Outcome::Reply(ref r) if r.content.as_deref() == Some("hi") && r.served_model == "m")
+        );
+        assert!(matches!(
+            interpret(per_minute(5), "m", "K", NOW),
+            Outcome::Limited(_)
+        ));
         let in_200 = Ok(HttpResponse::new(
             200,
             vec![],
             r#"{"error":{"code":429,"message":"Rate limit exceeded: free-models-per-min."}}"#,
         ));
-        assert!(matches!(interpret(in_200, "m", "K", NOW), Outcome::Limited(_)));
-        let auth = interpret(Ok(HttpResponse::new(401, vec![], "{}")), "m", "MY_KEY_VAR", NOW);
+        assert!(matches!(
+            interpret(in_200, "m", "K", NOW),
+            Outcome::Limited(_)
+        ));
+        let auth = interpret(
+            Ok(HttpResponse::new(401, vec![], "{}")),
+            "m",
+            "MY_KEY_VAR",
+            NOW,
+        );
         assert!(matches!(auth, Outcome::Fatal(ref m) if m.contains("MY_KEY_VAR")));
         assert!(matches!(
             interpret(Ok(HttpResponse::new(404, vec![], "")), "m", "K", NOW),
@@ -1951,7 +1980,11 @@ mod tests {
         ));
         assert!(matches!(
             interpret(
-                Ok(HttpResponse::new(400, vec![], r#"{"error":{"message":"x is not a valid model ID"}}"#)),
+                Ok(HttpResponse::new(
+                    400,
+                    vec![],
+                    r#"{"error":{"message":"x is not a valid model ID"}}"#
+                )),
                 "m",
                 "K",
                 NOW
@@ -1963,17 +1996,27 @@ mod tests {
             Outcome::Retryable(_)
         ));
         assert!(matches!(
-            interpret(Ok(HttpResponse::new(400, vec![], "too long")), "m", "K", NOW),
+            interpret(
+                Ok(HttpResponse::new(400, vec![], "too long")),
+                "m",
+                "K",
+                NOW
+            ),
             Outcome::Failed(_)
         ));
-        assert!(matches!(interpret(Err("refused".into()), "m", "K", NOW), Outcome::Retryable(_)));
+        assert!(matches!(
+            interpret(Err("refused".into()), "m", "K", NOW),
+            Outcome::Retryable(_)
+        ));
         // Null content is a reply with no content, not a parse failure.
         let null = Ok(HttpResponse::new(
             200,
             vec![],
             r#"{"choices":[{"message":{"content":null},"finish_reason":"length"}]}"#,
         ));
-        assert!(matches!(interpret(null, "m", "K", NOW), Outcome::Reply(ref r) if r.content.is_none() && r.finish_reason.as_deref() == Some("length")));
+        assert!(
+            matches!(interpret(null, "m", "K", NOW), Outcome::Reply(ref r) if r.content.is_none() && r.finish_reason.as_deref() == Some("length"))
+        );
     }
 
     #[test]
@@ -2015,7 +2058,10 @@ mod tests {
             }
         );
         // After a's reset passes, the pool comes back to a.
-        assert_eq!(pool.pick(NOW + 6 * 3_600_000, p.max_idle_ms()), Pick::Use(0));
+        assert_eq!(
+            pool.pick(NOW + 6 * 3_600_000, p.max_idle_ms()),
+            Pick::Use(0)
+        );
         // With everything paused past the idle bound, the run stops and says when to resume.
         let mut lone = ModelPool::new(&["x".into()]).unwrap();
         lone.apply(0, &ratelimit::plan_pause(&daily, NOW, 0, &p, 0.0));
@@ -2036,7 +2082,10 @@ mod tests {
     #[test]
     fn a_per_minute_limit_pauses_and_resumes_on_the_same_model() {
         let env = MockEnv::at(NOW);
-        let backend = MockBackend::new(&env, |_, n, _| if n == 1 { per_minute(20) } else { ok(CODE) });
+        let backend = MockBackend::new(
+            &env,
+            |_, n, _| if n == 1 { per_minute(20) } else { ok(CODE) },
+        );
         let dir = unique_tmp_dir("minute");
         let out = dir.join("traces.jsonl");
         let report = generate(
@@ -2050,10 +2099,20 @@ mod tests {
         .unwrap();
         assert_eq!(report.served, 2);
         assert_eq!(report.rate_limit_events, 1);
-        assert_eq!(backend.calls(), vec!["a:free", "a:free", "a:free"], "no rotation on a per-minute limit");
-        assert_eq!(*env.sleeps.borrow(), vec![20_000], "slept exactly the Retry-After");
+        assert_eq!(
+            backend.calls(),
+            vec!["a:free", "a:free", "a:free"],
+            "no rotation on a per-minute limit"
+        );
+        assert_eq!(
+            *env.sleeps.borrow(),
+            vec![20_000],
+            "slept exactly the Retry-After"
+        );
         let records = crate::nim::read_traces(&out).unwrap();
-        assert!(records.iter().all(|r| r.provider == "openrouter" && r.requested_model == "a:free"));
+        assert!(records
+            .iter()
+            .all(|r| r.provider == "openrouter" && r.requested_model == "a:free"));
     }
 
     #[test]
@@ -2112,13 +2171,19 @@ mod tests {
         }
         let journal = RunJournal::load(&journal_path(&out)).unwrap().unwrap();
         assert_eq!(journal.completed.len(), 3);
-        assert_eq!(journal.requests_spent, 4, "the fatal request was reserved before it was sent");
+        assert_eq!(
+            journal.requests_spent, 4,
+            "the fatal request was reserved before it was sent"
+        );
 
         // Resume with a healthy backend and the same cap: 6 left of 10.
         let healthy = MockBackend::new(&env, |_, _, _| ok(CODE));
         let resumed = generate(&healthy, &env, &prompts(6), &out, &pool, 6).unwrap();
         assert_eq!(resumed.skipped_existing, 3);
-        assert_eq!(resumed.served, 2, "the cap counts across runs: 6 - 4 spent = 2");
+        assert_eq!(
+            resumed.served, 2,
+            "the cap counts across runs: 6 - 4 spent = 2"
+        );
         assert_eq!(resumed.skipped_budget, 1);
         assert_eq!(resumed.requests_spent_total, 6);
         assert_eq!(healthy.calls().len(), 2);
@@ -2160,7 +2225,11 @@ mod tests {
         // Same time, rerun: the pause is honoured without a request.
         let again = generate(&backend, &env, &prompts(3), &out, &pool, 10).unwrap();
         assert!(again.stopped.is_some());
-        assert_eq!(backend.calls().len(), 1, "a paused model is not asked again");
+        assert_eq!(
+            backend.calls().len(),
+            1,
+            "a paused model is not asked again"
+        );
         // After the reset the run completes.
         env.now.set(reset);
         let done = generate(&backend, &env, &prompts(3), &out, &pool, 10).unwrap();
@@ -2176,7 +2245,15 @@ mod tests {
             }
         });
         let out2 = unique_tmp_dir("honour-sleep").join("traces.jsonl");
-        let slept = generate(&backend2, &env2, &prompts(2), &out2, &pool_of(&["m"], quiet_policy()), 10).unwrap();
+        let slept = generate(
+            &backend2,
+            &env2,
+            &prompts(2),
+            &out2,
+            &pool_of(&["m"], quiet_policy()),
+            10,
+        )
+        .unwrap();
         assert_eq!(slept.served, 2);
         assert_eq!(*env2.sleeps.borrow(), vec![8 * 3_600_000]);
     }
@@ -2236,7 +2313,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.served_by_model.get("paid"), Some(&1));
-        assert_eq!(backend.calls(), vec!["x:free", "paid"], "y:free was not tried in vain");
+        assert_eq!(
+            backend.calls(),
+            vec!["x:free", "paid"],
+            "y:free was not tried in vain"
+        );
     }
 
     #[test]
@@ -2250,7 +2331,15 @@ mod tests {
             }
         });
         let out = unique_tmp_dir("gone").join("traces.jsonl");
-        let report = generate(&backend, &env, &prompts(2), &out, &pool_of(&["gone", "live"], quiet_policy()), 10).unwrap();
+        let report = generate(
+            &backend,
+            &env,
+            &prompts(2),
+            &out,
+            &pool_of(&["gone", "live"], quiet_policy()),
+            10,
+        )
+        .unwrap();
         assert_eq!(report.served_by_model.get("live"), Some(&2));
         assert_eq!(backend.calls(), vec!["gone", "live", "live"]);
     }
@@ -2268,10 +2357,25 @@ mod tests {
             Ok(r)
         });
         let out = unique_tmp_dir("pace").join("traces.jsonl");
-        let report = generate(&backend, &env, &prompts(2), &out, &pool_of(&["m"], quiet_policy()), 10).unwrap();
+        let report = generate(
+            &backend,
+            &env,
+            &prompts(2),
+            &out,
+            &pool_of(&["m"], quiet_policy()),
+            10,
+        )
+        .unwrap();
         assert_eq!(report.served, 2);
-        assert_eq!(report.rate_limit_events, 0, "pacing is not a rate-limit event");
-        assert_eq!(env.sleeps.borrow().first(), Some(&15_000), "30 s window / (1 + 1)");
+        assert_eq!(
+            report.rate_limit_events, 0,
+            "pacing is not a rate-limit event"
+        );
+        assert_eq!(
+            env.sleeps.borrow().first(),
+            Some(&15_000),
+            "30 s window / (1 + 1)"
+        );
     }
 
     const LISTING: &str = r#"{"data":[
@@ -2292,7 +2396,11 @@ mod tests {
         assert_eq!(rule("nvidia/nemotron-nano-y"), Some(FreeRule::ZeroPricing));
         assert_eq!(rule("vendor/odd-one:free"), Some(FreeRule::FreeSuffix));
         assert_eq!(rule("vendor/paid"), None);
-        assert_eq!(rule("openrouter/auto"), None, "negative prices are not zero");
+        assert_eq!(
+            rule("openrouter/auto"),
+            None,
+            "negative prices are not zero"
+        );
 
         let free = filter_models(&models, true, &[]);
         assert_eq!(free.len(), 3);
@@ -2303,7 +2411,10 @@ mod tests {
         );
         let super_ = filter_models(&models, true, &["super".to_string(), "  ".to_string()]);
         assert_eq!(super_.len(), 1);
-        assert_eq!(filter_models(&models, false, &["paid".to_string()]).len(), 1);
+        assert_eq!(
+            filter_models(&models, false, &["paid".to_string()]).len(),
+            1
+        );
         assert!(parse_model_listing("{}").is_err());
         assert!(parse_model_listing("nope").is_err());
     }
@@ -2331,10 +2442,19 @@ mod tests {
             free: true,
             matches: vec!["nemotron".into()],
         };
-        let ids = resolve_models(&selection, &NimConfig::for_provider(Provider::OpenRouter), None).unwrap();
+        let ids = resolve_models(
+            &selection,
+            &NimConfig::for_provider(Provider::OpenRouter),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             ids,
-            vec!["first/explicit", "nvidia/nemotron-nano-y", "nvidia/nemotron-super-x:free"],
+            vec![
+                "first/explicit",
+                "nvidia/nemotron-nano-y",
+                "nvidia/nemotron-super-x:free"
+            ],
             "explicit ids first, then the listing, without duplicates"
         );
         let empty = ModelSelection::default();

@@ -988,7 +988,11 @@ mod tests {
         let dir = tempdir("routing");
         let len = 64 * 1024;
         let contents: Vec<Vec<u8>> = (0..4u8)
-            .map(|r| (0..len).map(|i| ((i * 31 + 7) % 251) as u8 ^ (r * 64)).collect())
+            .map(|r| {
+                (0..len)
+                    .map(|i| ((i * 31 + 7) % 251) as u8 ^ (r * 64))
+                    .collect()
+            })
             .collect();
         let paths: Vec<PathBuf> = contents
             .iter()
@@ -1250,7 +1254,9 @@ mod tests {
         #[cfg(not(feature = "peregrine-uring"))]
         assert_eq!(set.backend(), Backend::Threaded);
         let want = set.read_serial(Region::new(0, 64 * 1024)).expect("serial");
-        let got = set.read_striped(Region::new(0, 64 * 1024)).expect("striped");
+        let got = set
+            .read_striped(Region::new(0, 64 * 1024))
+            .expect("striped");
         assert_eq!(got, want);
         let stats = set.stats();
         assert_eq!(
