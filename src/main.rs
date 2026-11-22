@@ -1431,171 +1431,174 @@ enum LmAction {
     },
 }
 
-// The variants cannot be boxed without a second round of destructuring, and
-// `Train` legitimately carries every training flag.
+// Keep image-training's argument builder in a separate call frame so
+// subcommands do not reserve stack space for its flags while they parse.
+#[derive(clap::Args)]
+struct ImageTrainArgs {
+    /// Dataset: synthetic | cifar100 | tiny-imagenet. Repeatable
+    /// (roadmap 29.1): several sources train in one run, weighted by
+    /// `--dataset-weights` and combined per `--mix`. Every source must
+    /// share the image size and label count.
+    #[arg(long, default_value = "synthetic", action = clap::ArgAction::Append)]
+    dataset: Vec<String>,
+    /// Directory holding a dataset's `.bin` splits; repeat once per
+    /// `--dataset` that needs one, in the same order.
+    #[arg(long, action = clap::ArgAction::Append)]
+    data_dir: Vec<PathBuf>,
+    /// Weights over the datasets, e.g. `0.7,0.3`; empty is uniform.
+    #[arg(long, default_value = "")]
+    dataset_weights: String,
+    /// mixture (each batch from one source, drawn by weight) |
+    /// composite (every batch sliced from every source).
+    #[arg(long, default_value = "mixture")]
+    mix: String,
+    /// Stream records from disk instead of loading the split into memory.
+    #[arg(long, default_value_t = false)]
+    streaming: bool,
+    /// Objective: dblock | consistency | flow | distill.
+    #[arg(long, default_value = "dblock")]
+    objective: String,
+    /// Frozen teacher checkpoint for `--objective distill`. Repeatable
+    /// (roadmap 29.2): several teachers distil at once, weighted by
+    /// `--teacher-weights`.
+    #[arg(long, action = clap::ArgAction::Append)]
+    teacher: Vec<PathBuf>,
+    /// Weights over the teachers; empty is uniform.
+    #[arg(long, default_value = "")]
+    teacher_weights: String,
+    #[arg(long, default_value_t = 32)]
+    image_size: usize,
+    #[arg(long, default_value_t = 100)]
+    num_labels: usize,
+    #[arg(long, default_value_t = 3)]
+    num_blocks: usize,
+    /// Sigma window extension factor.
+    #[arg(long, default_value_t = 0.05)]
+    gamma: f64,
+    #[arg(long, default_value_t = 128)]
+    batch_size: usize,
+    #[arg(long, default_value_t = 0.001)]
+    lr: f64,
+    #[arg(long, default_value_t = 0.01)]
+    weight_decay: f64,
+    #[arg(long, default_value_t = 200)]
+    steps: usize,
+    #[arg(long, default_value_t = 20)]
+    log_every: usize,
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
+    /// Directory for content-addressed checkpoints.
+    #[arg(long, default_value = "checkpoints")]
+    out_dir: String,
+    /// Optional JSONL metrics file (one object per logged step).
+    #[arg(long)]
+    log_file: Option<String>,
+    /// Checkpoint activations during backward to reduce peak memory.
+    #[arg(long, default_value_t = false)]
+    grad_checkpointing: bool,
+    /// Save the checkpoint on a background thread.
+    #[arg(long, default_value_t = false)]
+    async_save: bool,
+    /// Resume from this checkpoint, or from the newest one in `--out-dir`
+    /// when passed without a value. The training state beside the model
+    /// (optimizer, schedules, RNG, EMA, estimators) is restored and
+    /// verified when present, so the continuation is exact.
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    resume: Option<String>,
+    /// Also write a checkpoint (model + training state) every n steps.
+    #[arg(long, default_value_t = 0)]
+    checkpoint_every: usize,
+    /// Relabel this fraction of every batch with a wrong class and charge
+    /// the model for believing it (roadmap 31.3): negative supervision
+    /// for the image trunk. 0 is off.
+    #[arg(long, default_value_t = 0.0)]
+    synthetic_negatives: f64,
+    /// Coefficient on the negative charge.
+    #[arg(long, default_value_t = 1.0)]
+    negative_penalty: f32,
+    /// Disable every training-time quality check.
+    #[arg(long, default_value_t = false)]
+    no_checks: bool,
+    /// Skip the pre-training certificate check.
+    #[arg(long, default_value_t = false)]
+    no_preflight: bool,
+    /// Re-verify the live model every n steps (0 = never).
+    #[arg(long, default_value_t = 0)]
+    verify_every: usize,
+    /// Boxes-of-experts spec (JSON). Enables Mixture of Specialized Micro
+    /// Experts in the trunk.
+    #[arg(long, conflicts_with = "moe_every")]
+    mosme_spec: Option<PathBuf>,
+    /// Which trunk layers get expert boxes.
+    #[arg(long, default_value_t = 2)]
+    mosme_every: usize,
+    /// Where to write the expert index; defaults to alongside the checkpoint.
+    #[arg(long)]
+    index_out: Option<PathBuf>,
+    /// Learning-rate schedule: constant | cosine | warmup.
+    #[arg(long, default_value = "constant")]
+    lr_schedule: String,
+    /// Micro-batches per optimizer step.
+    #[arg(long, default_value_t = 1)]
+    accumulate: usize,
+    /// Rescale gradients whose global norm exceeds this.
+    #[arg(long)]
+    clip_norm: Option<f32>,
+    /// Keep an exponential moving average of the weights and return it.
+    #[arg(long)]
+    ema_decay: Option<f64>,
+    /// Normalize each block's loss onto a common scale.
+    #[arg(long, default_value_t = false)]
+    normalize_block_loss: bool,
+    /// Auxiliary balance-loss weight schedule: constant | anneal.
+    /// Annealing holds the weight high while routing collapse is the risk,
+    /// then decays it so it stops fighting expert specialization.
+    #[arg(long, default_value = "constant")]
+    balance_schedule: String,
+    /// Starting weight for `--balance-schedule`.
+    #[arg(long, default_value_t = 0.01)]
+    balance_weight: f64,
+    /// Over which batch the balance loss measures expert load
+    /// (roadmap 23.4): micro | global. `global` averages the load over
+    /// the `--accumulate` window so the router is not pushed to balance
+    /// every micro-batch on its own, which inhibits specialization.
+    #[arg(long, default_value = "micro")]
+    balance_scope: String,
+    /// Loss-free bias balancing (roadmap 23.5): move each router's
+    /// selection bias by this much per step against its observed load.
+    /// `0` is off. DeepSeek-V3 uses 1e-3.
+    #[arg(long, default_value_t = 0.0)]
+    bias_balance_rate: f32,
+    /// Router z-loss weight (ST-MoE). Penalizes large routing logits,
+    /// which the balance loss cannot see — the softmax is invariant to a
+    /// per-row constant shift. `0.0` disables it exactly.
+    #[arg(long, default_value_t = 1e-3)]
+    z_level: f64,
+    /// Learned per-sigma uncertainty weighting, in [0, 1] (roadmap 20.5).
+    /// `0.0` is the exact identity. At its optimum the gradient becomes
+    /// that of log-loss, which no per-sigma rescaling can unbalance.
+    #[arg(long, default_value_t = 0.0)]
+    uncertainty: f64,
+    /// CDF bins for sigma importance sampling (roadmap 20.6). `0` disables
+    /// it; a cold sampler is exactly plain sampling in any case.
+    #[arg(long, default_value_t = 0)]
+    importance_bins: usize,
+    /// Replace every n-th layer's MLP with a flat mixture of experts.
+    #[arg(long)]
+    moe_every: Option<usize>,
+    #[arg(long, default_value_t = 4)]
+    moe_experts: usize,
+    #[arg(long, default_value_t = 1)]
+    moe_top_k: usize,
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Print the versioned file-channel contract built into this runtime.
     InteropContract,
     /// Block-wise training.
-    Train {
-        /// Dataset: synthetic | cifar100 | tiny-imagenet. Repeatable
-        /// (roadmap 29.1): several sources train in one run, weighted by
-        /// `--dataset-weights` and combined per `--mix`. Every source must
-        /// share the image size and label count.
-        #[arg(long, default_value = "synthetic", action = clap::ArgAction::Append)]
-        dataset: Vec<String>,
-        /// Directory holding a dataset's `.bin` splits; repeat once per
-        /// `--dataset` that needs one, in the same order.
-        #[arg(long, action = clap::ArgAction::Append)]
-        data_dir: Vec<PathBuf>,
-        /// Weights over the datasets, e.g. `0.7,0.3`; empty is uniform.
-        #[arg(long, default_value = "")]
-        dataset_weights: String,
-        /// mixture (each batch from one source, drawn by weight) |
-        /// composite (every batch sliced from every source).
-        #[arg(long, default_value = "mixture")]
-        mix: String,
-        /// Stream records from disk instead of loading the split into memory.
-        #[arg(long, default_value_t = false)]
-        streaming: bool,
-        /// Objective: dblock | consistency | flow | distill.
-        #[arg(long, default_value = "dblock")]
-        objective: String,
-        /// Frozen teacher checkpoint for `--objective distill`. Repeatable
-        /// (roadmap 29.2): several teachers distil at once, weighted by
-        /// `--teacher-weights`.
-        #[arg(long, action = clap::ArgAction::Append)]
-        teacher: Vec<PathBuf>,
-        /// Weights over the teachers; empty is uniform.
-        #[arg(long, default_value = "")]
-        teacher_weights: String,
-        #[arg(long, default_value_t = 32)]
-        image_size: usize,
-        #[arg(long, default_value_t = 100)]
-        num_labels: usize,
-        #[arg(long, default_value_t = 3)]
-        num_blocks: usize,
-        /// Sigma window extension factor.
-        #[arg(long, default_value_t = 0.05)]
-        gamma: f64,
-        #[arg(long, default_value_t = 128)]
-        batch_size: usize,
-        #[arg(long, default_value_t = 0.001)]
-        lr: f64,
-        #[arg(long, default_value_t = 0.01)]
-        weight_decay: f64,
-        #[arg(long, default_value_t = 200)]
-        steps: usize,
-        #[arg(long, default_value_t = 20)]
-        log_every: usize,
-        #[arg(long, default_value_t = 42)]
-        seed: u64,
-        /// Directory for content-addressed checkpoints.
-        #[arg(long, default_value = "checkpoints")]
-        out_dir: String,
-        /// Optional JSONL metrics file (one object per logged step).
-        #[arg(long)]
-        log_file: Option<String>,
-        /// Checkpoint activations during backward to reduce peak memory.
-        #[arg(long, default_value_t = false)]
-        grad_checkpointing: bool,
-        /// Save the checkpoint on a background thread.
-        #[arg(long, default_value_t = false)]
-        async_save: bool,
-        /// Resume from this checkpoint, or from the newest one in `--out-dir`
-        /// when passed without a value. The training state beside the model
-        /// (optimizer, schedules, RNG, EMA, estimators) is restored and
-        /// verified when present, so the continuation is exact.
-        #[arg(long, num_args = 0..=1, default_missing_value = "")]
-        resume: Option<String>,
-        /// Also write a checkpoint (model + training state) every n steps.
-        #[arg(long, default_value_t = 0)]
-        checkpoint_every: usize,
-        /// Relabel this fraction of every batch with a wrong class and charge
-        /// the model for believing it (roadmap 31.3): negative supervision
-        /// for the image trunk. 0 is off.
-        #[arg(long, default_value_t = 0.0)]
-        synthetic_negatives: f64,
-        /// Coefficient on the negative charge.
-        #[arg(long, default_value_t = 1.0)]
-        negative_penalty: f32,
-        /// Disable every training-time quality check.
-        #[arg(long, default_value_t = false)]
-        no_checks: bool,
-        /// Skip the pre-training certificate check.
-        #[arg(long, default_value_t = false)]
-        no_preflight: bool,
-        /// Re-verify the live model every n steps (0 = never).
-        #[arg(long, default_value_t = 0)]
-        verify_every: usize,
-        /// Boxes-of-experts spec (JSON). Enables Mixture of Specialized Micro
-        /// Experts in the trunk.
-        #[arg(long, conflicts_with = "moe_every")]
-        mosme_spec: Option<PathBuf>,
-        /// Which trunk layers get expert boxes.
-        #[arg(long, default_value_t = 2)]
-        mosme_every: usize,
-        /// Where to write the expert index; defaults to alongside the checkpoint.
-        #[arg(long)]
-        index_out: Option<PathBuf>,
-        /// Learning-rate schedule: constant | cosine | warmup.
-        #[arg(long, default_value = "constant")]
-        lr_schedule: String,
-        /// Micro-batches per optimizer step.
-        #[arg(long, default_value_t = 1)]
-        accumulate: usize,
-        /// Rescale gradients whose global norm exceeds this.
-        #[arg(long)]
-        clip_norm: Option<f32>,
-        /// Keep an exponential moving average of the weights and return it.
-        #[arg(long)]
-        ema_decay: Option<f64>,
-        /// Normalize each block's loss onto a common scale.
-        #[arg(long, default_value_t = false)]
-        normalize_block_loss: bool,
-        /// Auxiliary balance-loss weight schedule: constant | anneal.
-        /// Annealing holds the weight high while routing collapse is the risk,
-        /// then decays it so it stops fighting expert specialization.
-        #[arg(long, default_value = "constant")]
-        balance_schedule: String,
-        /// Starting weight for `--balance-schedule`.
-        #[arg(long, default_value_t = 0.01)]
-        balance_weight: f64,
-        /// Over which batch the balance loss measures expert load
-        /// (roadmap 23.4): micro | global. `global` averages the load over
-        /// the `--accumulate` window so the router is not pushed to balance
-        /// every micro-batch on its own, which inhibits specialization.
-        #[arg(long, default_value = "micro")]
-        balance_scope: String,
-        /// Loss-free bias balancing (roadmap 23.5): move each router's
-        /// selection bias by this much per step against its observed load.
-        /// `0` is off. DeepSeek-V3 uses 1e-3.
-        #[arg(long, default_value_t = 0.0)]
-        bias_balance_rate: f32,
-        /// Router z-loss weight (ST-MoE). Penalizes large routing logits,
-        /// which the balance loss cannot see — the softmax is invariant to a
-        /// per-row constant shift. `0.0` disables it exactly.
-        #[arg(long, default_value_t = 1e-3)]
-        z_level: f64,
-        /// Learned per-sigma uncertainty weighting, in [0, 1] (roadmap 20.5).
-        /// `0.0` is the exact identity. At its optimum the gradient becomes
-        /// that of log-loss, which no per-sigma rescaling can unbalance.
-        #[arg(long, default_value_t = 0.0)]
-        uncertainty: f64,
-        /// CDF bins for sigma importance sampling (roadmap 20.6). `0` disables
-        /// it; a cold sampler is exactly plain sampling in any case.
-        #[arg(long, default_value_t = 0)]
-        importance_bins: usize,
-        /// Replace every n-th layer's MLP with a flat mixture of experts.
-        #[arg(long)]
-        moe_every: Option<usize>,
-        #[arg(long, default_value_t = 4)]
-        moe_experts: usize,
-        #[arg(long, default_value_t = 1)]
-        moe_top_k: usize,
-    },
+    Train(Box<ImageTrainArgs>),
     /// Run diffusion sampling and print predictions for one batch.
     Sample {
         #[command(flatten)]
@@ -3683,7 +3686,7 @@ fn main() -> Result<()> {
                 CheatHarnessAction::Status { registry } => cmd_cheat_harness_status(&registry),
             },
         },
-        command @ Command::Train { .. } => cmd_train(command),
+        Command::Train(args) => cmd_train(*args),
         command @ Command::Sample { .. } => cmd_sample(command),
         Command::Bench {
             model,
@@ -7738,8 +7741,8 @@ fn cmd_verify(group: Option<&str>) -> Result<()> {
 }
 
 #[allow(clippy::too_many_lines)]
-fn cmd_train(command: Command) -> Result<()> {
-    let Command::Train {
+fn cmd_train(args: ImageTrainArgs) -> Result<()> {
+    let ImageTrainArgs {
         dataset,
         data_dir,
         dataset_weights,
@@ -7787,10 +7790,7 @@ fn cmd_train(command: Command) -> Result<()> {
         moe_every,
         moe_experts,
         moe_top_k,
-    } = command
-    else {
-        anyhow::bail!("internal error: cmd_train dispatched with a command other than `train`");
-    };
+    } = args;
 
     let out_path = Path::new(&out_dir).to_path_buf();
     // `--resume` with no value means "the newest checkpoint in --out-dir".
