@@ -13,8 +13,9 @@ use crate::ncm::tokenizer::train::{
     IntentLoss, IntentReader, TokenizerTrainConfig, TokenizerTrainReport,
 };
 use crate::ncm::tokenizer::NcmTokenizerConfig;
-use anyhow::Result;
+use anyhow::{ensure, Context as _, Result};
 use burn::tensor::backend::Backend;
+use burn::tensor::{Int, Tensor};
 use burn_autodiff::Autodiff;
 use clap::{Args, Subcommand};
 use std::path::PathBuf;
@@ -48,6 +49,8 @@ pub enum TokenizerAction {
     Train(Box<TokenizerTrainArgs>),
     /// Evaluate a saved tokenizer on held-out corpora.
     Eval(TokenizerEvalArgs),
+    /// Reconstruct supplied token IDs through the saved codec.
+    Reconstruct(TokenizerReconstructArgs),
 }
 
 /// Flags of `ncm tokenizer train`.
@@ -143,11 +146,25 @@ pub struct TokenizerEvalArgs {
     pub batch_size: usize,
 }
 
+/// Flags of `ncm tokenizer reconstruct`.
+#[derive(Args, Debug, Clone)]
+pub struct TokenizerReconstructArgs {
+    #[arg(long)]
+    pub checkpoint: PathBuf,
+    /// JSON array of equal-length arrays of input token IDs.
+    #[arg(long)]
+    pub token_ids: PathBuf,
+    /// Write the reconstructed token IDs as a JSON array of arrays.
+    #[arg(long)]
+    pub out: PathBuf,
+}
+
 /// What an `ncm` action produced.
 #[derive(Debug, Clone)]
 pub enum NcmReport {
     TokenizerTrain(Box<TokenizerTrainReport>),
     TokenizerEval(EvalReport),
+    TokenizerReconstruct(String),
     GeneratorTrain(Box<GeneratorTrainSummary>),
     Generate(Box<GenerateSummary>),
     Released(String),
@@ -161,7 +178,7 @@ impl NcmReport {
             Self::TokenizerEval(report) => report.render(),
             Self::GeneratorTrain(report) => report.render(),
             Self::Generate(report) => report.render(),
-            Self::Released(report) => report.clone(),
+            Self::TokenizerReconstruct(report) | Self::Released(report) => report.clone(),
         }
     }
 }
@@ -257,6 +274,9 @@ pub fn run_native<B: Backend<FloatElem = f32>>(
                 )?;
                 Ok(NcmReport::TokenizerEval(report))
             }
+            TokenizerAction::Reconstruct(args) => {
+                reconstruct_tokenizer::<B>(args, device).map(NcmReport::TokenizerReconstruct)
+            }
         },
         NcmAction::Train(args) => train_generator_cli::<B>(*args, device, progress)
             .map(|r| NcmReport::GeneratorTrain(Box::new(r))),
@@ -267,6 +287,43 @@ pub fn run_native<B: Backend<FloatElem = f32>>(
             anyhow::bail!("converted release inference and tuning require the CPU runtime")
         }
     }
+}
+
+fn reconstruct_tokenizer<B: Backend<FloatElem = f32>>(
+    args: TokenizerReconstructArgs,
+    device: &B::Device,
+) -> Result<String> {
+    use crate::ncm::ConceptCodec as _;
+
+    let codec = load_tokenizer::<B>(&args.checkpoint, device)?;
+    let raw = std::fs::read(&args.token_ids)
+        .with_context(|| format!("read {}", args.token_ids.display()))?;
+    let rows: Vec<Vec<u16>> =
+        serde_json::from_slice(&raw).context("read target token ID windows")?;
+    let len = codec.schedule().seq_len();
+    ensure!(
+        !rows.is_empty()
+            && rows.iter().all(|row| {
+                row.len() == len && row.iter().all(|&id| usize::from(id) < codec.vocab_size())
+            }),
+        "each target needs {len} in-vocabulary token IDs"
+    );
+    let mut decoded = Vec::with_capacity(rows.len());
+    for batch in rows.chunks(16) {
+        let flat: Vec<i64> = batch.iter().flatten().map(|&id| i64::from(id)).collect();
+        let tokens =
+            Tensor::<B, 1, Int>::from_ints(flat.as_slice(), device).reshape([batch.len(), len]);
+        let codes = codec.encode(tokens)?;
+        let logits = codec.decode_logits(codec.reconstruct(&codes.codes, batch.len())?)?;
+        let values = logits.argmax(2).into_data();
+        let ids: Vec<i64> = values.iter::<i64>().collect();
+        decoded.extend(ids.chunks_exact(len).map(<[i64]>::to_vec));
+    }
+    crate::interop::write_atomic(&args.out, &serde_json::to_vec(&decoded)?)?;
+    Ok(format!(
+        "reconstructed {} windows of {len} tokens",
+        rows.len()
+    ))
 }
 
 // ------------------------------------------------- stage 2: generator --

@@ -997,6 +997,12 @@ struct PromptContext<B: Backend> {
     valid: Vec<bool>,
 }
 
+/// State shared by every level and candidate of one prompted generation.
+struct PreparedGeneration<B: Backend> {
+    prompt: PromptContext<B>,
+    metric: Tensor<B, 2>,
+}
+
 impl<B: Backend<FloatElem = f32>> NcmGenerator<B> {
     pub fn new(
         config: &NcmGeneratorConfig,
@@ -1249,7 +1255,7 @@ impl<B: Backend<FloatElem = f32>> NcmGenerator<B> {
         level: usize,
         zhat_coarser: Tensor<B, 3>,
         prompt: Option<&Tensor<B, 2, Int>>,
-        prepared: Option<&PromptContext<B>>,
+        prepared: Option<&PreparedGeneration<B>>,
         relax: &RelaxOptions,
     ) -> Result<LevelForward<B>> {
         relax.validate()?;
@@ -1267,11 +1273,11 @@ impl<B: Backend<FloatElem = f32>> NcmGenerator<B> {
         );
         let device = zhat_coarser.device();
         let attractors = self.attractors(codec, level)?;
-        let metric = self.full_metric();
+        let metric = prepared.map_or_else(|| self.full_metric(), |input| input.metric.clone());
         let u0 = self.initial_state(level, len, zhat_coarser)?;
         let fresh;
-        let context = if prepared.is_some() {
-            prepared
+        let context = if let Some(prepared) = prepared {
+            Some(&prepared.prompt)
         } else {
             fresh = prompt.map(|p| self.prompt_context(p, batch)).transpose()?;
             fresh.as_ref()
@@ -1848,7 +1854,7 @@ pub struct ConceptFieldLm<'a, B: Backend, C> {
     model: &'a NcmGenerator<B>,
     codec: &'a C,
     relax: RelaxOptions,
-    prepared_prompt: Option<PromptContext<B>>,
+    prepared: Option<PreparedGeneration<B>>,
     traces: RefCell<Vec<LevelTrace>>,
 }
 
@@ -1860,7 +1866,7 @@ impl<'a, B: Backend<FloatElem = f32>, C: SoftConceptCodec<B>> ConceptFieldLm<'a,
             model,
             codec,
             relax,
-            prepared_prompt: None,
+            prepared: None,
             traces: RefCell::new(Vec::new()),
         })
     }
@@ -1884,7 +1890,7 @@ impl<B: Backend<FloatElem = f32>, C: SoftConceptCodec<B>> LevelModel<B>
         zhat_coarser: Tensor<B, 3>,
         prompt: Option<Tensor<B, 2, Int>>,
     ) -> Result<Tensor<B, 3>> {
-        let forward = if let Some(prepared) = &self.prepared_prompt {
+        let forward = if let Some(prepared) = &self.prepared {
             self.model.forward_level_prepared(
                 self.codec,
                 level,
@@ -2339,9 +2345,12 @@ pub fn generate<B: Backend<FloatElem = f32>, C: SoftConceptCodec<B>>(
     relax.record_prompt = false;
     let counting_codec = CountingCodec::new(codec);
     let mut field = ConceptFieldLm::new(model, &counting_codec, relax)?;
-    // Every level and every MBR sample receives the same prompt here.
+    // Every level and MBR sample sees the same prompt and frozen metric.
     if let Some(prompt) = prompt.as_ref().filter(|p| !B::ad_enabled(&p.device())) {
-        field.prepared_prompt = Some(model.prompt_context(prompt, batch)?);
+        field.prepared = Some(PreparedGeneration {
+            prompt: model.prompt_context(prompt, batch)?,
+            metric: model.full_metric(),
+        });
     }
     let counted = CountingLevelModel::new(&field);
     let mut sample_tokens = Vec::with_capacity(options.mbr_samples);
@@ -4667,7 +4676,7 @@ pub fn certificates() -> Result<Vec<Certificate>> {
     Ok(vec![
         ncm_cert(
             "prepare_prompt_and_attractor_norms_preserves_logits",
-            "Reusing the fixed prompt and attractor norms gives bit-identical CPU logits to recomputing them at every level and latent step.",
+            "Reusing the fixed prompt, metric, and attractor norms gives bit-identical CPU logits to recomputing them at every level and latent step.",
             cert_invariant_reuse()?,
             0.0,
         ),
@@ -4764,7 +4773,10 @@ fn cert_invariant_reuse() -> Result<f64> {
     let device = Default::default();
     let prompt = cert_prompt(&device);
     let batch = prompt.dims()[0];
-    let prepared = model.prompt_context(&prompt, batch)?;
+    let prepared = PreparedGeneration {
+        prompt: model.prompt_context(&prompt, batch)?,
+        metric: model.full_metric(),
+    };
     let relax = RelaxOptions {
         steps: 3,
         record_states: true,
