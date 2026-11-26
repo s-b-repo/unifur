@@ -2149,6 +2149,11 @@ pub fn train_language_specialist<B: burn::tensor::backend::AutodiffBackend<Float
             dir.display(),
             state.kind
         );
+        anyhow::ensure!(
+            state.optimizer.is_some(),
+            "student resume requires optimizer state in {}; start a fresh run to change the optimizer",
+            dir.display()
+        );
         state.verify_files(&dir)?;
         anyhow::ensure!(
             checkpoint::same_datasets(&state.datasets, std::slice::from_ref(&dataset_identity)),
@@ -2248,17 +2253,6 @@ pub fn train_language_specialist<B: burn::tensor::backend::AutodiffBackend<Float
         let Some(dir) = &config.out_dir else {
             return Ok(None);
         };
-        let model_path = checkpoint::save_content_addressed(model.clone(), dir, "student")?;
-        let state_dir = TrainState::dir_for(&model_path);
-        if state_dir.exists() {
-            std::fs::remove_dir_all(&state_dir)
-                .with_context(|| format!("clear {}", state_dir.display()))?;
-        }
-        let optimizer = Some(checkpoint::save_record::<B, _>(
-            optim.to_record(),
-            &state_dir,
-            "optimizer",
-        )?);
         let extras = StudentExtras {
             steps_taken: report.steps_taken,
             steps_skipped: report.steps_skipped,
@@ -2272,24 +2266,36 @@ pub fn train_language_specialist<B: burn::tensor::backend::AutodiffBackend<Float
             loss_sum,
             elapsed_secs: elapsed,
         };
-        let state = TrainState {
-            format_version: checkpoint::STATE_FORMAT_VERSION,
-            kind: "student".into(),
-            step,
-            seed: config.seed,
-            host_rng: serde_json::to_value(rng).context("serialize host RNG")?,
-            config: config_json.clone(),
-            build: checkpoint::BuildInfo::current(),
-            datasets: vec![dataset_identity.clone()],
-            model: checkpoint::model_entry(&model_path)?,
-            optimizer,
-            ema: None,
-            head: None,
-            head_optimizer: None,
-            extras: serde_json::to_value(&extras).context("serialize student training extras")?,
-            saved_unix_secs: checkpoint::unix_now(),
-        };
-        state.write(&state_dir)?;
+        let model_path = checkpoint::save_training_checkpoint(
+            model.clone(),
+            dir,
+            "student",
+            |state_dir, model| {
+                let optimizer = Some(checkpoint::save_record::<B, _>(
+                    optim.to_record(),
+                    state_dir,
+                    "optimizer",
+                )?);
+                Ok(TrainState {
+                    format_version: checkpoint::STATE_FORMAT_VERSION,
+                    kind: "student".into(),
+                    step,
+                    seed: config.seed,
+                    host_rng: serde_json::to_value(rng).context("serialize host RNG")?,
+                    config: config_json.clone(),
+                    build: checkpoint::BuildInfo::current(),
+                    datasets: vec![dataset_identity.clone()],
+                    model,
+                    optimizer,
+                    ema: None,
+                    head: None,
+                    head_optimizer: None,
+                    extras: serde_json::to_value(&extras)
+                        .context("serialize student training extras")?,
+                    saved_unix_secs: checkpoint::unix_now(),
+                })
+            },
+        )?;
         Ok(Some(model_path))
     };
 
@@ -4047,6 +4053,24 @@ mod tests {
         .unwrap()
         .expect("training state beside the model");
         assert_eq!(state_b.step, 4);
+
+        let state_dir = TrainState::dir_for(&halfway);
+        let saved = TrainState::for_model(&halfway)
+            .unwrap()
+            .expect("intermediate training state");
+        let mut missing_optimizer = saved.clone();
+        missing_optimizer.optimizer = None;
+        missing_optimizer.write(&state_dir).unwrap();
+        let failed = SpecialistTrainConfig {
+            out_dir: Some(dir.join("no-optimizer")),
+            ..resumed
+        };
+        let error = train_language_specialist(init.clone(), &data, &failed, &device)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("requires optimizer state"), "{error}");
+        assert!(!dir.join("no-optimizer").exists());
+        saved.write(&state_dir).unwrap();
 
         // A different specialist may not continue the run.
         let wrong_language = SpecialistTrainConfig {

@@ -518,23 +518,34 @@ where
         return 1.0;
     }
     let scale = max_norm / total_norm;
+    scale_gradients(grads, module, scale);
+    scale
+}
 
-    let mut visitor = ClipVisitor::<B> {
+/// Apply a scalar to every present parameter gradient.
+pub(crate) fn scale_gradients<B, M>(grads: &mut GradientsParams, module: &M, scale: f32)
+where
+    B: AutodiffBackend<FloatElem = f32>,
+    M: AutodiffModule<B>,
+{
+    if scale == 1.0 {
+        return;
+    }
+    let mut visitor = ScaleVisitor::<B> {
         grads,
         scale,
         _backend: std::marker::PhantomData,
     };
     module.visit(&mut visitor);
-    scale
 }
 
-struct ClipVisitor<'a, B: AutodiffBackend> {
+struct ScaleVisitor<'a, B: AutodiffBackend> {
     grads: &'a mut GradientsParams,
     scale: f32,
     _backend: std::marker::PhantomData<B>,
 }
 
-impl<B: AutodiffBackend<FloatElem = f32>> burn::module::ModuleVisitor<B> for ClipVisitor<'_, B> {
+impl<B: AutodiffBackend<FloatElem = f32>> burn::module::ModuleVisitor<B> for ScaleVisitor<'_, B> {
     fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
         if let Some(grad) = self.grads.remove::<B::InnerBackend, D>(param.id) {
             self.grads

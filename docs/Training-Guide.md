@@ -168,6 +168,68 @@ latent updates. It uses isolated Subnext stores for the context controls
 and writes the pass or fail report and fingerprints to `report.json`.
 [Evaluator source](../experiments/model_matrix/nina_release.py)
 
+### Native research controls
+
+Use `dblocks nina research check-grader` to check the seven pinned numeric
+fixtures. `compare` scores a single greedy output per case under a shared
+limit. The report keeps every planned case in its denominator and records
+strict correctness, semantic correctness, output status, paired gains and
+losses, and joint correctness on reworded and answer-changing pairs. The
+`runtime` command crosses two checkpoints with two runtimes using the same
+case plan. Use its per-case output comparison to detect changes that leave
+aggregate accuracy unchanged.
+
+`first-draws` joins the first prediction for every scheduled case, with
+coverage broken out by skill or length slice. Its report records pending
+draws, timeouts and incomplete outputs. Wait for its readiness flag before
+spending a retry budget. The archived capped pass decoded 58 of 96 prompts,
+including ten multiplication prompts and zero division prompts. `early-rank`
+requires both rungs to cover every candidate and seed on the same cohort.
+The historical science ranking reversed all three pairs from 60 to 120
+updates, so use the early screen for integrity and minimum-quality checks.
+
+```bash
+RAYON_NUM_THREADS=2 MATMUL_NUM_THREADS=2 dblocks nina research arithmetic \
+  --cases experiments/nina_research/arithmetic-cases.json \
+  --out-dir runs/arithmetic-96
+```
+
+The CPU pilot checks arithmetic independently and rejects any additive or
+multiplicative family shared by training and development. It fits two seeds
+with verified labels and two matched scrambled controls. The controls keep
+the same answer histogram, byte lengths and supervised positions. The run
+directory records the protocol before fitting, every attempt's elapsed time,
+the checkpoint digests, and the two CPU readouts for each fit. Use
+`--prepare-only` to inspect the protocol and byte masks before scheduling fits.
+
+Advancement requires both solver seeds to beat the train-only majority and
+their matched controls on canonical cases, improve on alternate phrasing,
+and answer both members of at least one answer-changing pair. In the original
+research the 384-step solver arms got 4/96 and 3/96, with zero jointly correct
+answer-changing pairs. Both fit all ten repeated training mappings. The
+result closed that recipe at development.
+
+`science-screen --development PATH --out-dir DIR` preserves unabridged
+science prompts, supplies the first- and longest-answer reference scores,
+and prepares four-choice rotations for `positions`. The historical 256-byte
+screen included 131 of 297 cases. The full plan retains the over-width slice
+for a longer-context evaluation. `long-record-validation --source PACK
+--out-dir DIR` verifies the existing byte pack, excludes normalized stems
+seen in raw training, and emits aligned and codec validation views together.
+The historical pack yielded 7,531 clean rows and a 384-row stratified screen.
+Treat both fast screens as development evidence. The retained research plan
+defines the separate family-disjoint confirmation gate.
+
+During a dense masked `lm train --accumulate N` run, `--accumulation-weighting
+auto` pools the loss and gradients over the accepted supervised targets.
+`tokens` requires a poolable objective, and `microbatches` selects the
+equal-window weighting. Resuming uses the reduction recorded in the sidecar.
+Keep the optimizer and state JSON with the weight file. LM and student
+snapshots retain distinct training boundaries when canonical weights repeat.
+The archived control measured the difference using windows with six and ten
+targets. Compare effective target exposure before interpreting a throughput or
+accuracy change. [Accumulation study](https://huggingface.co/blog/gradient_accumulation)
+
 ### Converted XSum checkpoints
 
 The native Rust CLI also loads the converted Hazy Research XSum release with

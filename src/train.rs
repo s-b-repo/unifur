@@ -24,7 +24,7 @@ use crate::{
     rawdata::RawImageDataset,
     reweight::{LogVarianceHead, SigmaImportanceSampler, UncertaintyWeighting},
     schedule::BalanceSchedule,
-    schedule::{BalanceScope, Ema, GlobalLoad, GradientAccumulator, LossScales, LrSchedule},
+    schedule::{BalanceScope, Cycle, Ema, GlobalLoad, GradientAccumulator, LossScales, LrSchedule},
     vit::ViTDiTConfig,
 };
 use crate::{
@@ -1862,6 +1862,20 @@ fn default_accumulate() -> usize {
     1
 }
 
+/// How a language-model optimizer step combines its microbatches.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LmAccumulationWeighting {
+    /// Pool targets when accumulating supported masked and graded SFT.
+    /// Resumes use the checkpoint's weighting, including legacy sidecars.
+    #[default]
+    Auto,
+    /// Pool the masked loss numerator and total supervised target weight.
+    Tokens,
+    /// Give every scheduled microbatch the same weight.
+    Microbatches,
+}
+
 /// Configuration for [`train_lm`] (roadmap Phase 24).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LmTrainConfig {
@@ -1872,10 +1886,12 @@ pub struct LmTrainConfig {
     /// image loop). `Constant` at the peak reproduces the old fixed-lr loop.
     #[serde(default = "default_lm_lr_schedule")]
     pub lr_schedule: LrSchedule,
-    /// Micro-batches per optimizer step, averaged not summed (roadmap 20.2).
-    /// `1` steps on every micro-batch, exactly as before.
+    /// Microbatches per optimizer step. `1` steps on every microbatch.
     #[serde(default = "default_accumulate")]
     pub accumulate: usize,
+    /// Denominator used to pool microbatch losses and gradients.
+    #[serde(default)]
+    pub accumulation_weighting: LmAccumulationWeighting,
     /// Rescale the accumulated gradient above this global norm (roadmap
     /// 20.3). `0.0` disables clipping exactly.
     #[serde(default)]
@@ -1931,6 +1947,7 @@ impl Default for LmTrainConfig {
             lr: 3e-4,
             lr_schedule: default_lm_lr_schedule(),
             accumulate: default_accumulate(),
+            accumulation_weighting: LmAccumulationWeighting::default(),
             clip_norm: 0.0,
             ema_decay: None,
             weight_decay: 0.01,
@@ -2112,6 +2129,318 @@ fn validate_lm_resume_scope(
     Ok(())
 }
 
+fn resolve_lm_accumulation_weighting(
+    requested: LmAccumulationWeighting,
+    prefer_tokens: bool,
+    supports_tokens: bool,
+    restored: Option<&TrainState>,
+) -> anyhow::Result<LmAccumulationWeighting> {
+    use LmAccumulationWeighting::{Auto, Microbatches, Tokens};
+    let saved = restored
+        .map(|state| {
+            let saved = state
+                .config
+                .get("accumulation_weighting")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .context("parse LM checkpoint accumulation weighting")?
+                .unwrap_or(Microbatches);
+            anyhow::ensure!(
+                saved != Auto,
+                "LM checkpoint has unresolved accumulation weighting"
+            );
+            Ok::<_, anyhow::Error>(saved)
+        })
+        .transpose()?;
+    let resolved = match (requested, saved) {
+        (Auto, Some(saved)) => saved,
+        (Auto, None) if prefer_tokens && supports_tokens => Tokens,
+        (Auto, None) => Microbatches,
+        (requested, Some(saved)) => {
+            anyhow::ensure!(
+                requested == saved,
+                "checkpoint accumulation weighting is {saved:?}; use it for resume or use base weights for a new optimizer"
+            );
+            saved
+        }
+        (requested, None) => requested,
+    };
+    anyhow::ensure!(
+        resolved != Tokens || supports_tokens,
+        "token-weighted accumulation requires a dense LM with dropout off, plain next-token loss and live final weights"
+    );
+    Ok(resolved)
+}
+
+/// One LM optimizer window. Numerical weighting and reporting use the same
+/// numerator and denominator, then clipping is applied to the pooled gradient.
+struct LmCycle {
+    gradients: GradientAccumulator,
+    pool_targets: bool,
+    denominator: f64,
+    loss: f64,
+    nll: f64,
+    last: Option<(crate::lm::LmMetrics, Vec<crate::moe::RoutingStats>)>,
+}
+
+struct LmUpdate {
+    gradients: GradientsParams,
+    metrics: crate::lm::LmMetrics,
+    routing: Vec<crate::moe::RoutingStats>,
+}
+
+impl LmCycle {
+    fn new(every: usize, weighting: LmAccumulationWeighting) -> Self {
+        Self {
+            gradients: GradientAccumulator::new(every),
+            pool_targets: weighting == LmAccumulationWeighting::Tokens && every > 1,
+            denominator: 0.0,
+            loss: 0.0,
+            nll: 0.0,
+            last: None,
+        }
+    }
+
+    fn fold<B: AutodiffBackend<FloatElem = f32>>(
+        &mut self,
+        step: crate::lm::LmStep<B>,
+        model: &LanguageModel<B>,
+        trainable: &crate::mosme::TrainableSet,
+    ) -> anyhow::Result<Option<LmUpdate>> {
+        let (weight, numerator_scale, loss) = if self.pool_targets {
+            let weight = f64::from(step.target_weight.into_scalar());
+            anyhow::ensure!(
+                weight.is_finite() && weight > 0.0,
+                "invalid LM target weight {weight}"
+            );
+            // Each step's local mean divided by max(weight, 1). Undo that
+            // divisor before adding its contribution to the pool.
+            let local_divisor = weight.max(1.0);
+            (weight, local_divisor, step.cross_entropy_sum)
+        } else {
+            let loss = if self.gradients.every() > 1 {
+                step.loss.mul_scalar(self.gradients.loss_scale() as f32)
+            } else {
+                step.loss
+            };
+            (1.0, 1.0, loss)
+        };
+        self.denominator += weight;
+        self.loss += f64::from(step.metrics.loss) * numerator_scale;
+        self.nll += f64::from(step.metrics.perplexity.ln()) * numerator_scale;
+        self.last = Some((step.metrics, step.routing));
+        let grads = trainable.gradients(&mut loss.backward(), model);
+        let cycle = self.gradients.fold(grads, model);
+        self.finish(cycle, model)
+    }
+
+    fn skip<B: AutodiffBackend<FloatElem = f32>>(
+        &mut self,
+        model: &LanguageModel<B>,
+    ) -> anyhow::Result<Option<LmUpdate>> {
+        let cycle = self.gradients.skip();
+        self.finish(cycle, model)
+    }
+
+    fn finish<B: AutodiffBackend<FloatElem = f32>>(
+        &mut self,
+        cycle: Cycle,
+        model: &LanguageModel<B>,
+    ) -> anyhow::Result<Option<LmUpdate>> {
+        let Cycle::Ready(gradients) = cycle else {
+            return Ok(None);
+        };
+        let last = self.last.take();
+        let denominator = std::mem::take(&mut self.denominator).max(1.0);
+        let loss = std::mem::take(&mut self.loss);
+        let nll = std::mem::take(&mut self.nll);
+        let Some(mut gradients) = gradients else {
+            return Ok(None);
+        };
+        let (mut metrics, routing) = last.context("LM cycle completed without its loss metrics")?;
+        if self.pool_targets {
+            crate::schedule::scale_gradients(&mut gradients, model, denominator.recip() as f32);
+        }
+        metrics.loss = (loss / denominator) as f32;
+        metrics.perplexity = (nll / denominator).exp() as f32;
+        Ok(Some(LmUpdate {
+            gradients,
+            metrics,
+            routing,
+        }))
+    }
+}
+
+/// Residuals against a fused loss and a same-shape summed gradient on fixed
+/// six- and ten-target windows. The legacy reduction is a negative control.
+pub(crate) fn lm_masked_accumulation_residuals() -> anyhow::Result<(f64, f64, f64)> {
+    use burn::module::{ModuleVisitor, Param};
+    use burn::tensor::{backend::Backend, Int};
+    type B = DefaultTrainBackend;
+
+    let device = Default::default();
+    let config = crate::lm::LmConfig {
+        context: 16,
+        hidden_size: 32,
+        num_layers: 2,
+        num_blocks: 1,
+        num_heads: 4,
+        intermediate_size: 64,
+        positions: crate::hybrid::PositionKind::Rotary,
+        ..crate::lm::LmConfig::tiny()
+    };
+    B::seed(&device, 42);
+    let initial = LanguageModel::<B>::new(&config, &device)?;
+    crate::tensor_ext::force_initialization(&initial);
+    let windows = Tensor::<B, 2, Int>::from_ints(
+        [*b"Answer is 17.   ", *b"Value is -42.   "].map(|row| row.map(i64::from)),
+        &device,
+    );
+    let masks = Tensor::<B, 2>::from_floats(
+        [
+            [
+                0., 0., 0., 0., 0., 0., 0., 1., 1., 1., 1., 1., 1., 0., 0., 0.,
+            ],
+            [
+                0., 0., 0., 1., 1., 1., 1., 1., 1., 1., 1., 1., 1., 0., 0., 0.,
+            ],
+        ],
+        &device,
+    );
+    let span = 0..initial.num_layers();
+    let trainable = crate::mosme::TrainableSet::all();
+    let objective = |model: &LanguageModel<B>, row: Option<usize>| {
+        let (tokens, mask) = row.map_or_else(
+            || (windows.clone(), masks.clone()),
+            |row| {
+                (
+                    windows.clone().narrow(0, row, 1),
+                    masks.clone().narrow(0, row, 1),
+                )
+            },
+        );
+        model.next_token_step_masked(tokens, mask, crate::lm::LmExtras::plain(), span.clone())
+    };
+    let pooled_model = initial.clone();
+    let pooled = LmCycle::new(1, LmAccumulationWeighting::Tokens)
+        .fold(objective(&pooled_model, None), &pooled_model, &trainable)?
+        .context("pooled checkpoint fixture did not produce an optimizer update")?;
+    let accumulated = |weighting, steps: usize| -> anyhow::Result<LmUpdate> {
+        let model = initial.clone();
+        let mut cycle = LmCycle::new(steps, weighting);
+        let first = objective(&model, Some(0));
+        anyhow::ensure!(
+            first.metrics.tokens_counted == 6,
+            "accumulation fixture changed its first target count"
+        );
+        anyhow::ensure!(cycle.fold(first, &model, &trainable)?.is_none());
+        if steps == 3 {
+            anyhow::ensure!(cycle.skip(&model)?.is_none());
+        }
+        let second = objective(&model, Some(1));
+        anyhow::ensure!(
+            second.metrics.tokens_counted == 10,
+            "accumulation fixture changed its second target count"
+        );
+        cycle
+            .fold(second, &model, &trainable)?
+            .context("missing accumulation fixture update")
+    };
+    let corrected = accumulated(LmAccumulationWeighting::Tokens, 3)?;
+    let legacy = accumulated(LmAccumulationWeighting::Microbatches, 2)?;
+    let loss = f64::from((pooled.metrics.loss - corrected.metrics.loss).abs());
+    anyhow::ensure!(
+        (pooled.metrics.loss - legacy.metrics.loss).abs() > 1e-4,
+        "legacy accumulation negative control did not change masked loss"
+    );
+
+    // Different matrix shapes can select different backend reductions.
+    // Compare to one backward pass through the pooled objective at the
+    // same per-window tensor shapes to isolate accumulation and AdamW.
+    let same_shape = initial.clone();
+    let first = objective(&same_shape, Some(0));
+    let second = objective(&same_shape, Some(1));
+    let joint = (first.cross_entropy_sum + second.cross_entropy_sum).div_scalar(16.0);
+    let joint_gradients = GradientsParams::from_grads(joint.backward(), &same_shape);
+
+    struct GradDiff<'a> {
+        reference: &'a GradientsParams,
+        candidate: &'a GradientsParams,
+        max: f32,
+        compared: usize,
+    }
+    impl ModuleVisitor<B> for GradDiff<'_> {
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+            let reference = self.reference.get::<NdArray<f32>, D>(param.id);
+            let candidate = self.candidate.get::<NdArray<f32>, D>(param.id);
+            match (reference, candidate) {
+                (Some(a), Some(b)) => {
+                    self.compared += 1;
+                    let diff = (a - b).abs().max().into_scalar();
+                    self.max = if diff.is_finite() {
+                        self.max.max(diff)
+                    } else {
+                        f32::INFINITY
+                    };
+                }
+                (None, None) => {}
+                _ => self.max = f32::INFINITY,
+            }
+        }
+    }
+    let gradient_error = |reference, candidate| {
+        let mut diff = GradDiff {
+            reference,
+            candidate,
+            max: 0.0,
+            compared: 0,
+        };
+        initial.visit(&mut diff);
+        if diff.compared == 0 {
+            f32::INFINITY
+        } else {
+            diff.max
+        }
+    };
+    let gradient = f64::from(gradient_error(&joint_gradients, &corrected.gradients));
+    let legacy_gradient = gradient_error(&joint_gradients, &legacy.gradients);
+    anyhow::ensure!(
+        legacy_gradient.is_finite() && legacy_gradient > 1e-4,
+        "legacy gradients must distinguish the fixture"
+    );
+
+    #[derive(Default)]
+    struct Parameters(Vec<f32>);
+    impl ModuleVisitor<B> for Parameters {
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+            self.0.extend(param.val().into_data().iter::<f32>());
+        }
+    }
+    let compare_update = |gradients| {
+        let mut adam = AdamWConfig::new().with_weight_decay(0.01).init();
+        let changed = adam.step(0.002, initial.clone(), gradients);
+        let mut params = Parameters::default();
+        changed.visit(&mut params);
+        params.0
+    };
+    let pooled = compare_update(joint_gradients);
+    let corrected = compare_update(corrected.gradients);
+    anyhow::ensure!(
+        !pooled.is_empty() && pooled.len() == corrected.len(),
+        "optimizer fixture parameter shape mismatch"
+    );
+    let parameters = pooled.iter().zip(corrected).fold(0.0f64, |max, (a, b)| {
+        let diff = f64::from((a - b).abs());
+        if diff.is_finite() {
+            max.max(diff)
+        } else {
+            f64::INFINITY
+        }
+    });
+    Ok((loss, gradient, parameters))
+}
+
 pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
     mut model: LanguageModel<B>,
     mix: &mut CorpusMix<'_>,
@@ -2203,19 +2532,47 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
         .with_weight_decay(config.weight_decay as f32)
         .init();
     let mut rng = ChaCha12Rng::seed_from_u64(config.seed);
-    let mut logger = config
-        .log_path
-        .as_ref()
-        .map(|path| crate::logging::MetricsLogger::open(path))
-        .transpose()?;
     let span = 0..model.num_layers();
 
     // Training state (roadmap Phase 28): identity of the data, the config as
     // JSON, and whatever an earlier run left beside the model being resumed.
     let dataset_identity = mix.identities()?;
+    let resume_state = config
+        .resume
+        .as_deref()
+        .map(TrainState::for_model)
+        .transpose()?
+        .flatten();
+    let supports_tokens = model.supports_token_weighted_accumulation()
+        && matches!(resident.scope, LmTrainingScope::Joint)
+        && config.penalty.is_off()
+        && (config.direction.is_none() || config.direction_weight == 0.0)
+        && (teacher_refs.is_empty() || config.distill_weight == 0.0)
+        && (inputs.negative_teacher.is_none() || config.negative_penalty == 0.0)
+        && config.bias_balance_rate == 0.0
+        && config.ema_decay.is_none()
+        && config.heretic.is_none();
+    let every = config.accumulate.max(1);
+    let weighting = resolve_lm_accumulation_weighting(
+        config.accumulation_weighting,
+        every > 1 && (mix.any_masks() || mix.any_grades()),
+        supports_tokens,
+        resume_state.as_ref(),
+    )?;
+    if weighting == LmAccumulationWeighting::Tokens {
+        anyhow::ensure!(
+            config.steps.is_multiple_of(every),
+            "token-weighted LM steps ({}) must end on an accumulation boundary of {every} microbatches",
+            config.steps
+        );
+    }
     let mut config_json = serde_json::to_value(config).context("serialize LM training config")?;
+    let weighting_json = serde_json::to_value(weighting)?;
+    config_json["accumulation_weighting"] = weighting_json.clone();
     config_json["training_scope"] = serde_json::to_value(&resident.scope)?;
-    if matches!(resident.scope, LmTrainingScope::Specialist { .. }) {
+    if matches!(resident.scope, LmTrainingScope::Specialist { .. })
+        || weighting == LmAccumulationWeighting::Tokens
+    {
         config_json["mix_mode"] = serde_json::to_value(mix.mode())?;
         config_json["mix_weights"] = serde_json::to_value(mix.weights())?;
     }
@@ -2235,8 +2592,8 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
         model = checkpoint::load::<B, _>(model, path, device)?;
     }
     if let Some(path) = &config.resume {
-        match TrainState::for_model(path)? {
-            Some(state) => {
+        match resume_state {
+            Some(mut state) => {
                 let dir = TrainState::dir_for(path);
                 anyhow::ensure!(
                     state.kind == "lm",
@@ -2244,6 +2601,13 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
                     dir.display(),
                     state.kind
                 );
+                anyhow::ensure!(
+                    state.config.is_object(),
+                    "LM checkpoint config is not an object"
+                );
+                // A sidecar written before weighting was stored used the legacy
+                // objective. Compare the resolved modes, independent of CLI spelling.
+                state.config["accumulation_weighting"] = weighting_json;
                 validate_lm_resume_scope(&state, &resident.scope, &config_json)?;
                 state.verify_files(&dir)?;
                 anyhow::ensure!(
@@ -2253,6 +2617,22 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
                     checkpoint::describe_datasets(&dataset_identity)
                 );
                 let differences = state.config_differences(&config_json);
+                if weighting == LmAccumulationWeighting::Tokens {
+                    anyhow::ensure!(
+                        state.optimizer.is_some() && state.step.is_multiple_of(every) && state.step < config.steps,
+                        "token-weighted LM resume requires optimizer state at a completed accumulation boundary before the requested endpoint"
+                    );
+                    anyhow::ensure!(
+                        differences.iter().all(|key| key == "log_every"),
+                        "incompatible token-weighted LM resume configuration: {}",
+                        differences.join(", ")
+                    );
+                    anyhow::ensure!(
+                        !matches!(config.lr_schedule, LrSchedule::WarmupCosine { .. })
+                            || state.config.get("steps") == config_json.get("steps"),
+                        "token-weighted LM resume must preserve the cosine schedule horizon"
+                    );
+                }
                 if !differences.is_empty() {
                     println!(
                         "warning: resuming with a different configuration in {}",
@@ -2267,6 +2647,11 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
                 restored = Some(state);
             }
             None => {
+                anyhow::ensure!(
+                    !TrainState::dir_for(path).exists(),
+                    "LM training state beside {} is incomplete; use base weights to start fresh",
+                    path.display()
+                );
                 anyhow::ensure!(
                     resident.scope == LmTrainingScope::Joint,
                     "specialist resume requires training state; use base_weights to start fresh"
@@ -2345,10 +2730,7 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
             warmup_steps: *warmup_steps,
         },
     };
-    // Loss-reduction levers ported from the image loop (roadmap Phase 20):
-    // warmup-aware LR, mean-averaged accumulation, post-accumulation
-    // clipping, and the bias-corrected EMA shadow returned for evaluation.
-    let mut accumulator = GradientAccumulator::new(config.accumulate);
+    let mut cycle = LmCycle::new(every, weighting);
     let mut ema = config.ema_decay.map(|d| {
         // The shadow is a clone, and cloning a lazily initialized parameter
         // draws a second, *different* value under the same id: the "average"
@@ -2365,11 +2747,12 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
             e.decay()
         );
     }
-    if config.accumulate > 1 {
-        println!(
-            "gradient accumulation: {} micro-batches per optimizer step (averaged)",
-            accumulator.every()
-        );
+    if every > 1 {
+        let reduction = match weighting {
+            LmAccumulationWeighting::Tokens => "pooled supervised targets",
+            _ => "equal microbatch weights",
+        };
+        println!("gradient accumulation: {every} micro-batches per optimizer step ({reduction})");
     }
     if config.clip_norm > 0.0 {
         println!(
@@ -2436,6 +2819,11 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
         start_step = state.step;
         report.resumed_from_step = start_step;
     }
+    let mut logger = config
+        .log_path
+        .as_ref()
+        .map(|path| crate::logging::MetricsLogger::open(path))
+        .transpose()?;
     let save_state = |step: usize,
                       model: &LanguageModel<B>,
                       optim: &burn_optim::adaptor::OptimizerAdaptor<
@@ -2452,22 +2840,6 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
         let Some(dir) = &config.out_dir else {
             return Ok(None);
         };
-        let model_path = checkpoint::save_content_addressed(model.clone(), dir, "lm")?;
-        let state_dir = TrainState::dir_for(&model_path);
-        if state_dir.exists() {
-            std::fs::remove_dir_all(&state_dir)
-                .with_context(|| format!("clear {}", state_dir.display()))?;
-        }
-        let optimizer = Some(checkpoint::save_record::<B, _>(
-            optim.to_record(),
-            &state_dir,
-            "optimizer",
-        )?);
-        let ema_file = ema
-            .map(|e| {
-                checkpoint::save_record::<B, _>(e.shadow().clone().into_record(), &state_dir, "ema")
-            })
-            .transpose()?;
         let extras = LmExtras {
             steps_taken: report.steps_taken,
             steps_skipped: report.steps_skipped,
@@ -2481,39 +2853,45 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
             elapsed_secs: elapsed,
             ema_updates: ema.map(Ema::updates),
         };
-        let state = TrainState {
-            format_version: checkpoint::STATE_FORMAT_VERSION,
-            kind: "lm".into(),
-            step,
-            seed: config.seed,
-            host_rng: serde_json::to_value(rng).context("serialize host RNG")?,
-            config: config_json.clone(),
-            build: checkpoint::BuildInfo::current(),
-            datasets: dataset_identity.clone(),
-            model: checkpoint::model_entry(&model_path)?,
-            optimizer,
-            ema: ema_file,
-            head: None,
-            head_optimizer: None,
-            extras: serde_json::to_value(&extras).context("serialize lm training extras")?,
-            saved_unix_secs: checkpoint::unix_now(),
-        };
-        state.write(&state_dir)?;
+        let model_path =
+            checkpoint::save_training_checkpoint(model.clone(), dir, "lm", |state_dir, model| {
+                let optimizer = Some(checkpoint::save_record::<B, _>(
+                    optim.to_record(),
+                    state_dir,
+                    "optimizer",
+                )?);
+                let ema_file = ema
+                    .map(|e| {
+                        checkpoint::save_record::<B, _>(
+                            e.shadow().clone().into_record(),
+                            state_dir,
+                            "ema",
+                        )
+                    })
+                    .transpose()?;
+                Ok(TrainState {
+                    format_version: checkpoint::STATE_FORMAT_VERSION,
+                    kind: "lm".into(),
+                    step,
+                    seed: config.seed,
+                    host_rng: serde_json::to_value(rng).context("serialize host RNG")?,
+                    config: config_json.clone(),
+                    build: checkpoint::BuildInfo::current(),
+                    datasets: dataset_identity.clone(),
+                    model,
+                    optimizer,
+                    ema: ema_file,
+                    head: None,
+                    head_optimizer: None,
+                    extras: serde_json::to_value(&extras)
+                        .context("serialize lm training extras")?,
+                    saved_unix_secs: checkpoint::unix_now(),
+                })
+            })?;
         Ok(Some(model_path))
     };
 
-    // Per-cycle bookkeeping. With `accumulate > 1` an optimizer step is made
-    // of several micro-batches, and the step's loss is their mean -- not the
-    // last one's, which is all the report used to see. Logging and periodic
-    // checkpoints fall due on micro-batch indices but can only happen once a
-    // step has been taken, so a due one waits for the next completed cycle
-    // instead of being dropped (with `accumulate = 4, log_every = 10` no
-    // step index was ever both, and the run logged nothing).
-    let mut cycle_loss = 0.0f64;
-    let mut cycle_nll = 0.0f64;
-    let mut cycle_micro = 0usize;
-    let mut cycle_last: Option<crate::lm::LmMetrics> = None;
-    let mut cycle_routing: Vec<crate::moe::RoutingStats> = Vec::new();
+    // A due log or checkpoint waits for the next completed optimizer update.
     let mut log_pending = false;
     let mut checkpoint_pending = false;
     for step in start_step..config.steps {
@@ -2590,11 +2968,7 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
             distill,
             direction: penalty,
         };
-        let crate::lm::LmStep {
-            loss,
-            metrics,
-            routing,
-        } = if let Some(mask) = loss_mask {
+        let current = if let Some(mask) = loss_mask {
             model.next_token_step_masked(tokens, mask, extras, span.clone())
         } else {
             match &resident.scope {
@@ -2610,6 +2984,7 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
             }
         };
 
+        let metrics = current.metrics;
         let rejection = if metrics.tokens_counted == 0 {
             Some("window has no supervised target".to_string())
         } else if !metrics.loss.is_finite() {
@@ -2620,7 +2995,7 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
             None
         };
         let accepted = rejection.is_none();
-        let cycle = match rejection {
+        let update = match rejection {
             Some(reason) => {
                 report.steps_skipped += 1;
                 println!("step {step}: {reason}, micro-batch discarded");
@@ -2628,7 +3003,7 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
                 // the one that completes it, the gradients the cycle already
                 // folded are stepped with below; ignoring this `Cycle` (as an
                 // earlier version did) silently threw them away.
-                accumulator.skip()
+                cycle.skip(&model)?
             }
             None => {
                 // Every accepted micro-batch counts toward the run's totals,
@@ -2637,51 +3012,20 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
                 report.penalized_tokens += metrics.penalized_tokens;
                 report.negative_teacher_tokens += metrics.negative_teacher_tokens;
                 source_stats.record(&origin, metrics.loss);
-                cycle_loss += f64::from(metrics.loss);
-                cycle_nll += f64::from(metrics.perplexity.ln());
-                cycle_micro += 1;
-                cycle_last = Some(metrics);
-                cycle_routing = routing;
-                // Scale so the accumulated total is the mean over the
-                // micro-batches: exactly what one `accumulate`-times-larger
-                // batch would produce.
-                let scaled = if accumulator.every() > 1 {
-                    loss.mul_scalar(accumulator.loss_scale() as f32)
-                } else {
-                    loss
-                };
-                let grads = trainable.gradients::<B, _>(&mut scaled.backward(), &model);
-                accumulator.fold(grads, &model)
+                cycle.fold(current, &model, &trainable)?
             }
         };
-        let cycle_done = cycle.is_ready();
-        let Some(mut summed) = cycle.into_gradients() else {
-            if cycle_done {
-                // Every micro-batch of the cycle was rejected: nothing to step
-                // with, and nothing carried into the next cycle.
-                cycle_loss = 0.0;
-                cycle_nll = 0.0;
-                cycle_micro = 0;
-                cycle_last = None;
-                cycle_routing.clear();
-            } else if accepted {
-                // Still filling the cycle: no step yet.
+        let Some(LmUpdate {
+            gradients: mut summed,
+            metrics,
+            routing,
+        }) = update
+        else {
+            if accepted {
                 report.steps_accumulated += 1;
             }
             continue;
         };
-        // What the step reports: the mean loss (and perplexity) over the
-        // cycle's accepted micro-batches, the last accepted one's diagnostics.
-        let micro = cycle_micro.max(1) as f64;
-        let metrics = crate::lm::LmMetrics {
-            loss: (cycle_loss / micro) as f32,
-            perplexity: (cycle_nll / micro).exp() as f32,
-            ..cycle_last.take().unwrap_or(metrics)
-        };
-        let routing = std::mem::take(&mut cycle_routing);
-        cycle_loss = 0.0;
-        cycle_nll = 0.0;
-        cycle_micro = 0;
         // Clipping applies to the *accumulated* gradient, because that is the
         // step actually taken — bounding micro-batches separately says nothing
         // about the norm of their sum.
@@ -2852,8 +3196,7 @@ pub fn train_lm_resident<B: AutodiffBackend<FloatElem = f32>>(
     anyhow::ensure!(
         report.steps_taken > 0,
         "no optimizer step was taken: every micro-batch was rejected, or the run \
-         ended before an accumulation cycle of {} completed",
-        accumulator.every()
+         ended before an accumulation cycle of {every} completed"
     );
     report.mean_loss = (loss_sum / report.steps_taken as f64) as f32;
     report.elapsed_secs = elapsed_before + started.elapsed().as_secs_f64();

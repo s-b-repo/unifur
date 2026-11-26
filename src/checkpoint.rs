@@ -68,6 +68,76 @@ pub fn save_content_addressed<B: Backend, M: Module<B>>(
     Ok(final_path)
 }
 
+/// Save a model and its resume state as one generation. Identical weights
+/// can belong to different steps, optimizers or parameter IDs, so training
+/// generations cannot reuse the weights-only checkpoint path.
+pub(crate) fn save_training_checkpoint<B: Backend, M: Module<B>>(
+    module: M,
+    dir: &Path,
+    stem: &str,
+    make_state: impl FnOnce(&Path, StateFile) -> anyhow::Result<TrainState>,
+) -> anyhow::Result<PathBuf> {
+    use std::io::ErrorKind;
+    use std::sync::atomic::Ordering;
+
+    fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    let hash = canonical_hash_hex::<B, M>(&module);
+    let prefix = format!("{stem}-{}", &hash[..HASH_LEN]);
+    let ext = <MpkRecorder as FileRecorder<B>>::file_extension();
+    let next_suffix = || {
+        let counter = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{}-{counter}", std::process::id())
+    };
+    let mut name = prefix.clone();
+    let (model_path, state_dir) = loop {
+        let model_path = dir.join(format!("{name}.{ext}"));
+        let state_dir = TrainState::dir_for(&model_path);
+        if !model_path.try_exists()? {
+            match fs::create_dir(&state_dir) {
+                Ok(()) => break (model_path, state_dir),
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+                Err(err) => {
+                    return Err(err).with_context(|| format!("reserve {}", state_dir.display()))
+                }
+            }
+        }
+        name = format!("{prefix}-{}", next_suffix());
+    };
+    let staged = loop {
+        let staged = dir.join(format!(".checkpoint-{}", next_suffix()));
+        match fs::create_dir(&staged) {
+            Ok(()) => break staged,
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(err).with_context(|| format!("stage {}", model_path.display())),
+        }
+    };
+    let staged_model = staged.join(format!("model.{ext}"));
+    let staged_state = staged.join("model.state");
+    module
+        .save_file(&staged_model, &MpkRecorder::new())
+        .map_err(|err| anyhow::anyhow!("serialize checkpoint: {err}"))?;
+    let entry = StateFile {
+        path: model_path.display().to_string(),
+        sha256: file_sha256_hex(&staged_model)?,
+    };
+    make_state(&staged_state, entry)?.write(&staged_state)?;
+    fs::rename(&staged_state, &state_dir)
+        .with_context(|| format!("publish {}", state_dir.display()))?;
+    fs::File::open(dir)
+        .and_then(|file| file.sync_all())
+        .with_context(|| format!("flush checkpoint sidecar {}", state_dir.display()))?;
+    // Discoverable model names become visible after the sidecar is durable.
+    publish(&staged_model, &model_path, dir)?;
+    fs::remove_dir(&staged).with_context(|| {
+        format!(
+            "checkpoint saved to {}, but cannot clear {}",
+            model_path.display(),
+            staged.display()
+        )
+    })?;
+    Ok(model_path)
+}
+
 /// Make a fully written temporary file durable, rename it over `dest`, and
 /// make the rename durable.
 ///

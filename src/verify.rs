@@ -2309,6 +2309,8 @@ fn lm_checks() -> anyhow::Result<Vec<Certificate>> {
         &device,
     );
     let decode_err = f64::from(u8::from(plain != cached));
+    let (pooled_loss_err, pooled_grad_err, pooled_update_err) =
+        crate::train::lm_masked_accumulation_residuals()?;
 
     Ok(vec![
         cert(
@@ -2355,6 +2357,27 @@ fn lm_checks() -> anyhow::Result<Vec<Certificate>> {
             "Cached and uncached generation produce identical sequences from the same seed.",
             decode_err,
             0.0,
+        ),
+        cert(
+            "lm",
+            "masked_accumulation_matches_pooled_loss",
+            "Pooling six and ten supervised targets, with a skipped microbatch, reproduces one combined batch loss.",
+            pooled_loss_err,
+            2e-6,
+        ),
+        cert(
+            "lm",
+            "masked_accumulation_matches_pooled_gradient",
+            "Accumulation matches one backward pass through the pooled masked objective on the same tensor shapes.",
+            pooled_grad_err,
+            2e-6,
+        ),
+        cert(
+            "lm",
+            "masked_accumulation_matches_pooled_adamw_update",
+            "AdamW applies the pooled masked update within CPU tolerance when both paths use the same tensor shapes.",
+            pooled_update_err,
+            1e-5,
         ),
     ])
 }

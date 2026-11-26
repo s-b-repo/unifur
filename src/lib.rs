@@ -199,6 +199,8 @@ pub mod multi_block;
 pub mod ncm;
 pub mod nim;
 pub mod nina;
+pub mod nina_eval;
+pub mod nina_research;
 pub mod ninagui;
 pub mod peregrine;
 pub mod planner;

@@ -256,3 +256,156 @@ fn integration_resume_is_bit_identical_for_the_lm_trainer() {
         report_b.checkpoint.unwrap().file_name()
     );
 }
+
+#[test]
+fn integration_masked_lm_resume_preserves_weighting_and_refuses_corruption() -> anyhow::Result<()> {
+    let _guard = serial();
+    use diffusionblocks::checkpoint::{canonical_hash_hex, TrainState};
+    use diffusionblocks::corpus::{mask_path, TokenCorpus};
+    use diffusionblocks::lm::{LanguageModel, LmConfig};
+    use diffusionblocks::train::{train_lm, LmAccumulationWeighting, LmTrainConfig};
+
+    let dir = scratch("lm-masked-resume");
+    let corpus_path = dir.join("masked.bin");
+    let ids: Vec<u16> = (0..96).map(|index| 65 + (index % 26)).collect();
+    let masks: Vec<u8> = (0..96).map(|index| u8::from(index % 12 >= 5)).collect();
+    TokenCorpus::write(&corpus_path, &ids)?;
+    TokenCorpus::write_masks(&mask_path(&corpus_path), &masks)?;
+    let mut corpus = TokenCorpus::in_memory(&corpus_path)?;
+    corpus.open_mask()?;
+
+    let device: Device = Default::default();
+    let shape = LmConfig::tiny();
+    <B as burn::tensor::backend::Backend>::seed(&device, 42);
+    let init = LanguageModel::<B>::new(&shape, &device)?;
+    diffusionblocks::tensor_ext::force_initialization(&init);
+    let config = LmTrainConfig {
+        steps: 4,
+        batch_size: 1,
+        accumulate: 2,
+        log_every: 1,
+        log_path: Some(dir.join("full.jsonl")),
+        model_config: Some(shape.clone()),
+        checkpoint_every: 2,
+        out_dir: Some(dir.join("full")),
+        ..Default::default()
+    };
+    let (full, report) = train_lm(init, &mut corpus, &config, &device)?;
+    assert_eq!(report.periodic_checkpoints.len(), 1);
+    let (at, checkpoint) = &report.periodic_checkpoints[0];
+    assert_eq!(*at, 2);
+    let state_dir = TrainState::dir_for(checkpoint);
+    let state = TrainState::for_model(checkpoint)?.expect("masked LM sidecar");
+    assert_eq!(state.config["accumulation_weighting"], "tokens");
+    assert_eq!(report.steps_taken, 2);
+
+    let resume = LmTrainConfig {
+        log_path: Some(dir.join("resume.jsonl")),
+        out_dir: Some(dir.join("resume")),
+        resume: Some(checkpoint.clone()),
+        ..config.clone()
+    };
+    let fresh = || LanguageModel::<B>::new(&shape, &device);
+    let (continued, resumed) = train_lm(fresh()?, &mut corpus, &resume, &device)?;
+    assert_eq!(resumed.resumed_from_step, 2);
+    assert_eq!(resumed.tokens_seen, report.tokens_seen);
+    assert_eq!(resumed.steps_taken, report.steps_taken);
+    assert_eq!(canonical_hash_hex(&full), canonical_hash_hex(&continued));
+    assert_eq!(
+        logged_losses(&dir.join("full.jsonl"))[1..],
+        logged_losses(&dir.join("resume.jsonl"))
+    );
+
+    // The optimizer and RNG advance even when the weights stay frozen.
+    // Both requested checkpoint boundaries must survive the repeated hash.
+    let (_, frozen) = train_lm(
+        fresh()?,
+        &mut corpus,
+        &LmTrainConfig {
+            lr: 0.0,
+            log_every: 0,
+            log_path: None,
+            out_dir: Some(dir.join("frozen")),
+            ..config.clone()
+        },
+        &device,
+    )?;
+    let (_, earlier) = &frozen.periodic_checkpoints[0];
+    let later = frozen.checkpoint.expect("final frozen checkpoint");
+    assert_ne!(earlier, &later);
+    let earlier_state = TrainState::for_model(earlier)?.expect("earlier frozen checkpoint state");
+    let later_state = TrainState::for_model(&later)?.expect("later frozen checkpoint state");
+    assert_eq!((earlier_state.step, later_state.step), (2, 4));
+    earlier_state.verify_files(&TrainState::dir_for(earlier))?;
+    later_state.verify_files(&TrainState::dir_for(&later))?;
+    let earlier_model = diffusionblocks::checkpoint::load(fresh()?, earlier, &device)?;
+    let later_model = diffusionblocks::checkpoint::load(fresh()?, &later, &device)?;
+    assert_eq!(
+        canonical_hash_hex(&earlier_model),
+        canonical_hash_hex(&later_model)
+    );
+
+    let reject = LmTrainConfig {
+        log_path: Some(dir.join("rejected.jsonl")),
+        out_dir: Some(dir.join("rejected")),
+        ..resume
+    };
+    let error = train_lm(
+        fresh()?,
+        &mut corpus,
+        &LmTrainConfig {
+            accumulate: 1,
+            ..reject.clone()
+        },
+        &device,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("accumulate"), "{error}");
+    let error = train_lm(
+        fresh()?,
+        &mut corpus,
+        &LmTrainConfig {
+            steps: 3,
+            ..reject.clone()
+        },
+        &device,
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("accumulation boundary"),
+        "{error}"
+    );
+    let mut legacy_state = state.clone();
+    legacy_state
+        .config
+        .as_object_mut()
+        .expect("configuration object")
+        .remove("accumulation_weighting");
+    legacy_state.write(&state_dir)?;
+    let error = train_lm(
+        fresh()?,
+        &mut corpus,
+        &LmTrainConfig {
+            accumulation_weighting: LmAccumulationWeighting::Tokens,
+            ..reject.clone()
+        },
+        &device,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("Microbatches"), "{error}");
+    state.write(&state_dir)?;
+
+    let optimizer = state_dir.join(state.optimizer.expect("masked LM optimizer").path);
+    let mut bytes = std::fs::read(&optimizer)?;
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xff;
+    std::fs::write(&optimizer, bytes)?;
+    let error = train_lm(fresh()?, &mut corpus, &reject, &device).unwrap_err();
+    assert!(
+        error.to_string().contains("optimizer file") && error.to_string().contains("corrupted"),
+        "{error}"
+    );
+    assert!(!dir.join("rejected").exists() && !dir.join("rejected.jsonl").exists());
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}

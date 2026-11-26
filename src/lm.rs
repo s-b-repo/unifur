@@ -635,6 +635,8 @@ pub struct LanguageModel<B: Backend> {
     /// objective and any resumed run agree on what the loss was.
     #[module(skip)]
     mtp_weight: f64,
+    #[module(skip)]
+    deterministic_dense_trunk: bool,
     context: usize,
     vocab_size: usize,
     layers_per_block: usize,
@@ -723,6 +725,9 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             } else {
                 0.0
             },
+            deterministic_dense_trunk: config.dropout == 0.0
+                && config.moe.is_none()
+                && config.mosme.is_none(),
             context: config.context,
             vocab_size: config.vocab_size,
             layers_per_block: config.layers_per_block(),
@@ -1488,6 +1493,11 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         self.mtp_weight > 0.0 && self.mtp_heads.is_some()
     }
 
+    /// A dense, deterministic trunk with a single next-token denominator.
+    pub(crate) fn supports_token_weighted_accumulation(&self) -> bool {
+        self.deterministic_dense_trunk && !self.mtp_active()
+    }
+
     fn objective(
         &self,
         tokens: Tensor<B, 2, Int>,
@@ -1586,7 +1596,8 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
                     * keep.clone()
             }
         };
-        let counted = loss_keep.clone().sum().clamp_min(1.0);
+        let target_weight = loss_keep.clone().sum();
+        let counted = target_weight.clone().clamp_min(1.0);
         let keep_all = loss_keep.clone();
         // Targets that actually carry loss. Counted *before* the clamp above:
         // reading the clamped denominator reported one target for a window
@@ -1596,11 +1607,12 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
         // Perplexity is `exp` of the mean NLL over the counted targets -- not of
         // the objective, which also carries the unlikelihood charge, the
         // distillation KL, the direction and MTP terms.
-        let mean_nll: f32 =
-            ((nll.clone() * loss_keep.clone()).sum() / counted.clone()).into_scalar();
+        let cross_entropy_sum = (nll.clone() * loss_keep.clone()).sum();
+        let cross_entropy_mean = cross_entropy_sum.clone() / counted.clone();
+        let mean_nll: f32 = cross_entropy_mean.clone().into_scalar();
 
         let (loss, penalized_tokens, penalty, penalized_prob) = match negatives {
-            None => ((nll * loss_keep).sum() / counted.clone(), 0, 0.0, 0.0),
+            None => (cross_entropy_mean, 0, 0.0, 0.0),
             Some((weights, unlikelihood_term)) => {
                 assert_eq!(
                     weights.dims(),
@@ -1827,6 +1839,8 @@ impl<B: Backend<FloatElem = f32>> LanguageModel<B> {
             loss,
             metrics,
             routing,
+            target_weight,
+            cross_entropy_sum,
         }
     }
 
@@ -2167,6 +2181,10 @@ pub struct LmStep<B: Backend> {
     /// Per-sparse-layer routing statistics of the executed span, in execution
     /// order; empty for a dense trunk (roadmap 23.6).
     pub routing: Vec<crate::moe::RoutingStats>,
+    /// Total non-padding target weight before clamping the denominator.
+    pub(crate) target_weight: Tensor<B, 1>,
+    /// Supervised next-token NLL numerator before any auxiliary terms.
+    pub(crate) cross_entropy_sum: Tensor<B, 1>,
 }
 
 /// Diagnostics for one language-model step.

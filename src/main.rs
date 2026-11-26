@@ -24,7 +24,7 @@ use diffusionblocks::{
     lm::{LanguageModel, LmConfig, Sampling, Unlikelihood},
     mlcheat,
     multi_block::{Gated, MultiBlockConfig, PlannedConfig, Strategy},
-    nina, ninagui,
+    nina, nina_eval, nina_research, ninagui,
     planner::Budget,
     precision::{Precision, PrecisionPolicy},
     profile::{format_duration, Profiler},
@@ -171,6 +171,24 @@ struct LmArchArgs {
 enum LmBackend {
     Cpu,
     Wgpu,
+}
+
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum LmAccumulationWeightingArg {
+    #[default]
+    Auto,
+    Tokens,
+    Microbatches,
+}
+
+impl From<LmAccumulationWeightingArg> for train::LmAccumulationWeighting {
+    fn from(value: LmAccumulationWeightingArg) -> Self {
+        match value {
+            LmAccumulationWeightingArg::Auto => Self::Auto,
+            LmAccumulationWeightingArg::Tokens => Self::Tokens,
+            LmAccumulationWeightingArg::Microbatches => Self::Microbatches,
+        }
+    }
 }
 
 #[derive(clap::Args, Clone)]
@@ -1175,10 +1193,13 @@ enum LmAction {
         /// over the first 5% of steps and decays to 1% of the peak.
         #[arg(long, default_value = "constant", value_parser = ["constant", "cosine", "warmup"])]
         lr_schedule: String,
-        /// Micro-batches per optimizer step, averaged not summed (roadmap
-        /// 20.2). 1 is a single batch per step, exactly as before.
+        /// Micro-batches per optimizer step. 1 takes one optimizer step per batch.
         #[arg(long, default_value_t = 1, value_parser = parse_positive_usize)]
         accumulate: usize,
+        /// Reduction across accumulated batches. Auto pools supported masked
+        /// targets for fresh runs and restores the checkpoint's reduction on resume.
+        #[arg(long, value_enum, default_value = "auto")]
+        accumulation_weighting: LmAccumulationWeightingArg,
         /// Rescale the accumulated gradient when its global norm exceeds this
         /// (roadmap 20.3). 0 disables clipping exactly.
         #[arg(long, default_value_t = 0.0)]
@@ -2794,6 +2815,11 @@ struct NinaChatArgs {
 /// The NINA program subcommands (PLAN-NINA.md §1, §4, §8).
 #[derive(Subcommand)]
 enum NinaAction {
+    /// Prepare and evaluate bounded development experiments.
+    Research {
+        #[command(subcommand)]
+        action: NinaResearchAction,
+    },
     /// Run the MCP training server: JSON-RPC 2.0 over stdio (newline-delimited
     /// frames), exposing the registry, the training queue, routing and log
     /// verification as MCP tools.
@@ -2837,6 +2863,84 @@ enum NinaAction {
         /// Root holding registry.json and logs/; defaults to the external drive.
         #[arg(long, default_value = diffusionblocks::nina::DEFAULT_ROOT)]
         root: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum NinaResearchAction {
+    /// Qualify the numeric grader against the seven frozen fixtures.
+    CheckGrader,
+    /// Score an incumbent and challenger on one frozen case and output budget.
+    Compare {
+        #[arg(long)]
+        cases: PathBuf,
+        #[arg(long)]
+        incumbent: PathBuf,
+        #[arg(long)]
+        challenger: PathBuf,
+    },
+    /// Cross two checkpoints and runtimes on the same development cases.
+    Runtime {
+        #[arg(long)]
+        cases: PathBuf,
+        #[arg(long)]
+        matrix: PathBuf,
+    },
+    /// Reconcile the first draw for each planned case before allowing retries.
+    FirstDraws {
+        #[arg(long)]
+        cases: PathBuf,
+        #[arg(long)]
+        predictions: PathBuf,
+    },
+    /// Measure early-to-full rank reversals on the same cases and seeds.
+    EarlyRank {
+        #[arg(long)]
+        scores: PathBuf,
+    },
+    /// Check whether the same original choice survives all four positions.
+    Positions {
+        #[arg(long)]
+        cases: PathBuf,
+        #[arg(long)]
+        predictions: PathBuf,
+    },
+    /// Prepare and run a matched two-seed solver-versus-scrambled fit on CPU.
+    Arithmetic {
+        #[arg(long)]
+        cases: PathBuf,
+        #[arg(long)]
+        out_dir: PathBuf,
+        #[arg(long, default_value_t = 64)]
+        context: usize,
+        #[arg(long, default_value_t = 96)]
+        steps: usize,
+        #[arg(long, default_value_t = 8)]
+        batch_size: usize,
+        #[arg(long, default_value_t = 6)]
+        max_output_tokens: usize,
+        #[arg(long)]
+        prepare_only: bool,
+    },
+    /// Select the exact-fit science cases and a prescribed position diagnostic.
+    ScienceScreen {
+        #[arg(long)]
+        development: PathBuf,
+        #[arg(long)]
+        out_dir: PathBuf,
+        #[arg(long, default_value_t = 256)]
+        context: usize,
+        #[arg(long, default_value_t = 32)]
+        diagnostic_per_slice: usize,
+    },
+    /// Verify the existing byte pack and rebuild its clean and stratified development views.
+    LongRecordValidation {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        out_dir: PathBuf,
+        #[arg(long, default_value_t = 384)]
+        screen_size: usize,
     },
 }
 
@@ -5928,6 +6032,7 @@ fn cmd_lm_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
             lr,
             lr_schedule,
             accumulate,
+            accumulation_weighting,
             clip_norm,
             ema_decay,
             weight_decay,
@@ -6084,6 +6189,7 @@ fn cmd_lm_backend<B: burn::tensor::backend::Backend<FloatElem = f32>>(
                 lr,
                 lr_schedule: diffusionblocks::schedule::LrSchedule::parse(&lr_schedule, lr, steps)?,
                 accumulate,
+                accumulation_weighting: accumulation_weighting.into(),
                 clip_norm,
                 ema_decay,
                 weight_decay,
@@ -9086,6 +9192,7 @@ fn cmd_corpus(action: CorpusAction) -> Result<()> {
 /// The NINA program: MCP server, registry reads, chain verification.
 fn cmd_nina(action: NinaAction) -> Result<()> {
     match action {
+        NinaAction::Research { action } => cmd_nina_research(action),
         NinaAction::McpServe { root } => {
             let server = nina::McpServer::new(nina::NinaPaths::new(root));
             let stdin = std::io::stdin();
@@ -9116,6 +9223,80 @@ fn cmd_nina(action: NinaAction) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn cmd_nina_research(action: NinaResearchAction) -> Result<()> {
+    let report = match action {
+        NinaResearchAction::CheckGrader => {
+            let fixtures = nina_eval::grade_fixtures();
+            ensure!(
+                fixtures.iter().all(|result| result.matches_fixture),
+                "numeric grader changed a frozen verdict"
+            );
+            serde_json::to_value(fixtures)?
+        }
+        NinaResearchAction::Compare {
+            cases,
+            incumbent,
+            challenger,
+        } => serde_json::to_value(nina_eval::score_paired(
+            &nina_research::read_json(&cases)?,
+            &nina_research::read_json(&incumbent)?,
+            &nina_research::read_json(&challenger)?,
+        )?)?,
+        NinaResearchAction::Runtime { cases, matrix } => {
+            serde_json::to_value(nina_eval::score_runtime(
+                &nina_research::read_json(&cases)?,
+                &nina_research::read_json(&matrix)?,
+            )?)?
+        }
+        NinaResearchAction::FirstDraws { cases, predictions } => {
+            serde_json::to_value(nina_eval::score_first_draws(
+                &nina_research::read_json(&cases)?,
+                &nina_research::read_json(&predictions)?,
+            )?)?
+        }
+        NinaResearchAction::EarlyRank { scores } => serde_json::to_value(
+            nina_eval::audit_early_rank(&nina_research::read_json(&scores)?)?,
+        )?,
+        NinaResearchAction::Positions { cases, predictions } => {
+            let cases: Vec<_> = nina_research::read_json(&cases)?;
+            serde_json::to_value(nina_eval::score_choice_positions(
+                &cases,
+                &nina_research::read_json(&predictions)?,
+            )?)?
+        }
+        NinaResearchAction::Arithmetic {
+            cases,
+            out_dir,
+            context,
+            steps,
+            batch_size,
+            max_output_tokens,
+            prepare_only,
+        } => {
+            let budget = nina_research::ArithmeticBudget {
+                context,
+                steps,
+                batch_size,
+                max_output_tokens,
+            };
+            nina_research::arithmetic(&cases, &out_dir, budget, prepare_only)?
+        }
+        NinaResearchAction::ScienceScreen {
+            development,
+            out_dir,
+            context,
+            diagnostic_per_slice,
+        } => nina_research::science_screen(&development, &out_dir, context, diagnostic_per_slice)?,
+        NinaResearchAction::LongRecordValidation {
+            source,
+            out_dir,
+            screen_size,
+        } => nina_research::long_record_validation(&source, &out_dir, screen_size)?,
+    };
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
 }
 
 fn cmd_nina_registry(action: &NinaRegistryAction, registry: &Path) -> Result<()> {
